@@ -9,9 +9,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from cgr.kernel.contracts import ExecutionRequest, ExecutionResult, Plugin
+from cgr.kernel.contracts import (
+    ExecutionRequest,
+    ExecutionResult,
+    HealthStatus,
+    Plugin,
+)
 from cgr.kernel.registry import PluginRegistry
 from cgr.shared.events import Event, EventBus, EventType
+
+from .runtime_health import PluginHealthSnapshot, RuntimeHealthSnapshot
 
 
 class KernelRuntime:
@@ -64,6 +71,29 @@ class KernelRuntime:
         """Shutdown and unregister every plugin managed by the runtime."""
         for plugin_id in self._registry.plugin_ids():
             self.unregister_plugin(plugin_id)
+
+    def health_snapshot(self) -> RuntimeHealthSnapshot:
+        """Return current runtime and registered plugin health information."""
+        plugins = [
+            PluginHealthSnapshot(
+                plugin_id=plugin.metadata.id,
+                plugin_name=plugin.metadata.name,
+                plugin_version=plugin.metadata.version,
+                state=plugin.state,
+                health=plugin.health,
+                capabilities=[
+                    capability.id for capability in plugin.metadata.capabilities
+                ],
+            )
+            for plugin in self._registry.all()
+        ]
+        return RuntimeHealthSnapshot(
+            healthy=all(
+                plugin.health == HealthStatus.HEALTHY for plugin in plugins
+            ),
+            plugin_count=len(plugins),
+            plugins=plugins,
+        )
 
     def execute(
         self,
