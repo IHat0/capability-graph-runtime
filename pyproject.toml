@@ -8,5 +8,8 @@ version="0.1.0"
 requires-python=">=3.12"
 dependencies=["fastapi","pydantic>=2","pluggy","structlog","uvicorn"]
 
+[project.scripts]
+cgr-smoke = "cgr.apps.cli.main:main"
+
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]
