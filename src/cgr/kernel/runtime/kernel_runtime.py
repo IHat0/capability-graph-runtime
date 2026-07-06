@@ -15,11 +15,9 @@ from cgr.kernel.contracts import (
     HealthStatus,
     Plugin,
 )
-from cgr.kernel.exceptions import (
-    CapabilityNotFoundError,
-    PluginAlreadyRegisteredError,
-)
+from cgr.kernel.exceptions import PluginAlreadyRegisteredError
 from cgr.kernel.registry import PluginRegistry
+from cgr.kernel.router import CapabilityRouter
 from cgr.shared.events import Event, EventBus, EventType
 
 from .runtime_health import PluginHealthSnapshot, RuntimeHealthSnapshot
@@ -36,9 +34,13 @@ class KernelRuntime:
         self,
         registry: PluginRegistry | None = None,
         event_bus: EventBus | None = None,
+        router: CapabilityRouter | None = None,
     ) -> None:
         self._registry = registry if registry is not None else PluginRegistry()
         self._event_bus = event_bus if event_bus is not None else EventBus()
+        self._router = (
+            router if router is not None else CapabilityRouter(self._registry)
+        )
 
     @property
     def registry(self) -> PluginRegistry:
@@ -49,6 +51,11 @@ class KernelRuntime:
     def event_bus(self) -> EventBus:
         """Return the runtime event bus."""
         return self._event_bus
+
+    @property
+    def router(self) -> CapabilityRouter:
+        """Return the runtime capability router."""
+        return self._router
 
     def register_plugin(self, plugin: Plugin[Any, Any]) -> None:
         """Initialize and register a plugin with the runtime."""
@@ -123,13 +130,8 @@ class KernelRuntime:
         request: ExecutionRequest[Any],
     ) -> ExecutionResult[Any]:
         """Execute a request using the first plugin supporting its capability."""
-        plugins = self._registry.find_by_capability(request.capability)
-        if not plugins:
-            raise CapabilityNotFoundError(
-                f"No plugin registered for capability '{request.capability.id}'."
-            )
-
-        return self._execute_plugin(plugins[0].metadata.id, request)
+        plugin = self._router.select_plugin(request)
+        return self._execute_plugin(plugin.metadata.id, request)
 
     def _execute_plugin(
         self,
