@@ -15,6 +15,11 @@ from cgr.kernel.contracts import (
     PluginState,
 )
 from cgr.kernel.registry import PluginRegistry
+from cgr.kernel.exceptions import (
+    CapabilityNotFoundError,
+    PluginExecutionError,
+    PluginNotFoundError,
+)
 from cgr.kernel.runtime import KernelRuntime
 from cgr.plugins.examples import EchoPlugin
 from cgr.shared.events import Event, EventBus, EventType
@@ -215,6 +220,7 @@ def test_runtime_publishes_failure_and_reraises_original_exception(
         runtime.execute("failing", request)
 
     assert str(raised.value) == "plugin exploded"
+    assert not isinstance(raised.value, PluginExecutionError)
     started, failed = runtime.event_bus.history()
     assert started.type == EventType.EXECUTION_STARTED
     assert failed.type == EventType.EXECUTION_FAILED
@@ -267,12 +273,34 @@ def test_execute_capability_without_match_raises_without_events(
     )
 
     with pytest.raises(
-        LookupError,
+        CapabilityNotFoundError,
         match="No plugin registered for capability 'echo'",
     ):
         runtime.execute_capability(request)
 
     assert runtime.event_bus.history() == []
+
+
+def test_execute_missing_plugin_raises_explicit_error_and_publishes_failure(
+    capability: Capability,
+) -> None:
+    runtime = KernelRuntime()
+    request = ExecutionRequest[dict[str, str]](
+        capability=capability,
+        context=ExecutionContext(execution_id="missing-plugin"),
+        payload={},
+    )
+
+    with pytest.raises(
+        PluginNotFoundError,
+        match="Plugin 'missing' is not registered.",
+    ):
+        runtime.execute("missing", request)
+
+    started, failed = runtime.event_bus.history()
+    assert started.type == EventType.EXECUTION_STARTED
+    assert failed.type == EventType.EXECUTION_FAILED
+    assert failed.payload["error_type"] == "PluginNotFoundError"
 
 
 def test_execute_capability_publishes_failure_and_reraises(

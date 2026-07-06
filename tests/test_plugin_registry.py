@@ -1,6 +1,10 @@
 import pytest
 
 from cgr.kernel.contracts import Capability, CapabilityVersion
+from cgr.kernel.exceptions import (
+    PluginAlreadyRegisteredError,
+    PluginNotFoundError,
+)
 from cgr.kernel.registry import PluginRegistry
 from cgr.plugins.examples import EchoPlugin
 
@@ -27,8 +31,11 @@ def test_register_and_get_plugin() -> None:
     assert registry.plugin_ids() == ["echo"]
 
 
-def test_get_unknown_plugin_raises_key_error() -> None:
-    with pytest.raises(KeyError):
+def test_get_unknown_plugin_raises_plugin_not_found_error() -> None:
+    with pytest.raises(
+        PluginNotFoundError,
+        match="Plugin 'missing' is not registered.",
+    ):
         PluginRegistry().get("missing")
 
 
@@ -67,9 +74,12 @@ def test_unregister_unknown_plugin_is_a_no_op() -> None:
     assert len(registry) == 0
 
 
-def test_duplicate_registration_raises_value_error() -> None:
+def test_duplicate_registration_raises_explicit_error() -> None:
     registry = PluginRegistry()
     registry.register(EchoPlugin())
 
-    with pytest.raises(ValueError, match="already registered"):
+    with pytest.raises(
+        PluginAlreadyRegisteredError,
+        match="Plugin 'echo' is already registered.",
+    ):
         registry.register(EchoPlugin())

@@ -14,6 +14,10 @@ from typing import Any
 
 from cgr.kernel.contracts.capability import Capability
 from cgr.kernel.contracts.plugin import Plugin
+from cgr.kernel.exceptions import (
+    PluginAlreadyRegisteredError,
+    PluginNotFoundError,
+)
 
 
 class PluginRegistry:
@@ -30,13 +34,13 @@ class PluginRegistry:
 
         Raises
         ------
-        ValueError
+        PluginAlreadyRegisteredError
             If a plugin with the same id is already registered.
         """
         plugin_id = plugin.metadata.id
 
         if plugin_id in self._plugins:
-            raise ValueError(
+            raise PluginAlreadyRegisteredError(
                 f"Plugin '{plugin_id}' is already registered."
             )
 
@@ -54,10 +58,15 @@ class PluginRegistry:
 
         Raises
         ------
-        KeyError
+        PluginNotFoundError
             If the plugin is not registered.
         """
-        return self._plugins[plugin_id]
+        try:
+            return self._plugins[plugin_id]
+        except KeyError as exc:
+            raise PluginNotFoundError(
+                f"Plugin '{plugin_id}' is not registered."
+            ) from exc
 
     def all(self) -> list[Plugin[Any, Any]]:
         """

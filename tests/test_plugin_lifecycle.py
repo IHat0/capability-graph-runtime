@@ -1,6 +1,7 @@
 import pytest
 
 from cgr.kernel.contracts import PluginState
+from cgr.kernel.exceptions import PluginAlreadyRegisteredError
 from cgr.kernel.runtime import KernelRuntime
 from cgr.plugins.examples import EchoPlugin
 from cgr.shared.events import EventType
@@ -82,7 +83,7 @@ def test_duplicate_registration_shuts_down_second_plugin() -> None:
     second = EchoPlugin()
     runtime.register_plugin(first)
 
-    with pytest.raises(ValueError, match="already registered"):
+    with pytest.raises(PluginAlreadyRegisteredError, match="already registered"):
         runtime.register_plugin(second)
 
     assert first.state == PluginState.RUNNING

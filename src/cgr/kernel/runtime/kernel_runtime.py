@@ -15,6 +15,10 @@ from cgr.kernel.contracts import (
     HealthStatus,
     Plugin,
 )
+from cgr.kernel.exceptions import (
+    CapabilityNotFoundError,
+    PluginAlreadyRegisteredError,
+)
 from cgr.kernel.registry import PluginRegistry
 from cgr.shared.events import Event, EventBus, EventType
 
@@ -51,7 +55,7 @@ class KernelRuntime:
         plugin.initialize()
         try:
             self._registry.register(plugin)
-        except ValueError:
+        except PluginAlreadyRegisteredError:
             plugin.shutdown()
             raise
 
@@ -121,7 +125,7 @@ class KernelRuntime:
         """Execute a request using the first plugin supporting its capability."""
         plugins = self._registry.find_by_capability(request.capability)
         if not plugins:
-            raise LookupError(
+            raise CapabilityNotFoundError(
                 f"No plugin registered for capability '{request.capability.id}'."
             )
 
