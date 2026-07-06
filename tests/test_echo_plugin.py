@@ -25,6 +25,15 @@ def test_echo_plugin_initialize_execute_shutdown_lifecycle() -> None:
 
     assert plugin.state == PluginState.DISCOVERED
     assert plugin.health == HealthStatus.HEALTHY
+    assert plugin.metadata.capabilities == [
+        Capability(
+            id="echo",
+            name="Echo",
+            description="Echo capability",
+            version=CapabilityVersion(major=1, minor=0, patch=0),
+            tags=["example", "test"],
+        )
+    ]
 
     plugin.initialize()
     assert plugin.state == PluginState.RUNNING

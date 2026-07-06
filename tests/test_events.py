@@ -225,3 +225,78 @@ def test_runtime_publishes_failure_and_reraises_original_exception(
         "error_type": "RuntimeError",
         "error_message": "plugin exploded",
     }
+
+
+def test_execute_capability_uses_first_match_and_publishes_events(
+    capability: Capability,
+) -> None:
+    registry = PluginRegistry()
+    registry.register(EchoPlugin())
+    registry.register(FailingPlugin(capability))
+    runtime = KernelRuntime(registry=registry)
+    request = ExecutionRequest[dict[str, str]](
+        capability=capability,
+        context=ExecutionContext(execution_id="capability-execution"),
+        payload={"message": "capability result"},
+    )
+
+    result = runtime.execute_capability(request)
+
+    assert result.output == {"message": "capability result"}
+    started, completed = runtime.event_bus.history()
+    assert started.type == EventType.EXECUTION_STARTED
+    assert started.payload["plugin_id"] == "echo"
+    assert started.payload["capability_id"] == "echo"
+    assert started.execution_id == "capability-execution"
+    assert completed.type == EventType.EXECUTION_COMPLETED
+    assert completed.payload == {
+        "plugin_id": "echo",
+        "capability_id": "echo",
+        "status": "success",
+    }
+
+
+def test_execute_capability_without_match_raises_without_events(
+    capability: Capability,
+) -> None:
+    runtime = KernelRuntime()
+    request = ExecutionRequest[dict[str, str]](
+        capability=capability,
+        context=ExecutionContext(),
+        payload={},
+    )
+
+    with pytest.raises(
+        LookupError,
+        match="No plugin registered for capability 'echo'",
+    ):
+        runtime.execute_capability(request)
+
+    assert runtime.event_bus.history() == []
+
+
+def test_execute_capability_publishes_failure_and_reraises(
+    capability: Capability,
+) -> None:
+    registry = PluginRegistry()
+    registry.register(FailingPlugin(capability))
+    runtime = KernelRuntime(registry=registry)
+    request = ExecutionRequest[dict[str, str]](
+        capability=capability,
+        context=ExecutionContext(execution_id="capability-failed"),
+        payload={},
+    )
+
+    with pytest.raises(RuntimeError, match="plugin exploded"):
+        runtime.execute_capability(request)
+
+    started, failed = runtime.event_bus.history()
+    assert started.type == EventType.EXECUTION_STARTED
+    assert failed.type == EventType.EXECUTION_FAILED
+    assert failed.execution_id == "capability-failed"
+    assert failed.payload == {
+        "plugin_id": "failing",
+        "capability_id": "echo",
+        "error_type": "RuntimeError",
+        "error_message": "plugin exploded",
+    }

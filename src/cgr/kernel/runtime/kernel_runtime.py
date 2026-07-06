@@ -56,6 +56,27 @@ class KernelRuntime:
         Returns:
             ExecutionResult from the plugin.
         """
+        return self._execute_plugin(plugin_id, request)
+
+    def execute_capability(
+        self,
+        request: ExecutionRequest[Any],
+    ) -> ExecutionResult[Any]:
+        """Execute a request using the first plugin supporting its capability."""
+        plugins = self._registry.find_by_capability(request.capability)
+        if not plugins:
+            raise LookupError(
+                f"No plugin registered for capability '{request.capability.id}'."
+            )
+
+        return self._execute_plugin(plugins[0].metadata.id, request)
+
+    def _execute_plugin(
+        self,
+        plugin_id: str,
+        request: ExecutionRequest[Any],
+    ) -> ExecutionResult[Any]:
+        """Execute a plugin and publish its execution lifecycle events."""
         capability_id = request.capability.id
         self._event_bus.publish(
             Event(

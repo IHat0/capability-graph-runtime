@@ -12,6 +12,8 @@ from __future__ import annotations
 from typing import Any
 
 from cgr.kernel.contracts import (
+    Capability,
+    CapabilityVersion,
     ExecutionRequest,
     ExecutionResult,
     ExecutionStatus,
@@ -39,7 +41,15 @@ class EchoPlugin(Plugin[Any, Any]):
             version="1.0.0",
             author="Capability Graph Runtime",
             description="Reference implementation used for testing.",
-            capabilities=[],
+            capabilities=[
+                Capability(
+                    id="echo",
+                    name="Echo",
+                    description="Echo capability",
+                    version=CapabilityVersion(major=1, minor=0, patch=0),
+                    tags=["example", "test"],
+                )
+            ],
         )
 
     @property

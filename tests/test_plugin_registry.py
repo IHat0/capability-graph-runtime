@@ -39,7 +39,7 @@ def test_find_by_capability(capability: Capability) -> None:
     )
     non_matching_plugin = EchoPlugin()
     non_matching_plugin._metadata = non_matching_plugin.metadata.model_copy(
-        update={"id": "other"}
+        update={"id": "other", "capabilities": []}
     )
     registry.register(matching_plugin)
     registry.register(non_matching_plugin)
