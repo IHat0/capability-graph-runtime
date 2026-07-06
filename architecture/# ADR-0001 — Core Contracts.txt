@@ -1,0 +1,481 @@
+# ADR-0001 — Core Contracts
+
+**Status:** Accepted
+
+**Version:** 0.1
+
+**Date:** 2026-07-06
+
+**Authors:** Capability Graph Runtime Team
+
+---
+
+# Purpose
+
+This Architecture Decision Record establishes the foundational language of the Capability Graph Runtime (CGR).
+
+Before the runtime can execute plugins, route capabilities, publish events, or build execution graphs, every component must agree on a common vocabulary.
+
+This document defines that vocabulary.
+
+These contracts are intended to remain stable throughout the lifetime of the project.
+
+Future runtime components depend on these contracts.
+
+---
+
+# Problem
+
+Most AI orchestration frameworks are implementation-driven.
+
+Examples include:
+
+- "Call OpenAI."
+- "Call Anthropic."
+- "Run Qiskit."
+- "Run a search."
+
+As new technologies emerge, these systems accumulate adapters, exceptions, and special-case logic.
+
+Eventually the runtime becomes tightly coupled to specific implementations rather than the capabilities they provide.
+
+The result is:
+
+- difficult upgrades
+- brittle integrations
+- duplicated logic
+- poor replaceability
+
+CGR rejects this approach.
+
+---
+
+# Decision
+
+The runtime will never communicate directly with implementations.
+
+Instead, every interaction will occur through contracts.
+
+Implementations become interchangeable.
+
+Capabilities become the unit of execution.
+
+---
+
+# Principle 1
+
+Capabilities are first-class citizens.
+
+The runtime knows only about capabilities.
+
+It does not know about models.
+
+Examples of capabilities include:
+
+- Mathematical Reasoning
+- Python Code Generation
+- Formal Verification
+- Symbolic Algebra
+- Circuit Simulation
+- Planning
+- Search
+- Memory Retrieval
+
+A capability describes **what** can be done.
+
+Never **how** it is performed.
+
+---
+
+# Principle 2
+
+Plugins implement capabilities.
+
+A plugin is an implementation.
+
+Examples:
+
+OpenAI Plugin
+
+Capabilities
+
+- reasoning
+- summarization
+- coding
+
+----------------------------
+
+Qiskit Plugin
+
+Capabilities
+
+- circuit simulation
+- quantum verification
+
+----------------------------
+
+SymPy Plugin
+
+Capabilities
+
+- symbolic algebra
+- dimensional analysis
+
+The runtime only requests capabilities.
+
+The plugin decides how to satisfy them.
+
+---
+
+# Principle 3
+
+Everything is an Execution.
+
+Every operation inside CGR is represented as an execution.
+
+Examples:
+
+Generate text
+
+↓
+
+Execution
+
+-------------------
+
+Verify theorem
+
+↓
+
+Execution
+
+-------------------
+
+Run search
+
+↓
+
+Execution
+
+-------------------
+
+Execute graph node
+
+↓
+
+Execution
+
+-------------------
+
+Compile code
+
+↓
+
+Execution
+
+Because every action shares the same lifecycle, the runtime can provide:
+
+- telemetry
+- auditing
+- retries
+- scheduling
+- routing
+- learning
+
+without special-case logic.
+
+---
+
+# Principle 4
+
+Context travels with every execution.
+
+ExecutionContext contains everything required to perform work.
+
+Examples include
+
+- inputs
+- metadata
+- deadlines
+- budget
+- correlation id
+- trace id
+- parent execution
+- user constraints
+- security information
+
+Context is immutable.
+
+Each execution receives its own snapshot.
+
+---
+
+# Principle 5
+
+Results are structured.
+
+Every execution returns an ExecutionResult.
+
+An execution never returns arbitrary objects directly.
+
+ExecutionResult contains
+
+- status
+- output
+- metadata
+- duration
+- diagnostics
+- errors
+- confidence
+- verifier information
+
+This allows downstream systems to reason about executions uniformly.
+
+---
+
+# Principle 6
+
+Plugins are self-describing.
+
+Every plugin publishes metadata.
+
+Metadata includes
+
+- identifier
+- version
+- author
+- capabilities
+- dependencies
+- health status
+- configuration schema
+
+The runtime never hardcodes knowledge about plugins.
+
+---
+
+# Principle 7
+
+Contracts are versioned.
+
+Every contract evolves independently.
+
+Breaking changes require version increments.
+
+Consumers specify compatibility ranges.
+
+The runtime may support multiple versions simultaneously.
+
+---
+
+# Principle 8
+
+Contracts are immutable.
+
+Requests represent historical facts.
+
+Results represent historical facts.
+
+Events represent historical facts.
+
+Once created, they cannot be modified.
+
+If new information becomes available, a new event or execution is produced.
+
+This enables deterministic replay.
+
+---
+
+# Core Contract Overview
+
+The following contracts form the language of CGR.
+
+## Capability
+
+Represents a stable ability the runtime can execute.
+
+Examples
+
+- reasoning
+- coding
+- planning
+- verification
+
+---
+
+## CapabilityVersion
+
+Represents semantic versioning of a capability.
+
+Used to negotiate compatibility.
+
+---
+
+## PluginMetadata
+
+Describes a plugin.
+
+Contains identity, version, capabilities and configuration.
+
+---
+
+## PluginManifest
+
+Describes how a plugin is loaded.
+
+Includes metadata plus runtime information.
+
+---
+
+## ExecutionRequest
+
+Represents work requested by the runtime.
+
+Immutable.
+
+---
+
+## ExecutionContext
+
+Represents the environment surrounding an execution.
+
+Immutable.
+
+---
+
+## ExecutionResult
+
+Represents the outcome of an execution.
+
+Contains output and diagnostics.
+
+---
+
+## ExecutionStatus
+
+Enumeration.
+
+Examples
+
+- Pending
+- Running
+- Completed
+- Failed
+- Cancelled
+- TimedOut
+
+---
+
+## PluginState
+
+Represents lifecycle state.
+
+Examples
+
+- Loaded
+- Active
+- Disabled
+- Unloaded
+- Failed
+
+---
+
+## HealthStatus
+
+Represents operational health.
+
+Examples
+
+- Healthy
+- Degraded
+- Unavailable
+
+---
+
+## Plugin
+
+The base interface implemented by every plugin.
+
+Defines lifecycle operations and capability execution.
+
+---
+
+# Relationship Diagram
+
+```
+ExecutionRequest
+        │
+        ▼
+ExecutionContext
+        │
+        ▼
+Plugin
+        │
+        ▼
+Capability
+        │
+        ▼
+ExecutionResult
+```
+
+---
+
+# Non-Goals
+
+This ADR does not define
+
+- Plugin discovery
+- Routing
+- Scheduling
+- Event Bus
+- Capability Graph
+- Learning Memory
+- Competition Engine
+- Fusion Engine
+
+These systems are specified in later ADRs.
+
+---
+
+# Consequences
+
+Positive
+
+- Stable interfaces
+- Interchangeable plugins
+- Easier testing
+- Replaceable implementations
+- Long-term compatibility
+
+Negative
+
+- Additional upfront design
+- More abstraction than prototype systems
+- Slightly more boilerplate
+
+The project accepts these costs because long-term maintainability is a primary objective.
+
+---
+
+# Future ADRs
+
+ADR-0002 Plugin Architecture
+
+ADR-0003 Event Bus
+
+ADR-0004 Registry
+
+ADR-0005 Kernel Execution
+
+ADR-0006 Capability Router
+
+ADR-0007 Learning Memory
+
+ADR-0008 Competition Engine
+
+ADR-0009 Fusion Engine
+
+ADR-0010 Capability Graph
+
+---
+
+End of ADR-0001

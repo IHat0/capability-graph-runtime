@@ -1,0 +1,12 @@
+fastapi
+pydantic>=2
+pluggy
+structlog
+uvicorn
+
+[dev]
+pytest
+pytest-asyncio
+ruff
+black
+mypy

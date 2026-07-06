@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/cgr/__init__.py
+src/cgr.egg-info/PKG-INFO
+src/cgr.egg-info/SOURCES.txt
+src/cgr.egg-info/dependency_links.txt
+src/cgr.egg-info/requires.txt
+src/cgr.egg-info/top_level.txt
+src/cgr/kernel/__init__.py
+src/cgr/kernel/contracts/capability.py
+src/cgr/kernel/contracts/capability_version.py
+src/cgr/plugins/__init__.py
+src/cgr/shared/__init__.py
+tests/test_smoke.py
