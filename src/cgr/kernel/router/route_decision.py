@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, ConfigDict
 
+from .route_strategy import RouteStrategy
+
 
 class RouteDecision(BaseModel):
     """Immutable record of a capability routing decision."""
@@ -11,5 +13,5 @@ class RouteDecision(BaseModel):
     capability_id: str
     selected_plugin_id: str
     candidate_plugin_ids: list[str]
-    strategy: str
+    strategy: RouteStrategy
     reason: str

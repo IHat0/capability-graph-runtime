@@ -8,11 +8,12 @@ from cgr.kernel.contracts import (
     CapabilityVersion,
     ExecutionContext,
     ExecutionRequest,
+    HealthStatus,
     Plugin,
 )
 from cgr.kernel.exceptions import CapabilityNotFoundError
 from cgr.kernel.registry import PluginRegistry
-from cgr.kernel.router import CapabilityRouter, RouteDecision
+from cgr.kernel.router import CapabilityRouter, RouteDecision, RouteStrategy
 from cgr.kernel.runtime import KernelRuntime
 from cgr.plugins.examples import EchoPlugin
 
@@ -56,9 +57,9 @@ def test_router_returns_structured_route_decision() -> None:
     assert decision.capability_id == "echo"
     assert decision.selected_plugin_id == "echo"
     assert decision.candidate_plugin_ids == ["echo", "echo-second"]
-    assert decision.strategy == "first_match"
+    assert decision.strategy == RouteStrategy.FIRST_MATCH
     assert decision.reason == (
-        "Selected first plugin registered for requested capability."
+        "Selected first available plugin for requested capability."
     )
 
 
@@ -79,6 +80,41 @@ def test_router_route_raises_when_no_plugin_supports_capability() -> None:
         match="No plugin registered for capability 'missing'",
     ):
         router.route(make_request("missing"))
+
+
+class UnavailableEchoPlugin(EchoPlugin):
+    """Echo plugin that is unavailable for routing."""
+
+    @property
+    def health(self) -> HealthStatus:
+        return HealthStatus.UNAVAILABLE
+
+
+def test_router_filters_unavailable_plugins() -> None:
+    registry = PluginRegistry()
+    unavailable = UnavailableEchoPlugin()
+    available = EchoPlugin()
+    available._metadata = available.metadata.model_copy(
+        update={"id": "echo-available"}
+    )
+    registry.register(unavailable)
+    registry.register(available)
+
+    decision = CapabilityRouter(registry).route(make_request())
+
+    assert decision.selected_plugin_id == "echo-available"
+    assert decision.candidate_plugin_ids == ["echo-available"]
+
+
+def test_router_raises_when_all_matching_plugins_are_unavailable() -> None:
+    registry = PluginRegistry()
+    registry.register(UnavailableEchoPlugin())
+
+    with pytest.raises(
+        CapabilityNotFoundError,
+        match="No available plugin registered for capability 'echo'",
+    ):
+        CapabilityRouter(registry).route(make_request())
 
 
 class RecordingRouter(CapabilityRouter):
