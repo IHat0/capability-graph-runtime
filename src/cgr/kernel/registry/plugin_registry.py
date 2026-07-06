@@ -65,6 +65,10 @@ class PluginRegistry:
         """
         return list(self._plugins.values())
 
+    def plugin_ids(self) -> list[str]:
+        """Return a copy of all registered plugin identifiers."""
+        return list(self._plugins)
+
     def find_by_capability(
         self,
         capability: Capability,

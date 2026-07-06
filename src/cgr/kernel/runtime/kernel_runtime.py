@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cgr.kernel.contracts import ExecutionRequest, ExecutionResult
+from cgr.kernel.contracts import ExecutionRequest, ExecutionResult, Plugin
 from cgr.kernel.registry import PluginRegistry
 from cgr.shared.events import Event, EventBus, EventType
 
@@ -38,6 +38,32 @@ class KernelRuntime:
     def event_bus(self) -> EventBus:
         """Return the runtime event bus."""
         return self._event_bus
+
+    def register_plugin(self, plugin: Plugin[Any, Any]) -> None:
+        """Initialize and register a plugin with the runtime."""
+        plugin.initialize()
+        try:
+            self._registry.register(plugin)
+        except ValueError:
+            plugin.shutdown()
+            raise
+
+        self._publish_plugin_event(EventType.PLUGIN_REGISTERED, plugin)
+
+    def unregister_plugin(self, plugin_id: str) -> None:
+        """Shutdown and unregister a plugin if it exists."""
+        if plugin_id not in self._registry:
+            return
+
+        plugin = self._registry.get(plugin_id)
+        plugin.shutdown()
+        self._registry.unregister(plugin_id)
+        self._publish_plugin_event(EventType.PLUGIN_UNREGISTERED, plugin)
+
+    def shutdown(self) -> None:
+        """Shutdown and unregister every plugin managed by the runtime."""
+        for plugin_id in self._registry.plugin_ids():
+            self.unregister_plugin(plugin_id)
 
     def execute(
         self,
@@ -125,3 +151,21 @@ class KernelRuntime:
             )
         )
         return result
+
+    def _publish_plugin_event(
+        self,
+        event_type: EventType,
+        plugin: Plugin[Any, Any],
+    ) -> None:
+        """Publish a plugin lifecycle event."""
+        self._event_bus.publish(
+            Event(
+                type=event_type,
+                source="kernel.runtime",
+                payload={
+                    "plugin_id": plugin.metadata.id,
+                    "plugin_name": plugin.metadata.name,
+                    "plugin_version": plugin.metadata.version,
+                },
+            )
+        )

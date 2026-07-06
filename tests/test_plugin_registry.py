@@ -24,6 +24,7 @@ def test_register_and_get_plugin() -> None:
     assert "echo" in registry
     assert len(registry) == 1
     assert registry.all() == [plugin]
+    assert registry.plugin_ids() == ["echo"]
 
 
 def test_get_unknown_plugin_raises_key_error() -> None:
