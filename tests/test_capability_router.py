@@ -1,6 +1,7 @@
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from cgr.kernel.contracts import (
     Capability,
@@ -11,7 +12,7 @@ from cgr.kernel.contracts import (
 )
 from cgr.kernel.exceptions import CapabilityNotFoundError
 from cgr.kernel.registry import PluginRegistry
-from cgr.kernel.router import CapabilityRouter
+from cgr.kernel.router import CapabilityRouter, RouteDecision
 from cgr.kernel.runtime import KernelRuntime
 from cgr.plugins.examples import EchoPlugin
 
@@ -41,14 +42,43 @@ def test_router_selects_first_matching_plugin() -> None:
     assert selected is first
 
 
-def test_router_raises_when_no_plugin_supports_capability() -> None:
+def test_router_returns_structured_route_decision() -> None:
+    registry = PluginRegistry()
+    first = EchoPlugin()
+    second = EchoPlugin()
+    second._metadata = second.metadata.model_copy(update={"id": "echo-second"})
+    registry.register(first)
+    registry.register(second)
+
+    decision = CapabilityRouter(registry).route(make_request())
+
+    assert isinstance(decision, RouteDecision)
+    assert decision.capability_id == "echo"
+    assert decision.selected_plugin_id == "echo"
+    assert decision.candidate_plugin_ids == ["echo", "echo-second"]
+    assert decision.strategy == "first_match"
+    assert decision.reason == (
+        "Selected first plugin registered for requested capability."
+    )
+
+
+def test_route_decision_is_immutable() -> None:
+    registry = PluginRegistry()
+    registry.register(EchoPlugin())
+    decision = CapabilityRouter(registry).route(make_request())
+
+    with pytest.raises(ValidationError):
+        decision.selected_plugin_id = "changed"
+
+
+def test_router_route_raises_when_no_plugin_supports_capability() -> None:
     router = CapabilityRouter(PluginRegistry())
 
     with pytest.raises(
         CapabilityNotFoundError,
         match="No plugin registered for capability 'missing'",
     ):
-        router.select_plugin(make_request("missing"))
+        router.route(make_request("missing"))
 
 
 class RecordingRouter(CapabilityRouter):
