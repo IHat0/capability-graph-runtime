@@ -168,6 +168,7 @@ class KernelRuntime:
                         "capability_id": capability_id,
                         "error_type": type(exc).__name__,
                         "error_message": str(exc),
+                        "duration_ms": 0.0,
                     },
                 )
             )
@@ -183,6 +184,7 @@ class KernelRuntime:
                     "plugin_id": plugin_id,
                     "capability_id": capability_id,
                     "status": result.status.value,
+                    "duration_ms": result.duration_ms,
                 },
             )
         )

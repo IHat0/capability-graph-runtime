@@ -165,6 +165,7 @@ def test_runtime_publishes_started_and_completed_events(
         "plugin_id": "echo",
         "capability_id": "echo",
         "status": "success",
+        "duration_ms": 0.0,
     }
 
 
@@ -230,6 +231,7 @@ def test_runtime_publishes_failure_and_reraises_original_exception(
         "capability_id": "echo",
         "error_type": "RuntimeError",
         "error_message": "plugin exploded",
+        "duration_ms": 0.0,
     }
 
 
@@ -259,6 +261,7 @@ def test_execute_capability_uses_first_match_and_publishes_events(
         "plugin_id": "echo",
         "capability_id": "echo",
         "status": "success",
+        "duration_ms": 0.0,
     }
 
 
@@ -327,4 +330,5 @@ def test_execute_capability_publishes_failure_and_reraises(
         "capability_id": "echo",
         "error_type": "RuntimeError",
         "error_message": "plugin exploded",
+        "duration_ms": 0.0,
     }
