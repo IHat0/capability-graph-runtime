@@ -4,6 +4,7 @@ from cgr.kernel.contracts import (
     PluginState,
 )
 from cgr.kernel.runtime import KernelRuntime, create_runtime
+from cgr.plugins.builtin import CalculatorPlugin, TextStatsPlugin
 from cgr.plugins.examples import EchoPlugin
 from cgr.shared.events import EventType
 
@@ -48,3 +49,65 @@ def test_bootstrap_with_examples_emits_plugin_registered_event() -> None:
         "plugin_name": "Echo Plugin",
         "plugin_version": "1.0.0",
     }
+
+
+def test_create_runtime_with_builtin_registers_both_plugins() -> None:
+    runtime = create_runtime(include_builtin=True)
+
+    assert runtime.registry.plugin_ids() == [
+        "builtin.calculator",
+        "builtin.text_stats",
+    ]
+    assert isinstance(
+        runtime.registry.get("builtin.calculator"),
+        CalculatorPlugin,
+    )
+    assert isinstance(
+        runtime.registry.get("builtin.text_stats"),
+        TextStatsPlugin,
+    )
+    assert runtime.registry.get("builtin.calculator").state == PluginState.RUNNING
+    assert runtime.registry.get("builtin.text_stats").state == PluginState.RUNNING
+
+
+def test_bootstrap_calculator_executes_by_capability() -> None:
+    runtime = create_runtime(include_builtin=True)
+    plugin = runtime.registry.get("builtin.calculator")
+    request = ExecutionRequest[dict[str, str]](
+        capability=plugin.metadata.capabilities[0],
+        context=ExecutionContext(),
+        payload={"expression": "6 * 7"},
+    )
+
+    result = runtime.execute_capability(request)
+
+    assert result.output == {"expression": "6 * 7", "result": 42}
+
+
+def test_bootstrap_text_stats_executes_by_capability() -> None:
+    runtime = create_runtime(include_builtin=True)
+    plugin = runtime.registry.get("builtin.text_stats")
+    request = ExecutionRequest[dict[str, str]](
+        capability=plugin.metadata.capabilities[0],
+        context=ExecutionContext(),
+        payload={"text": "one two"},
+    )
+
+    result = runtime.execute_capability(request)
+
+    assert result.output == {
+        "character_count": 7,
+        "word_count": 2,
+        "line_count": 1,
+        "non_empty_line_count": 1,
+    }
+
+
+def test_bootstrap_examples_and_builtin_register_all_plugins() -> None:
+    runtime = create_runtime(include_examples=True, include_builtin=True)
+
+    assert runtime.registry.plugin_ids() == [
+        "echo",
+        "builtin.calculator",
+        "builtin.text_stats",
+    ]
