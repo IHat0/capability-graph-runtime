@@ -7,6 +7,7 @@ It does not know about concrete plugin implementations.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from cgr.kernel.contracts import (
@@ -16,6 +17,7 @@ from cgr.kernel.contracts import (
     Plugin,
 )
 from cgr.kernel.exceptions import PluginAlreadyRegisteredError
+from cgr.kernel.loader import PluginLoader
 from cgr.kernel.registry import PluginRegistry
 from cgr.kernel.router import CapabilityRouter
 from cgr.shared.events import Event, EventBus, EventType
@@ -67,6 +69,11 @@ class KernelRuntime:
             raise
 
         self._publish_plugin_event(EventType.PLUGIN_REGISTERED, plugin)
+
+    def load_plugins(self, import_paths: Iterable[str]) -> None:
+        """Load and register plugins from Python import paths."""
+        for plugin in PluginLoader().load_many(import_paths):
+            self.register_plugin(plugin)
 
     def unregister_plugin(self, plugin_id: str) -> None:
         """Shutdown and unregister a plugin if it exists."""
