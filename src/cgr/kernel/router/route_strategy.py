@@ -8,3 +8,4 @@ class RouteStrategy(str, Enum):
 
     FIRST_MATCH = "first_match"
     HIGHEST_PRIORITY = "highest_priority"
+    MEMORY_BEST = "memory_best"

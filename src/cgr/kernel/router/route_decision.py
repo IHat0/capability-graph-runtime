@@ -1,6 +1,6 @@
 """Structured capability routing decisions."""
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .route_strategy import RouteStrategy
 
@@ -15,3 +15,4 @@ class RouteDecision(BaseModel):
     candidate_plugin_ids: list[str]
     strategy: RouteStrategy
     reason: str
+    candidate_scores: dict[str, str] = Field(default_factory=dict)
