@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from typing import Any
 
 from cgr.kernel.benchmark import (
     BenchmarkExporter,
@@ -14,6 +15,16 @@ from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.pipeline import ModelPipeline
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.runtime import create_runtime
+from cgr.kernel.runtime import KernelRuntime
+from cgr.kernel.swe import SWEABRunner, create_local_swe_tasks
+from cgr.plugins.agents import (
+    MultiModelCodingAgentPlugin,
+    SingleModelCodingAgentPlugin,
+)
+from cgr.plugins.providers.openai_compatible import (
+    OpenAICompatibleChatConfig,
+    OpenAICompatibleChatPlugin,
+)
 
 
 def main() -> int:
@@ -151,6 +162,109 @@ def openai_benchmark_main(argv: list[str] | None = None) -> int:
             exporter.write_json(result, args.json_out)
         if args.markdown_out is not None:
             exporter.write_markdown(result, args.markdown_out)
+        print(json.dumps(result.model_dump(mode="json")))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
+
+
+class _LocalCodingChatClient:
+    """Deterministic local client used to exercise the real coding pipeline."""
+
+    def create_chat_completion(
+        self,
+        config: OpenAICompatibleChatConfig,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        prompt = messages[-1]["content"]
+        if prompt.startswith("Critique the proposed coding patch"):
+            content = "The draft satisfies the requested greeting change."
+        else:
+            content = json.dumps(
+                {
+                    "files": {"app.py": 'print("hello CGR")\n'},
+                    "explanation": "Updated the greeting.",
+                }
+            )
+        return {
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+
+def coding_ab_local_main() -> int:
+    """Run the local baseline versus coding-agent evaluation."""
+    runtime = KernelRuntime()
+    client = _LocalCodingChatClient()
+    draft = OpenAICompatibleChatPlugin(
+        config=OpenAICompatibleChatConfig(
+            api_key="local",
+            model="local-draft",
+            base_url="http://localhost",
+            provider_name="local",
+        ),
+        client=client,
+        capability_id="model.code",
+        plugin_id="provider.local.draft",
+    )
+    critic = OpenAICompatibleChatPlugin(
+        config=OpenAICompatibleChatConfig(
+            api_key="local",
+            model="local-critic",
+            base_url="http://localhost",
+            provider_name="local",
+        ),
+        client=client,
+        capability_id="model.reason",
+        plugin_id="provider.local.critic",
+    )
+    runtime.register_plugin(draft)
+    runtime.register_plugin(critic)
+    single = SingleModelCodingAgentPlugin(runtime)
+    multi = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(single)
+    runtime.register_plugin(multi)
+    result = SWEABRunner(runtime).run_suite(
+        "local_coding_ab",
+        create_local_swe_tasks(),
+        draft.metadata.id,
+        single.metadata.id,
+        multi.metadata.id,
+    )
+    print(json.dumps(result.model_dump(mode="json")))
+    return 0
+
+
+def coding_ab_real_main() -> int:
+    """Run coding A/B evaluation against explicit real provider settings."""
+    try:
+        draft_config = OpenAICompatibleChatConfig.from_env("CGR_DRAFT")
+        critic_config = OpenAICompatibleChatConfig.from_env("CGR_CRITIC")
+        runtime = KernelRuntime()
+        draft = OpenAICompatibleChatPlugin(
+            config=draft_config,
+            capability_id="model.code",
+            plugin_id="provider.coding.draft",
+        )
+        critic = OpenAICompatibleChatPlugin(
+            config=critic_config,
+            capability_id="model.reason",
+            plugin_id="provider.coding.critic",
+        )
+        runtime.register_plugin(draft)
+        runtime.register_plugin(critic)
+        single = SingleModelCodingAgentPlugin(runtime)
+        multi = MultiModelCodingAgentPlugin(runtime)
+        runtime.register_plugin(single)
+        runtime.register_plugin(multi)
+        result = SWEABRunner(runtime).run_suite(
+            "real_coding_ab",
+            create_local_swe_tasks(),
+            draft.metadata.id,
+            single.metadata.id,
+            multi.metadata.id,
+        )
         print(json.dumps(result.model_dump(mode="json")))
         return 0
     except Exception as exc:

@@ -5,6 +5,8 @@ import pytest
 
 from cgr.apps.cli.main import (
     benchmark_main,
+    coding_ab_local_main,
+    coding_ab_real_main,
     demo_main,
     main,
     model_demo_main,
@@ -116,6 +118,37 @@ def test_openai_benchmark_main_parses_export_args_before_missing_key(
     }
     assert not json_path.exists()
     assert not markdown_path.exists()
+    assert exit_code == 1
+
+
+def test_coding_ab_local_main_prints_valid_evaluation_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = coding_ab_local_main()
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["suite_name"] == "local_coding_ab"
+    assert output["pass_rates"] == {
+        "baseline": 1.0,
+        "cgr_single": 1.0,
+        "cgr_multi": 1.0,
+    }
+    assert exit_code == 0
+
+
+def test_coding_ab_real_main_reports_missing_environment_as_json(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for prefix in ("CGR_DRAFT", "CGR_CRITIC"):
+        for suffix in ("API_KEY", "MODEL", "BASE_URL", "PROVIDER_NAME"):
+            monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+
+    exit_code = coding_ab_real_main()
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "CGR_DRAFT_API_KEY is not set."
+    }
     assert exit_code == 1
 
 

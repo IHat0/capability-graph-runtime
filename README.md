@@ -151,6 +151,22 @@ cgr-openai-benchmark
 cgr-openai-benchmark --json-out benchmark-results/openai.json --markdown-out benchmark-results/openai.md
 ```
 
+## Real Coding-Agent A/B Evaluation
+
+CGR can compare a direct model baseline with single-agent and multi-agent
+draft/critique/repair coding modes. Exercise the full path locally without API
+keys:
+
+```bash
+cgr-coding-ab-local
+```
+
+`cgr-coding-ab-real` runs the same local SWE-style tasks through two explicit
+OpenAI-compatible providers configured with `CGR_DRAFT_*` and `CGR_CRITIC_*`
+environment variables. This is the path toward GLM versus GLM+CGR measurement;
+it makes real provider calls and may incur costs. Official SWE-bench and
+SWE-bench Pro integration remain future work.
+
 ## Next Possible Steps
 
 - Add additional real model provider plugins.

@@ -1,0 +1,23 @@
+{
+  "suite_name": "local",
+  "total_tasks": 1,
+  "succeeded_tasks": 1,
+  "verified_tasks": 1,
+  "failed_tasks": 0,
+  "average_duration_ms": 1.234,
+  "results": [
+    {
+      "task_id": "calculator.simple_arithmetic",
+      "capability_id": "calculator.evaluate",
+      "plugin_id": null,
+      "succeeded": true,
+      "verified": true,
+      "duration_ms": 1.234,
+      "output": {
+        "result": 7
+      },
+      "error_type": null,
+      "error_message": null
+    }
+  ]
+}
