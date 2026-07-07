@@ -3,6 +3,7 @@
 import json
 
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
+from cgr.kernel.pipeline import ModelPipeline
 from cgr.kernel.runtime import create_runtime
 
 
@@ -17,6 +18,14 @@ def main() -> int:
     )
     result = runtime.execute_capability(request)
     print(json.dumps(result.output))
+    return 0
+
+
+def model_demo_main() -> int:
+    """Run the deterministic model pipeline and print its JSON result."""
+    runtime = create_runtime(include_mock_models=True)
+    result = ModelPipeline(runtime).run("Build a tiny calculator.")
+    print(json.dumps(result.model_dump()))
     return 0
 
 

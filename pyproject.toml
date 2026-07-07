@@ -10,6 +10,7 @@ dependencies=["fastapi","pydantic>=2","pluggy","structlog","uvicorn"]
 
 [project.scripts]
 cgr-smoke = "cgr.apps.cli.main:main"
+cgr-model-demo = "cgr.apps.cli.main:model_demo_main"
 
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]
