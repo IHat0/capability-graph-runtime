@@ -1,3 +1,5 @@
+import pytest
+
 from cgr.kernel.contracts import (
     ExecutionContext,
     ExecutionRequest,
@@ -6,6 +8,7 @@ from cgr.kernel.contracts import (
 from cgr.kernel.runtime import KernelRuntime, create_runtime
 from cgr.plugins.builtin import CalculatorPlugin, TextStatsPlugin
 from cgr.plugins.examples import EchoPlugin
+from cgr.plugins.model import MockCodingModelPlugin, MockReasoningModelPlugin
 from cgr.shared.events import EventType
 
 
@@ -110,4 +113,68 @@ def test_bootstrap_examples_and_builtin_register_all_plugins() -> None:
         "echo",
         "builtin.calculator",
         "builtin.text_stats",
+    ]
+
+
+def test_create_runtime_with_mock_models_registers_both_plugins() -> None:
+    runtime = create_runtime(include_mock_models=True)
+
+    assert runtime.registry.plugin_ids() == [
+        "mock.reasoning_model",
+        "mock.coding_model",
+    ]
+    assert isinstance(
+        runtime.registry.get("mock.reasoning_model"),
+        MockReasoningModelPlugin,
+    )
+    assert isinstance(
+        runtime.registry.get("mock.coding_model"),
+        MockCodingModelPlugin,
+    )
+
+
+@pytest.mark.parametrize(
+    ("plugin_id", "prompt", "expected_text"),
+    [
+        (
+            "mock.reasoning_model",
+            "reason",
+            "Reasoned answer: reason",
+        ),
+        ("mock.coding_model", "code", "Code response: code"),
+    ],
+)
+def test_bootstrap_mock_model_executes_by_capability(
+    plugin_id: str,
+    prompt: str,
+    expected_text: str,
+) -> None:
+    runtime = create_runtime(include_mock_models=True)
+    plugin = runtime.registry.get(plugin_id)
+    request = ExecutionRequest[dict[str, object]](
+        capability=plugin.metadata.capabilities[0],
+        context=ExecutionContext(),
+        payload={
+            "messages": [{"role": "user", "content": prompt}],
+        },
+    )
+
+    result = runtime.execute_capability(request)
+
+    assert result.output["text"] == expected_text
+
+
+def test_bootstrap_all_groups_registers_every_plugin() -> None:
+    runtime = create_runtime(
+        include_examples=True,
+        include_builtin=True,
+        include_mock_models=True,
+    )
+
+    assert runtime.registry.plugin_ids() == [
+        "echo",
+        "builtin.calculator",
+        "builtin.text_stats",
+        "mock.reasoning_model",
+        "mock.coding_model",
     ]
