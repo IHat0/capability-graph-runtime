@@ -17,6 +17,7 @@ cgr-benchmark = "cgr.apps.cli.main:benchmark_main"
 cgr-openai-benchmark = "cgr.apps.cli.main:openai_benchmark_main"
 cgr-coding-ab-local = "cgr.apps.cli.main:coding_ab_local_main"
 cgr-coding-ab-real = "cgr.apps.cli.main:coding_ab_real_main"
+cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]

@@ -20,6 +20,16 @@ src/cgr/kernel/benchmark/benchmark_suite_result.py
 src/cgr/kernel/benchmark/benchmark_task.py
 src/cgr/kernel/benchmark/local_benchmark_suite.py
 src/cgr/kernel/benchmark/model_provider_benchmark_suite.py
+src/cgr/kernel/booster/__init__.py
+src/cgr/kernel/booster/booster_benchmark_runner.py
+src/cgr/kernel/booster/booster_candidate.py
+src/cgr/kernel/booster/booster_comparison_result.py
+src/cgr/kernel/booster/booster_domain.py
+src/cgr/kernel/booster/booster_engine.py
+src/cgr/kernel/booster/booster_mode.py
+src/cgr/kernel/booster/booster_result.py
+src/cgr/kernel/booster/booster_task.py
+src/cgr/kernel/booster/booster_trace.py
 src/cgr/kernel/coding/__init__.py
 src/cgr/kernel/coding/coding_patch.py
 src/cgr/kernel/coding/coding_prompt.py
@@ -91,6 +101,7 @@ src/cgr/kernel/verification/verification_status.py
 src/cgr/kernel/verification/verifier.py
 src/cgr/plugins/agents/__init__.py
 src/cgr/plugins/agents/local_coding_ab_plugins.py
+src/cgr/plugins/agents/local_booster_model_plugins.py
 src/cgr/plugins/agents/multi_model_coding_agent.py
 src/cgr/plugins/agents/single_model_coding_agent.py
 src/cgr/plugins/builtin/__init__.py
@@ -118,6 +129,7 @@ src/cgr/shared/events/event_handler.py
 src/cgr/shared/events/event_type.py
 tests/test_benchmark.py
 tests/test_benchmark_report.py
+tests/test_booster.py
 tests/test_bootstrap.py
 tests/test_builtin_plugins.py
 tests/test_capability_graph.py

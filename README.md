@@ -167,6 +167,21 @@ environment variables. This is the path toward GLM versus GLM+CGR measurement;
 it makes real provider calls and may incur costs. Official SWE-bench and
 SWE-bench Pro integration remain future work.
 
+## CGR Booster Engine
+
+CGR's main product goal is to improve an LLM by wrapping it in orchestration
+that generates candidates, critiques and repairs weak answers, verifies and
+scores outputs, and selects the strongest result. The key comparison is **base
+model alone versus base model + CGR**.
+
+```bash
+cgr-boost-local
+```
+
+This command exercises the complete comparison path with deterministic local
+model fixtures. It proves the measurement and trace shape, not real model
+improvement. Real GLM and OpenAI-compatible provider runs are the next step.
+
 ## Next Possible Steps
 
 - Add additional real model provider plugins.

@@ -5,6 +5,7 @@ import pytest
 
 from cgr.apps.cli.main import (
     benchmark_main,
+    boost_local_main,
     coding_ab_local_main,
     coding_ab_real_main,
     demo_main,
@@ -167,6 +168,23 @@ def test_coding_ab_real_main_reports_missing_environment_as_json(
         "error": "CGR_DRAFT_API_KEY is not set."
     }
     assert exit_code == 1
+
+
+def test_boost_local_main_prints_improved_scores(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = boost_local_main()
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["suite_name"] == "local_booster"
+    assert output["total_tasks"] == 3
+    assert output["baseline_average_score"] < output[
+        "boosted_single_average_score"
+    ]
+    assert output["boosted_single_average_score"] < output[
+        "boosted_multi_average_score"
+    ]
+    assert exit_code == 0
 
 
 def test_benchmark_main_prints_json_summary(

@@ -10,14 +10,21 @@ from cgr.kernel.benchmark import (
     create_local_benchmark_tasks,
     create_model_provider_benchmark_tasks,
 )
+from cgr.kernel.booster import (
+    BoosterBenchmarkRunner,
+    BoosterDomain,
+    BoosterEngine,
+    BoosterTask,
+)
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
-from cgr.kernel.pipeline import ModelPipeline
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
-from cgr.kernel.runtime import create_runtime
-from cgr.kernel.runtime import KernelRuntime
+from cgr.kernel.pipeline import ModelPipeline
+from cgr.kernel.runtime import KernelRuntime, create_runtime
 from cgr.kernel.swe import SWEABRunner, create_local_swe_tasks
 from cgr.plugins.agents import (
     LocalBaselineCodingProvider,
+    LocalBoosterBaseModelPlugin,
+    LocalBoosterCriticModelPlugin,
     LocalMultiCodingProvider,
     LocalSingleCodingProvider,
     MultiModelCodingAgentPlugin,
@@ -235,6 +242,59 @@ def coding_ab_real_main() -> int:
     except Exception as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
+
+
+def boost_local_main() -> int:
+    """Run the deterministic local Booster Engine comparison path."""
+    runtime = KernelRuntime()
+    runtime.register_plugin(LocalBoosterBaseModelPlugin())
+    runtime.register_plugin(LocalBoosterCriticModelPlugin())
+    engine = BoosterEngine(
+        runtime,
+        base_capability_id="model.code",
+        critic_capability_id="model.reason",
+    )
+    tasks = [
+        BoosterTask(
+            id="local.greeting",
+            domain=BoosterDomain.CODING,
+            prompt='Change the program so it prints "hello CGR".',
+            input_data={"files": {"app.py": 'print("hello")\n'}},
+            expected_output={"app.py": 'print("hello CGR")\n'},
+        ),
+        BoosterTask(
+            id="local.add",
+            domain=BoosterDomain.CODING,
+            prompt="Fix add so it returns a + b.",
+            input_data={
+                "files": {
+                    "math_utils.py": "def add(a, b):\n    return a - b\n"
+                }
+            },
+            expected_output={
+                "math_utils.py": "def add(a, b):\n    return a + b\n"
+            },
+        ),
+        BoosterTask(
+            id="local.is_even",
+            domain=BoosterDomain.CODING,
+            prompt=(
+                "Fix is_even so it returns True for even numbers and False "
+                "for odd numbers."
+            ),
+            input_data={
+                "files": {
+                    "numbers.py": "def is_even(n):\n    return n % 2 == 1\n"
+                }
+            },
+            expected_output={
+                "numbers.py": "def is_even(n):\n    return n % 2 == 0\n"
+            },
+        ),
+    ]
+    report = BoosterBenchmarkRunner(engine).run("local_booster", tasks)
+    print(json.dumps(report))
+    return 0
 
 
 if __name__ == "__main__":
