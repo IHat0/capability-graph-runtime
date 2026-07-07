@@ -134,8 +134,23 @@ def test_swe_ab_runner_computes_all_mode_pass_rates() -> None:
     )
 
     assert result.pass_rates == {
-        "baseline": 1.0,
-        "cgr_single": 1.0,
-        "cgr_multi": 1.0,
+        "baseline": pytest.approx(1 / 3),
+        "cgr_single": pytest.approx(1 / 3),
+        "cgr_multi": pytest.approx(1 / 3),
     }
-    assert len(result.results) == 3
+    assert result.deltas == {
+        "cgr_single_minus_baseline": 0.0,
+        "cgr_multi_minus_baseline": 0.0,
+    }
+    assert len(result.results) == 9
+
+
+def test_local_swe_suite_contains_three_distinct_tasks() -> None:
+    tasks = create_local_swe_tasks()
+
+    assert len(tasks) >= 3
+    assert {task.id for task in tasks} >= {
+        "local.greeting",
+        "local.add",
+        "local.is_even",
+    }

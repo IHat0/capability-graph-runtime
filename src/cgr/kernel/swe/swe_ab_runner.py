@@ -40,10 +40,19 @@ class SWEABRunner:
             mode: self._pass_rate(results, mode, len(tasks))
             for mode, _ in modes
         }
+        deltas = {
+            "cgr_single_minus_baseline": (
+                pass_rates["cgr_single"] - pass_rates["baseline"]
+            ),
+            "cgr_multi_minus_baseline": (
+                pass_rates["cgr_multi"] - pass_rates["baseline"]
+            ),
+        }
         return SWEEvalResult(
             suite_name=suite_name,
             total_tasks=len(tasks),
             pass_rates=pass_rates,
+            deltas=deltas,
             results=results,
         )
 

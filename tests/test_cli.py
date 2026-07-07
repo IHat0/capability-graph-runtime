@@ -128,11 +128,28 @@ def test_coding_ab_local_main_prints_valid_evaluation_json(
 
     output = json.loads(capsys.readouterr().out)
     assert output["suite_name"] == "local_coding_ab"
+    assert output["total_tasks"] == 3
     assert output["pass_rates"] == {
-        "baseline": 1.0,
-        "cgr_single": 1.0,
+        "baseline": pytest.approx(1 / 3),
+        "cgr_single": pytest.approx(2 / 3),
         "cgr_multi": 1.0,
     }
+    assert output["deltas"] == {
+        "cgr_single_minus_baseline": pytest.approx(1 / 3),
+        "cgr_multi_minus_baseline": pytest.approx(2 / 3),
+    }
+    passed_by_mode = {
+        mode: sum(
+            result["passed"]
+            for result in output["results"]
+            if result["mode"] == mode
+        )
+        for mode in ("baseline", "cgr_single", "cgr_multi")
+    }
+    assert passed_by_mode == {"baseline": 1, "cgr_single": 2, "cgr_multi": 3}
+    assert output["deltas"]["cgr_single_minus_baseline"] > 0
+    assert output["deltas"]["cgr_multi_minus_baseline"] > 0
+    assert output["pass_rates"]["cgr_multi"] > output["pass_rates"]["cgr_single"]
     assert exit_code == 0
 
 

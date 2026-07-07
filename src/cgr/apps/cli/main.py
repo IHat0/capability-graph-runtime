@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-from typing import Any
 
 from cgr.kernel.benchmark import (
     BenchmarkExporter,
@@ -18,6 +17,9 @@ from cgr.kernel.runtime import create_runtime
 from cgr.kernel.runtime import KernelRuntime
 from cgr.kernel.swe import SWEABRunner, create_local_swe_tasks
 from cgr.plugins.agents import (
+    LocalBaselineCodingProvider,
+    LocalMultiCodingProvider,
+    LocalSingleCodingProvider,
     MultiModelCodingAgentPlugin,
     SingleModelCodingAgentPlugin,
 )
@@ -169,66 +171,29 @@ def openai_benchmark_main(argv: list[str] | None = None) -> int:
         return 1
 
 
-class _LocalCodingChatClient:
-    """Deterministic local client used to exercise the real coding pipeline."""
-
-    def create_chat_completion(
-        self,
-        config: OpenAICompatibleChatConfig,
-        messages: list[dict[str, str]],
-    ) -> dict[str, Any]:
-        prompt = messages[-1]["content"]
-        if prompt.startswith("Critique the proposed coding patch"):
-            content = "The draft satisfies the requested greeting change."
-        else:
-            content = json.dumps(
-                {
-                    "files": {"app.py": 'print("hello CGR")\n'},
-                    "explanation": "Updated the greeting.",
-                }
-            )
-        return {
-            "choices": [{"message": {"content": content}}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-        }
-
-
 def coding_ab_local_main() -> int:
     """Run the local baseline versus coding-agent evaluation."""
     runtime = KernelRuntime()
-    client = _LocalCodingChatClient()
-    draft = OpenAICompatibleChatPlugin(
-        config=OpenAICompatibleChatConfig(
-            api_key="local",
-            model="local-draft",
-            base_url="http://localhost",
-            provider_name="local",
-        ),
-        client=client,
-        capability_id="model.code",
-        plugin_id="provider.local.draft",
+    baseline = LocalBaselineCodingProvider()
+    single_provider = LocalSingleCodingProvider()
+    multi_provider = LocalMultiCodingProvider()
+    runtime.register_plugin(baseline)
+    runtime.register_plugin(single_provider)
+    runtime.register_plugin(multi_provider)
+    single = SingleModelCodingAgentPlugin(
+        runtime, model_capability_id="model.code.single"
     )
-    critic = OpenAICompatibleChatPlugin(
-        config=OpenAICompatibleChatConfig(
-            api_key="local",
-            model="local-critic",
-            base_url="http://localhost",
-            provider_name="local",
-        ),
-        client=client,
-        capability_id="model.reason",
-        plugin_id="provider.local.critic",
+    multi = MultiModelCodingAgentPlugin(
+        runtime,
+        draft_capability_id="model.code.multi",
+        critique_capability_id="model.reason.multi",
     )
-    runtime.register_plugin(draft)
-    runtime.register_plugin(critic)
-    single = SingleModelCodingAgentPlugin(runtime)
-    multi = MultiModelCodingAgentPlugin(runtime)
     runtime.register_plugin(single)
     runtime.register_plugin(multi)
     result = SWEABRunner(runtime).run_suite(
         "local_coding_ab",
         create_local_swe_tasks(),
-        draft.metadata.id,
+        baseline.metadata.id,
         single.metadata.id,
         multi.metadata.id,
     )
