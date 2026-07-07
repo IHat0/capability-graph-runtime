@@ -105,13 +105,26 @@ It prints one JSON object containing:
 
 ## Project Status
 
-This is an MVP runtime architecture. It currently uses deterministic local
-plugins and mock model plugins to demonstrate the core system.. Real external model integrations are not
-included yet.
+This is an MVP runtime architecture. Deterministic local and mock model plugins
+remain the default; an optional OpenAI-compatible Responses API provider is
+available for real model calls.
+
+## Optional OpenAI Provider Demo
+
+The core demo uses local deterministic plugins. The OpenAI provider is optional
+and is not required for tests or loaded by default.
+
+PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY="..."
+$env:OPENAI_MODEL="gpt-4.1-mini"  # optional
+cgr-openai-demo
+```
 
 ## Next Possible Steps
 
-- Add the first real model provider plugin.
+- Add additional real model provider plugins.
 - Add persistence for `LearningMemory`.
 - Add async and parallel execution.
 - Add richer verifiers.

@@ -4,6 +4,7 @@ import json
 
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.pipeline import ModelPipeline
+from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.runtime import create_runtime
 
 
@@ -67,6 +68,34 @@ def demo_main() -> int:
     }
     print(json.dumps(output))
     return 0
+
+
+def openai_demo_main() -> int:
+    """Run the optional OpenAI provider demo and print JSON only."""
+    try:
+        runtime = create_runtime(include_openai_provider=True)
+        plugin = runtime.registry.get("provider.openai.responses")
+        request = ExecutionRequest[ModelRequest](
+            capability=plugin.metadata.capabilities[0],
+            context=ExecutionContext(),
+            payload=ModelRequest(
+                messages=[
+                    ModelMessage(
+                        role=ModelRole.USER,
+                        content=(
+                            "Explain Capability Graph Runtime in one short "
+                            "paragraph."
+                        ),
+                    )
+                ]
+            ),
+        )
+        result = runtime.execute_capability(request)
+        print(json.dumps(result.output))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
 
 
 if __name__ == "__main__":

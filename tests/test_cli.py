@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from cgr.apps.cli.main import demo_main, main, model_demo_main
+from cgr.apps.cli.main import (
+    demo_main,
+    main,
+    model_demo_main,
+    openai_demo_main,
+)
 
 
 def test_main_prints_echo_payload_as_json(
@@ -50,3 +55,17 @@ def test_demo_main_prints_end_to_end_json(
     assert output["runtime_health"]["healthy"] is True
     assert output["runtime_health"]["plugin_count"] == 5
     assert exit_code == 0
+
+
+def test_openai_demo_main_reports_missing_key_as_json(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    exit_code = openai_demo_main()
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "OPENAI_API_KEY is not set."
+    }
+    assert exit_code == 1
