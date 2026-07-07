@@ -35,6 +35,7 @@ src/cgr/kernel/coding/code_test_case.py
 src/cgr/kernel/coding/coding_patch.py
 src/cgr/kernel/coding/coding_prompt.py
 src/cgr/kernel/coding/coding_task.py
+src/cgr/kernel/coding/hard_coding_suite.py
 src/cgr/kernel/coding/json_patch_parser.py
 src/cgr/kernel/coding/python_test_runner.py
 src/cgr/kernel/competition/__init__.py
@@ -144,6 +145,7 @@ tests/test_echo_plugin.py
 tests/test_events.py
 tests/test_fusion.py
 tests/test_graph_executor.py
+tests/test_hard_coding_suite.py
 tests/test_learning_memory.py
 tests/test_model_pipeline.py
 tests/test_model_plugins.py

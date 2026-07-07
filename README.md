@@ -167,6 +167,17 @@ environment variables. This is the path toward GLM versus GLM+CGR measurement;
 it makes real provider calls and may incur costs. Official SWE-bench and
 SWE-bench Pro integration remain future work.
 
+## Hard Coding A/B Evaluation
+
+`cgr-coding-ab-real` runs the tiny sanity suite. `cgr-coding-ab-hard` runs eight
+harder local coding challenges with executable tests and is the better command
+for checking whether CGR improves a real model. It uses the same `CGR_DRAFT_*`
+and `CGR_CRITIC_*` provider configuration and is still not official SWE-bench.
+
+```bash
+cgr-coding-ab-hard
+```
+
 ## CGR Booster Engine
 
 CGR's main product goal is to improve an LLM by wrapping it in orchestration

@@ -7,6 +7,7 @@ from cgr.apps.cli.main import (
     benchmark_main,
     boost_local_main,
     coding_ab_local_main,
+    coding_ab_hard_main,
     coding_ab_real_main,
     demo_main,
     main,
@@ -163,6 +164,22 @@ def test_coding_ab_real_main_reports_missing_environment_as_json(
             monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
 
     exit_code = coding_ab_real_main()
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "CGR_DRAFT_API_KEY is not set."
+    }
+    assert exit_code == 1
+
+
+def test_coding_ab_hard_main_reports_missing_environment_as_json(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for prefix in ("CGR_DRAFT", "CGR_CRITIC"):
+        for suffix in ("API_KEY", "MODEL", "BASE_URL", "PROVIDER_NAME"):
+            monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+
+    exit_code = coding_ab_hard_main()
 
     assert json.loads(capsys.readouterr().out) == {
         "error": "CGR_DRAFT_API_KEY is not set."

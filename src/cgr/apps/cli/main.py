@@ -17,11 +17,12 @@ from cgr.kernel.booster import (
     BoosterTask,
 )
 from cgr.kernel.coding import CodeTestCase
+from cgr.kernel.coding.hard_coding_suite import create_hard_coding_tasks
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.pipeline import ModelPipeline
 from cgr.kernel.runtime import KernelRuntime, create_runtime
-from cgr.kernel.swe import SWEABRunner, create_local_swe_tasks
+from cgr.kernel.swe import SWEABRunner, SWEEvalResult, SWETask, create_local_swe_tasks
 from cgr.plugins.agents import (
     LocalBaselineCodingProvider,
     LocalBoosterBaseModelPlugin,
@@ -212,37 +213,56 @@ def coding_ab_local_main() -> int:
 def coding_ab_real_main() -> int:
     """Run coding A/B evaluation against explicit real provider settings."""
     try:
-        draft_config = OpenAICompatibleChatConfig.from_env("CGR_DRAFT")
-        critic_config = OpenAICompatibleChatConfig.from_env("CGR_CRITIC")
-        runtime = KernelRuntime()
-        draft = OpenAICompatibleChatPlugin(
-            config=draft_config,
-            capability_id="model.code",
-            plugin_id="provider.coding.draft",
-        )
-        critic = OpenAICompatibleChatPlugin(
-            config=critic_config,
-            capability_id="model.reason",
-            plugin_id="provider.coding.critic",
-        )
-        runtime.register_plugin(draft)
-        runtime.register_plugin(critic)
-        single = SingleModelCodingAgentPlugin(runtime)
-        multi = MultiModelCodingAgentPlugin(runtime)
-        runtime.register_plugin(single)
-        runtime.register_plugin(multi)
-        result = SWEABRunner(runtime).run_suite(
-            "real_coding_ab",
-            create_local_swe_tasks(),
-            draft.metadata.id,
-            single.metadata.id,
-            multi.metadata.id,
+        result = _run_real_coding_ab("real_coding_ab", create_local_swe_tasks())
+        print(json.dumps(result.model_dump(mode="json")))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
+
+
+def coding_ab_hard_main() -> int:
+    """Run the hard executable coding suite against explicit real providers."""
+    try:
+        result = _run_real_coding_ab(
+            "hard_coding_ab", create_hard_coding_tasks()
         )
         print(json.dumps(result.model_dump(mode="json")))
         return 0
     except Exception as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
+
+
+def _run_real_coding_ab(
+    suite_name: str, tasks: list[SWETask]
+) -> SWEEvalResult:
+    draft_config = OpenAICompatibleChatConfig.from_env("CGR_DRAFT")
+    critic_config = OpenAICompatibleChatConfig.from_env("CGR_CRITIC")
+    runtime = KernelRuntime()
+    draft = OpenAICompatibleChatPlugin(
+        config=draft_config,
+        capability_id="model.code",
+        plugin_id="provider.coding.draft",
+    )
+    critic = OpenAICompatibleChatPlugin(
+        config=critic_config,
+        capability_id="model.reason",
+        plugin_id="provider.coding.critic",
+    )
+    runtime.register_plugin(draft)
+    runtime.register_plugin(critic)
+    single = SingleModelCodingAgentPlugin(runtime)
+    multi = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(single)
+    runtime.register_plugin(multi)
+    return SWEABRunner(runtime).run_suite(
+        suite_name,
+        tasks,
+        draft.metadata.id,
+        single.metadata.id,
+        multi.metadata.id,
+    )
 
 
 def boost_local_main() -> int:
