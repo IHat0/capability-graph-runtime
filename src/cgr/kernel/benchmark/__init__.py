@@ -7,6 +7,7 @@ from .benchmark_runner import BenchmarkRunner
 from .benchmark_suite_result import BenchmarkSuiteResult
 from .benchmark_task import BenchmarkTask
 from .local_benchmark_suite import create_local_benchmark_tasks
+from .model_provider_benchmark_suite import create_model_provider_benchmark_tasks
 
 __all__ = [
     "BenchmarkCaseResult",
@@ -16,4 +17,5 @@ __all__ = [
     "BenchmarkSuiteResult",
     "BenchmarkTask",
     "create_local_benchmark_tasks",
+    "create_model_provider_benchmark_tasks",
 ]

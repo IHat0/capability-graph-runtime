@@ -2,11 +2,13 @@
 
 import argparse
 import json
+import os
 
 from cgr.kernel.benchmark import (
     BenchmarkExporter,
     BenchmarkRunner,
     create_local_benchmark_tasks,
+    create_model_provider_benchmark_tasks,
 )
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.pipeline import ModelPipeline
@@ -123,6 +125,37 @@ def benchmark_main(argv: list[str] | None = None) -> int:
         exporter.write_markdown(result, args.markdown_out)
     print(json.dumps(result.model_dump(mode="json")))
     return 0
+
+
+def openai_benchmark_main(argv: list[str] | None = None) -> int:
+    """Run the optional OpenAI provider benchmark and print JSON only."""
+    parser = argparse.ArgumentParser(
+        description="Run the optional OpenAI provider benchmark."
+    )
+    parser.add_argument("--json-out", help="Path for formatted JSON results.")
+    parser.add_argument("--markdown-out", help="Path for the Markdown report.")
+    args = parser.parse_args(argv)
+
+    if not os.getenv("OPENAI_API_KEY"):
+        print(json.dumps({"error": "OPENAI_API_KEY is not set."}))
+        return 1
+
+    try:
+        runtime = create_runtime(include_openai_provider=True)
+        result = BenchmarkRunner(runtime).run_suite(
+            "openai_provider",
+            create_model_provider_benchmark_tasks(),
+        )
+        exporter = BenchmarkExporter()
+        if args.json_out is not None:
+            exporter.write_json(result, args.json_out)
+        if args.markdown_out is not None:
+            exporter.write_markdown(result, args.markdown_out)
+        print(json.dumps(result.model_dump(mode="json")))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from cgr.apps.cli.main import (
     demo_main,
     main,
     model_demo_main,
+    openai_benchmark_main,
     openai_demo_main,
 )
 
@@ -70,6 +71,51 @@ def test_openai_demo_main_reports_missing_key_as_json(
     assert json.loads(capsys.readouterr().out) == {
         "error": "OPENAI_API_KEY is not set."
     }
+    assert exit_code == 1
+
+
+def test_openai_benchmark_main_reports_missing_key_without_runtime(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def fail_create_runtime(**_: bool) -> None:
+        raise AssertionError("runtime must not be created without an API key")
+
+    monkeypatch.setattr("cgr.apps.cli.main.create_runtime", fail_create_runtime)
+
+    exit_code = openai_benchmark_main([])
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "OPENAI_API_KEY is not set."
+    }
+    assert exit_code == 1
+
+
+def test_openai_benchmark_main_parses_export_args_before_missing_key(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    json_path = tmp_path / "openai.json"
+    markdown_path = tmp_path / "openai.md"
+
+    exit_code = openai_benchmark_main(
+        [
+            "--json-out",
+            str(json_path),
+            "--markdown-out",
+            str(markdown_path),
+        ]
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "OPENAI_API_KEY is not set."
+    }
+    assert not json_path.exists()
+    assert not markdown_path.exists()
     assert exit_code == 1
 
 

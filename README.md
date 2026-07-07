@@ -140,6 +140,17 @@ JSON is suitable for tooling and automation. Markdown is useful for README
 notes, outreach, and benchmark summaries. The benchmark covers the calculator,
 text stats, mock reasoning model, and mock coding model.
 
+## Optional OpenAI Provider Benchmark
+
+This tiny `model.reason` benchmark is intended for private provider evaluation.
+It is not required for tests and may incur provider costs.
+
+```powershell
+$env:OPENAI_API_KEY="..."
+cgr-openai-benchmark
+cgr-openai-benchmark --json-out benchmark-results/openai.json --markdown-out benchmark-results/openai.md
+```
+
 ## Next Possible Steps
 
 - Add additional real model provider plugins.

@@ -7,6 +7,7 @@ from cgr.kernel.benchmark import (
     BenchmarkSuiteResult,
     BenchmarkTask,
     create_local_benchmark_tasks,
+    create_model_provider_benchmark_tasks,
 )
 from cgr.kernel.runtime import create_runtime
 
@@ -104,6 +105,19 @@ def test_local_benchmark_tasks_are_unique_and_cover_capabilities() -> None:
         "model.reason",
         "model.code",
     }.issubset(capability_ids)
+
+
+def test_model_provider_benchmark_tasks_are_schema_only_reasoning_tasks() -> None:
+    tasks = create_model_provider_benchmark_tasks()
+
+    assert tasks
+    assert len({task.id for task in tasks}) == len(tasks)
+    assert all(task.capability_id == "model.reason" for task in tasks)
+    assert all(
+        {"text", "model_id"}.issubset(task.required_output_keys)
+        for task in tasks
+    )
+    assert all(task.expected_output is None for task in tasks)
 
 
 def test_runner_executes_and_exactly_verifies_calculator_task() -> None:
