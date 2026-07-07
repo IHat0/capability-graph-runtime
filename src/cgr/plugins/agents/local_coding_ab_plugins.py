@@ -103,11 +103,11 @@ class _LocalCodingProvider(Plugin[Any, dict[str, Any]]):
                 {"math_utils.py": "def add(a, b):\n    return a - b\n"},
                 {"math_utils.py": "def add(a, b):\n    return a + b\n"},
             )
-        if "numbers.py" in prompt:
+        if "number_utils.py" in prompt:
             return (
                 "local.is_even",
-                {"numbers.py": "def is_even(n):\n    return n % 2 == 1\n"},
-                {"numbers.py": "def is_even(n):\n    return n % 2 == 0\n"},
+                {"number_utils.py": "def is_even(n):\n    return n % 2 == 1\n"},
+                {"number_utils.py": "def is_even(n):\n    return n % 2 == 0\n"},
             )
         return (
             "local.greeting",

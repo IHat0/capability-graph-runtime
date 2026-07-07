@@ -5,7 +5,7 @@ import re
 from time import perf_counter
 from typing import Any
 
-from cgr.kernel.coding import JsonPatchParser
+from cgr.kernel.coding import JsonPatchParser, PythonTestRunner
 from cgr.kernel.contracts import (
     Capability,
     CapabilityVersion,
@@ -246,6 +246,18 @@ class BoosterEngine:
             except ValueError:
                 return 0.0, False, None, ["Coding output was not valid patch JSON."]
             files = structured["files"]
+            if task.test_files and task.test_commands:
+                passed, messages = PythonTestRunner().run(
+                    files,
+                    task.test_files,
+                    task.test_commands,
+                )
+                return (
+                    1.0 if passed else 0.0,
+                    passed,
+                    structured,
+                    messages,
+                )
             if task.expected_output is not None:
                 passed = files == task.expected_output
                 return (

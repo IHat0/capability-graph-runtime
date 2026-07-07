@@ -14,6 +14,7 @@ from cgr.kernel.booster import (
     BoosterTask,
     BoosterTrace,
 )
+from cgr.kernel.coding import CodeTestCase
 from cgr.kernel.runtime import KernelRuntime
 from cgr.plugins.agents import (
     LocalBoosterBaseModelPlugin,
@@ -35,8 +36,8 @@ def coding_task(task_id: str = "local.greeting") -> BoosterTask:
         ),
         "local.is_even": (
             "Fix is_even for even and odd numbers.",
-            {"numbers.py": "def is_even(n):\n    return n % 2 == 1\n"},
-            {"numbers.py": "def is_even(n):\n    return n % 2 == 0\n"},
+            {"number_utils.py": "def is_even(n):\n    return n % 2 == 1\n"},
+            {"number_utils.py": "def is_even(n):\n    return n % 2 == 0\n"},
         ),
     }
     prompt, files, expected = data[task_id]
@@ -214,6 +215,62 @@ def test_coding_scoring_accepts_raw_and_fenced_json() -> None:
 
     assert raw[0:2] == (1.0, True)
     assert fenced[0:2] == (1.0, True)
+
+
+def test_coding_scoring_prioritizes_tests_over_exact_text() -> None:
+    task = BoosterTask(
+        id="functional-add",
+        domain=BoosterDomain.CODING,
+        prompt="Fix add.",
+        expected_output={"math_utils.py": "def add(a, b):\n    return a + b\n"},
+        test_files={
+            "test_task.py": (
+                "from math_utils import add\n"
+                "assert add(1, 2) == 3\n"
+                "assert add(-5, 5) == 0\n"
+            )
+        },
+        test_commands=[
+            CodeTestCase(name="add", command=["python", "test_task.py"])
+        ],
+    )
+    text_different = json.dumps(
+        {
+            "files": {
+                "math_utils.py": (
+                    "def add(a: float, b: float) -> float:\n"
+                    "    \"\"\"Return the sum.\"\"\"\n"
+                    "    return a + b\n"
+                )
+            }
+        }
+    )
+
+    score, verified, _, messages = local_engine()._score_candidate(
+        task, text_different
+    )
+
+    assert (score, verified) == (1.0, True)
+    assert any("exit code 0" in message for message in messages)
+
+
+def test_coding_scoring_returns_zero_when_tests_fail() -> None:
+    task = BoosterTask(
+        id="failed-add",
+        domain=BoosterDomain.CODING,
+        prompt="Fix add.",
+        test_files={
+            "test_task.py": "from math_utils import add\nassert add(1, 2) == 3\n"
+        },
+        test_commands=[
+            CodeTestCase(name="add", command=["python", "test_task.py"])
+        ],
+    )
+    wrong = json.dumps(
+        {"files": {"math_utils.py": "def add(a, b):\n    return a - b\n"}}
+    )
+
+    assert local_engine()._score_candidate(task, wrong)[0:2] == (0.0, False)
 
 
 def test_required_output_key_scoring() -> None:

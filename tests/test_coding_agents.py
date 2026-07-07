@@ -3,10 +3,10 @@ from typing import Any
 
 import pytest
 
-from cgr.kernel.coding import JsonPatchParser
+from cgr.kernel.coding import CodeTestCase, JsonPatchParser
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.runtime import KernelRuntime
-from cgr.kernel.swe import SWEABRunner, create_local_swe_tasks
+from cgr.kernel.swe import SWEABRunner, SWETask, create_local_swe_tasks
 from cgr.plugins.agents import (
     MultiModelCodingAgentPlugin,
     SingleModelCodingAgentPlugin,
@@ -154,3 +154,64 @@ def test_local_swe_suite_contains_three_distinct_tasks() -> None:
         "local.add",
         "local.is_even",
     }
+
+
+def test_swe_runner_accepts_functionally_correct_text_different_code() -> None:
+    class FunctionalClient:
+        def create_chat_completion(
+            self,
+            config: OpenAICompatibleChatConfig,
+            messages: list[dict[str, str]],
+        ) -> dict[str, Any]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "files": {
+                                        "math_utils.py": (
+                                            "def add(a: float, b: float) -> float:\n"
+                                            "    \"\"\"Return the sum.\"\"\"\n"
+                                            "    return a + b\n"
+                                        )
+                                    },
+                                    "explanation": "Functionally equivalent.",
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    runtime = KernelRuntime()
+    plugin = OpenAICompatibleChatPlugin(
+        config=OpenAICompatibleChatConfig(
+            api_key="local", model="functional", base_url="http://localhost"
+        ),
+        client=FunctionalClient(),
+        capability_id="model.code",
+        plugin_id="functional",
+    )
+    runtime.register_plugin(plugin)
+    task = SWETask(
+        id="functional",
+        issue="Fix add.",
+        files={"math_utils.py": "def add(a, b):\n    return a - b\n"},
+        expected_files={"math_utils.py": "def add(a, b):\n    return a + b\n"},
+        test_files={
+            "test_task.py": (
+                "from math_utils import add\n"
+                "assert add(1, 2) == 3\n"
+                "assert add(-5, 5) == 0\n"
+            )
+        },
+        test_commands=[
+            CodeTestCase(name="functional", command=["python", "test_task.py"])
+        ],
+    )
+
+    case = SWEABRunner(runtime)._run_case(task, "baseline", plugin.metadata.id)
+
+    assert case.passed is True
+    assert case.files != task.expected_files

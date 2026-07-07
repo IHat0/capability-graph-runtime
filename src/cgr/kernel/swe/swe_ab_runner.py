@@ -2,7 +2,13 @@
 
 from typing import Any
 
-from cgr.kernel.coding import CodingPatch, CodingTask, JsonPatchParser, build_patch_prompt
+from cgr.kernel.coding import (
+    CodingPatch,
+    CodingTask,
+    JsonPatchParser,
+    PythonTestRunner,
+    build_patch_prompt,
+)
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest, ExecutionStatus
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.runtime import KernelRuntime
@@ -65,11 +71,18 @@ class SWEABRunner:
                 if mode == "baseline"
                 else self._run_agent(task, plugin_id)
             )
+            passed = patch.files == task.expected_files
+            if task.test_files and task.test_commands:
+                passed, _ = PythonTestRunner().run(
+                    patch.files,
+                    task.test_files,
+                    task.test_commands,
+                )
             return SWECaseResult(
                 task_id=task.id,
                 mode=mode,
                 plugin_id=plugin_id,
-                passed=patch.files == task.expected_files,
+                passed=passed,
                 files=patch.files,
             )
         except Exception as exc:

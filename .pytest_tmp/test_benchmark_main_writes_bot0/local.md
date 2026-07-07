@@ -17,9 +17,9 @@
 
 | Task | Capability | Plugin | Succeeded | Verified | Duration |
 |---|---|---|---:|---:|---:|
-| calculator.simple_arithmetic | calculator.evaluate | - | true | true | 0.08 ms |
+| calculator.simple_arithmetic | calculator.evaluate | - | true | true | 0.09 ms |
 | calculator.parentheses | calculator.evaluate | - | true | true | 0.04 ms |
-| text_stats.simple | text.stats | - | true | true | 0.02 ms |
+| text_stats.simple | text.stats | - | true | true | 0.03 ms |
 | text_stats.multiline | text.stats | - | true | true | 0.02 ms |
-| model.reason | model.reason | - | true | true | 0.05 ms |
+| model.reason | model.reason | - | true | true | 0.06 ms |
 | model.code | model.code | - | true | true | 0.03 ms |

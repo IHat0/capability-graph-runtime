@@ -31,10 +31,12 @@ src/cgr/kernel/booster/booster_result.py
 src/cgr/kernel/booster/booster_task.py
 src/cgr/kernel/booster/booster_trace.py
 src/cgr/kernel/coding/__init__.py
+src/cgr/kernel/coding/code_test_case.py
 src/cgr/kernel/coding/coding_patch.py
 src/cgr/kernel/coding/coding_prompt.py
 src/cgr/kernel/coding/coding_task.py
 src/cgr/kernel/coding/json_patch_parser.py
+src/cgr/kernel/coding/python_test_runner.py
 src/cgr/kernel/competition/__init__.py
 src/cgr/kernel/competition/competition_engine.py
 src/cgr/kernel/competition/competition_result.py
@@ -100,8 +102,8 @@ src/cgr/kernel/verification/verification_result.py
 src/cgr/kernel/verification/verification_status.py
 src/cgr/kernel/verification/verifier.py
 src/cgr/plugins/agents/__init__.py
-src/cgr/plugins/agents/local_coding_ab_plugins.py
 src/cgr/plugins/agents/local_booster_model_plugins.py
+src/cgr/plugins/agents/local_coding_ab_plugins.py
 src/cgr/plugins/agents/multi_model_coding_agent.py
 src/cgr/plugins/agents/single_model_coding_agent.py
 src/cgr/plugins/builtin/__init__.py
@@ -150,6 +152,7 @@ tests/test_openai_provider_plugin.py
 tests/test_plugin_lifecycle.py
 tests/test_plugin_loader.py
 tests/test_plugin_registry.py
+tests/test_python_test_runner.py
 tests/test_router_components.py
 tests/test_runtime_errors.py
 tests/test_runtime_health.py

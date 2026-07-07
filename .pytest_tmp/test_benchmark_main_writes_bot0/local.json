@@ -4,7 +4,7 @@
   "succeeded_tasks": 6,
   "verified_tasks": 6,
   "failed_tasks": 0,
-  "average_duration_ms": 0.04038334979365269,
+  "average_duration_ms": 0.044483342207968235,
   "results": [
     {
       "task_id": "calculator.simple_arithmetic",
@@ -12,7 +12,7 @@
       "plugin_id": null,
       "succeeded": true,
       "verified": true,
-      "duration_ms": 0.08230004459619522,
+      "duration_ms": 0.09320001117885113,
       "output": {
         "expression": "1 + 2 * 3",
         "result": 7
@@ -26,7 +26,7 @@
       "plugin_id": null,
       "succeeded": true,
       "verified": true,
-      "duration_ms": 0.03650016151368618,
+      "duration_ms": 0.03829994238913059,
       "output": {
         "expression": "(10 + 5) / 3",
         "result": 5.0
@@ -40,7 +40,7 @@
       "plugin_id": null,
       "succeeded": true,
       "verified": true,
-      "duration_ms": 0.02429983578622341,
+      "duration_ms": 0.0254001934081316,
       "output": {
         "character_count": 11,
         "word_count": 2,
@@ -56,7 +56,7 @@
       "plugin_id": null,
       "succeeded": true,
       "verified": true,
-      "duration_ms": 0.02410006709396839,
+      "duration_ms": 0.021300045773386955,
       "output": {
         "character_count": 12,
         "word_count": 2,
@@ -72,7 +72,7 @@
       "plugin_id": null,
       "succeeded": true,
       "verified": true,
-      "duration_ms": 0.04619988612830639,
+      "duration_ms": 0.05559995770454407,
       "output": {
         "text": "Reasoned answer: Explain routing.",
         "model_id": "mock.reasoning_model",
@@ -91,7 +91,7 @@
       "plugin_id": null,
       "succeeded": true,
       "verified": true,
-      "duration_ms": 0.028900103643536568,
+      "duration_ms": 0.03309990279376507,
       "output": {
         "text": "Code response: Write a function.",
         "model_id": "mock.coding_model",

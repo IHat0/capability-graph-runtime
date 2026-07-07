@@ -16,6 +16,7 @@ from cgr.kernel.booster import (
     BoosterEngine,
     BoosterTask,
 )
+from cgr.kernel.coding import CodeTestCase
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.pipeline import ModelPipeline
@@ -261,6 +262,19 @@ def boost_local_main() -> int:
             prompt='Change the program so it prints "hello CGR".',
             input_data={"files": {"app.py": 'print("hello")\n'}},
             expected_output={"app.py": 'print("hello CGR")\n'},
+            test_files={
+                "test_task.py": (
+                    "import subprocess, sys\n"
+                    "result = subprocess.run([sys.executable, 'app.py'], "
+                    "capture_output=True, text=True)\n"
+                    "assert result.stdout == 'hello CGR\\n'\n"
+                )
+            },
+            test_commands=[
+                CodeTestCase(
+                    name="run_greeting_test", command=["python", "test_task.py"]
+                )
+            ],
         ),
         BoosterTask(
             id="local.add",
@@ -274,6 +288,17 @@ def boost_local_main() -> int:
             expected_output={
                 "math_utils.py": "def add(a, b):\n    return a + b\n"
             },
+            test_files={
+                "test_task.py": (
+                    "from math_utils import add\n"
+                    "assert add(1, 2) == 3\n"
+                    "assert add(-5, 5) == 0\n"
+                    "assert add(10, -3) == 7\n"
+                )
+            },
+            test_commands=[
+                CodeTestCase(name="run_add_test", command=["python", "test_task.py"])
+            ],
         ),
         BoosterTask(
             id="local.is_even",
@@ -284,12 +309,26 @@ def boost_local_main() -> int:
             ),
             input_data={
                 "files": {
-                    "numbers.py": "def is_even(n):\n    return n % 2 == 1\n"
+                    "number_utils.py": "def is_even(n):\n    return n % 2 == 1\n"
                 }
             },
             expected_output={
-                "numbers.py": "def is_even(n):\n    return n % 2 == 0\n"
+                "number_utils.py": "def is_even(n):\n    return n % 2 == 0\n"
             },
+            test_files={
+                "test_task.py": (
+                    "from number_utils import is_even\n"
+                    "assert is_even(2) is True\n"
+                    "assert is_even(3) is False\n"
+                    "assert is_even(0) is True\n"
+                    "assert is_even(-4) is True\n"
+                )
+            },
+            test_commands=[
+                CodeTestCase(
+                    name="run_is_even_test", command=["python", "test_task.py"]
+                )
+            ],
         ),
     ]
     report = BoosterBenchmarkRunner(engine).run("local_booster", tasks)
