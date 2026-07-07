@@ -122,6 +122,24 @@ $env:OPENAI_MODEL="gpt-4.1-mini"  # optional
 cgr-openai-demo
 ```
 
+## Local Benchmark
+
+Run the deterministic local benchmark (no API keys required):
+
+```bash
+cgr-benchmark
+```
+
+Write machine-readable JSON results and a human-readable Markdown report:
+
+```bash
+cgr-benchmark --json-out benchmark-results/local.json --markdown-out benchmark-results/local.md
+```
+
+JSON is suitable for tooling and automation. Markdown is useful for README
+notes, outreach, and benchmark summaries. The benchmark covers the calculator,
+text stats, mock reasoning model, and mock coding model.
+
 ## Next Possible Steps
 
 - Add additional real model provider plugins.

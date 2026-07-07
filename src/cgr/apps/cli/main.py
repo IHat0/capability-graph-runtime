@@ -1,7 +1,13 @@
-"""Minimal command-line smoke test for the Capability Graph Runtime."""
+"""Command-line demos for the Capability Graph Runtime."""
 
+import argparse
 import json
 
+from cgr.kernel.benchmark import (
+    BenchmarkExporter,
+    BenchmarkRunner,
+    create_local_benchmark_tasks,
+)
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.pipeline import ModelPipeline
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
@@ -96,6 +102,27 @@ def openai_demo_main() -> int:
     except Exception as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
+
+
+def benchmark_main(argv: list[str] | None = None) -> int:
+    """Run the deterministic local benchmark suite and optionally export it."""
+    parser = argparse.ArgumentParser(description="Run the local CGR benchmark.")
+    parser.add_argument("--json-out", help="Path for formatted JSON results.")
+    parser.add_argument("--markdown-out", help="Path for the Markdown report.")
+    args = parser.parse_args(argv)
+
+    runtime = create_runtime(include_builtin=True, include_mock_models=True)
+    result = BenchmarkRunner(runtime).run_suite(
+        "CGR Local Benchmark",
+        create_local_benchmark_tasks(),
+    )
+    exporter = BenchmarkExporter()
+    if args.json_out is not None:
+        exporter.write_json(result, args.json_out)
+    if args.markdown_out is not None:
+        exporter.write_markdown(result, args.markdown_out)
+    print(json.dumps(result.model_dump(mode="json")))
+    return 0
 
 
 if __name__ == "__main__":
