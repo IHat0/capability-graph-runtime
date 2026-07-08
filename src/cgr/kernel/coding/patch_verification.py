@@ -32,3 +32,34 @@ def select_patch(
 
 def _patch_size(patch: CodingPatch) -> tuple[int, int]:
     return len(patch.files), sum(len(name) + len(text) for name, text in patch.files.items())
+
+
+def patch_fingerprint(patch: CodingPatch) -> tuple[tuple[str, str], ...]:
+    """Return a stable exact-content identity for repetition detection."""
+    return tuple(sorted(patch.files.items()))
+
+
+def extract_forbidden_patterns_from_failed_code(
+    files: dict[str, str], failure_summary: str
+) -> list[str]:
+    """Derive generic implementation warnings from code and verifier evidence."""
+    code = "\n".join(files.values())
+    summary = failure_summary.lower()
+    hints: list[str] = []
+    if "{**" in code and "expected" in summary and "got" in summary:
+        hints.append(
+            "Do not use dictionary unpacking merge like {**a, **b}; it overwrites "
+            "duplicate keys."
+        )
+    if ".update(" in code and "expected" in summary and "got" in summary:
+        hints.append(
+            "Do not use dict.update for conflicting values; it overwrites duplicate "
+            "keys."
+        )
+    if ("return False," in code or "return True," in code) and (
+        "bool" in summary or "boolean" in summary
+    ):
+        hints.append("Do not return tuples when tests expect booleans.")
+    if ".lower()" in code and "has no attribute" in summary and "lower" in summary:
+        hints.append("Do not call .lower() before handling non-string values.")
+    return hints

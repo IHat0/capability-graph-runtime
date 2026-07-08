@@ -250,7 +250,7 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
         result = _run_real_coding_ab(
             "hard_coding_ab",
             tasks,
-            multi_repair_attempts=3 if args.retry_failed else 2,
+            multi_repair_attempts=4 if args.retry_failed else 3,
             debug_trace=args.debug_trace,
         )
         print(
@@ -269,7 +269,7 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
 def _run_real_coding_ab(
     suite_name: str,
     tasks: list[SWETask],
-    multi_repair_attempts: int = 2,
+    multi_repair_attempts: int = 3,
     debug_trace: bool = False,
 ) -> SWEEvalResult:
     draft_config = OpenAICompatibleChatConfig.from_env("CGR_DRAFT")

@@ -9,11 +9,17 @@ from .coding_patch_normalizer import (
 from .coding_prompt import (
     build_format_retry_prompt,
     build_patch_prompt,
+    build_repair_plan_prompt,
     build_repair_prompt,
 )
 from .coding_task import CodingTask
 from .json_patch_parser import JsonPatchParser
-from .patch_verification import select_patch, verify_patch
+from .patch_verification import (
+    extract_forbidden_patterns_from_failed_code,
+    patch_fingerprint,
+    select_patch,
+    verify_patch,
+)
 from .python_test_runner import PythonTestRunner, summarize_python_test_failure
 
 __all__ = [
@@ -27,7 +33,10 @@ __all__ = [
     "build_patch_prompt",
     "build_format_retry_prompt",
     "build_repair_prompt",
+    "build_repair_plan_prompt",
     "select_patch",
+    "extract_forbidden_patterns_from_failed_code",
+    "patch_fingerprint",
     "verify_patch",
     "summarize_python_test_failure",
 ]

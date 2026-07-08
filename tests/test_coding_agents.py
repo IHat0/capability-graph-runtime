@@ -7,6 +7,7 @@ from cgr.kernel.coding import (
     CodeTestCase,
     CodingPatch,
     JsonPatchParser,
+    PythonTestRunner,
     select_patch,
 )
 from cgr.kernel.coding.hard_coding_suite import create_hard_coding_tasks
@@ -35,6 +36,7 @@ class SequencedClient:
     def __init__(self, critique: bool = False) -> None:
         self.critique = critique
         self.calls = 0
+        self.prompts: list[str] = []
 
     def create_chat_completion(
         self,
@@ -42,6 +44,7 @@ class SequencedClient:
         messages: list[dict[str, str]],
     ) -> dict[str, Any]:
         self.calls += 1
+        self.prompts.append(messages[-1]["content"])
         content = "No corrections needed." if self.critique else PATCH_TEXT
         return {"choices": [{"message": {"content": content}}]}
 
@@ -364,15 +367,17 @@ def test_multi_agent_second_semantic_repair_fixes_merge_counts() -> None:
 
     assert result.output["files"] == task.expected_files
     trace = result.output["_trace"]
-    assert trace["repair_attempts_count"] == 2
-    assert trace["candidates_count"] == 3
+    assert trace["repair_attempts_count"] == 3
+    assert trace["repair_variant_count"] == 3
+    assert trace["candidates_count"] == 4
     assert trace["selected_candidate_id"] == "repair_2"
     assert trace["candidate_scores"] == {
         "candidate_1": 0.0,
         "repair_1": 0.0,
         "repair_2": 1.0,
+        "repair_3": 1.0,
     }
-    assert len(draft_client.prompts) == 3
+    assert len(draft_client.prompts) == 4
     first_repair = draft_client.prompts[1]
     second_repair = draft_client.prompts[2]
     assert "expected {'x': 3, 'y': 3}, got {'x': 2, 'y': 3}" in first_repair
@@ -381,6 +386,17 @@ def test_multi_agent_second_semantic_repair_fixes_merge_counts() -> None:
     assert "Your previous repair still failed" in second_repair
     assert "Previous repair files" in second_repair
     assert trace["candidate_file_previews"]["repair_2"] == task.expected_files
+    assert trace["repeated_candidate_rejections"] == 1
+    assert trace["known_failing_candidate_ids"] == [
+        "candidate_1",
+        "repair_1",
+    ]
+    assert any(
+        "dictionary unpacking" in hint
+        for hint in trace["forbidden_pattern_hints"]
+    )
+    assert "explicit for-loop over the second input" in second_repair
+    assert "identify the exact semantic bug" in critic_client.prompts[0]
 
 
 class DiagnosticAwareMergeClient:
@@ -430,6 +446,11 @@ def test_multi_agent_uses_explicit_expected_got_diagnostic() -> None:
     failing = {
         "counter_utils.py": "def merge_counts(a, b):\n    return {**a, **b}\n"
     }
+    baseline_passed, _ = PythonTestRunner().run(
+        failing, task.test_files, task.test_commands
+    )
+    assert baseline_passed is False
+
     client = DiagnosticAwareMergeClient(failing, task.expected_files)
     runtime = KernelRuntime()
     config = OpenAICompatibleChatConfig(

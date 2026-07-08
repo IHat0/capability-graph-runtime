@@ -100,10 +100,20 @@ def summarize_python_test_failure(messages: list[str]) -> str:
     )
     selected = [
         line
+        for line in non_empty
+        if "AssertionError:" in line and "expected" in line and "got" in line
+    ]
+    selected.extend(
+        line
+        for line in non_empty
+        if "expected" in line and "got" in line
+    )
+    selected.extend(
+        line
         for marker in priority_markers
         for line in non_empty
         if marker in line
-    ]
+    )
     selected.extend(
         line
         for marker in secondary_markers

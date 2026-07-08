@@ -194,6 +194,15 @@ class SWEABRunner:
             "repair_prompt_preview": trace.get("repair_prompt_preview"),
             "candidate_scores": trace.get("candidate_scores"),
             "candidate_file_previews": trace.get("candidate_file_previews"),
+            "known_failing_candidate_ids": trace.get(
+                "known_failing_candidate_ids"
+            ),
+            "repeated_candidate_rejections": trace.get(
+                "repeated_candidate_rejections"
+            ),
+            "forbidden_pattern_hints": trace.get("forbidden_pattern_hints"),
+            "repair_plan_preview": trace.get("repair_plan_preview"),
+            "repair_variant_count": trace.get("repair_variant_count"),
         }
 
     @staticmethod

@@ -29,3 +29,8 @@ class SWECaseResult(BaseModel):
     repair_prompt_preview: str | None = None
     candidate_scores: dict[str, float] | None = None
     candidate_file_previews: dict[str, dict[str, str]] | None = None
+    known_failing_candidate_ids: list[str] | None = None
+    repeated_candidate_rejections: int | None = None
+    forbidden_pattern_hints: list[str] | None = None
+    repair_plan_preview: str | None = None
+    repair_variant_count: int | None = None
