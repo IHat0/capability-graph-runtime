@@ -34,3 +34,6 @@ class SWECaseResult(BaseModel):
     forbidden_pattern_hints: list[str] | None = None
     repair_plan_preview: str | None = None
     repair_variant_count: int | None = None
+    test_assertion_checklist: list[str] | None = None
+    latest_failure_preview_by_candidate: dict[str, str] | None = None
+    repair_prompt_previews_by_attempt: dict[str, str] | None = None

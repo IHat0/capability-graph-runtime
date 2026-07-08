@@ -10,7 +10,9 @@ from cgr.kernel.coding import (
     build_format_retry_prompt,
     build_patch_prompt,
     build_repair_prompt,
+    extract_test_assertion_checklist,
     select_patch,
+    summarize_python_test_failure,
     verify_patch,
 )
 from cgr.kernel.contracts import (
@@ -84,6 +86,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
 
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
+        test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         model_result = self._execute_model(build_patch_prompt(task))
         patch, format_duration = self._normalize_with_retry(
             self._model_text(model_result.output), task
@@ -123,6 +126,12 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             selected_id,
             verification[1] if verification is not None else [],
             repair_prompt,
+            test_assertion_checklist,
+            (
+                {"candidate_1": summarize_python_test_failure(verification[1])}
+                if verification is not None and not verification[0]
+                else {}
+            ),
         )
         return ExecutionResult(
             context=request.context,
@@ -171,6 +180,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         selected_id: str,
         verifier_messages: list[str],
         repair_prompt: str | None,
+        test_assertion_checklist: list[str],
+        latest_failures: dict[str, str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -195,6 +206,16 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 }
                 for candidate_id, candidate, _ in candidates
             },
+            "test_assertion_checklist": test_assertion_checklist,
+            "latest_failure_preview_by_candidate": {
+                candidate_id: failure[:1000]
+                for candidate_id, failure in latest_failures.items()
+            },
+            "repair_prompt_previews_by_attempt": (
+                {"repair_1": repair_prompt[:1000]}
+                if repair_prompt is not None
+                else {}
+            ),
         }
 
     @staticmethod

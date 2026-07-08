@@ -40,11 +40,14 @@ def patch_fingerprint(patch: CodingPatch) -> tuple[tuple[str, str], ...]:
 
 
 def extract_forbidden_patterns_from_failed_code(
-    files: dict[str, str], failure_summary: str
+    files: dict[str, str],
+    failure_summary: str,
+    test_assertion_checklist: list[str] | None = None,
 ) -> list[str]:
     """Derive generic implementation warnings from code and verifier evidence."""
     code = "\n".join(files.values())
     summary = failure_summary.lower()
+    checklist = "\n".join(test_assertion_checklist or []).lower()
     hints: list[str] = []
     if "{**" in code and "expected" in summary and "got" in summary:
         hints.append(
@@ -60,6 +63,18 @@ def extract_forbidden_patterns_from_failed_code(
         "bool" in summary or "boolean" in summary
     ):
         hints.append("Do not return tuples when tests expect booleans.")
-    if ".lower()" in code and "has no attribute" in summary and "lower" in summary:
-        hints.append("Do not call .lower() before handling non-string values.")
+    normalization_evidence = (
+        ("has no attribute" in summary and "lower" in summary)
+        or "valueerror: yes" in summary
+        or all(value in checklist for value in ("yes", "off", "1", "0"))
+    )
+    if ".lower()" in code and normalization_evidence:
+        hints.extend(
+            [
+                "Handle bool inputs before string normalization.",
+                "Normalize strings with strip().lower() before comparison.",
+                "Include all truthy/falsy string values shown in the tests, not only "
+                "'true' and 'false'.",
+            ]
+        )
     return hints

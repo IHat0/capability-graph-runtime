@@ -21,6 +21,7 @@ from .patch_verification import (
     verify_patch,
 )
 from .python_test_runner import PythonTestRunner, summarize_python_test_failure
+from .test_assertion_checklist import extract_test_assertion_checklist
 
 __all__ = [
     "CodeTestCase",
@@ -36,6 +37,7 @@ __all__ = [
     "build_repair_plan_prompt",
     "select_patch",
     "extract_forbidden_patterns_from_failed_code",
+    "extract_test_assertion_checklist",
     "patch_fingerprint",
     "verify_patch",
     "summarize_python_test_failure",

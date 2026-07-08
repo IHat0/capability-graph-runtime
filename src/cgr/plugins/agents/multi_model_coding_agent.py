@@ -13,6 +13,7 @@ from cgr.kernel.coding import (
     build_repair_plan_prompt,
     build_repair_prompt,
     extract_forbidden_patterns_from_failed_code,
+    extract_test_assertion_checklist,
     patch_fingerprint,
     select_patch,
     summarize_python_test_failure,
@@ -96,6 +97,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
 
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
+        test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         draft_result = self._execute_model(
             self._draft_capability_id, build_patch_prompt(task)
         )
@@ -117,6 +119,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         forbidden_hints: list[str] = []
         repeated_rejections = 0
         repair_plan = ""
+        latest_failures: dict[str, str] = {}
         if draft_verification is not None and draft_verification[0]:
             output = draft_patch.model_dump()
             output["_trace"] = self._trace(
@@ -124,6 +127,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 "candidate_1",
                 verifier_messages,
                 repair_prompts,
+                test_assertion_checklist=test_assertion_checklist,
             )
             return ExecutionResult(
                 context=request.context,
@@ -136,9 +140,12 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             known_failures.append(
                 ("candidate_1", draft_patch.files, draft_summary)
             )
+            latest_failures["candidate_1"] = draft_summary
             forbidden_hints.extend(
                 extract_forbidden_patterns_from_failed_code(
-                    draft_patch.files, draft_summary
+                    draft_patch.files,
+                    draft_summary,
+                    test_assertion_checklist,
                 )
             )
             critique_prompt = build_repair_plan_prompt(
@@ -185,7 +192,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 variant_instruction = self._variant_instruction(task, attempt)
                 repair_prompt = build_repair_prompt(
                     task,
-                    draft_patch.files,
+                    current_patch.files,
                     current_messages,
                     critique,
                     previous_repair_files=(
@@ -217,6 +224,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     known_failures.append(
                         (candidate_id, repaired_patch.files, rejection)
                     )
+                    latest_failures[candidate_id] = rejection
                     current_patch = repaired_patch
                     current_messages = [rejection]
                     continue
@@ -252,8 +260,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 known_failures.append(
                     (candidate_id, repaired_patch.files, failure_summary)
                 )
+                latest_failures[candidate_id] = failure_summary
                 for hint in extract_forbidden_patterns_from_failed_code(
-                    repaired_patch.files, failure_summary
+                    repaired_patch.files,
+                    failure_summary,
+                    test_assertion_checklist,
                 ):
                     if hint not in forbidden_hints:
                         forbidden_hints.append(hint)
@@ -278,6 +289,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repeated_rejections,
             forbidden_hints,
             repair_plan,
+            test_assertion_checklist,
+            latest_failures,
         )
         return ExecutionResult(
             context=request.context,
@@ -332,6 +345,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repeated_rejections: int = 0,
         forbidden_hints: list[str] | None = None,
         repair_plan: str = "",
+        test_assertion_checklist: list[str] | None = None,
+        latest_failures: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -361,6 +376,15 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "forbidden_pattern_hints": forbidden_hints or [],
             "repair_plan_preview": repair_plan[:1000] if repair_plan else None,
             "repair_variant_count": len(repair_prompts),
+            "test_assertion_checklist": test_assertion_checklist or [],
+            "latest_failure_preview_by_candidate": {
+                candidate_id: failure[:1000]
+                for candidate_id, failure in (latest_failures or {}).items()
+            },
+            "repair_prompt_previews_by_attempt": {
+                f"repair_{index}": prompt[:1000]
+                for index, prompt in enumerate(repair_prompts, 1)
+            },
         }
 
     @staticmethod

@@ -203,6 +203,13 @@ class SWEABRunner:
             "forbidden_pattern_hints": trace.get("forbidden_pattern_hints"),
             "repair_plan_preview": trace.get("repair_plan_preview"),
             "repair_variant_count": trace.get("repair_variant_count"),
+            "test_assertion_checklist": trace.get("test_assertion_checklist"),
+            "latest_failure_preview_by_candidate": trace.get(
+                "latest_failure_preview_by_candidate"
+            ),
+            "repair_prompt_previews_by_attempt": trace.get(
+                "repair_prompt_previews_by_attempt"
+            ),
         }
 
     @staticmethod

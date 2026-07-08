@@ -4,6 +4,7 @@ import json
 
 from .coding_task import CodingTask
 from .python_test_runner import summarize_python_test_failure
+from .test_assertion_checklist import extract_test_assertion_checklist
 
 
 def build_patch_prompt(task: CodingTask, extra_instruction: str = "") -> str:
@@ -39,6 +40,8 @@ def build_repair_prompt(
     """Build a concise repair prompt grounded in concrete verifier feedback."""
     feedback = "\n".join(test_messages) or "No test output was captured."
     diagnostic = summarize_python_test_failure(test_messages)
+    checklist = extract_test_assertion_checklist(task.test_files)
+    checklist_text = "\n".join(f"- {item}" for item in checklist)
     critique_section = f"\nCritique:\n{critique}" if critique else ""
     previous_section = (
         "\nPrevious repair files:\n"
@@ -85,17 +88,23 @@ def build_repair_prompt(
     )
     plan_section = f"\nRepair plan:\n{repair_plan}" if repair_plan else ""
     return (
-        "The current implementation failed tests. You must repair it.\n"
-        f"Diagnostic summary:\n{diagnostic}\n{retry_instruction}Before writing "
-        "code, infer the semantic mismatch from "
+        "The current implementation failed tests. Repair against the full "
+        "checklist below.\n"
+        f"Test assertion checklist:\n{checklist_text}\n"
+        "Do not stop after fixing only the first traceback. The repaired code "
+        "must satisfy every checklist item. Before writing code, infer all "
+        "accepted inputs and required outputs from the checklist.\n"
+        f"Latest failure diagnostic:\n{diagnostic}\n"
+        f"{retry_instruction}Before writing code, infer the semantic mismatch from "
         "the expected/got values. Then output only the corrected JSON. The tests "
         "are the source of truth. Do not repeat the previous implementation if the "
         "diagnostic says it overwrote or lost expected values. "
         f"{merge_warning}{variant_instruction}\n"
+        f"{known_section}{hints_section}\n"
         f"Test files (source of truth):\n{json.dumps(task.test_files, indent=2)}\n"
         f"Current generated files:\n{json.dumps(generated_files, indent=2)}"
         f"{previous_section}\nOriginal task:\n{task.issue}\nOriginal files:\n"
-        f"{json.dumps(task.files, indent=2)}{known_section}{hints_section}"
+        f"{json.dumps(task.files, indent=2)}"
         f"{plan_section}\nFull test output:\n{feedback}"
         f"{critique_section}\nDo not change the public API. Do not add extra "
         "return values. Preserve existing filenames, public function names, signatures "
@@ -113,9 +122,14 @@ def build_repair_plan_prompt(
     diagnostic: str,
 ) -> str:
     """Ask a critic for a semantic plan before requesting replacement code."""
+    checklist = extract_test_assertion_checklist(task.test_files)
+    checklist_text = "\n".join(f"- {item}" for item in checklist)
     return (
         "Given the failing tests and known failing code, identify the exact semantic "
-        "bug and the minimal algorithmic fix. Do not write code yet. Be specific.\n"
+        "bug and the minimal algorithmic fix. Do not write code yet. Be specific. "
+        "List every required behavior from the checklist. Then identify what the "
+        "current code misses.\n"
+        f"Test assertion checklist:\n{checklist_text}\n"
         f"Task:\n{task.issue}\nFailed files:\n"
         f"{json.dumps(failed_files, indent=2)}\nTest source:\n"
         f"{json.dumps(task.test_files, indent=2)}\nDiagnostic:\n{diagnostic}"

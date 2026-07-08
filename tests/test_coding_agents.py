@@ -8,6 +8,7 @@ from cgr.kernel.coding import (
     CodingPatch,
     JsonPatchParser,
     PythonTestRunner,
+    extract_test_assertion_checklist,
     select_patch,
 )
 from cgr.kernel.coding.hard_coding_suite import create_hard_coding_tasks
@@ -497,3 +498,121 @@ def test_multi_agent_uses_explicit_expected_got_diagnostic() -> None:
     assert diagnostic in client.prompts[1]
     assert diagnostic in trace["repair_prompt_preview"]
     assert diagnostic in trace["verifier_messages_preview"]
+
+
+class FullChecklistParseClient:
+    def __init__(self, complete_files: dict[str, str]) -> None:
+        self.complete_files = complete_files
+        self.prompts: list[str] = []
+
+    def create_chat_completion(
+        self,
+        config: OpenAICompatibleChatConfig,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        prompt = messages[-1]["content"]
+        self.prompts.append(prompt)
+        if len(self.prompts) == 1:
+            files = {
+                "parse_utils.py": (
+                    "def parse_bool(value):\n"
+                    "    normalized = value.lower()\n"
+                    "    if normalized == 'true':\n        return True\n"
+                    "    if normalized == 'false':\n        return False\n"
+                    "    raise ValueError(value)\n"
+                )
+            }
+        elif len(self.prompts) == 2:
+            files = {
+                "parse_utils.py": (
+                    "def parse_bool(value):\n"
+                    "    if isinstance(value, bool):\n        return value\n"
+                    "    normalized = str(value).strip().lower()\n"
+                    "    if normalized == 'true':\n        return True\n"
+                    "    if normalized == 'false':\n        return False\n"
+                    "    raise ValueError(value)\n"
+                )
+            }
+        else:
+            required = (
+                "YES should parse as True",
+                "off should parse as False",
+                "1 should parse as True",
+                "0 should parse as False",
+            )
+            files = (
+                self.complete_files
+                if all(item in prompt for item in required)
+                else {}
+            )
+        return {
+            "choices": [
+                {"message": {"content": json.dumps({"files": files})}}
+            ]
+        }
+
+
+def test_multi_agent_repairs_parse_bool_from_full_test_checklist() -> None:
+    task = next(
+        task
+        for task in create_hard_coding_tasks()
+        if task.id == "hard.parse_bool"
+    )
+    checklist = extract_test_assertion_checklist(task.test_files)
+    checklist_text = "\n".join(checklist)
+    assert all(value in checklist_text for value in ("YES", "off", "'1'", "'0'"))
+
+    draft_client = FullChecklistParseClient(task.expected_files)
+    critic_client = SequencedClient(critique=True)
+    runtime = KernelRuntime()
+    config = OpenAICompatibleChatConfig(
+        api_key="local", model="checklist", base_url="http://localhost"
+    )
+    runtime.register_plugin(
+        OpenAICompatibleChatPlugin(
+            config=config,
+            client=draft_client,
+            capability_id="model.code",
+            plugin_id="checklist.draft",
+        )
+    )
+    runtime.register_plugin(
+        OpenAICompatibleChatPlugin(
+            config=config,
+            client=critic_client,
+            capability_id="model.reason",
+            plugin_id="checklist.critic",
+        )
+    )
+    agent = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(agent)
+
+    result = runtime.execute(
+        agent.metadata.id,
+        ExecutionRequest(
+            capability=agent.metadata.capabilities[0],
+            context=ExecutionContext(),
+            payload={
+                "issue": task.issue,
+                "files": task.files,
+                "test_files": task.test_files,
+                "test_commands": task.test_commands,
+            },
+        ),
+    )
+
+    trace = result.output["_trace"]
+    assert result.output["files"] == task.expected_files
+    assert trace["selected_candidate_id"] == "repair_2"
+    assert trace["test_assertion_checklist"] == checklist
+    assert "YES" in trace["latest_failure_preview_by_candidate"]["repair_1"]
+    assert json.dumps(task.expected_files, indent=2) in draft_client.prompts[3]
+    assert all(value in critic_client.prompts[0] for value in ("YES", "off", "'1'", "'0'"))
+    assert "Handle bool inputs before string normalization." in trace[
+        "forbidden_pattern_hints"
+    ]
+    assert set(trace["repair_prompt_previews_by_attempt"]) == {
+        "repair_1",
+        "repair_2",
+        "repair_3",
+    }

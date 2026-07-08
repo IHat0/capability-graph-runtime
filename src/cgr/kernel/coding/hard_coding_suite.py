@@ -77,12 +77,21 @@ def create_hard_coding_tasks() -> list[SWETask]:
             ),
             (
                 "from parse_utils import parse_bool\n"
-                "assert parse_bool(True) is True\n"
-                "assert parse_bool('YES') is True\n"
-                "assert parse_bool('off') is False\n"
+                "\n"
+                "def assert_is(actual, expected, label):\n"
+                "    assert actual is expected, "
+                "f'{label}: expected {expected!r}, got {actual!r}'\n"
+                "\n"
+                "assert_is(parse_bool(True), True, 'bool True should return True')\n"
+                "assert_is(parse_bool(False), False, "
+                "'bool False should return False')\n"
+                "assert_is(parse_bool('YES'), True, 'YES should parse as True')\n"
+                "assert_is(parse_bool('off'), False, 'off should parse as False')\n"
+                "assert_is(parse_bool('1'), True, '1 should parse as True')\n"
+                "assert_is(parse_bool('0'), False, '0 should parse as False')\n"
                 "try:\n    parse_bool('maybe')\n"
                 "except ValueError:\n    pass\n"
-                "else:\n    raise AssertionError('ValueError not raised')\n"
+                "else:\n    raise AssertionError('maybe should raise ValueError')\n"
             ),
         ),
         _task(
