@@ -20,3 +20,4 @@ class SWECaseResult(BaseModel):
     files: dict[str, str] | None = None
     error_type: str | None = None
     error_message: str | None = None
+    raw_output_preview: str | None = None

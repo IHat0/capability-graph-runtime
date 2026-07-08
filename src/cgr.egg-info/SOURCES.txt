@@ -33,6 +33,7 @@ src/cgr/kernel/booster/booster_trace.py
 src/cgr/kernel/coding/__init__.py
 src/cgr/kernel/coding/code_test_case.py
 src/cgr/kernel/coding/coding_patch.py
+src/cgr/kernel/coding/coding_patch_normalizer.py
 src/cgr/kernel/coding/coding_prompt.py
 src/cgr/kernel/coding/coding_task.py
 src/cgr/kernel/coding/hard_coding_suite.py
@@ -140,6 +141,7 @@ tests/test_capability_graph.py
 tests/test_capability_router.py
 tests/test_cli.py
 tests/test_coding_agents.py
+tests/test_coding_patch_normalizer.py
 tests/test_competition.py
 tests/test_contracts.py
 tests/test_echo_plugin.py

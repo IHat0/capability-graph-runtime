@@ -28,7 +28,12 @@ class UrllibOpenAICompatibleChatClient:
         messages: list[dict[str, str]],
     ) -> dict[str, Any]:
         body = json.dumps(
-            {"model": config.model, "messages": messages, "temperature": 0}
+            {
+                "model": config.model,
+                "messages": messages,
+                "temperature": 0,
+                "top_p": 1,
+            }
         ).encode("utf-8")
         request = Request(
             f"{config.base_url.rstrip('/')}/chat/completions",

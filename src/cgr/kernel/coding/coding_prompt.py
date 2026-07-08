@@ -10,13 +10,16 @@ def build_patch_prompt(task: CodingTask, extra_instruction: str = "") -> str:
     files = json.dumps(task.files, indent=2)
     extra = f"\n{extra_instruction}\n" if extra_instruction else "\n"
     return (
-        "Solve the coding issue below. Return only valid JSON. JSON shape must be "
+        "Return only valid JSON. No markdown. No explanation outside JSON. "
+        "Solve the coding issue below. JSON shape must be "
         '{"files":{"filename.py":"full file content"}}. '
         "Do not include markdown fences. Do not change file names unless asked. "
         "Preserve the requested function signatures and return types. Make the "
         "smallest change needed to pass tests. Every changed file value must "
         "contain the complete replacement file.\n"
         f"Issue:\n{task.issue}\nOriginal files:\n{files}{extra}"
+        "Return only valid JSON in the required files shape. No markdown or "
+        "explanation outside JSON. Preserve existing filenames unless asked."
     )
 
 
@@ -40,5 +43,18 @@ def build_repair_prompt(
         f"Original task:\n{task.issue}\nOriginal files:\n"
         f"{json.dumps(task.files, indent=2)}\nCurrent generated files:\n"
         f"{json.dumps(generated_files, indent=2)}\nTest failures:\n{feedback}"
-        f"{critique_section}"
+        f"{critique_section}\nReturn only valid JSON in the required files shape. "
+        "No markdown or explanation outside JSON."
+    )
+
+
+def build_format_retry_prompt(previous_answer: str) -> str:
+    """Request one strict structural conversion without changing code logic."""
+    return (
+        "The previous answer was not valid JSON in the required format.\n\n"
+        "Convert it into this exact JSON shape and return only JSON:\n\n"
+        '{\n  "files": {\n    "filename.py": "full file content"\n  }\n}\n\n'
+        "Do not use markdown fences. Do not add explanation. Do not change the "
+        "code logic unless needed to make the JSON valid.\n\nPrevious answer:\n"
+        f"{previous_answer}"
     )

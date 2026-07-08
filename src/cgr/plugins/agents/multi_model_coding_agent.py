@@ -5,7 +5,10 @@ from typing import Any
 
 from cgr.kernel.coding import (
     CodingTask,
-    JsonPatchParser,
+    CodingPatch,
+    CodingPatchNormalizationError,
+    CodingPatchNormalizer,
+    build_format_retry_prompt,
     build_patch_prompt,
     build_repair_prompt,
     select_patch,
@@ -89,15 +92,14 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             self._draft_capability_id, build_patch_prompt(task)
         )
         draft = self._model_text(draft_result.output)
-        parser = JsonPatchParser()
-        draft_patch = parser.parse(draft)
+        draft_patch, draft_format_duration = self._normalize_with_retry(draft, task)
         draft_verification = verify_patch(task, draft_patch)
         if draft_verification is not None and draft_verification[0]:
             return ExecutionResult(
                 context=request.context,
                 status=ExecutionStatus.SUCCESS,
                 output=draft_patch.model_dump(),
-                duration_ms=draft_result.duration_ms,
+                duration_ms=draft_result.duration_ms + draft_format_duration,
             )
         critique_prompt = (
             "Critique the proposed coding patch. Identify mistakes and suggest "
@@ -123,10 +125,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 f"Draft patch:\n{draft}\nCritique:\n{critique}\nRepair the draft.",
             )
         repair_result = self._execute_model(self._draft_capability_id, repair_prompt)
-        try:
-            repaired_patch = parser.parse(self._model_text(repair_result.output))
-        except ValueError:
-            repaired_patch = draft_patch
+        repaired_patch, repair_format_duration = self._normalize_with_retry(
+            self._model_text(repair_result.output), task
+        )
         repaired_verification = verify_patch(task, repaired_patch)
         patch = (
             select_patch(
@@ -144,8 +145,10 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             output=patch.model_dump(),
             duration_ms=(
                 draft_result.duration_ms
+                + draft_format_duration
                 + critique_result.duration_ms
                 + repair_result.duration_ms
+                + repair_format_duration
             ),
         )
 
@@ -168,6 +171,22 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         if result.status != ExecutionStatus.SUCCESS:
             raise RuntimeError(result.error or "Coding model execution failed.")
         return result
+
+    def _normalize_with_retry(
+        self, text: str, task: CodingTask
+    ) -> tuple[CodingPatch, float]:
+        normalizer = CodingPatchNormalizer()
+        allowed_filenames = set(task.files)
+        try:
+            return normalizer.normalize(text, allowed_filenames), 0.0
+        except CodingPatchNormalizationError:
+            retry = self._execute_model(
+                self._draft_capability_id, build_format_retry_prompt(text)
+            )
+            patch = normalizer.normalize(
+                self._model_text(retry.output), allowed_filenames
+            )
+            return patch, retry.duration_ms
 
     @staticmethod
     def _parse_task(payload: Any) -> CodingTask:

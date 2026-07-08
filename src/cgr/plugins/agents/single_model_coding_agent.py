@@ -4,7 +4,10 @@ from typing import Any
 
 from cgr.kernel.coding import (
     CodingTask,
-    JsonPatchParser,
+    CodingPatch,
+    CodingPatchNormalizationError,
+    CodingPatchNormalizer,
+    build_format_retry_prompt,
     build_patch_prompt,
     build_repair_prompt,
     select_patch,
@@ -82,19 +85,20 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
         model_result = self._execute_model(build_patch_prompt(task))
-        parser = JsonPatchParser()
-        patch = parser.parse(self._model_text(model_result.output))
+        patch, format_duration = self._normalize_with_retry(
+            self._model_text(model_result.output), task
+        )
         verification = verify_patch(task, patch)
-        duration_ms = model_result.duration_ms
+        duration_ms = model_result.duration_ms + format_duration
         if verification is not None and not verification[0]:
             repair_result = self._execute_model(
                 build_repair_prompt(task, patch.files, verification[1])
             )
             duration_ms += repair_result.duration_ms
-            try:
-                repaired = parser.parse(self._model_text(repair_result.output))
-            except ValueError:
-                repaired = patch
+            repaired, retry_duration = self._normalize_with_retry(
+                self._model_text(repair_result.output), task
+            )
+            duration_ms += retry_duration
             repaired_verification = verify_patch(task, repaired)
             repaired_passed = (
                 repaired_verification[0]
@@ -128,6 +132,20 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         if result.status != ExecutionStatus.SUCCESS:
             raise RuntimeError(result.error or "Coding model execution failed.")
         return result
+
+    def _normalize_with_retry(
+        self, text: str, task: CodingTask
+    ) -> tuple[CodingPatch, float]:
+        normalizer = CodingPatchNormalizer()
+        allowed_filenames = set(task.files)
+        try:
+            return normalizer.normalize(text, allowed_filenames), 0.0
+        except CodingPatchNormalizationError:
+            retry = self._execute_model(build_format_retry_prompt(text))
+            patch = normalizer.normalize(
+                self._model_text(retry.output), allowed_filenames
+            )
+            return patch, retry.duration_ms
 
     @staticmethod
     def _parse_task(payload: Any) -> CodingTask:

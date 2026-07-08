@@ -4,9 +4,11 @@ from typing import Any
 
 from cgr.kernel.coding import (
     CodingPatch,
+    CodingPatchNormalizationError,
+    CodingPatchNormalizer,
     CodingTask,
-    JsonPatchParser,
     PythonTestRunner,
+    build_format_retry_prompt,
     build_patch_prompt,
 )
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest, ExecutionStatus
@@ -93,6 +95,7 @@ class SWEABRunner:
                 passed=False,
                 error_type=type(exc).__name__,
                 error_message=str(exc),
+                raw_output_preview=getattr(exc, "raw_output_preview", None),
             )
 
     def _run_baseline(self, task: SWETask, plugin_id: str) -> CodingPatch:
@@ -115,7 +118,33 @@ class SWEABRunner:
         )
         if result.status != ExecutionStatus.SUCCESS:
             raise RuntimeError(result.error or "Baseline model execution failed.")
-        return JsonPatchParser().parse(self._model_text(result.output))
+        text = self._model_text(result.output)
+        normalizer = CodingPatchNormalizer()
+        try:
+            return normalizer.normalize(text, set(task.files))
+        except CodingPatchNormalizationError:
+            retry = self._runtime.execute(
+                plugin_id,
+                ExecutionRequest[ModelRequest](
+                    capability=plugin.metadata.capabilities[0],
+                    context=ExecutionContext(),
+                    payload=ModelRequest(
+                        messages=[
+                            ModelMessage(
+                                role=ModelRole.USER,
+                                content=build_format_retry_prompt(text),
+                            )
+                        ]
+                    ),
+                ),
+            )
+            if retry.status != ExecutionStatus.SUCCESS:
+                raise RuntimeError(
+                    retry.error or "Baseline format retry execution failed."
+                )
+            return normalizer.normalize(
+                self._model_text(retry.output), set(task.files)
+            )
 
     def _run_agent(self, task: SWETask, plugin_id: str) -> CodingPatch:
         plugin = self._runtime.registry.get(plugin_id)
