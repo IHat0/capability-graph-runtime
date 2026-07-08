@@ -672,3 +672,112 @@ def test_multi_agent_repairs_parse_bool_from_full_test_checklist() -> None:
     ]["repair_2"]
     assert trace["truthy_examples"] == ["YES", "1"]
     assert trace["falsy_examples"] == ["off", "0"]
+
+
+def _multi_runtime_with_sequence(
+    responses: list[dict[str, str]],
+) -> tuple[KernelRuntime, MultiModelCodingAgentPlugin]:
+    client = FeedbackRepairClient(responses[0], responses[1])
+    client._responses = responses
+    runtime = KernelRuntime()
+    config = OpenAICompatibleChatConfig(
+        api_key="local", model="monotonic", base_url="http://localhost"
+    )
+    runtime.register_plugin(
+        OpenAICompatibleChatPlugin(
+            config=config,
+            client=client,
+            capability_id="model.code",
+            plugin_id="monotonic.draft",
+        )
+    )
+    runtime.register_plugin(
+        OpenAICompatibleChatPlugin(
+            config=config,
+            client=SequencedClient(critique=True),
+            capability_id="model.reason",
+            plugin_id="monotonic.critic",
+        )
+    )
+    agent = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(agent)
+    return runtime, agent
+
+
+def _execute_multi_task(
+    runtime: KernelRuntime,
+    agent: MultiModelCodingAgentPlugin,
+    task_id: str,
+) -> dict[str, Any]:
+    task = next(task for task in create_hard_coding_tasks() if task.id == task_id)
+    result = runtime.execute(
+        agent.metadata.id,
+        ExecutionRequest(
+            capability=agent.metadata.capabilities[0],
+            context=ExecutionContext(),
+            payload={
+                "issue": task.issue,
+                "files": task.files,
+                "test_files": task.test_files,
+                "test_commands": task.test_commands,
+            },
+        ),
+    )
+    return result.output
+
+
+def test_multi_agent_selects_verified_single_path_fallback() -> None:
+    task = next(
+        task for task in create_hard_coding_tasks() if task.id == "hard.parse_bool"
+    )
+    responses = [task.files] * 5 + [task.expected_files]
+    runtime, agent = _multi_runtime_with_sequence(responses)
+
+    output = _execute_multi_task(runtime, agent, task.id)
+
+    assert output["files"] == task.expected_files
+    trace = output["_trace"]
+    assert trace["selected_candidate_id"] == "single_fallback_candidate"
+    assert trace["single_fallback_used"] is True
+    assert trace["single_fallback_candidate_id"] == "single_fallback_candidate"
+    assert trace["single_fallback_score"] == 1.0
+    assert trace["multi_monotonic_guard_applied"] is True
+    assert trace["all_candidate_scores_before_selection"][
+        "single_fallback_candidate"
+    ] == 1.0
+    assert "monotonic guard" in trace["final_selection_reason"]
+
+
+def test_multi_agent_does_not_use_fallback_when_multi_candidate_passes() -> None:
+    task = next(
+        task for task in create_hard_coding_tasks() if task.id == "hard.parse_bool"
+    )
+    runtime, agent = _multi_runtime_with_sequence(
+        [task.expected_files, task.expected_files]
+    )
+
+    output = _execute_multi_task(runtime, agent, task.id)
+
+    trace = output["_trace"]
+    assert trace["selected_candidate_id"] == "candidate_1"
+    assert trace["single_fallback_used"] is False
+    assert trace["multi_monotonic_guard_applied"] is False
+    assert trace["single_fallback_candidate_id"] is None
+
+
+def test_multi_agent_fails_honestly_when_single_fallback_also_fails() -> None:
+    task = next(
+        task for task in create_hard_coding_tasks() if task.id == "hard.parse_bool"
+    )
+    runtime, agent = _multi_runtime_with_sequence([task.files] * 6)
+
+    output = _execute_multi_task(runtime, agent, task.id)
+
+    trace = output["_trace"]
+    assert trace["single_fallback_used"] is False
+    assert trace["single_fallback_score"] == 0.0
+    assert trace["multi_monotonic_guard_applied"] is True
+    assert all(score == 0.0 for score in trace["candidate_scores"].values())
+    assert "No multi-model or single-path fallback" in trace[
+        "final_selection_reason"
+    ]

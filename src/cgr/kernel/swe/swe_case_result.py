@@ -44,3 +44,9 @@ class SWECaseResult(BaseModel):
     failed_required_examples_by_attempt: dict[str, list[str]] | None = None
     truthy_examples: list[str] | None = None
     falsy_examples: list[str] | None = None
+    single_fallback_used: bool | None = None
+    single_fallback_candidate_id: str | None = None
+    single_fallback_score: float | None = None
+    multi_monotonic_guard_applied: bool | None = None
+    all_candidate_scores_before_selection: dict[str, float] | None = None
+    final_selection_reason: str | None = None

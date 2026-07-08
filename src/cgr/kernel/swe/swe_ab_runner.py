@@ -221,6 +221,18 @@ class SWEABRunner:
             ),
             "truthy_examples": trace.get("truthy_examples"),
             "falsy_examples": trace.get("falsy_examples"),
+            "single_fallback_used": trace.get("single_fallback_used"),
+            "single_fallback_candidate_id": trace.get(
+                "single_fallback_candidate_id"
+            ),
+            "single_fallback_score": trace.get("single_fallback_score"),
+            "multi_monotonic_guard_applied": trace.get(
+                "multi_monotonic_guard_applied"
+            ),
+            "all_candidate_scores_before_selection": trace.get(
+                "all_candidate_scores_before_selection"
+            ),
+            "final_selection_reason": trace.get("final_selection_reason"),
         }
 
     @staticmethod

@@ -38,6 +38,8 @@ from cgr.kernel.contracts import (
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.runtime import KernelRuntime
 
+from .single_model_coding_agent import SingleModelCodingAgentPlugin
+
 class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     """Generate a patch using deterministic draft, critique, and repair stages."""
 
@@ -131,6 +133,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         failed_required_examples: list[str] = []
         repair_variant_names: list[str] = []
         coverage_missing_by_candidate: dict[str, list[str]] = {}
+        single_fallback_used = False
+        single_fallback_candidate_id: str | None = None
+        single_fallback_score: float | None = None
+        monotonic_guard_applied = False
+        final_selection_reason = "Selected the best verified multi-model candidate."
         if draft_verification is not None and draft_verification[0]:
             output = draft_patch.model_dump()
             output["_trace"] = self._trace(
@@ -142,6 +149,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 test_io_examples=test_io_examples,
                 truthy_examples=truthy_examples,
                 falsy_examples=falsy_examples,
+                final_selection_reason=(
+                    "Initial multi-model candidate passed verification."
+                ),
             )
             return ExecutionResult(
                 context=request.context,
@@ -327,6 +337,57 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     if repaired_verification is not None
                     else current_messages
                 )
+            if not patch_passed:
+                monotonic_guard_applied = True
+                single_fallback_candidate_id = "single_fallback_candidate"
+                try:
+                    fallback_patch, fallback_duration = self._run_single_fallback(
+                        task, request.context
+                    )
+                    total_duration += fallback_duration
+                    fallback_verification = verify_patch(task, fallback_patch)
+                    fallback_passed = bool(
+                        fallback_verification and fallback_verification[0]
+                    )
+                    single_fallback_score = 1.0 if fallback_passed else 0.0
+                    candidates.append(
+                        (
+                            single_fallback_candidate_id,
+                            fallback_patch,
+                            fallback_passed,
+                        )
+                    )
+                    if fallback_verification is not None:
+                        verifier_messages.extend(fallback_verification[1])
+                    if fallback_passed:
+                        patch = fallback_patch
+                        patch_passed = True
+                        single_fallback_used = True
+                        final_selection_reason = (
+                            "Selected verified single-path fallback via the "
+                            "multi monotonic guard."
+                        )
+                    else:
+                        patch = select_patch(
+                            patch,
+                            patch_passed,
+                            fallback_patch,
+                            fallback_passed,
+                        )
+                        final_selection_reason = (
+                            "No multi-model or single-path fallback candidate "
+                            "passed verification."
+                        )
+                except Exception as exc:
+                    single_fallback_score = 0.0
+                    verifier_messages.append(
+                        f"Single-path monotonic fallback failed: {type(exc).__name__}: "
+                        f"{exc}"
+                    )
+                    final_selection_reason = (
+                        "No multi-model candidate passed and the single-path "
+                        "fallback raised an error."
+                    )
         selected_id = next(
             candidate_id
             for candidate_id, candidate, _ in candidates
@@ -350,6 +411,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             coverage_missing_by_candidate,
             truthy_examples,
             falsy_examples,
+            single_fallback_used,
+            single_fallback_candidate_id,
+            single_fallback_score,
+            monotonic_guard_applied,
+            final_selection_reason,
         )
         return ExecutionResult(
             context=request.context,
@@ -357,6 +423,25 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             output=output,
             duration_ms=total_duration,
         )
+
+    def _run_single_fallback(
+        self, task: CodingTask, context: ExecutionContext
+    ) -> tuple[CodingPatch, float]:
+        fallback = SingleModelCodingAgentPlugin(
+            self._runtime,
+            model_capability_id=self._draft_capability_id,
+            plugin_id=f"{self.metadata.id}.single_fallback",
+        )
+        result = fallback.execute(
+            ExecutionRequest[CodingTask](
+                capability=fallback.metadata.capabilities[0],
+                context=context,
+                payload=task,
+            )
+        )
+        if result.status != ExecutionStatus.SUCCESS:
+            raise RuntimeError(result.error or "Single-path fallback failed.")
+        return CodingPatch.model_validate(result.output), result.duration_ms
 
     def _execute_model(self, capability_id: str, prompt: str) -> ExecutionResult[Any]:
         capability = Capability(
@@ -412,6 +497,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         coverage_missing_by_candidate: dict[str, list[str]] | None = None,
         truthy_examples: list[str] | None = None,
         falsy_examples: list[str] | None = None,
+        single_fallback_used: bool = False,
+        single_fallback_candidate_id: str | None = None,
+        single_fallback_score: float | None = None,
+        monotonic_guard_applied: bool = False,
+        final_selection_reason: str = "No final selection was made.",
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -468,6 +558,15 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             },
             "truthy_examples": truthy_examples or [],
             "falsy_examples": falsy_examples or [],
+            "single_fallback_used": single_fallback_used,
+            "single_fallback_candidate_id": single_fallback_candidate_id,
+            "single_fallback_score": single_fallback_score,
+            "multi_monotonic_guard_applied": monotonic_guard_applied,
+            "all_candidate_scores_before_selection": {
+                candidate_id: 1.0 if passed else 0.0
+                for candidate_id, _, passed in candidates
+            },
+            "final_selection_reason": final_selection_reason,
         }
 
     @staticmethod
