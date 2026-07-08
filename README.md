@@ -185,6 +185,21 @@ the executable test source and failure diagnostics.
 `--debug-trace` exposes candidate scores, repair counts, selected candidates,
 and capped verifier/prompt previews for targeted task diagnosis.
 
+## Coding v1 Benchmark
+
+Coding v1 expands evaluation to 26 executable Python tasks. Baseline calls the
+model directly, `cgr_single` adds verifier-guided repair, and `cgr_multi` adds
+multi-candidate repair plus the monotonic single-path fallback. Visible tests
+are available to repair prompts; hidden tests are used for final scoring but
+their source is not shown to the model.
+
+```bash
+cgr-coding-ab-v1 --max-tasks 5
+cgr-coding-ab-v1 --task-id v1.parse_bool_extended --debug-trace
+cgr-coding-ab-v1 --runs 3
+cgr-coding-ab-v1 > benchmark-results/coding-v1.json
+```
+
 ## CGR Booster Engine
 
 CGR's main product goal is to improve an LLM by wrapping it in orchestration

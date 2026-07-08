@@ -50,3 +50,8 @@ class SWECaseResult(BaseModel):
     multi_monotonic_guard_applied: bool | None = None
     all_candidate_scores_before_selection: dict[str, float] | None = None
     final_selection_reason: str | None = None
+    elapsed_seconds: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    estimated_cost: float | None = None

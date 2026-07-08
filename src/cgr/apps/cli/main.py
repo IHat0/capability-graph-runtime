@@ -18,6 +18,8 @@ from cgr.kernel.booster import (
 )
 from cgr.kernel.coding import CodeTestCase
 from cgr.kernel.coding.hard_coding_suite import create_hard_coding_tasks
+from cgr.kernel.coding.v1_benchmarks import create_coding_v1_tasks
+from cgr.kernel.coding.v1_runner import CodingV1Runner
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.pipeline import ModelPipeline
@@ -260,6 +262,42 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
                 )
             )
         )
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
+
+
+def coding_ab_v1_main(argv: list[str] | None = None) -> int:
+    """Run the 26-task Coding v1 suite against explicit real providers."""
+    parser = argparse.ArgumentParser(description="Run the Coding v1 A/B suite.")
+    parser.add_argument("--max-tasks", type=int, help="Run only the first N tasks.")
+    parser.add_argument("--task-id", help="Run one Coding v1 task by id.")
+    parser.add_argument("--runs", type=int, default=1, help="Repeat the suite N times.")
+    parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="Include coding-agent candidate and repair trace fields.",
+    )
+    args = parser.parse_args(argv)
+    try:
+        tasks = create_coding_v1_tasks()
+        if args.task_id is not None:
+            tasks = [task for task in tasks if task.id == args.task_id]
+            if not tasks:
+                raise ValueError(f"Unknown Coding v1 task '{args.task_id}'.")
+        if args.max_tasks is not None:
+            if args.max_tasks <= 0:
+                raise ValueError("--max-tasks must be positive.")
+            tasks = tasks[: args.max_tasks]
+        report = CodingV1Runner(
+            lambda selected, debug: _run_real_coding_ab(
+                "coding_v1",
+                selected,
+                debug_trace=debug,
+            )
+        ).run(tasks, runs=args.runs, debug_trace=args.debug_trace)
+        print(json.dumps(report))
         return 0
     except Exception as exc:
         print(json.dumps({"error": str(exc)}))

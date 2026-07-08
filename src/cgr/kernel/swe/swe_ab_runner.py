@@ -1,5 +1,6 @@
 """Baseline versus CGR coding-agent evaluation runner."""
 
+import time
 from typing import Any
 
 from cgr.kernel.coding import (
@@ -72,6 +73,7 @@ class SWEABRunner:
         plugin_id: str,
         debug_trace: bool = False,
     ) -> SWECaseResult:
+        started = time.perf_counter()
         try:
             trace: dict[str, Any] | None = None
             if mode == "baseline":
@@ -81,11 +83,11 @@ class SWEABRunner:
                     task, plugin_id, debug_trace=debug_trace
                 )
             passed = patch.files == task.expected_files
-            if task.test_files and task.test_commands:
+            if task.scoring_test_files and task.scoring_test_commands:
                 passed, _ = PythonTestRunner().run(
                     patch.files,
-                    task.test_files,
-                    task.test_commands,
+                    task.scoring_test_files,
+                    task.scoring_test_commands,
                 )
             return SWECaseResult(
                 task_id=task.id,
@@ -93,6 +95,7 @@ class SWEABRunner:
                 plugin_id=plugin_id,
                 passed=passed,
                 files=patch.files,
+                elapsed_seconds=time.perf_counter() - started,
                 **(self._trace_fields(trace) if debug_trace else {}),
             )
         except Exception as exc:
@@ -104,6 +107,7 @@ class SWEABRunner:
                 error_type=type(exc).__name__,
                 error_message=str(exc),
                 raw_output_preview=getattr(exc, "raw_output_preview", None),
+                elapsed_seconds=time.perf_counter() - started,
             )
 
     def _run_baseline(self, task: SWETask, plugin_id: str) -> CodingPatch:
@@ -166,8 +170,8 @@ class SWEABRunner:
                 payload={
                     "issue": task.issue,
                     "files": task.files,
-                    "test_files": task.test_files,
-                    "test_commands": task.test_commands,
+                    "test_files": task.prompt_test_files,
+                    "test_commands": task.prompt_test_commands,
                     "metadata": {"debug_trace": str(debug_trace).lower()},
                 },
             ),
