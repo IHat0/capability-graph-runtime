@@ -56,6 +56,53 @@ def patch_fingerprint(patch: CodingPatch) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(patch.files.items()))
 
 
+def check_bool_before_string_normalization(
+    files: dict[str, str], task_contract_checklist: list[str]
+) -> str | None:
+    """Reject parser code that normalizes strings before handling bool inputs."""
+    contract = "\n".join(task_contract_checklist).casefold()
+    if "bool inputs return themselves" not in contract:
+        return None
+    for content in files.values():
+        for match in re.finditer(
+            r"def\s+\w+\s*\(\s*(?P<param>[A-Za-z_]\w*)\b[^)]*\)\s*:",
+            content,
+        ):
+            param = match.group("param")
+            body = content[match.end() :]
+            normalization_positions = [
+                position
+                for pattern in (
+                    rf"{re.escape(param)}\s*\.\s*strip\s*\(",
+                    rf"{re.escape(param)}\s*\.\s*lower\s*\(",
+                )
+                if (position := _first_match_position(pattern, body)) is not None
+            ]
+            if not normalization_positions:
+                continue
+            first_normalization = min(normalization_positions)
+            bool_guard_patterns = (
+                rf"isinstance\s*\(\s*{re.escape(param)}\s*,\s*bool\s*\)",
+                rf"type\s*\(\s*{re.escape(param)}\s*\)\s+is\s+bool",
+            )
+            bool_guard_positions = [
+                position
+                for pattern in bool_guard_patterns
+                if (position := _first_match_position(pattern, body)) is not None
+            ]
+            if not bool_guard_positions or min(bool_guard_positions) > first_normalization:
+                return (
+                    "Rejected candidate before tests; bool inputs must be handled "
+                    "before string normalization."
+                )
+    return None
+
+
+def _first_match_position(pattern: str, text: str) -> int | None:
+    match = re.search(pattern, text)
+    return match.start() if match is not None else None
+
+
 def extract_forbidden_patterns_from_failed_code(
     files: dict[str, str],
     failure_summary: str,

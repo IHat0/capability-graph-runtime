@@ -7,6 +7,9 @@ from cgr.kernel.coding import (
     CodingTask,
     PythonTestRunner,
     build_repair_prompt,
+    check_bool_before_string_normalization,
+    check_example_literal_coverage,
+    classify_boolean_contract_examples,
     extract_forbidden_patterns_from_failed_code,
     extract_syntax_error_summary,
     extract_task_contract_checklist,
@@ -76,6 +79,22 @@ class _CriticClient:
                         "content": "Repair every visible and safe hidden requirement."
                     }
                 }
+            ]
+        }
+
+
+class _StaticPatchClient:
+    def __init__(self, files: dict[str, str]) -> None:
+        self.files = files
+
+    def create_chat_completion(
+        self,
+        config: OpenAICompatibleChatConfig,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        return {
+            "choices": [
+                {"message": {"content": json.dumps({"files": self.files})}}
             ]
         }
 
@@ -205,6 +224,96 @@ def test_v1_task_contract_extraction_and_generic_hints() -> None:
     assert "The required exception type is TypeError, not ValueError." in merge_hints
     assert "Check isinstance(size, int) as well as positivity." in chunk_hints
     assert "Validate integer type before using range." in chunk_hints
+
+
+def test_bool_before_string_guard_is_contract_derived() -> None:
+    contract = [
+        "bool inputs return themselves",
+        "strings are stripped",
+    ]
+    bad_files = {
+        "parse_utils.py": (
+            "def parse_bool(value):\n"
+            "    normalized = value.strip().lower()\n"
+            "    return normalized == 'true'\n"
+        )
+    }
+    good_files = {
+        "parse_utils.py": (
+            "def parse_bool(value):\n"
+            "    if isinstance(value, bool):\n"
+            "        return value\n"
+            "    normalized = value.strip().lower()\n"
+            "    return normalized == 'true'\n"
+        )
+    }
+
+    assert check_bool_before_string_normalization(bad_files, contract) == (
+        "Rejected candidate before tests; bool inputs must be handled before "
+        "string normalization."
+    )
+    assert check_bool_before_string_normalization(good_files, contract) is None
+    assert check_bool_before_string_normalization(bad_files, []) is None
+
+
+def test_parser_contract_values_and_spaced_literal_coverage() -> None:
+    contract = extract_task_contract_checklist(
+        next(
+            task for task in create_coding_v1_tasks()
+            if task.id == "v1.parse_bool_extended"
+        ).issue
+    )
+    truthy, falsy = classify_boolean_contract_examples(contract)
+    files = {
+        "parse_utils.py": (
+            "def parse_bool(value):\n"
+            "    normalized = str(value).strip().lower()\n"
+            "    return normalized in {'yes'}\n"
+        )
+    }
+
+    assert truthy == ["true", "yes", "y", "1", "on"]
+    assert falsy == ["false", "no", "n", "0", "off"]
+    assert check_example_literal_coverage(
+        files, ["parse_bool(' YES ') -> True"]
+    ) == []
+
+
+def test_final_exact_verification_marks_malformed_selected_files_failed() -> None:
+    task = next(
+        task for task in create_coding_v1_tasks()
+        if task.id == "v1.parse_bool_extended"
+    )
+    client = _StaticPatchClient(
+        {
+            "parse_utils.py": (
+                "def parse_bool(value):\n"
+                "    if value:\n"
+                "        return True\n"
+                "else:\n"
+                "    return False\n"
+            )
+        }
+    )
+    runtime = KernelRuntime()
+    plugin = OpenAICompatibleChatPlugin(
+        config=OpenAICompatibleChatConfig(
+            api_key="local", model="malformed", base_url="http://localhost"
+        ),
+        client=client,
+        capability_id="model.code",
+        plugin_id="malformed.model",
+    )
+    runtime.register_plugin(plugin)
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "baseline", plugin.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is False
+    assert result.final_exact_verification_passed is False
+    assert result.final_exact_verification_summary is not None
+    assert "SyntaxError" in result.final_exact_verification_summary
 
 
 def _fake_evaluation(tasks: list[SWETask], debug: bool) -> SWEEvalResult:

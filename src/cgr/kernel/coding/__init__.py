@@ -15,6 +15,7 @@ from .coding_prompt import (
 from .coding_task import CodingTask
 from .json_patch_parser import JsonPatchParser
 from .patch_verification import (
+    check_bool_before_string_normalization,
     extract_forbidden_patterns_from_failed_code,
     patch_fingerprint,
     select_patch,
@@ -29,6 +30,7 @@ from .python_test_runner import (
 from .task_contract import extract_task_contract_checklist
 from .test_assertion_checklist import extract_test_assertion_checklist
 from .test_io_examples import (
+    classify_boolean_contract_examples,
     check_example_literal_coverage,
     classify_boolean_string_examples,
     extract_test_io_examples,
@@ -48,11 +50,13 @@ __all__ = [
     "build_repair_prompt",
     "build_repair_plan_prompt",
     "select_patch",
+    "check_bool_before_string_normalization",
     "extract_forbidden_patterns_from_failed_code",
     "extract_test_assertion_checklist",
     "extract_test_io_examples",
     "infer_failed_test_io_examples",
     "check_example_literal_coverage",
+    "classify_boolean_contract_examples",
     "classify_boolean_string_examples",
     "patch_fingerprint",
     "verify_patch",

@@ -662,7 +662,7 @@ def test_multi_agent_repairs_parse_bool_from_full_test_checklist() -> None:
     assert trace["test_io_examples"] == io_examples
     assert "parse_bool('off') -> False" in trace["failed_required_examples"]
     assert trace["repair_variant_names"][-1] == (
-        "test-example-driven implementation"
+        "contract-table parser implementation"
     )
     assert trace["example_coverage_missing_by_candidate"]["repair_2"] == [
         "parse_bool('off') -> False"

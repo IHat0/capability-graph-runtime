@@ -60,3 +60,8 @@ class SWECaseResult(BaseModel):
     hidden_failure_summary_safe: str | None = None
     syntax_error_summary: str | None = None
     hidden_source_included: bool | None = None
+    parser_contract_detected: bool | None = None
+    bool_before_string_guard_applied: bool | None = None
+    rejected_candidates_before_tests: list[str] | None = None
+    final_exact_verification_passed: bool | None = None
+    final_exact_verification_summary: str | None = None

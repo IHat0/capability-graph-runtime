@@ -10,7 +10,9 @@ from cgr.kernel.coding import (
     build_format_retry_prompt,
     build_patch_prompt,
     build_repair_prompt,
+    check_bool_before_string_normalization,
     check_example_literal_coverage,
+    classify_boolean_contract_examples,
     classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
     extract_syntax_error_summary,
@@ -96,14 +98,23 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         task_contract_checklist = extract_task_contract_checklist(task.issue)
         test_io_examples = extract_test_io_examples(task.test_files)
-        truthy_examples, falsy_examples = classify_boolean_string_examples(
-            test_io_examples
+        truthy_examples, falsy_examples = _merge_boolean_examples(
+            classify_boolean_string_examples(test_io_examples),
+            classify_boolean_contract_examples(task_contract_checklist),
         )
+        parser_contract_detected = bool(truthy_examples or falsy_examples)
         model_result = self._execute_model(build_patch_prompt(task))
         patch, format_duration = self._normalize_with_retry(
             self._model_text(model_result.output), task
         )
-        verification = verify_patch(task, patch)
+        bool_guard = check_bool_before_string_normalization(
+            patch.files, task_contract_checklist
+        )
+        verification = (
+            (False, [bool_guard])
+            if bool_guard is not None
+            else verify_patch(task, patch)
+        )
         duration_ms = model_result.duration_ms + format_duration
         candidates: list[tuple[str, CodingPatch, bool]] = [
             ("candidate_1", patch, bool(verification and verification[0]))
@@ -133,10 +144,16 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 self._model_text(repair_result.output), task
             )
             duration_ms += retry_duration
+            repair_bool_guard = check_bool_before_string_normalization(
+                repaired.files, task_contract_checklist
+            )
             coverage_missing = check_example_literal_coverage(
                 repaired.files, test_io_examples
             )
-            if coverage_missing:
+            if repair_bool_guard is not None:
+                verifier_messages.append(repair_bool_guard)
+                repaired_passed = False
+            elif coverage_missing:
                 coverage_missing_by_candidate["repair_1"] = coverage_missing
                 verifier_messages.append(
                     "Rejected candidate before tests; missing required example "
@@ -157,6 +174,19 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             for candidate_id, candidate, _ in candidates
             if candidate is patch
         )
+        final_verification = verify_patch(task, patch)
+        final_exact_passed = (
+            final_verification[0] if final_verification is not None else None
+        )
+        final_exact_summary = (
+            "\n".join(final_verification[1])[-1000:]
+            if final_verification is not None
+            else "No executable verification contract was provided."
+        )
+        if final_verification is not None and not final_verification[0]:
+            verifier_messages.append(
+                "Final selected candidate failed exact-file verification."
+            )
         output = patch.model_dump()
         output["_trace"] = self._trace(
             candidates,
@@ -183,6 +213,10 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             falsy_examples,
             task_contract_checklist,
             forbidden_hints,
+            parser_contract_detected,
+            bool_guard is not None,
+            final_exact_passed,
+            final_exact_summary,
         )
         return ExecutionResult(
             context=request.context,
@@ -240,6 +274,10 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         falsy_examples: list[str],
         task_contract_checklist: list[str],
         forbidden_hints: list[str],
+        parser_contract_detected: bool,
+        bool_guard_applied: bool,
+        final_exact_passed: bool | None,
+        final_exact_summary: str,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -309,6 +347,15 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 verifier_messages
             ),
             "hidden_source_included": False,
+            "parser_contract_detected": parser_contract_detected,
+            "bool_before_string_guard_applied": bool_guard_applied,
+            "rejected_candidates_before_tests": [
+                candidate_id
+                for candidate_id, _, passed in candidates
+                if not passed
+            ],
+            "final_exact_verification_passed": final_exact_passed,
+            "final_exact_verification_summary": final_exact_summary,
         }
 
     @staticmethod
@@ -324,3 +371,23 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         if not isinstance(output, dict) or not isinstance(output.get("text"), str):
             raise RuntimeError("Model response did not contain text.")
         return output["text"]
+
+
+def _merge_boolean_examples(
+    visible_examples: tuple[list[str], list[str]],
+    contract_examples: tuple[list[str], list[str]],
+) -> tuple[list[str], list[str]]:
+    truthy, falsy = visible_examples
+    contract_truthy, contract_falsy = contract_examples
+    return (
+        _unique([*truthy, *contract_truthy]),
+        _unique([*falsy, *contract_falsy]),
+    )
+
+
+def _unique(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result

@@ -69,6 +69,7 @@ def check_example_literal_coverage(
     normalization = (
         "str(" in code or "isinstance(value, str)" in code or ".lower()" in code
     )
+    strips_and_lowers = ".strip()" in code and ".lower()" in code
     if not normalization:
         return []
     finite_membership = bool(
@@ -84,6 +85,8 @@ def check_example_literal_coverage(
         if not values:
             continue
         if all(value.casefold() in lowered for value in values):
+            continue
+        if strips_and_lowers and all(value.strip().casefold() in lowered for value in values):
             continue
         if not finite_membership:
             continue
@@ -106,6 +109,37 @@ def classify_boolean_string_examples(
             if value not in target:
                 target.append(value)
     return truthy, falsy
+
+
+def classify_boolean_contract_examples(
+    task_contract_checklist: list[str],
+) -> tuple[list[str], list[str]]:
+    """Extract truthy/falsy parser values from natural-language task contracts."""
+    truthy: list[str] = []
+    falsy: list[str] = []
+    for item in task_contract_checklist:
+        lowered = item.casefold()
+        if "true values include" in lowered:
+            _extend_unique(truthy, _values_after_include(item))
+        if "false values include" in lowered:
+            _extend_unique(falsy, _values_after_include(item))
+    return truthy, falsy
+
+
+def _extend_unique(target: list[str], values: list[str]) -> None:
+    for value in values:
+        if value and value not in target:
+            target.append(value)
+
+
+def _values_after_include(text: str) -> list[str]:
+    _, _, tail = text.partition("include")
+    tail = tail.strip().rstrip(".")
+    return [
+        value.strip().strip("'\"")
+        for value in re.split(r",|\band\b", tail)
+        if value.strip()
+    ]
 
 
 def _quoted_values(text: str) -> list[str]:

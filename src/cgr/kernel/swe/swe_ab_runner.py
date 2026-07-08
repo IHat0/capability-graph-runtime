@@ -82,13 +82,16 @@ class SWEABRunner:
                 patch, trace = self._run_agent(
                     task, plugin_id, debug_trace=debug_trace
                 )
-            passed = patch.files == task.expected_files
-            if task.scoring_test_files and task.scoring_test_commands:
-                passed, _ = PythonTestRunner().run(
-                    patch.files,
-                    task.scoring_test_files,
-                    task.scoring_test_commands,
-                )
+            passed, final_messages = self._verify_final_patch(task, patch)
+            final_summary = "\n".join(final_messages)[-1000:]
+            trace_fields = self._trace_fields(trace) if debug_trace else {}
+            if not passed and debug_trace:
+                trace_fields["final_selection_reason"] = (
+                    (trace_fields.get("final_selection_reason") or "")
+                    + " Final selected candidate failed exact-file verification."
+                ).strip()
+            trace_fields["final_exact_verification_passed"] = passed
+            trace_fields["final_exact_verification_summary"] = final_summary
             return SWECaseResult(
                 task_id=task.id,
                 mode=mode,
@@ -96,7 +99,7 @@ class SWEABRunner:
                 passed=passed,
                 files=patch.files,
                 elapsed_seconds=time.perf_counter() - started,
-                **(self._trace_fields(trace) if debug_trace else {}),
+                **trace_fields,
             )
         except Exception as exc:
             return SWECaseResult(
@@ -157,6 +160,30 @@ class SWEABRunner:
             return normalizer.normalize(
                 self._model_text(retry.output), set(task.files)
             )
+
+    @staticmethod
+    def _verify_final_patch(
+        task: SWETask, patch: CodingPatch
+    ) -> tuple[bool, list[str]]:
+        if task.scoring_test_files and task.scoring_test_commands:
+            passed, messages = PythonTestRunner().run(
+                patch.files,
+                task.scoring_test_files,
+                task.scoring_test_commands,
+            )
+            if not passed:
+                return False, [
+                    "Final selected candidate failed exact-file verification.",
+                    *messages,
+                ]
+            return True, messages
+        passed = patch.files == task.expected_files
+        message = (
+            "Final selected files matched expected files."
+            if passed
+            else "Final selected candidate failed exact-file verification."
+        )
+        return passed, [message]
 
     def _run_agent(
         self, task: SWETask, plugin_id: str, debug_trace: bool = False
@@ -246,6 +273,19 @@ class SWEABRunner:
             ),
             "syntax_error_summary": trace.get("syntax_error_summary"),
             "hidden_source_included": trace.get("hidden_source_included"),
+            "parser_contract_detected": trace.get("parser_contract_detected"),
+            "bool_before_string_guard_applied": trace.get(
+                "bool_before_string_guard_applied"
+            ),
+            "rejected_candidates_before_tests": trace.get(
+                "rejected_candidates_before_tests"
+            ),
+            "final_exact_verification_passed": trace.get(
+                "final_exact_verification_passed"
+            ),
+            "final_exact_verification_summary": trace.get(
+                "final_exact_verification_summary"
+            ),
         }
 
     @staticmethod

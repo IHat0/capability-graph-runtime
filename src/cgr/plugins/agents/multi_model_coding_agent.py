@@ -12,7 +12,9 @@ from cgr.kernel.coding import (
     build_patch_prompt,
     build_repair_plan_prompt,
     build_repair_prompt,
+    check_bool_before_string_normalization,
     check_example_literal_coverage,
+    classify_boolean_contract_examples,
     classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
     extract_syntax_error_summary,
@@ -40,7 +42,11 @@ from cgr.kernel.contracts import (
 from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.kernel.runtime import KernelRuntime
 
-from .single_model_coding_agent import SingleModelCodingAgentPlugin
+from .single_model_coding_agent import (
+    SingleModelCodingAgentPlugin,
+    _merge_boolean_examples,
+)
+
 
 class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     """Generate a patch using deterministic draft, critique, and repair stages."""
@@ -108,15 +114,24 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         task_contract_checklist = extract_task_contract_checklist(task.issue)
         test_io_examples = extract_test_io_examples(task.test_files)
-        truthy_examples, falsy_examples = classify_boolean_string_examples(
-            test_io_examples
+        truthy_examples, falsy_examples = _merge_boolean_examples(
+            classify_boolean_string_examples(test_io_examples),
+            classify_boolean_contract_examples(task_contract_checklist),
         )
+        parser_contract_detected = bool(truthy_examples or falsy_examples)
         draft_result = self._execute_model(
             self._draft_capability_id, build_patch_prompt(task)
         )
         draft = self._model_text(draft_result.output)
         draft_patch, draft_format_duration = self._normalize_with_retry(draft, task)
-        draft_verification = verify_patch(task, draft_patch)
+        draft_bool_guard = check_bool_before_string_normalization(
+            draft_patch.files, task_contract_checklist
+        )
+        draft_verification = (
+            (False, [draft_bool_guard])
+            if draft_bool_guard is not None
+            else verify_patch(task, draft_patch)
+        )
         candidates: list[tuple[str, CodingPatch, bool]] = [
             (
                 "candidate_1",
@@ -141,7 +156,12 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         single_fallback_score: float | None = None
         monotonic_guard_applied = False
         final_selection_reason = "Selected the best verified multi-model candidate."
+        bool_guard_applied = draft_bool_guard is not None
+        rejected_candidates_before_tests: list[str] = (
+            ["candidate_1"] if draft_bool_guard is not None else []
+        )
         if draft_verification is not None and draft_verification[0]:
+            final_verification = verify_patch(task, draft_patch)
             output = draft_patch.model_dump()
             output["_trace"] = self._trace(
                 candidates,
@@ -155,6 +175,19 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 task_contract_checklist=task_contract_checklist,
                 final_selection_reason=(
                     "Initial multi-model candidate passed verification."
+                ),
+                parser_contract_detected=parser_contract_detected,
+                bool_guard_applied=bool_guard_applied,
+                rejected_candidates_before_tests=rejected_candidates_before_tests,
+                final_exact_passed=(
+                    final_verification[0]
+                    if final_verification is not None
+                    else None
+                ),
+                final_exact_summary=(
+                    "\n".join(final_verification[1])[-1000:]
+                    if final_verification is not None
+                    else "No executable verification contract was provided."
                 ),
             )
             return ExecutionResult(
@@ -269,10 +302,26 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     current_patch = repaired_patch
                     current_messages = [rejection]
                     continue
+                repair_bool_guard = check_bool_before_string_normalization(
+                    repaired_patch.files, task_contract_checklist
+                )
+                if repair_bool_guard is not None:
+                    bool_guard_applied = True
+                    rejected_candidates_before_tests.append(candidate_id)
+                    verifier_messages.append(repair_bool_guard)
+                    candidates.append((candidate_id, repaired_patch, False))
+                    known_failures.append(
+                        (candidate_id, repaired_patch.files, repair_bool_guard)
+                    )
+                    latest_failures[candidate_id] = repair_bool_guard
+                    current_patch = repaired_patch
+                    current_messages = [repair_bool_guard]
+                    continue
                 coverage_missing = check_example_literal_coverage(
                     repaired_patch.files, test_io_examples
                 )
                 if coverage_missing:
+                    rejected_candidates_before_tests.append(candidate_id)
                     coverage_missing_by_candidate[candidate_id] = coverage_missing
                     rejection = (
                         "Rejected candidate before tests; missing required example "
@@ -399,6 +448,23 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             for candidate_id, candidate, _ in candidates
             if candidate is patch
         )
+        final_verification = verify_patch(task, patch)
+        final_exact_passed = (
+            final_verification[0] if final_verification is not None else None
+        )
+        final_exact_summary = (
+            "\n".join(final_verification[1])[-1000:]
+            if final_verification is not None
+            else "No executable verification contract was provided."
+        )
+        if final_verification is not None and not final_verification[0]:
+            verifier_messages.append(
+                "Final selected candidate failed exact-file verification."
+            )
+            final_selection_reason = (
+                f"{final_selection_reason} Final selected candidate failed "
+                "exact-file verification."
+            )
         output = patch.model_dump()
         output["_trace"] = self._trace(
             candidates,
@@ -423,6 +489,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             monotonic_guard_applied,
             final_selection_reason,
             task_contract_checklist,
+            parser_contract_detected,
+            bool_guard_applied,
+            rejected_candidates_before_tests,
+            final_exact_passed,
+            final_exact_summary,
         )
         return ExecutionResult(
             context=request.context,
@@ -510,6 +581,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         monotonic_guard_applied: bool = False,
         final_selection_reason: str = "No final selection was made.",
         task_contract_checklist: list[str] | None = None,
+        parser_contract_detected: bool = False,
+        bool_guard_applied: bool = False,
+        rejected_candidates_before_tests: list[str] | None = None,
+        final_exact_passed: bool | None = None,
+        final_exact_summary: str = "",
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -593,6 +669,13 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 verifier_messages
             ),
             "hidden_source_included": False,
+            "parser_contract_detected": parser_contract_detected,
+            "bool_before_string_guard_applied": bool_guard_applied,
+            "rejected_candidates_before_tests": (
+                rejected_candidates_before_tests or []
+            ),
+            "final_exact_verification_passed": final_exact_passed,
+            "final_exact_verification_summary": final_exact_summary,
         }
 
     @staticmethod
@@ -631,7 +714,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         parser_context = any(
             marker in context for marker in ("parse", "normalize", "accepted value")
         )
-        if attempt >= 3 and test_io_examples:
+        if attempt >= 3 and (test_io_examples or truthy_examples or falsy_examples):
             parser_instruction = (
                 " Build explicit accepted-value sets from the examples."
                 if parser_context
@@ -645,8 +728,18 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     f"truthy examples: {', '.join(truthy_examples)}\n"
                     f"falsy examples: {', '.join(falsy_examples)}."
                 )
-            return "test-example-driven implementation", (
-                "Implement directly from the Required input/output examples. A "
+            name = (
+                "contract-table parser implementation"
+                if parser_context and (truthy_examples or falsy_examples)
+                else "test-example-driven implementation"
+            )
+            return name, (
+                "Implement directly from the task contract and Required "
+                "input/output examples using explicit accepted-value sets. "
+                "Handle bool inputs before any string operation. Normalize "
+                "non-bool values with str(value).strip().lower(). Include every "
+                "truthy value named in the contract. Include every falsy value "
+                "named in the contract. Raise ValueError for invalid values. A "
                 "table/set-based implementation is acceptable. Include every "
                 "truthy/falsy or expected value shown in the examples."
                 f"{parser_instruction}{boolean_examples} "

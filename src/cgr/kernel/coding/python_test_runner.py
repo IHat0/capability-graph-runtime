@@ -23,6 +23,9 @@ class PythonTestRunner:
         with tempfile.TemporaryDirectory(prefix="cgr-code-test-") as directory:
             root = Path(directory).resolve()
             self._write_files(root, files)
+            syntax_messages = self._compile_generated_python(files)
+            if syntax_messages:
+                return False, syntax_messages
             self._write_files(root, test_files)
             for test_case in commands:
                 try:
@@ -62,6 +65,29 @@ class PythonTestRunner:
                 raise ValueError(f"File path escapes test directory: {relative_name}")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def _compile_generated_python(files: dict[str, str]) -> list[str]:
+        messages: list[str] = []
+        for relative_name, content in files.items():
+            if not relative_name.endswith(".py"):
+                continue
+            try:
+                compile(content, relative_name, "exec")
+            except (SyntaxError, IndentationError, TabError) as exc:
+                error_type = type(exc).__name__
+                line_number = exc.lineno or 0
+                line_text = (exc.text or "").strip()
+                messages.append(
+                    "compile_generated_python: command ['compile', "
+                    f"{relative_name!r}]; exit code 1 (expected 0)."
+                )
+                messages.append(
+                    f"stderr: {error_type}: {exc.msg} in {relative_name}, "
+                    f"line {line_number}\nOffending line: {line_text}"
+                )
+                break
+        return messages
 
     @staticmethod
     def _output_messages(
