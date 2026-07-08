@@ -40,3 +40,7 @@ class SWECaseResult(BaseModel):
     test_io_examples: list[str] | None = None
     failed_required_examples: list[str] | None = None
     repair_variant_names: list[str] | None = None
+    example_coverage_missing_by_candidate: dict[str, list[str]] | None = None
+    failed_required_examples_by_attempt: dict[str, list[str]] | None = None
+    truthy_examples: list[str] | None = None
+    falsy_examples: list[str] | None = None

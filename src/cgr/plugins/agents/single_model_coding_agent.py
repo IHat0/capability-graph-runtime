@@ -10,6 +10,8 @@ from cgr.kernel.coding import (
     build_format_retry_prompt,
     build_patch_prompt,
     build_repair_prompt,
+    check_example_literal_coverage,
+    classify_boolean_string_examples,
     extract_test_assertion_checklist,
     extract_test_io_examples,
     infer_failed_test_io_examples,
@@ -90,6 +92,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         test_io_examples = extract_test_io_examples(task.test_files)
+        truthy_examples, falsy_examples = classify_boolean_string_examples(
+            test_io_examples
+        )
         model_result = self._execute_model(build_patch_prompt(task))
         patch, format_duration = self._normalize_with_retry(
             self._model_text(model_result.output), task
@@ -100,6 +105,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             ("candidate_1", patch, bool(verification and verification[0]))
         ]
         repair_prompt: str | None = None
+        verifier_messages = verification[1] if verification is not None else []
+        coverage_missing_by_candidate: dict[str, list[str]] = {}
         if verification is not None and not verification[0]:
             repair_prompt = build_repair_prompt(
                 task, patch.files, verification[1]
@@ -110,12 +117,23 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 self._model_text(repair_result.output), task
             )
             duration_ms += retry_duration
-            repaired_verification = verify_patch(task, repaired)
-            repaired_passed = (
-                repaired_verification[0]
-                if repaired_verification is not None
-                else False
+            coverage_missing = check_example_literal_coverage(
+                repaired.files, test_io_examples
             )
+            if coverage_missing:
+                coverage_missing_by_candidate["repair_1"] = coverage_missing
+                verifier_messages.append(
+                    "Rejected candidate before tests; missing required example "
+                    f"coverage: {', '.join(coverage_missing)}"
+                )
+                repaired_passed = False
+            else:
+                repaired_verification = verify_patch(task, repaired)
+                repaired_passed = (
+                    repaired_verification[0]
+                    if repaired_verification is not None
+                    else False
+                )
             candidates.append(("repair_1", repaired, repaired_passed))
             patch = select_patch(patch, False, repaired, repaired_passed)
         selected_id = next(
@@ -127,7 +145,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         output["_trace"] = self._trace(
             candidates,
             selected_id,
-            verification[1] if verification is not None else [],
+            verifier_messages,
             repair_prompt,
             test_assertion_checklist,
             (
@@ -144,6 +162,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 if verification is not None and not verification[0]
                 else []
             ),
+            coverage_missing_by_candidate,
+            truthy_examples,
+            falsy_examples,
         )
         return ExecutionResult(
             context=request.context,
@@ -196,6 +217,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         latest_failures: dict[str, str],
         test_io_examples: list[str],
         failed_required_examples: list[str],
+        coverage_missing_by_candidate: dict[str, list[str]],
+        truthy_examples: list[str],
+        falsy_examples: list[str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -235,6 +259,17 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "repair_variant_names": (
                 ["single-model repair"] if repair_prompt is not None else []
             ),
+            "example_coverage_missing_by_candidate": (
+                coverage_missing_by_candidate
+            ),
+            "failed_required_examples_by_attempt": {
+                candidate_id: infer_failed_test_io_examples(
+                    test_io_examples, failure
+                )
+                for candidate_id, failure in latest_failures.items()
+            },
+            "truthy_examples": truthy_examples,
+            "falsy_examples": falsy_examples,
         }
 
     @staticmethod

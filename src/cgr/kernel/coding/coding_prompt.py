@@ -40,6 +40,7 @@ def build_repair_prompt(
     forbidden_pattern_hints: list[str] | None = None,
     repair_plan: str = "",
     variant_instruction: str = "",
+    failed_required_examples: list[str] | None = None,
 ) -> str:
     """Build a concise repair prompt grounded in concrete verifier feedback."""
     feedback = "\n".join(test_messages) or "No test output was captured."
@@ -48,12 +49,17 @@ def build_repair_prompt(
     checklist_text = "\n".join(f"- {item}" for item in checklist)
     io_examples = extract_test_io_examples(task.test_files)
     io_examples_text = "\n".join(f"- {item}" for item in io_examples)
-    failed_examples = infer_failed_test_io_examples(io_examples, diagnostic)
+    failed_examples = list(failed_required_examples or [])
+    for example in infer_failed_test_io_examples(io_examples, diagnostic):
+        if example not in failed_examples:
+            failed_examples.append(example)
     failed_examples_section = (
-        "\nFailed required example:\n- " + "\n- ".join(failed_examples)
+        "FAILED REQUIRED EXAMPLES THAT MUST BE FIXED NOW:\n- "
+        + "\n- ".join(failed_examples)
         if failed_examples
-        else ""
+        else "FAILED REQUIRED EXAMPLES THAT MUST BE FIXED NOW:\n- None identified."
     )
+    self_check = "\n".join(f"[ ] {example}" for example in io_examples)
     critique_section = f"\nCritique:\n{critique}" if critique else ""
     previous_section = (
         "\nPrevious repair files:\n"
@@ -102,7 +108,13 @@ def build_repair_prompt(
     return (
         "The current implementation failed tests. Repair against the full "
         "contract below.\n"
-        f"Required input/output examples:\n{io_examples_text}\n"
+        f"{failed_examples_section}\n"
+        "Your previous repair failed the examples above. The next answer is "
+        "invalid unless it satisfies every failed required example. If a failed "
+        "example contains a string literal such as 'off', that literal or an "
+        "equivalent normalized handling path must be present in the "
+        "implementation.\n"
+        f"ALL REQUIRED INPUT/OUTPUT EXAMPLES:\n{io_examples_text}\n"
         "You must implement every required input/output example exactly. Do not "
         "produce code that only fixes the latest failing example. If the examples "
         "show several accepted string values, include all of them in the "
@@ -111,7 +123,7 @@ def build_repair_prompt(
         "Do not stop after fixing only the first traceback. The repaired code "
         "must satisfy every checklist item. Before writing code, infer all "
         "accepted inputs and required outputs from the checklist.\n"
-        f"Latest failure diagnostic:\n{diagnostic}{failed_examples_section}\n"
+        f"Latest failure diagnostic:\n{diagnostic}\n"
         f"{retry_instruction}Before writing code, infer the semantic mismatch from "
         "the expected/got values. Then output only the corrected JSON. The tests "
         "are the source of truth. Do not repeat the previous implementation if the "
@@ -130,6 +142,8 @@ def build_repair_prompt(
         'this shape: {"files":{"filename.py":"full file content"}}. No markdown. '
         "No explanation outside JSON. Implement the repair plan exactly. Do not "
         "repeat any known failing implementation."
+        f"\nBefore finalizing, mentally check each required example:\n{self_check}\n"
+        "Your JSON answer must implement all of them."
     )
 
 

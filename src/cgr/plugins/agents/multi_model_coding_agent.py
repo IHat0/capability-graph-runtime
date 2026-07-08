@@ -12,6 +12,8 @@ from cgr.kernel.coding import (
     build_patch_prompt,
     build_repair_plan_prompt,
     build_repair_prompt,
+    check_example_literal_coverage,
+    classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
     extract_test_assertion_checklist,
     extract_test_io_examples,
@@ -101,6 +103,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         test_io_examples = extract_test_io_examples(task.test_files)
+        truthy_examples, falsy_examples = classify_boolean_string_examples(
+            test_io_examples
+        )
         draft_result = self._execute_model(
             self._draft_capability_id, build_patch_prompt(task)
         )
@@ -125,6 +130,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         latest_failures: dict[str, str] = {}
         failed_required_examples: list[str] = []
         repair_variant_names: list[str] = []
+        coverage_missing_by_candidate: dict[str, list[str]] = {}
         if draft_verification is not None and draft_verification[0]:
             output = draft_patch.model_dump()
             output["_trace"] = self._trace(
@@ -134,6 +140,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repair_prompts,
                 test_assertion_checklist=test_assertion_checklist,
                 test_io_examples=test_io_examples,
+                truthy_examples=truthy_examples,
+                falsy_examples=falsy_examples,
             )
             return ExecutionResult(
                 context=request.context,
@@ -200,7 +208,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             current_messages = draft_verification[1]
             for attempt in range(1, self._max_repair_attempts + 1):
                 variant_name, variant_instruction = self._variant_instruction(
-                    task, attempt, test_io_examples
+                    task,
+                    attempt,
+                    test_io_examples,
+                    truthy_examples,
+                    falsy_examples,
                 )
                 repair_variant_names.append(variant_name)
                 repair_prompt = build_repair_prompt(
@@ -216,6 +228,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     forbidden_pattern_hints=forbidden_hints,
                     repair_plan=repair_plan,
                     variant_instruction=variant_instruction,
+                    failed_required_examples=failed_required_examples,
                 )
                 repair_prompts.append(repair_prompt)
                 repair_result = self._execute_model(
@@ -238,6 +251,27 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                         (candidate_id, repaired_patch.files, rejection)
                     )
                     latest_failures[candidate_id] = rejection
+                    current_patch = repaired_patch
+                    current_messages = [rejection]
+                    continue
+                coverage_missing = check_example_literal_coverage(
+                    repaired_patch.files, test_io_examples
+                )
+                if coverage_missing:
+                    coverage_missing_by_candidate[candidate_id] = coverage_missing
+                    rejection = (
+                        "Rejected candidate before tests; missing required example "
+                        f"coverage: {', '.join(coverage_missing)}"
+                    )
+                    verifier_messages.append(rejection)
+                    candidates.append((candidate_id, repaired_patch, False))
+                    known_failures.append(
+                        (candidate_id, repaired_patch.files, rejection)
+                    )
+                    latest_failures[candidate_id] = rejection
+                    for example in coverage_missing:
+                        if example not in failed_required_examples:
+                            failed_required_examples.append(example)
                     current_patch = repaired_patch
                     current_messages = [rejection]
                     continue
@@ -313,6 +347,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             test_io_examples,
             failed_required_examples,
             repair_variant_names,
+            coverage_missing_by_candidate,
+            truthy_examples,
+            falsy_examples,
         )
         return ExecutionResult(
             context=request.context,
@@ -372,6 +409,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         test_io_examples: list[str] | None = None,
         failed_required_examples: list[str] | None = None,
         repair_variant_names: list[str] | None = None,
+        coverage_missing_by_candidate: dict[str, list[str]] | None = None,
+        truthy_examples: list[str] | None = None,
+        falsy_examples: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -417,6 +457,17 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "test_io_examples": test_io_examples or [],
             "failed_required_examples": failed_required_examples or [],
             "repair_variant_names": repair_variant_names or [],
+            "example_coverage_missing_by_candidate": (
+                coverage_missing_by_candidate or {}
+            ),
+            "failed_required_examples_by_attempt": {
+                candidate_id: infer_failed_test_io_examples(
+                    test_io_examples or [], failure
+                )
+                for candidate_id, failure in (latest_failures or {}).items()
+            },
+            "truthy_examples": truthy_examples or [],
+            "falsy_examples": falsy_examples or [],
         }
 
     @staticmethod
@@ -429,7 +480,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
 
     @staticmethod
     def _variant_instruction(
-        task: CodingTask, attempt: int, test_io_examples: list[str]
+        task: CodingTask,
+        attempt: int,
+        test_io_examples: list[str],
+        truthy_examples: list[str],
+        falsy_examples: list[str],
     ) -> tuple[str, str]:
         if attempt == 1:
             return (
@@ -457,11 +512,19 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 if parser_context
                 else ""
             )
+            boolean_examples = ""
+            if truthy_examples or falsy_examples:
+                boolean_examples = (
+                    " Your code must contain all string examples from the contract, "
+                    "normalized to lowercase where appropriate:\n"
+                    f"truthy examples: {', '.join(truthy_examples)}\n"
+                    f"falsy examples: {', '.join(falsy_examples)}."
+                )
             return "test-example-driven implementation", (
                 "Implement directly from the Required input/output examples. A "
                 "table/set-based implementation is acceptable. Include every "
                 "truthy/falsy or expected value shown in the examples."
-                f"{parser_instruction} "
+                f"{parser_instruction}{boolean_examples} "
             )
         return f"test-derived variant {attempt}", (
             f"Repair variant {attempt}: derive the implementation directly from "

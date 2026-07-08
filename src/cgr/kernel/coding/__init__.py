@@ -23,6 +23,8 @@ from .patch_verification import (
 from .python_test_runner import PythonTestRunner, summarize_python_test_failure
 from .test_assertion_checklist import extract_test_assertion_checklist
 from .test_io_examples import (
+    check_example_literal_coverage,
+    classify_boolean_string_examples,
     extract_test_io_examples,
     infer_failed_test_io_examples,
 )
@@ -44,6 +46,8 @@ __all__ = [
     "extract_test_assertion_checklist",
     "extract_test_io_examples",
     "infer_failed_test_io_examples",
+    "check_example_literal_coverage",
+    "classify_boolean_string_examples",
     "patch_fingerprint",
     "verify_patch",
     "summarize_python_test_failure",

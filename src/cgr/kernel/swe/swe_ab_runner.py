@@ -213,6 +213,14 @@ class SWEABRunner:
             "test_io_examples": trace.get("test_io_examples"),
             "failed_required_examples": trace.get("failed_required_examples"),
             "repair_variant_names": trace.get("repair_variant_names"),
+            "example_coverage_missing_by_candidate": trace.get(
+                "example_coverage_missing_by_candidate"
+            ),
+            "failed_required_examples_by_attempt": trace.get(
+                "failed_required_examples_by_attempt"
+            ),
+            "truthy_examples": trace.get("truthy_examples"),
+            "falsy_examples": trace.get("falsy_examples"),
         }
 
     @staticmethod
