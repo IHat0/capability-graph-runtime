@@ -221,12 +221,18 @@ def coding_ab_real_main() -> int:
         return 1
 
 
-def coding_ab_hard_main() -> int:
+def coding_ab_hard_main(argv: list[str] | None = None) -> int:
     """Run the hard executable coding suite against explicit real providers."""
+    parser = argparse.ArgumentParser(description="Run the hard coding A/B suite.")
+    parser.add_argument("--max-tasks", type=int, help="Run only the first N tasks.")
+    args = parser.parse_args(argv)
     try:
-        result = _run_real_coding_ab(
-            "hard_coding_ab", create_hard_coding_tasks()
-        )
+        tasks = create_hard_coding_tasks()
+        if args.max_tasks is not None:
+            if args.max_tasks <= 0:
+                raise ValueError("--max-tasks must be positive.")
+            tasks = tasks[: args.max_tasks]
+        result = _run_real_coding_ab("hard_coding_ab", tasks)
         print(json.dumps(result.model_dump(mode="json")))
         return 0
     except Exception as exc:

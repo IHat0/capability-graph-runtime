@@ -3,7 +3,13 @@ from typing import Any
 
 import pytest
 
-from cgr.kernel.coding import CodeTestCase, JsonPatchParser
+from cgr.kernel.coding import (
+    CodeTestCase,
+    CodingPatch,
+    JsonPatchParser,
+    select_patch,
+)
+from cgr.kernel.coding.hard_coding_suite import create_hard_coding_tasks
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.runtime import KernelRuntime
 from cgr.kernel.swe import SWEABRunner, SWETask, create_local_swe_tasks
@@ -215,3 +221,79 @@ def test_swe_runner_accepts_functionally_correct_text_different_code() -> None:
 
     assert case.passed is True
     assert case.files != task.expected_files
+
+
+class FeedbackRepairClient:
+    def __init__(self, first_files: dict[str, str], repaired_files: dict[str, str]) -> None:
+        self._responses = [first_files, repaired_files]
+        self.prompts: list[str] = []
+
+    def create_chat_completion(
+        self,
+        config: OpenAICompatibleChatConfig,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        self.prompts.append(messages[-1]["content"])
+        files = self._responses[min(len(self.prompts) - 1, 1)]
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {"files": files, "explanation": "feedback repair"}
+                        )
+                    }
+                }
+            ]
+        }
+
+
+@pytest.mark.parametrize(
+    "task_id",
+    ["hard.parse_bool", "hard.merge_counts", "hard.validate_password"],
+)
+def test_single_agent_repairs_observed_bugs_from_test_feedback(task_id: str) -> None:
+    task = next(task for task in create_hard_coding_tasks() if task.id == task_id)
+    client = FeedbackRepairClient(task.files, task.expected_files)
+    runtime = KernelRuntime()
+    model = OpenAICompatibleChatPlugin(
+        config=OpenAICompatibleChatConfig(
+            api_key="local", model="feedback", base_url="http://localhost"
+        ),
+        client=client,
+        capability_id="model.code",
+        plugin_id="feedback.model",
+    )
+    runtime.register_plugin(model)
+    agent = SingleModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(agent)
+
+    result = runtime.execute(
+        agent.metadata.id,
+        ExecutionRequest(
+            capability=agent.metadata.capabilities[0],
+            context=ExecutionContext(),
+            payload={
+                "issue": task.issue,
+                "files": task.files,
+                "test_files": task.test_files,
+                "test_commands": task.test_commands,
+            },
+        ),
+    )
+
+    assert result.output["files"] == task.expected_files
+    assert len(client.prompts) == 2
+    repair_prompt = client.prompts[1]
+    assert "failed the tests below" in repair_prompt
+    assert "exit code" in repair_prompt
+    assert "Do not change the public API" in repair_prompt
+    assert "Do not add extra return values" in repair_prompt
+
+
+def test_passing_original_is_not_replaced_by_failing_repair() -> None:
+    original = CodingPatch(files={"module.py": "def value():\n    return True\n"})
+    repair = CodingPatch(files={"module.py": "def value():\n    return (True, 'ok')\n"})
+
+    assert select_patch(original, True, repair, False) is original
+    assert select_patch(original, False, repair, True) is repair

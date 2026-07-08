@@ -124,7 +124,12 @@ class SWEABRunner:
             ExecutionRequest[dict[str, Any]](
                 capability=plugin.metadata.capabilities[0],
                 context=ExecutionContext(),
-                payload={"issue": task.issue, "files": task.files},
+                payload={
+                    "issue": task.issue,
+                    "files": task.files,
+                    "test_files": task.test_files,
+                    "test_commands": task.test_commands,
+                },
             ),
         )
         if result.status != ExecutionStatus.SUCCESS:

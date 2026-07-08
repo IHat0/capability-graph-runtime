@@ -3,7 +3,14 @@
 import json
 from typing import Any
 
-from cgr.kernel.coding import CodingTask, JsonPatchParser, build_patch_prompt
+from cgr.kernel.coding import (
+    CodingTask,
+    JsonPatchParser,
+    build_patch_prompt,
+    build_repair_prompt,
+    select_patch,
+    verify_patch,
+)
 from cgr.kernel.contracts import (
     Capability,
     CapabilityVersion,
@@ -82,9 +89,20 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             self._draft_capability_id, build_patch_prompt(task)
         )
         draft = self._model_text(draft_result.output)
+        parser = JsonPatchParser()
+        draft_patch = parser.parse(draft)
+        draft_verification = verify_patch(task, draft_patch)
+        if draft_verification is not None and draft_verification[0]:
+            return ExecutionResult(
+                context=request.context,
+                status=ExecutionStatus.SUCCESS,
+                output=draft_patch.model_dump(),
+                duration_ms=draft_result.duration_ms,
+            )
         critique_prompt = (
             "Critique the proposed coding patch. Identify mistakes and suggest "
-            "specific corrections.\n"
+            "specific corrections. Preserve the public API, function signatures, "
+            "and return types. Do not suggest extra return values.\n"
             f"Issue:\n{task.issue}\nOriginal files:\n"
             f"{json.dumps(task.files, indent=2)}\nDraft patch:\n{draft}"
         )
@@ -92,14 +110,34 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             self._critique_capability_id, critique_prompt
         )
         critique = self._model_text(critique_result.output)
-        repair_result = self._execute_model(
-            self._draft_capability_id,
-            build_patch_prompt(
+        if draft_verification is not None:
+            repair_prompt = build_repair_prompt(
+                task,
+                draft_patch.files,
+                draft_verification[1],
+                critique,
+            )
+        else:
+            repair_prompt = build_patch_prompt(
                 task,
                 f"Draft patch:\n{draft}\nCritique:\n{critique}\nRepair the draft.",
-            ),
+            )
+        repair_result = self._execute_model(self._draft_capability_id, repair_prompt)
+        try:
+            repaired_patch = parser.parse(self._model_text(repair_result.output))
+        except ValueError:
+            repaired_patch = draft_patch
+        repaired_verification = verify_patch(task, repaired_patch)
+        patch = (
+            select_patch(
+                draft_patch,
+                bool(draft_verification and draft_verification[0]),
+                repaired_patch,
+                bool(repaired_verification and repaired_verification[0]),
+            )
+            if draft_verification is not None
+            else repaired_patch
         )
-        patch = JsonPatchParser().parse(self._model_text(repair_result.output))
         return ExecutionResult(
             context=request.context,
             status=ExecutionStatus.SUCCESS,

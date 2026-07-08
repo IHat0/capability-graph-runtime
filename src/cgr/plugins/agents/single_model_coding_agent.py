@@ -2,7 +2,14 @@
 
 from typing import Any
 
-from cgr.kernel.coding import CodingTask, JsonPatchParser, build_patch_prompt
+from cgr.kernel.coding import (
+    CodingTask,
+    JsonPatchParser,
+    build_patch_prompt,
+    build_repair_prompt,
+    select_patch,
+    verify_patch,
+)
 from cgr.kernel.contracts import (
     Capability,
     CapabilityVersion,
@@ -75,12 +82,31 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
         model_result = self._execute_model(build_patch_prompt(task))
-        patch = JsonPatchParser().parse(self._model_text(model_result.output))
+        parser = JsonPatchParser()
+        patch = parser.parse(self._model_text(model_result.output))
+        verification = verify_patch(task, patch)
+        duration_ms = model_result.duration_ms
+        if verification is not None and not verification[0]:
+            repair_result = self._execute_model(
+                build_repair_prompt(task, patch.files, verification[1])
+            )
+            duration_ms += repair_result.duration_ms
+            try:
+                repaired = parser.parse(self._model_text(repair_result.output))
+            except ValueError:
+                repaired = patch
+            repaired_verification = verify_patch(task, repaired)
+            repaired_passed = (
+                repaired_verification[0]
+                if repaired_verification is not None
+                else False
+            )
+            patch = select_patch(patch, False, repaired, repaired_passed)
         return ExecutionResult(
             context=request.context,
             status=ExecutionStatus.SUCCESS,
             output=patch.model_dump(),
-            duration_ms=model_result.duration_ms,
+            duration_ms=duration_ms,
         )
 
     def _execute_model(self, prompt: str) -> ExecutionResult[Any]:

@@ -70,5 +70,5 @@ class PythonTestRunner:
             if not output:
                 continue
             text = output.decode(errors="replace") if isinstance(output, bytes) else output
-            messages.append(f"{label}: {text.strip()[:1000]}")
+            messages.append(f"{label}: {text.strip()[-2000:]}")
         return messages

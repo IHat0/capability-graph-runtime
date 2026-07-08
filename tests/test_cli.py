@@ -179,7 +179,7 @@ def test_coding_ab_hard_main_reports_missing_environment_as_json(
         for suffix in ("API_KEY", "MODEL", "BASE_URL", "PROVIDER_NAME"):
             monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
 
-    exit_code = coding_ab_hard_main()
+    exit_code = coding_ab_hard_main([])
 
     assert json.loads(capsys.readouterr().out) == {
         "error": "CGR_DRAFT_API_KEY is not set."
