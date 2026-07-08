@@ -193,6 +193,7 @@ class SWEABRunner:
             ),
             "repair_prompt_preview": trace.get("repair_prompt_preview"),
             "candidate_scores": trace.get("candidate_scores"),
+            "candidate_file_previews": trace.get("candidate_file_previews"),
         }
 
     @staticmethod

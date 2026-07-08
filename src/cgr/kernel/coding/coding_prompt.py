@@ -48,30 +48,35 @@ def build_repair_prompt(
         if stronger_retry
         else ""
     )
+    merge_evidence = (
+        diagnostic + "\n" + "\n".join(task.test_files.values())
+    ).lower()
+    merge_warning = (
+        "Do not use a shallow dictionary merge such as update(), {**a, **b}, or "
+        "result.update(b) when the tests show overlapping values must be combined. "
+        if any(
+            marker in merge_evidence
+            for marker in ("merge_counts", "overlapping", "summed", "counts")
+        )
+        else ""
+    )
     return (
-        "The generated code failed the tests below. Repair the code to pass the "
-        f"tests. {retry_instruction}Do not change the public API. Do not add "
-        "extra return values. "
-        "Preserve public function names, requested signatures, and return types. "
-        "Make the smallest code change that passes tests. Do not add explanations "
-        "outside JSON. Return only valid JSON with complete replacement files in "
-        'this shape: {"files":{"filename.py":"full file content"}}. Do not use '
-        "markdown fences and do not change file names unless asked. The tests below "
-        "are the source of truth. Infer the required behavior from them. Your job "
-        "is to make the generated files pass these tests with the smallest possible "
-        "change. Do not use a simpler implementation if it violates the test "
-        "assertions. When two values conflict, follow the behavior asserted in "
-        "the tests rather than choosing a default or simple merge. The current "
-        "implementation failed these tests.\n"
-        f"Original task:\n{task.issue}\nOriginal files:\n"
-        f"{json.dumps(task.files, indent=2)}\nCurrent generated files:\n"
-        f"{json.dumps(generated_files, indent=2)}{previous_section}\n"
+        "The current implementation failed tests. You must repair it. "
+        f"{retry_instruction}Before writing code, infer the semantic mismatch from "
+        "the expected/got values. Then output only the corrected JSON. The tests "
+        "are the source of truth. Do not repeat the previous implementation if the "
+        "diagnostic says it overwrote or lost expected values. "
+        f"{merge_warning}\nDiagnostic summary:\n{diagnostic}\n"
         f"Test files (source of truth):\n{json.dumps(task.test_files, indent=2)}\n"
-        f"Diagnostic summary:\n{diagnostic}\nFull test output:\n{feedback}"
-        f"{critique_section}\nReturn only valid JSON in the required files shape. "
-        "No markdown or explanation outside JSON. Preserve existing filenames, "
-        "function names, signatures unless tests require otherwise, and return "
-        "types expected by tests."
+        f"Current generated files:\n{json.dumps(generated_files, indent=2)}"
+        f"{previous_section}\nOriginal task:\n{task.issue}\nOriginal files:\n"
+        f"{json.dumps(task.files, indent=2)}\nFull test output:\n{feedback}"
+        f"{critique_section}\nDo not change the public API. Do not add extra "
+        "return values. Preserve existing filenames, public function names, signatures "
+        "unless tests require otherwise, and return types expected by tests. Make "
+        "the smallest code change that passes tests. Return only valid JSON with "
+        'this shape: {"files":{"filename.py":"full file content"}}. No markdown. '
+        "No explanation outside JSON."
     )
 
 

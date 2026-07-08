@@ -159,6 +159,7 @@ def test_swe_ab_runner_computes_all_mode_pass_rates() -> None:
     assert multi_case.candidates_count == 1
     assert multi_case.selected_candidate_id == "candidate_1"
     assert multi_case.candidate_scores is not None
+    assert multi_case.candidate_file_previews is not None
 
 
 def test_local_swe_suite_contains_three_distinct_tasks() -> None:
@@ -297,7 +298,7 @@ def test_single_agent_repairs_observed_bugs_from_test_feedback(task_id: str) -> 
     assert result.output["files"] == task.expected_files
     assert len(client.prompts) == 2
     repair_prompt = client.prompts[1]
-    assert "failed the tests below" in repair_prompt
+    assert "current implementation failed tests" in repair_prompt
     assert "exit code" in repair_prompt
     assert "Do not change the public API" in repair_prompt
     assert "Do not add extra return values" in repair_prompt
@@ -374,8 +375,104 @@ def test_multi_agent_second_semantic_repair_fixes_merge_counts() -> None:
     assert len(draft_client.prompts) == 3
     first_repair = draft_client.prompts[1]
     second_repair = draft_client.prompts[2]
-    assert "assert result == {'x': 3, 'y': 3}" in first_repair
+    assert "expected {'x': 3, 'y': 3}, got {'x': 2, 'y': 3}" in first_repair
     assert "AssertionError" in first_repair
-    assert "tests below are the source of truth" in first_repair
+    assert "tests are the source of truth" in first_repair
     assert "Your previous repair still failed" in second_repair
     assert "Previous repair files" in second_repair
+    assert trace["candidate_file_previews"]["repair_2"] == task.expected_files
+
+
+class DiagnosticAwareMergeClient:
+    def __init__(
+        self, failing_files: dict[str, str], passing_files: dict[str, str]
+    ) -> None:
+        self.failing_files = failing_files
+        self.passing_files = passing_files
+        self.prompts: list[str] = []
+
+    def create_chat_completion(
+        self,
+        config: OpenAICompatibleChatConfig,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        prompt = messages[-1]["content"]
+        self.prompts.append(prompt)
+        signals = (
+            "expected {'x': 3, 'y': 3}, got {'x': 2, 'y': 3}",
+            "overlapping keys must be summed",
+            "not overwritten",
+        )
+        files = (
+            self.passing_files
+            if any(signal in prompt for signal in signals)
+            else self.failing_files
+        )
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {"files": files, "explanation": "diagnostic repair"}
+                        )
+                    }
+                }
+            ]
+        }
+
+
+def test_multi_agent_uses_explicit_expected_got_diagnostic() -> None:
+    task = next(
+        task
+        for task in create_hard_coding_tasks()
+        if task.id == "hard.merge_counts"
+    )
+    failing = {
+        "counter_utils.py": "def merge_counts(a, b):\n    return {**a, **b}\n"
+    }
+    client = DiagnosticAwareMergeClient(failing, task.expected_files)
+    runtime = KernelRuntime()
+    config = OpenAICompatibleChatConfig(
+        api_key="local", model="diagnostic", base_url="http://localhost"
+    )
+    draft = OpenAICompatibleChatPlugin(
+        config=config,
+        client=client,
+        capability_id="model.code",
+        plugin_id="diagnostic.draft",
+    )
+    critic = OpenAICompatibleChatPlugin(
+        config=config,
+        client=SequencedClient(critique=True),
+        capability_id="model.reason",
+        plugin_id="diagnostic.critic",
+    )
+    runtime.register_plugin(draft)
+    runtime.register_plugin(critic)
+    agent = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(agent)
+
+    result = runtime.execute(
+        agent.metadata.id,
+        ExecutionRequest(
+            capability=agent.metadata.capabilities[0],
+            context=ExecutionContext(),
+            payload={
+                "issue": task.issue,
+                "files": task.files,
+                "test_files": task.test_files,
+                "test_commands": task.test_commands,
+            },
+        ),
+    )
+
+    assert result.output["files"] == task.expected_files
+    trace = result.output["_trace"]
+    assert trace["repair_attempts_count"] >= 1
+    assert trace["selected_candidate_id"] == "repair_1"
+    assert trace["candidate_file_previews"]["candidate_1"] == failing
+    assert trace["candidate_file_previews"]["repair_1"] == task.expected_files
+    diagnostic = "expected {'x': 3, 'y': 3}, got {'x': 2, 'y': 3}"
+    assert diagnostic in client.prompts[1]
+    assert diagnostic in trace["repair_prompt_preview"]
+    assert diagnostic in trace["verifier_messages_preview"]

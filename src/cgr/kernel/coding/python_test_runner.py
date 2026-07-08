@@ -83,16 +83,33 @@ def summarize_python_test_failure(messages: list[str]) -> str:
     """Extract assertion and traceback signals plus the final diagnostic lines."""
     lines = [line.strip() for message in messages for line in message.splitlines()]
     non_empty = [line for line in lines if line]
-    markers = (
+    priority_markers = (
+        "expected",
+        "got",
+        "must be summed",
+        "not overwritten",
+        "must not be mutated",
         "AssertionError",
         "assert ",
+    )
+    secondary_markers = (
         "E       ",
         "Traceback",
         "Expected",
-        "expected",
         "==",
     )
-    selected = [line for line in non_empty if any(marker in line for marker in markers)]
+    selected = [
+        line
+        for marker in priority_markers
+        for line in non_empty
+        if marker in line
+    ]
+    selected.extend(
+        line
+        for marker in secondary_markers
+        for line in non_empty
+        if marker in line
+    )
     selected.extend(non_empty[-20:])
     deduplicated = list(dict.fromkeys(selected))
     return "\n".join(deduplicated)

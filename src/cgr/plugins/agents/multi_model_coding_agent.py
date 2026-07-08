@@ -270,6 +270,13 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 candidate_id: 1.0 if passed else 0.0
                 for candidate_id, _, passed in candidates
             },
+            "candidate_file_previews": {
+                candidate_id: {
+                    filename: content[:1000]
+                    for filename, content in candidate.files.items()
+                }
+                for candidate_id, candidate, _ in candidates
+            },
         }
 
     @staticmethod

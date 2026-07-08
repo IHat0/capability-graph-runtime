@@ -28,3 +28,4 @@ class SWECaseResult(BaseModel):
     verifier_messages_preview: str | None = None
     repair_prompt_preview: str | None = None
     candidate_scores: dict[str, float] | None = None
+    candidate_file_previews: dict[str, dict[str, str]] | None = None
