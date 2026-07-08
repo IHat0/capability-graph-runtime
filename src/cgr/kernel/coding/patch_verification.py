@@ -1,5 +1,7 @@
 """Shared verification and deterministic selection for coding-agent patches."""
 
+import re
+
 from .coding_patch import CodingPatch
 from .coding_task import CodingTask
 from .python_test_runner import PythonTestRunner
@@ -43,11 +45,13 @@ def extract_forbidden_patterns_from_failed_code(
     files: dict[str, str],
     failure_summary: str,
     test_assertion_checklist: list[str] | None = None,
+    test_io_examples: list[str] | None = None,
 ) -> list[str]:
     """Derive generic implementation warnings from code and verifier evidence."""
     code = "\n".join(files.values())
     summary = failure_summary.lower()
     checklist = "\n".join(test_assertion_checklist or []).lower()
+    examples = test_io_examples or []
     hints: list[str] = []
     if "{**" in code and "expected" in summary and "got" in summary:
         hints.append(
@@ -77,4 +81,31 @@ def extract_forbidden_patterns_from_failed_code(
                 "'true' and 'false'.",
             ]
         )
+    truthy_values = _string_inputs_for_result(examples, "True")
+    falsy_values = _string_inputs_for_result(examples, "False")
+    if truthy_values:
+        hints.append(
+            "The implementation must include all truthy examples shown: "
+            f"{', '.join(truthy_values)}."
+        )
+    if falsy_values:
+        hints.append(
+            "The implementation must include all falsy examples shown: "
+            f"{', '.join(falsy_values)}."
+        )
+    if truthy_values and falsy_values:
+        hints.append("Do not stop at true/false only.")
     return hints
+
+
+def _string_inputs_for_result(examples: list[str], result: str) -> list[str]:
+    values: list[str] = []
+    for example in examples:
+        call, separator, expected = example.partition(" -> ")
+        if not separator or expected != result:
+            continue
+        for match in re.finditer(r"(?P<quote>['\"])(?P<value>.*?)(?P=quote)", call):
+            value = match.group("value")
+            if value and value not in values:
+                values.append(value)
+    return values

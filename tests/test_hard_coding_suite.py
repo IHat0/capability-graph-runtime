@@ -142,3 +142,4 @@ def test_fake_provider_hard_suite_detects_boosted_improvement() -> None:
     assert result.pass_rates["baseline"] < result.pass_rates["cgr_single"]
     assert result.pass_rates["cgr_single"] <= result.pass_rates["cgr_multi"]
     assert result.pass_rates["baseline"] < result.pass_rates["cgr_multi"]
+    assert result.pass_rates["cgr_multi"] == 1.0

@@ -210,6 +210,9 @@ class SWEABRunner:
             "repair_prompt_previews_by_attempt": trace.get(
                 "repair_prompt_previews_by_attempt"
             ),
+            "test_io_examples": trace.get("test_io_examples"),
+            "failed_required_examples": trace.get("failed_required_examples"),
+            "repair_variant_names": trace.get("repair_variant_names"),
         }
 
     @staticmethod

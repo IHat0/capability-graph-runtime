@@ -11,6 +11,8 @@ from cgr.kernel.coding import (
     build_patch_prompt,
     build_repair_prompt,
     extract_test_assertion_checklist,
+    extract_test_io_examples,
+    infer_failed_test_io_examples,
     select_patch,
     summarize_python_test_failure,
     verify_patch,
@@ -87,6 +89,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
+        test_io_examples = extract_test_io_examples(task.test_files)
         model_result = self._execute_model(build_patch_prompt(task))
         patch, format_duration = self._normalize_with_retry(
             self._model_text(model_result.output), task
@@ -131,6 +134,15 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 {"candidate_1": summarize_python_test_failure(verification[1])}
                 if verification is not None and not verification[0]
                 else {}
+            ),
+            test_io_examples,
+            (
+                infer_failed_test_io_examples(
+                    test_io_examples,
+                    summarize_python_test_failure(verification[1]),
+                )
+                if verification is not None and not verification[0]
+                else []
             ),
         )
         return ExecutionResult(
@@ -182,6 +194,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repair_prompt: str | None,
         test_assertion_checklist: list[str],
         latest_failures: dict[str, str],
+        test_io_examples: list[str],
+        failed_required_examples: list[str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -215,6 +229,11 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 {"repair_1": repair_prompt[:1000]}
                 if repair_prompt is not None
                 else {}
+            ),
+            "test_io_examples": test_io_examples,
+            "failed_required_examples": failed_required_examples,
+            "repair_variant_names": (
+                ["single-model repair"] if repair_prompt is not None else []
             ),
         }
 

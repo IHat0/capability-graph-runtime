@@ -5,6 +5,10 @@ import json
 from .coding_task import CodingTask
 from .python_test_runner import summarize_python_test_failure
 from .test_assertion_checklist import extract_test_assertion_checklist
+from .test_io_examples import (
+    extract_test_io_examples,
+    infer_failed_test_io_examples,
+)
 
 
 def build_patch_prompt(task: CodingTask, extra_instruction: str = "") -> str:
@@ -42,6 +46,14 @@ def build_repair_prompt(
     diagnostic = summarize_python_test_failure(test_messages)
     checklist = extract_test_assertion_checklist(task.test_files)
     checklist_text = "\n".join(f"- {item}" for item in checklist)
+    io_examples = extract_test_io_examples(task.test_files)
+    io_examples_text = "\n".join(f"- {item}" for item in io_examples)
+    failed_examples = infer_failed_test_io_examples(io_examples, diagnostic)
+    failed_examples_section = (
+        "\nFailed required example:\n- " + "\n- ".join(failed_examples)
+        if failed_examples
+        else ""
+    )
     critique_section = f"\nCritique:\n{critique}" if critique else ""
     previous_section = (
         "\nPrevious repair files:\n"
@@ -89,12 +101,17 @@ def build_repair_prompt(
     plan_section = f"\nRepair plan:\n{repair_plan}" if repair_plan else ""
     return (
         "The current implementation failed tests. Repair against the full "
-        "checklist below.\n"
+        "contract below.\n"
+        f"Required input/output examples:\n{io_examples_text}\n"
+        "You must implement every required input/output example exactly. Do not "
+        "produce code that only fixes the latest failing example. If the examples "
+        "show several accepted string values, include all of them in the "
+        "implementation.\n"
         f"Test assertion checklist:\n{checklist_text}\n"
         "Do not stop after fixing only the first traceback. The repaired code "
         "must satisfy every checklist item. Before writing code, infer all "
         "accepted inputs and required outputs from the checklist.\n"
-        f"Latest failure diagnostic:\n{diagnostic}\n"
+        f"Latest failure diagnostic:\n{diagnostic}{failed_examples_section}\n"
         f"{retry_instruction}Before writing code, infer the semantic mismatch from "
         "the expected/got values. Then output only the corrected JSON. The tests "
         "are the source of truth. Do not repeat the previous implementation if the "
@@ -124,11 +141,14 @@ def build_repair_plan_prompt(
     """Ask a critic for a semantic plan before requesting replacement code."""
     checklist = extract_test_assertion_checklist(task.test_files)
     checklist_text = "\n".join(f"- {item}" for item in checklist)
+    io_examples = extract_test_io_examples(task.test_files)
+    io_examples_text = "\n".join(f"- {item}" for item in io_examples)
     return (
         "Given the failing tests and known failing code, identify the exact semantic "
         "bug and the minimal algorithmic fix. Do not write code yet. Be specific. "
         "List every required behavior from the checklist. Then identify what the "
         "current code misses.\n"
+        f"Required input/output examples:\n{io_examples_text}\n"
         f"Test assertion checklist:\n{checklist_text}\n"
         f"Task:\n{task.issue}\nFailed files:\n"
         f"{json.dumps(failed_files, indent=2)}\nTest source:\n"

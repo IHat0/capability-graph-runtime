@@ -9,6 +9,7 @@ from cgr.kernel.coding import (
     JsonPatchParser,
     PythonTestRunner,
     extract_test_assertion_checklist,
+    extract_test_io_examples,
     select_patch,
 )
 from cgr.kernel.coding.hard_coding_suite import create_hard_coding_tasks
@@ -533,8 +534,20 @@ class FullChecklistParseClient:
                     "    raise ValueError(value)\n"
                 )
             }
+        elif len(self.prompts) == 3:
+            files = {
+                "parse_utils.py": (
+                    "def parse_bool(value):\n"
+                    "    if isinstance(value, bool):\n        return value\n"
+                    "    normalized = str(value).strip().lower()\n"
+                    "    if normalized in {'true', 'yes', '1'}:\n        return True\n"
+                    "    if normalized in {'false', '0'}:\n        return False\n"
+                    "    raise ValueError(value)\n"
+                )
+            }
         else:
             required = (
+                "Required input/output examples",
                 "YES should parse as True",
                 "off should parse as False",
                 "1 should parse as True",
@@ -561,6 +574,16 @@ def test_multi_agent_repairs_parse_bool_from_full_test_checklist() -> None:
     checklist = extract_test_assertion_checklist(task.test_files)
     checklist_text = "\n".join(checklist)
     assert all(value in checklist_text for value in ("YES", "off", "'1'", "'0'"))
+    io_examples = extract_test_io_examples(task.test_files)
+    assert io_examples == [
+        "parse_bool(True) -> True",
+        "parse_bool(False) -> False",
+        "parse_bool('YES') -> True",
+        "parse_bool('off') -> False",
+        "parse_bool('1') -> True",
+        "parse_bool('0') -> False",
+        "parse_bool('maybe') -> raises ValueError",
+    ]
 
     draft_client = FullChecklistParseClient(task.expected_files)
     critic_client = SequencedClient(critique=True)
@@ -603,10 +626,12 @@ def test_multi_agent_repairs_parse_bool_from_full_test_checklist() -> None:
 
     trace = result.output["_trace"]
     assert result.output["files"] == task.expected_files
-    assert trace["selected_candidate_id"] == "repair_2"
+    assert trace["selected_candidate_id"] == "repair_3"
     assert trace["test_assertion_checklist"] == checklist
     assert "YES" in trace["latest_failure_preview_by_candidate"]["repair_1"]
-    assert json.dumps(task.expected_files, indent=2) in draft_client.prompts[3]
+    assert "off" in trace["latest_failure_preview_by_candidate"]["repair_2"]
+    assert "Required input/output examples" in draft_client.prompts[3]
+    assert "parse_bool('off') -> False" in draft_client.prompts[3]
     assert all(value in critic_client.prompts[0] for value in ("YES", "off", "'1'", "'0'"))
     assert "Handle bool inputs before string normalization." in trace[
         "forbidden_pattern_hints"
@@ -616,3 +641,8 @@ def test_multi_agent_repairs_parse_bool_from_full_test_checklist() -> None:
         "repair_2",
         "repair_3",
     }
+    assert trace["test_io_examples"] == io_examples
+    assert "parse_bool('off') -> False" in trace["failed_required_examples"]
+    assert trace["repair_variant_names"][-1] == (
+        "test-example-driven implementation"
+    )

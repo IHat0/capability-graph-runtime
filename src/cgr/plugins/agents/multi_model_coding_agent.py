@@ -14,6 +14,8 @@ from cgr.kernel.coding import (
     build_repair_prompt,
     extract_forbidden_patterns_from_failed_code,
     extract_test_assertion_checklist,
+    extract_test_io_examples,
+    infer_failed_test_io_examples,
     patch_fingerprint,
     select_patch,
     summarize_python_test_failure,
@@ -98,6 +100,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
+        test_io_examples = extract_test_io_examples(task.test_files)
         draft_result = self._execute_model(
             self._draft_capability_id, build_patch_prompt(task)
         )
@@ -120,6 +123,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repeated_rejections = 0
         repair_plan = ""
         latest_failures: dict[str, str] = {}
+        failed_required_examples: list[str] = []
+        repair_variant_names: list[str] = []
         if draft_verification is not None and draft_verification[0]:
             output = draft_patch.model_dump()
             output["_trace"] = self._trace(
@@ -128,6 +133,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 verifier_messages,
                 repair_prompts,
                 test_assertion_checklist=test_assertion_checklist,
+                test_io_examples=test_io_examples,
             )
             return ExecutionResult(
                 context=request.context,
@@ -141,11 +147,15 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 ("candidate_1", draft_patch.files, draft_summary)
             )
             latest_failures["candidate_1"] = draft_summary
+            failed_required_examples.extend(
+                infer_failed_test_io_examples(test_io_examples, draft_summary)
+            )
             forbidden_hints.extend(
                 extract_forbidden_patterns_from_failed_code(
                     draft_patch.files,
                     draft_summary,
                     test_assertion_checklist,
+                    test_io_examples,
                 )
             )
             critique_prompt = build_repair_plan_prompt(
@@ -189,7 +199,10 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             current_patch = draft_patch
             current_messages = draft_verification[1]
             for attempt in range(1, self._max_repair_attempts + 1):
-                variant_instruction = self._variant_instruction(task, attempt)
+                variant_name, variant_instruction = self._variant_instruction(
+                    task, attempt, test_io_examples
+                )
+                repair_variant_names.append(variant_name)
                 repair_prompt = build_repair_prompt(
                     task,
                     current_patch.files,
@@ -261,10 +274,16 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     (candidate_id, repaired_patch.files, failure_summary)
                 )
                 latest_failures[candidate_id] = failure_summary
+                for example in infer_failed_test_io_examples(
+                    test_io_examples, failure_summary
+                ):
+                    if example not in failed_required_examples:
+                        failed_required_examples.append(example)
                 for hint in extract_forbidden_patterns_from_failed_code(
                     repaired_patch.files,
                     failure_summary,
                     test_assertion_checklist,
+                    test_io_examples,
                 ):
                     if hint not in forbidden_hints:
                         forbidden_hints.append(hint)
@@ -291,6 +310,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repair_plan,
             test_assertion_checklist,
             latest_failures,
+            test_io_examples,
+            failed_required_examples,
+            repair_variant_names,
         )
         return ExecutionResult(
             context=request.context,
@@ -347,6 +369,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repair_plan: str = "",
         test_assertion_checklist: list[str] | None = None,
         latest_failures: dict[str, str] | None = None,
+        test_io_examples: list[str] | None = None,
+        failed_required_examples: list[str] | None = None,
+        repair_variant_names: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -355,7 +380,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "selected_candidate_id": selected_id,
             "verifier_messages_preview": "\n".join(verifier_messages)[-1000:],
             "repair_prompt_preview": (
-                repair_prompts[0][:1000] if repair_prompts else None
+                MultiModelCodingAgentPlugin._repair_prompt_preview(
+                    repair_prompts[0]
+                )
+                if repair_prompts
+                else None
             ),
             "candidate_scores": {
                 candidate_id: 1.0 if passed else 0.0
@@ -385,12 +414,28 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 f"repair_{index}": prompt[:1000]
                 for index, prompt in enumerate(repair_prompts, 1)
             },
+            "test_io_examples": test_io_examples or [],
+            "failed_required_examples": failed_required_examples or [],
+            "repair_variant_names": repair_variant_names or [],
         }
 
     @staticmethod
-    def _variant_instruction(task: CodingTask, attempt: int) -> str:
+    def _repair_prompt_preview(prompt: str) -> str:
+        marker = "Latest failure diagnostic:"
+        diagnostic_index = prompt.find(marker)
+        if diagnostic_index < 0 or diagnostic_index < 500:
+            return prompt[:1000]
+        return (prompt[:500] + "\n...\n" + prompt[diagnostic_index:])[:1000]
+
+    @staticmethod
+    def _variant_instruction(
+        task: CodingTask, attempt: int, test_io_examples: list[str]
+    ) -> tuple[str, str]:
         if attempt == 1:
-            return "Repair variant 1: make the smallest semantic patch. "
+            return (
+                "minimal semantic patch",
+                "Repair variant 1: make the smallest semantic patch. ",
+            )
         context = (
             task.issue + "\n" + "\n".join(task.test_files.values())
         ).lower()
@@ -399,11 +444,26 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             for marker in ("merge", "counts", "overlapping", "summed", "dictionary", "mapping")
         )
         if attempt == 2 and merge_context:
-            return (
+            return "loop-based implementation", (
                 "Repair variant 2: use an explicit for-loop over the second input "
                 "when combining mappings. "
             )
-        return (
+        parser_context = any(
+            marker in context for marker in ("parse", "normalize", "accepted value")
+        )
+        if attempt >= 3 and test_io_examples:
+            parser_instruction = (
+                " Build explicit accepted-value sets from the examples."
+                if parser_context
+                else ""
+            )
+            return "test-example-driven implementation", (
+                "Implement directly from the Required input/output examples. A "
+                "table/set-based implementation is acceptable. Include every "
+                "truthy/falsy or expected value shown in the examples."
+                f"{parser_instruction} "
+            )
+        return f"test-derived variant {attempt}", (
             f"Repair variant {attempt}: derive the implementation directly from "
             "each test assertion and use a different algorithm. "
         )
