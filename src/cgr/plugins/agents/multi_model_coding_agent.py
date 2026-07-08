@@ -98,11 +98,26 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         draft = self._model_text(draft_result.output)
         draft_patch, draft_format_duration = self._normalize_with_retry(draft, task)
         draft_verification = verify_patch(task, draft_patch)
+        candidates: list[tuple[str, CodingPatch, bool]] = [
+            (
+                "candidate_1",
+                draft_patch,
+                bool(draft_verification and draft_verification[0]),
+            )
+        ]
+        verifier_messages = (
+            draft_verification[1] if draft_verification is not None else []
+        )
+        repair_prompts: list[str] = []
         if draft_verification is not None and draft_verification[0]:
+            output = draft_patch.model_dump()
+            output["_trace"] = self._trace(
+                candidates, "candidate_1", verifier_messages, repair_prompts
+            )
             return ExecutionResult(
                 context=request.context,
                 status=ExecutionStatus.SUCCESS,
-                output=draft_patch.model_dump(),
+                output=output,
                 duration_ms=draft_result.duration_ms + draft_format_duration,
             )
         critique_prompt = (
@@ -126,6 +141,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 task,
                 f"Draft patch:\n{draft}\nCritique:\n{critique}\nRepair the draft.",
             )
+            repair_prompts.append(repair_prompt)
             repair_result = self._execute_model(
                 self._draft_capability_id, repair_prompt
             )
@@ -133,6 +149,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 self._model_text(repair_result.output), task
             )
             total_duration += repair_result.duration_ms + format_duration
+            candidates.append(("repair_1", patch, False))
         else:
             patch = draft_patch
             patch_passed = draft_verification[0]
@@ -149,6 +166,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     ),
                     stronger_retry=attempt > 1,
                 )
+                repair_prompts.append(repair_prompt)
                 repair_result = self._execute_model(
                     self._draft_capability_id, repair_prompt
                 )
@@ -160,6 +178,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repaired_passed = bool(
                     repaired_verification and repaired_verification[0]
                 )
+                candidates.append(
+                    (f"repair_{attempt}", repaired_patch, repaired_passed)
+                )
+                if repaired_verification is not None:
+                    verifier_messages.extend(repaired_verification[1])
                 patch = select_patch(
                     patch,
                     patch_passed,
@@ -175,10 +198,19 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     if repaired_verification is not None
                     else current_messages
                 )
+        selected_id = next(
+            candidate_id
+            for candidate_id, candidate, _ in candidates
+            if candidate is patch
+        )
+        output = patch.model_dump()
+        output["_trace"] = self._trace(
+            candidates, selected_id, verifier_messages, repair_prompts
+        )
         return ExecutionResult(
             context=request.context,
             status=ExecutionStatus.SUCCESS,
-            output=patch.model_dump(),
+            output=output,
             duration_ms=total_duration,
         )
 
@@ -217,6 +249,28 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 self._model_text(retry.output), allowed_filenames
             )
             return patch, retry.duration_ms
+
+    @staticmethod
+    def _trace(
+        candidates: list[tuple[str, CodingPatch, bool]],
+        selected_id: str,
+        verifier_messages: list[str],
+        repair_prompts: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "attempts_count": len(candidates),
+            "candidates_count": len(candidates),
+            "repair_attempts_count": len(repair_prompts),
+            "selected_candidate_id": selected_id,
+            "verifier_messages_preview": "\n".join(verifier_messages)[-1000:],
+            "repair_prompt_preview": (
+                repair_prompts[-1][:1000] if repair_prompts else None
+            ),
+            "candidate_scores": {
+                candidate_id: 1.0 if passed else 0.0
+                for candidate_id, _, passed in candidates
+            },
+        }
 
     @staticmethod
     def _parse_task(payload: Any) -> CodingTask:

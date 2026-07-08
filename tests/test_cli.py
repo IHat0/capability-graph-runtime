@@ -187,6 +187,22 @@ def test_coding_ab_hard_main_reports_missing_environment_as_json(
     assert exit_code == 1
 
 
+def test_coding_ab_hard_accepts_task_and_debug_trace_flags(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CGR_DRAFT_API_KEY", raising=False)
+
+    exit_code = coding_ab_hard_main(
+        ["--task-id", "hard.merge_counts", "--debug-trace"]
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "CGR_DRAFT_API_KEY is not set."
+    }
+    assert exit_code == 1
+
+
 def test_boost_local_main_prints_improved_scores(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

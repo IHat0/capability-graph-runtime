@@ -33,6 +33,7 @@ class SWEABRunner:
         baseline_plugin_id: str,
         single_agent_plugin_id: str,
         multi_agent_plugin_id: str,
+        debug_trace: bool = False,
     ) -> SWEEvalResult:
         modes: list[tuple[SWEMode, str]] = [
             ("baseline", baseline_plugin_id),
@@ -40,7 +41,7 @@ class SWEABRunner:
             ("cgr_multi", multi_agent_plugin_id),
         ]
         results = [
-            self._run_case(task, mode, plugin_id)
+            self._run_case(task, mode, plugin_id, debug_trace)
             for task in tasks
             for mode, plugin_id in modes
         ]
@@ -65,14 +66,20 @@ class SWEABRunner:
         )
 
     def _run_case(
-        self, task: SWETask, mode: SWEMode, plugin_id: str
+        self,
+        task: SWETask,
+        mode: SWEMode,
+        plugin_id: str,
+        debug_trace: bool = False,
     ) -> SWECaseResult:
         try:
-            patch = (
-                self._run_baseline(task, plugin_id)
-                if mode == "baseline"
-                else self._run_agent(task, plugin_id)
-            )
+            trace: dict[str, Any] | None = None
+            if mode == "baseline":
+                patch = self._run_baseline(task, plugin_id)
+            else:
+                patch, trace = self._run_agent(
+                    task, plugin_id, debug_trace=debug_trace
+                )
             passed = patch.files == task.expected_files
             if task.test_files and task.test_commands:
                 passed, _ = PythonTestRunner().run(
@@ -86,6 +93,7 @@ class SWEABRunner:
                 plugin_id=plugin_id,
                 passed=passed,
                 files=patch.files,
+                **(self._trace_fields(trace) if debug_trace else {}),
             )
         except Exception as exc:
             return SWECaseResult(
@@ -146,7 +154,9 @@ class SWEABRunner:
                 self._model_text(retry.output), set(task.files)
             )
 
-    def _run_agent(self, task: SWETask, plugin_id: str) -> CodingPatch:
+    def _run_agent(
+        self, task: SWETask, plugin_id: str, debug_trace: bool = False
+    ) -> tuple[CodingPatch, dict[str, Any] | None]:
         plugin = self._runtime.registry.get(plugin_id)
         result = self._runtime.execute(
             plugin_id,
@@ -158,12 +168,32 @@ class SWEABRunner:
                     "files": task.files,
                     "test_files": task.test_files,
                     "test_commands": task.test_commands,
+                    "metadata": {"debug_trace": str(debug_trace).lower()},
                 },
             ),
         )
         if result.status != ExecutionStatus.SUCCESS:
             raise RuntimeError(result.error or "Coding agent execution failed.")
-        return CodingPatch.model_validate(result.output)
+        output = result.output
+        patch = CodingPatch.model_validate(output)
+        trace = output.get("_trace") if isinstance(output, dict) else None
+        return patch, trace if isinstance(trace, dict) else None
+
+    @staticmethod
+    def _trace_fields(trace: dict[str, Any] | None) -> dict[str, Any]:
+        if trace is None:
+            return {}
+        return {
+            "attempts_count": trace.get("attempts_count"),
+            "candidates_count": trace.get("candidates_count"),
+            "repair_attempts_count": trace.get("repair_attempts_count"),
+            "selected_candidate_id": trace.get("selected_candidate_id"),
+            "verifier_messages_preview": trace.get(
+                "verifier_messages_preview"
+            ),
+            "repair_prompt_preview": trace.get("repair_prompt_preview"),
+            "candidate_scores": trace.get("candidate_scores"),
+        }
 
     @staticmethod
     def _model_text(output: Any) -> str:

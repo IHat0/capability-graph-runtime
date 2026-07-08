@@ -137,6 +137,7 @@ def test_swe_ab_runner_computes_all_mode_pass_rates() -> None:
         "draft",
         "agent.single_model_coding",
         "agent.multi_model_coding",
+        debug_trace=True,
     )
 
     assert result.pass_rates == {
@@ -149,6 +150,15 @@ def test_swe_ab_runner_computes_all_mode_pass_rates() -> None:
         "cgr_multi_minus_baseline": 0.0,
     }
     assert len(result.results) == 9
+    multi_case = next(
+        case
+        for case in result.results
+        if case.task_id == "local.greeting" and case.mode == "cgr_multi"
+    )
+    assert multi_case.repair_attempts_count == 0
+    assert multi_case.candidates_count == 1
+    assert multi_case.selected_candidate_id == "candidate_1"
+    assert multi_case.candidate_scores is not None
 
 
 def test_local_swe_suite_contains_three_distinct_tasks() -> None:
@@ -299,6 +309,7 @@ def test_passing_original_is_not_replaced_by_failing_repair() -> None:
 
     assert select_patch(original, True, repair, False) is original
     assert select_patch(original, False, repair, True) is repair
+    assert select_patch(original, False, repair, False) is original
 
 
 def test_multi_agent_second_semantic_repair_fixes_merge_counts() -> None:
@@ -351,6 +362,15 @@ def test_multi_agent_second_semantic_repair_fixes_merge_counts() -> None:
     )
 
     assert result.output["files"] == task.expected_files
+    trace = result.output["_trace"]
+    assert trace["repair_attempts_count"] == 2
+    assert trace["candidates_count"] == 3
+    assert trace["selected_candidate_id"] == "repair_2"
+    assert trace["candidate_scores"] == {
+        "candidate_1": 0.0,
+        "repair_1": 0.0,
+        "repair_2": 1.0,
+    }
     assert len(draft_client.prompts) == 3
     first_repair = draft_client.prompts[1]
     second_repair = draft_client.prompts[2]

@@ -177,10 +177,13 @@ and `CGR_CRITIC_*` provider configuration and is still not official SWE-bench.
 ```bash
 cgr-coding-ab-hard
 cgr-coding-ab-hard --max-tasks 4 --retry-failed
+cgr-coding-ab-hard --task-id hard.merge_counts --debug-trace
 ```
 
 `--retry-failed` allows one additional multi-model semantic repair attempt using
 the executable test source and failure diagnostics.
+`--debug-trace` exposes candidate scores, repair counts, selected candidates,
+and capped verifier/prompt previews for targeted task diagnosis.
 
 ## CGR Booster Engine
 

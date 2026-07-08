@@ -21,3 +21,10 @@ class SWECaseResult(BaseModel):
     error_type: str | None = None
     error_message: str | None = None
     raw_output_preview: str | None = None
+    attempts_count: int | None = None
+    candidates_count: int | None = None
+    repair_attempts_count: int | None = None
+    selected_candidate_id: str | None = None
+    verifier_messages_preview: str | None = None
+    repair_prompt_preview: str | None = None
+    candidate_scores: dict[str, float] | None = None

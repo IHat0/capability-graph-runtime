@@ -90,10 +90,15 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         )
         verification = verify_patch(task, patch)
         duration_ms = model_result.duration_ms + format_duration
+        candidates: list[tuple[str, CodingPatch, bool]] = [
+            ("candidate_1", patch, bool(verification and verification[0]))
+        ]
+        repair_prompt: str | None = None
         if verification is not None and not verification[0]:
-            repair_result = self._execute_model(
-                build_repair_prompt(task, patch.files, verification[1])
+            repair_prompt = build_repair_prompt(
+                task, patch.files, verification[1]
             )
+            repair_result = self._execute_model(repair_prompt)
             duration_ms += repair_result.duration_ms
             repaired, retry_duration = self._normalize_with_retry(
                 self._model_text(repair_result.output), task
@@ -105,11 +110,24 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 if repaired_verification is not None
                 else False
             )
+            candidates.append(("repair_1", repaired, repaired_passed))
             patch = select_patch(patch, False, repaired, repaired_passed)
+        selected_id = next(
+            candidate_id
+            for candidate_id, candidate, _ in candidates
+            if candidate is patch
+        )
+        output = patch.model_dump()
+        output["_trace"] = self._trace(
+            candidates,
+            selected_id,
+            verification[1] if verification is not None else [],
+            repair_prompt,
+        )
         return ExecutionResult(
             context=request.context,
             status=ExecutionStatus.SUCCESS,
-            output=patch.model_dump(),
+            output=output,
             duration_ms=duration_ms,
         )
 
@@ -146,6 +164,31 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 self._model_text(retry.output), allowed_filenames
             )
             return patch, retry.duration_ms
+
+    @staticmethod
+    def _trace(
+        candidates: list[tuple[str, CodingPatch, bool]],
+        selected_id: str,
+        verifier_messages: list[str],
+        repair_prompt: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "attempts_count": len(candidates),
+            "candidates_count": len(candidates),
+            "repair_attempts_count": sum(
+                candidate_id.startswith("repair_")
+                for candidate_id, _, _ in candidates
+            ),
+            "selected_candidate_id": selected_id,
+            "verifier_messages_preview": "\n".join(verifier_messages)[-1000:],
+            "repair_prompt_preview": (
+                repair_prompt[:1000] if repair_prompt is not None else None
+            ),
+            "candidate_scores": {
+                candidate_id: 1.0 if passed else 0.0
+                for candidate_id, _, passed in candidates
+            },
+        }
 
     @staticmethod
     def _parse_task(payload: Any) -> CodingTask:

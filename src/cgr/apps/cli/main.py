@@ -230,6 +230,12 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Allow one additional multi-model semantic repair attempt.",
     )
+    parser.add_argument("--task-id", help="Run one hard-suite task by id.")
+    parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="Include coding-agent candidate and repair trace fields.",
+    )
     args = parser.parse_args(argv)
     try:
         tasks = create_hard_coding_tasks()
@@ -237,12 +243,23 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
             if args.max_tasks <= 0:
                 raise ValueError("--max-tasks must be positive.")
             tasks = tasks[: args.max_tasks]
+        if args.task_id is not None:
+            tasks = [task for task in tasks if task.id == args.task_id]
+            if not tasks:
+                raise ValueError(f"Unknown hard coding task '{args.task_id}'.")
         result = _run_real_coding_ab(
             "hard_coding_ab",
             tasks,
             multi_repair_attempts=3 if args.retry_failed else 2,
+            debug_trace=args.debug_trace,
         )
-        print(json.dumps(result.model_dump(mode="json")))
+        print(
+            json.dumps(
+                result.model_dump(
+                    mode="json", exclude_none=not args.debug_trace
+                )
+            )
+        )
         return 0
     except Exception as exc:
         print(json.dumps({"error": str(exc)}))
@@ -253,6 +270,7 @@ def _run_real_coding_ab(
     suite_name: str,
     tasks: list[SWETask],
     multi_repair_attempts: int = 2,
+    debug_trace: bool = False,
 ) -> SWEEvalResult:
     draft_config = OpenAICompatibleChatConfig.from_env("CGR_DRAFT")
     critic_config = OpenAICompatibleChatConfig.from_env("CGR_CRITIC")
@@ -281,6 +299,7 @@ def _run_real_coding_ab(
         draft.metadata.id,
         single.metadata.id,
         multi.metadata.id,
+        debug_trace=debug_trace,
     )
 
 
