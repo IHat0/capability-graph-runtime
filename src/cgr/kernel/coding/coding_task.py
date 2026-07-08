@@ -14,4 +14,6 @@ class CodingTask(BaseModel):
     files: dict[str, str] = Field(min_length=1)
     test_files: dict[str, str] = Field(default_factory=dict)
     test_commands: list[CodeTestCase] = Field(default_factory=list)
+    hidden_test_files: dict[str, str] = Field(default_factory=dict)
+    hidden_test_commands: list[CodeTestCase] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)

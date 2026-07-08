@@ -172,6 +172,8 @@ class SWEABRunner:
                     "files": task.files,
                     "test_files": task.prompt_test_files,
                     "test_commands": task.prompt_test_commands,
+                    "hidden_test_files": task.hidden_test_files,
+                    "hidden_test_commands": task.hidden_test_commands,
                     "metadata": {"debug_trace": str(debug_trace).lower()},
                 },
             ),
@@ -237,6 +239,13 @@ class SWEABRunner:
                 "all_candidate_scores_before_selection"
             ),
             "final_selection_reason": trace.get("final_selection_reason"),
+            "task_contract_checklist": trace.get("task_contract_checklist"),
+            "visible_failure_summary": trace.get("visible_failure_summary"),
+            "hidden_failure_summary_safe": trace.get(
+                "hidden_failure_summary_safe"
+            ),
+            "syntax_error_summary": trace.get("syntax_error_summary"),
+            "hidden_source_included": trace.get("hidden_source_included"),
         }
 
     @staticmethod

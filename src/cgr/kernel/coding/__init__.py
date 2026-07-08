@@ -20,7 +20,13 @@ from .patch_verification import (
     select_patch,
     verify_patch,
 )
-from .python_test_runner import PythonTestRunner, summarize_python_test_failure
+from .python_test_runner import (
+    PythonTestRunner,
+    extract_syntax_error_summary,
+    safe_hidden_failure_summary,
+    summarize_python_test_failure,
+)
+from .task_contract import extract_task_contract_checklist
 from .test_assertion_checklist import extract_test_assertion_checklist
 from .test_io_examples import (
     check_example_literal_coverage,
@@ -51,4 +57,7 @@ __all__ = [
     "patch_fingerprint",
     "verify_patch",
     "summarize_python_test_failure",
+    "extract_syntax_error_summary",
+    "safe_hidden_failure_summary",
+    "extract_task_contract_checklist",
 ]

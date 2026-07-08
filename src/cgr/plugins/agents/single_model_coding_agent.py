@@ -12,6 +12,9 @@ from cgr.kernel.coding import (
     build_repair_prompt,
     check_example_literal_coverage,
     classify_boolean_string_examples,
+    extract_forbidden_patterns_from_failed_code,
+    extract_syntax_error_summary,
+    extract_task_contract_checklist,
     extract_test_assertion_checklist,
     extract_test_io_examples,
     infer_failed_test_io_examples,
@@ -91,6 +94,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
+        task_contract_checklist = extract_task_contract_checklist(task.issue)
         test_io_examples = extract_test_io_examples(task.test_files)
         truthy_examples, falsy_examples = classify_boolean_string_examples(
             test_io_examples
@@ -107,9 +111,21 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repair_prompt: str | None = None
         verifier_messages = verification[1] if verification is not None else []
         coverage_missing_by_candidate: dict[str, list[str]] = {}
+        forbidden_hints: list[str] = []
         if verification is not None and not verification[0]:
+            failure_summary = summarize_python_test_failure(verification[1])
+            forbidden_hints = extract_forbidden_patterns_from_failed_code(
+                patch.files,
+                failure_summary,
+                test_assertion_checklist,
+                test_io_examples,
+                task_contract_checklist,
+            )
             repair_prompt = build_repair_prompt(
-                task, patch.files, verification[1]
+                task,
+                patch.files,
+                verification[1],
+                forbidden_pattern_hints=forbidden_hints,
             )
             repair_result = self._execute_model(repair_prompt)
             duration_ms += repair_result.duration_ms
@@ -165,6 +181,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             coverage_missing_by_candidate,
             truthy_examples,
             falsy_examples,
+            task_contract_checklist,
+            forbidden_hints,
         )
         return ExecutionResult(
             context=request.context,
@@ -220,6 +238,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         coverage_missing_by_candidate: dict[str, list[str]],
         truthy_examples: list[str],
         falsy_examples: list[str],
+        task_contract_checklist: list[str],
+        forbidden_hints: list[str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -270,6 +290,25 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             },
             "truthy_examples": truthy_examples,
             "falsy_examples": falsy_examples,
+            "task_contract_checklist": task_contract_checklist,
+            "forbidden_pattern_hints": forbidden_hints,
+            "visible_failure_summary": summarize_python_test_failure(
+                [
+                    message
+                    for message in verifier_messages
+                    if not message.startswith("Hidden scoring also failed.")
+                ]
+            ),
+            "hidden_failure_summary_safe": "\n".join(
+                message
+                for message in verifier_messages
+                if message.startswith("Hidden scoring also failed.")
+            )[:2000]
+            or None,
+            "syntax_error_summary": extract_syntax_error_summary(
+                verifier_messages
+            ),
+            "hidden_source_included": False,
         }
 
     @staticmethod

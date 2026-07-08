@@ -16,7 +16,7 @@ from cgr.kernel.booster import (
     BoosterEngine,
     BoosterTask,
 )
-from cgr.kernel.coding import CodeTestCase
+from cgr.kernel.coding import CodeTestCase, PythonTestRunner
 from cgr.kernel.coding.hard_coding_suite import create_hard_coding_tasks
 from cgr.kernel.coding.v1_benchmarks import create_coding_v1_tasks
 from cgr.kernel.coding.v1_runner import CodingV1Runner
@@ -275,6 +275,11 @@ def coding_ab_v1_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task-id", help="Run one Coding v1 task by id.")
     parser.add_argument("--runs", type=int, default=1, help="Repeat the suite N times.")
     parser.add_argument(
+        "--reference-check",
+        action="store_true",
+        help="Run bundled reference files against visible and hidden tests only.",
+    )
+    parser.add_argument(
         "--debug-trace",
         action="store_true",
         help="Include coding-agent candidate and repair trace fields.",
@@ -290,6 +295,31 @@ def coding_ab_v1_main(argv: list[str] | None = None) -> int:
             if args.max_tasks <= 0:
                 raise ValueError("--max-tasks must be positive.")
             tasks = tasks[: args.max_tasks]
+        if args.reference_check:
+            cases = []
+            for task in tasks:
+                passed, messages = PythonTestRunner().run(
+                    task.expected_files,
+                    task.scoring_test_files,
+                    task.scoring_test_commands,
+                )
+                cases.append(
+                    {
+                        "task_id": task.id,
+                        "passed": passed,
+                        "failure_summary": None if passed else messages[-1],
+                    }
+                )
+            output = {
+                "suite_name": "coding_v1_reference",
+                "total_tasks": len(tasks),
+                "passed_tasks": sum(
+                    1 for case in cases if case["passed"] is True
+                ),
+                "results": cases,
+            }
+            print(json.dumps(output))
+            return 0 if all(case["passed"] is True for case in cases) else 1
         report = CodingV1Runner(
             lambda selected, debug: _run_real_coding_ab(
                 "coding_v1",

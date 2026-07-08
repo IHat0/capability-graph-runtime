@@ -97,6 +97,10 @@ def summarize_python_test_failure(messages: list[str]) -> str:
         "Traceback",
         "Expected",
         "==",
+        "SyntaxError",
+        "IndentationError",
+        "TabError",
+        "NameError",
     )
     selected = [
         line
@@ -123,3 +127,38 @@ def summarize_python_test_failure(messages: list[str]) -> str:
     selected.extend(non_empty[-20:])
     deduplicated = list(dict.fromkeys(selected))
     return "\n".join(deduplicated)
+
+
+def extract_syntax_error_summary(messages: list[str]) -> str | None:
+    """Return filename/line/offending-code context for parse and obvious typo errors."""
+    lines = [line.rstrip() for message in messages for line in message.splitlines()]
+    error_types = ("SyntaxError", "IndentationError", "TabError", "NameError")
+    error_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if any(error_type in line for error_type in error_types)
+    ]
+    if not error_indexes:
+        return None
+    index = error_indexes[-1]
+    start = max(0, index - 5)
+    context = [line.strip() for line in lines[start : index + 1] if line.strip()]
+    return "\n".join(context)[-2000:]
+
+
+def safe_hidden_failure_summary(messages: list[str]) -> str:
+    """Keep actionable exception/assertion text without exposing hidden source."""
+    lines = [line.strip() for message in messages for line in message.splitlines()]
+    safe_markers = (
+        "AssertionError:",
+        "SyntaxError:",
+        "IndentationError:",
+        "TabError:",
+        "NameError:",
+        "TypeError:",
+        "ValueError:",
+        "expected",
+        "got",
+    )
+    selected = [line for line in lines if any(marker in line for marker in safe_markers)]
+    return "\n".join(dict.fromkeys(selected))[-2000:] or "Hidden test command failed."

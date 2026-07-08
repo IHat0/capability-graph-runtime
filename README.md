@@ -197,8 +197,12 @@ their source is not shown to the model.
 cgr-coding-ab-v1 --max-tasks 5
 cgr-coding-ab-v1 --task-id v1.parse_bool_extended --debug-trace
 cgr-coding-ab-v1 --runs 3
+cgr-coding-ab-v1 --reference-check
 cgr-coding-ab-v1 > benchmark-results/coding-v1.json
 ```
+
+`--reference-check` runs the bundled reference implementations against both
+visible and hidden tests locally without model credentials or provider calls.
 
 ## CGR Booster Engine
 

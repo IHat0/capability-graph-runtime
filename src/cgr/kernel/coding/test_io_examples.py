@@ -75,7 +75,6 @@ def check_example_literal_coverage(
         re.search(r"\bin\s*[\{\[\(]", code)
         or re.search(r"==\s*['\"]", code)
     )
-    broad_membership = " in " in code or "{" in code
     missing: list[str] = []
     for example in test_io_examples:
         call, _, expected = example.partition(" -> ")
@@ -86,7 +85,7 @@ def check_example_literal_coverage(
             continue
         if all(value.casefold() in lowered for value in values):
             continue
-        if broad_membership and not finite_membership:
+        if not finite_membership:
             continue
         missing.append(example)
     return missing

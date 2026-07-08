@@ -40,6 +40,11 @@ src/cgr/kernel/coding/hard_coding_suite.py
 src/cgr/kernel/coding/json_patch_parser.py
 src/cgr/kernel/coding/patch_verification.py
 src/cgr/kernel/coding/python_test_runner.py
+src/cgr/kernel/coding/task_contract.py
+src/cgr/kernel/coding/test_assertion_checklist.py
+src/cgr/kernel/coding/test_io_examples.py
+src/cgr/kernel/coding/v1_benchmarks.py
+src/cgr/kernel/coding/v1_runner.py
 src/cgr/kernel/competition/__init__.py
 src/cgr/kernel/competition/competition_engine.py
 src/cgr/kernel/competition/competition_result.py
@@ -142,6 +147,7 @@ tests/test_capability_router.py
 tests/test_cli.py
 tests/test_coding_agents.py
 tests/test_coding_patch_normalizer.py
+tests/test_coding_v1.py
 tests/test_competition.py
 tests/test_contracts.py
 tests/test_echo_plugin.py

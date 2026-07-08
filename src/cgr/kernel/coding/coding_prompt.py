@@ -3,7 +3,11 @@
 import json
 
 from .coding_task import CodingTask
-from .python_test_runner import summarize_python_test_failure
+from .python_test_runner import (
+    extract_syntax_error_summary,
+    summarize_python_test_failure,
+)
+from .task_contract import extract_task_contract_checklist
 from .test_assertion_checklist import extract_test_assertion_checklist
 from .test_io_examples import (
     extract_test_io_examples,
@@ -45,6 +49,24 @@ def build_repair_prompt(
     """Build a concise repair prompt grounded in concrete verifier feedback."""
     feedback = "\n".join(test_messages) or "No test output was captured."
     diagnostic = summarize_python_test_failure(test_messages)
+    syntax_error = extract_syntax_error_summary(test_messages)
+    syntax_section = (
+        "SYNTAX REPAIR REQUIRED:\nYour previous code does not even parse. First "
+        "produce syntactically valid Python. Then satisfy the tests.\n"
+        f"{syntax_error}\nDo not preserve the malformed indentation or typo.\n"
+        if syntax_error
+        else ""
+    )
+    contract = extract_task_contract_checklist(task.issue)
+    contract_text = "\n".join(f"- {item}" for item in contract)
+    hidden_summaries = [
+        message
+        for message in test_messages
+        if message.startswith("Hidden scoring also failed.")
+    ]
+    hidden_section = (
+        "\n".join(hidden_summaries) + "\n" if hidden_summaries else ""
+    )
     checklist = extract_test_assertion_checklist(task.test_files)
     checklist_text = "\n".join(f"- {item}" for item in checklist)
     io_examples = extract_test_io_examples(task.test_files)
@@ -108,6 +130,7 @@ def build_repair_prompt(
     return (
         "The current implementation failed tests. Repair against the full "
         "contract below.\n"
+        f"{syntax_section}"
         f"{failed_examples_section}\n"
         "Your previous repair failed the examples above. The next answer is "
         "invalid unless it satisfies every failed required example. If a failed "
@@ -120,10 +143,14 @@ def build_repair_prompt(
         "show several accepted string values, include all of them in the "
         "implementation.\n"
         f"Test assertion checklist:\n{checklist_text}\n"
+        f"Task contract checklist:\n{contract_text}\n"
+        "The task contract is source of truth alongside tests. Repair must satisfy "
+        "every contract item.\n"
         "Do not stop after fixing only the first traceback. The repaired code "
         "must satisfy every checklist item. Before writing code, infer all "
         "accepted inputs and required outputs from the checklist.\n"
         f"Latest failure diagnostic:\n{diagnostic}\n"
+        f"{hidden_section}"
         f"{retry_instruction}Before writing code, infer the semantic mismatch from "
         "the expected/got values. Then output only the corrected JSON. The tests "
         "are the source of truth. Do not repeat the previous implementation if the "
@@ -157,6 +184,8 @@ def build_repair_plan_prompt(
     checklist_text = "\n".join(f"- {item}" for item in checklist)
     io_examples = extract_test_io_examples(task.test_files)
     io_examples_text = "\n".join(f"- {item}" for item in io_examples)
+    contract = extract_task_contract_checklist(task.issue)
+    contract_text = "\n".join(f"- {item}" for item in contract)
     return (
         "Given the failing tests and known failing code, identify the exact semantic "
         "bug and the minimal algorithmic fix. Do not write code yet. Be specific. "
@@ -164,6 +193,7 @@ def build_repair_plan_prompt(
         "current code misses.\n"
         f"Required input/output examples:\n{io_examples_text}\n"
         f"Test assertion checklist:\n{checklist_text}\n"
+        f"Task contract checklist:\n{contract_text}\n"
         f"Task:\n{task.issue}\nFailed files:\n"
         f"{json.dumps(failed_files, indent=2)}\nTest source:\n"
         f"{json.dumps(task.test_files, indent=2)}\nDiagnostic:\n{diagnostic}"

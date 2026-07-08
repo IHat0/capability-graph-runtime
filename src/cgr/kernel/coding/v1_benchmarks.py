@@ -35,7 +35,7 @@ def create_coding_v1_tasks() -> list[SWETask]:
     return [
         _task(
             "normalize_username",
-            "Implement normalize_username: trim, lowercase, replace internal whitespace with underscores, and reject an empty result.",
+            "Implement normalize_username; strip surrounding whitespace; lowercase text; replace internal whitespace with underscores; empty results raise ValueError.",
             "username_utils.py",
             "def normalize_username(value):\n    return value\n",
             "def normalize_username(value):\n    result = '_'.join(value.strip().lower().split())\n    if not result:\n        raise ValueError('empty username')\n    return result\n",
@@ -44,7 +44,7 @@ def create_coding_v1_tasks() -> list[SWETask]:
         ),
         _task(
             "parse_bool_extended",
-            "Implement parse_bool for bools and case-insensitive true/yes/y/1/on and false/no/n/0/off strings; invalid values raise ValueError.",
+            "Implement parse_bool; bool inputs return themselves; true values include true, yes, y, 1, on; false values include false, no, n, 0, off; matching is case-insensitive; strings are stripped; invalid values raise ValueError.",
             "parse_utils.py",
             "def parse_bool(value):\n    return value == 'true'\n",
             "def parse_bool(value):\n    if isinstance(value, bool):\n        return value\n    value = str(value).strip().lower()\n    if value in {'true','yes','y','1','on'}:\n        return True\n    if value in {'false','no','n','0','off'}:\n        return False\n    raise ValueError(value)\n",
@@ -53,7 +53,7 @@ def create_coding_v1_tasks() -> list[SWETask]:
         ),
         _task(
             "merge_counts_nested",
-            "Implement merge_counts that sums overlapping numeric counts without mutation, supports empty mappings, and rejects non-numeric overlaps.",
+            "Implement merge_counts; overlapping numeric counts are summed; inputs are not mutated; empty dictionaries are supported; non-numeric overlapping values raise TypeError.",
             "count_utils.py",
             "def merge_counts(a, b):\n    return {**a, **b}\n",
             "def merge_counts(a, b):\n    result = dict(a)\n    for key, value in b.items():\n        if key in result:\n            if not isinstance(result[key], (int, float)) or not isinstance(value, (int, float)):\n                raise TypeError('overlapping counts must be numeric')\n            result[key] += value\n        else:\n            result[key] = value\n    return result\n",
@@ -62,7 +62,7 @@ def create_coding_v1_tasks() -> list[SWETask]:
         ),
         _task(
             "flatten_once",
-            "Implement flatten_once: expand lists and tuples one level, never strings, preserving order.",
+            "Implement flatten_once; expand lists and tuples one level; strings are not expanded; preserve order.",
             "list_utils.py",
             "def flatten_once(items):\n    return sum(items, [])\n",
             "def flatten_once(items):\n    result=[]\n    for item in items:\n        result.extend(item if isinstance(item, (list, tuple)) else [item])\n    return result\n",
@@ -71,7 +71,7 @@ def create_coding_v1_tasks() -> list[SWETask]:
         ),
         _task(
             "chunk_list_strict",
-            "Implement chunk_list with a positive integer size, remainder chunks, and no input mutation.",
+            "Implement chunk_list; size must be a positive integer; the final chunk may be smaller; input is not mutated.",
             "chunk_utils.py",
             "def chunk_list(items, size):\n    return [items]\n",
             "def chunk_list(items, size):\n    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:\n        raise ValueError('size must be a positive integer')\n    return [items[i:i+size] for i in range(0, len(items), size)]\n",

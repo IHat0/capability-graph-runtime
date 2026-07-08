@@ -55,3 +55,8 @@ class SWECaseResult(BaseModel):
     completion_tokens: int | None = None
     total_tokens: int | None = None
     estimated_cost: float | None = None
+    task_contract_checklist: list[str] | None = None
+    visible_failure_summary: str | None = None
+    hidden_failure_summary_safe: str | None = None
+    syntax_error_summary: str | None = None
+    hidden_source_included: bool | None = None

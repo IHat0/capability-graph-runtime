@@ -4,7 +4,7 @@ import re
 
 from .coding_patch import CodingPatch
 from .coding_task import CodingTask
-from .python_test_runner import PythonTestRunner
+from .python_test_runner import PythonTestRunner, safe_hidden_failure_summary
 
 
 def verify_patch(
@@ -13,11 +13,26 @@ def verify_patch(
     """Run task tests when available, otherwise report no verification contract."""
     if not task.test_files or not task.test_commands:
         return None
-    return PythonTestRunner().run(
+    visible = PythonTestRunner().run(
         patch.files,
         task.test_files,
         task.test_commands,
     )
+    if not visible[0] or not task.hidden_test_files or not task.hidden_test_commands:
+        return visible
+    hidden = PythonTestRunner().run(
+        patch.files,
+        task.hidden_test_files,
+        task.hidden_test_commands,
+    )
+    if hidden[0]:
+        return True, [*visible[1], *hidden[1]]
+    safe_summary = safe_hidden_failure_summary(hidden[1])
+    return False, [
+        *visible[1],
+        "Hidden scoring also failed. Safe hidden failure summary:\n"
+        f"{safe_summary}\nHidden source included: false",
+    ]
 
 
 def select_patch(
@@ -46,12 +61,14 @@ def extract_forbidden_patterns_from_failed_code(
     failure_summary: str,
     test_assertion_checklist: list[str] | None = None,
     test_io_examples: list[str] | None = None,
+    task_contract_checklist: list[str] | None = None,
 ) -> list[str]:
     """Derive generic implementation warnings from code and verifier evidence."""
     code = "\n".join(files.values())
     summary = failure_summary.lower()
     checklist = "\n".join(test_assertion_checklist or []).lower()
     examples = test_io_examples or []
+    contract = "\n".join(task_contract_checklist or []).lower()
     hints: list[str] = []
     if "{**" in code and "expected" in summary and "got" in summary:
         hints.append(
@@ -95,6 +112,21 @@ def extract_forbidden_patterns_from_failed_code(
         )
     if truthy_values and falsy_values:
         hints.append("Do not stop at true/false only.")
+    if "positive integer" in contract:
+        hints.append("Check isinstance(size, int) as well as positivity.")
+    if "raise typeerror" in contract and "raise ValueError" in code:
+        hints.append("The required exception type is TypeError, not ValueError.")
+    if (
+        ("cannot be interpreted as an integer" in summary or "range(" in code)
+        and "integer" in contract
+    ):
+        hints.append("Validate integer type before using range.")
+    if ".lower()" in code and "bool" in contract:
+        hints.append("Handle bool inputs before string normalization.")
+    if "strip" in contract and ".lower()" in code and ".strip()" not in code:
+        hints.append("Normalize strings with strip().lower(), not lower() alone.")
+    if any(error in summary for error in ("syntaxerror", "indentationerror", "taberror", "nameerror")):
+        hints.append("Do not preserve the malformed indentation or typo.")
     return hints
 
 

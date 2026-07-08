@@ -15,6 +15,8 @@ from cgr.kernel.coding import (
     check_example_literal_coverage,
     classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
+    extract_syntax_error_summary,
+    extract_task_contract_checklist,
     extract_test_assertion_checklist,
     extract_test_io_examples,
     infer_failed_test_io_examples,
@@ -104,6 +106,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
     def execute(self, request: ExecutionRequest[Any]) -> ExecutionResult[dict[str, Any]]:
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
+        task_contract_checklist = extract_task_contract_checklist(task.issue)
         test_io_examples = extract_test_io_examples(task.test_files)
         truthy_examples, falsy_examples = classify_boolean_string_examples(
             test_io_examples
@@ -149,6 +152,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 test_io_examples=test_io_examples,
                 truthy_examples=truthy_examples,
                 falsy_examples=falsy_examples,
+                task_contract_checklist=task_contract_checklist,
                 final_selection_reason=(
                     "Initial multi-model candidate passed verification."
                 ),
@@ -174,6 +178,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     draft_summary,
                     test_assertion_checklist,
                     test_io_examples,
+                    task_contract_checklist,
                 )
             )
             critique_prompt = build_repair_plan_prompt(
@@ -328,6 +333,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     failure_summary,
                     test_assertion_checklist,
                     test_io_examples,
+                    task_contract_checklist,
                 ):
                     if hint not in forbidden_hints:
                         forbidden_hints.append(hint)
@@ -416,6 +422,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             single_fallback_score,
             monotonic_guard_applied,
             final_selection_reason,
+            task_contract_checklist,
         )
         return ExecutionResult(
             context=request.context,
@@ -502,6 +509,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         single_fallback_score: float | None = None,
         monotonic_guard_applied: bool = False,
         final_selection_reason: str = "No final selection was made.",
+        task_contract_checklist: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -567,6 +575,24 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 for candidate_id, _, passed in candidates
             },
             "final_selection_reason": final_selection_reason,
+            "task_contract_checklist": task_contract_checklist or [],
+            "visible_failure_summary": summarize_python_test_failure(
+                [
+                    message
+                    for message in verifier_messages
+                    if not message.startswith("Hidden scoring also failed.")
+                ]
+            ),
+            "hidden_failure_summary_safe": "\n".join(
+                message
+                for message in verifier_messages
+                if message.startswith("Hidden scoring also failed.")
+            )[:2000]
+            or None,
+            "syntax_error_summary": extract_syntax_error_summary(
+                verifier_messages
+            ),
+            "hidden_source_included": False,
         }
 
     @staticmethod
