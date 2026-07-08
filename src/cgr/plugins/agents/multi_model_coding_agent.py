@@ -38,10 +38,14 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         draft_capability_id: str = "model.code",
         critique_capability_id: str = "model.reason",
         plugin_id: str = "agent.multi_model_coding",
+        max_repair_attempts: int = 2,
     ) -> None:
+        if max_repair_attempts < 1:
+            raise ValueError("max_repair_attempts must be positive.")
         self._runtime = runtime
         self._draft_capability_id = draft_capability_id
         self._critique_capability_id = critique_capability_id
+        self._max_repair_attempts = max_repair_attempts
         self._state = PluginState.DISCOVERED
         tags = ["agent", "coding", "multi-model", "patch"]
         self._metadata = PluginMetadata(
@@ -112,44 +116,70 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             self._critique_capability_id, critique_prompt
         )
         critique = self._model_text(critique_result.output)
-        if draft_verification is not None:
-            repair_prompt = build_repair_prompt(
-                task,
-                draft_patch.files,
-                draft_verification[1],
-                critique,
-            )
-        else:
+        total_duration = (
+            draft_result.duration_ms
+            + draft_format_duration
+            + critique_result.duration_ms
+        )
+        if draft_verification is None:
             repair_prompt = build_patch_prompt(
                 task,
                 f"Draft patch:\n{draft}\nCritique:\n{critique}\nRepair the draft.",
             )
-        repair_result = self._execute_model(self._draft_capability_id, repair_prompt)
-        repaired_patch, repair_format_duration = self._normalize_with_retry(
-            self._model_text(repair_result.output), task
-        )
-        repaired_verification = verify_patch(task, repaired_patch)
-        patch = (
-            select_patch(
-                draft_patch,
-                bool(draft_verification and draft_verification[0]),
-                repaired_patch,
-                bool(repaired_verification and repaired_verification[0]),
+            repair_result = self._execute_model(
+                self._draft_capability_id, repair_prompt
             )
-            if draft_verification is not None
-            else repaired_patch
-        )
+            patch, format_duration = self._normalize_with_retry(
+                self._model_text(repair_result.output), task
+            )
+            total_duration += repair_result.duration_ms + format_duration
+        else:
+            patch = draft_patch
+            patch_passed = draft_verification[0]
+            current_patch = draft_patch
+            current_messages = draft_verification[1]
+            for attempt in range(1, self._max_repair_attempts + 1):
+                repair_prompt = build_repair_prompt(
+                    task,
+                    draft_patch.files,
+                    current_messages,
+                    critique,
+                    previous_repair_files=(
+                        current_patch.files if attempt > 1 else None
+                    ),
+                    stronger_retry=attempt > 1,
+                )
+                repair_result = self._execute_model(
+                    self._draft_capability_id, repair_prompt
+                )
+                repaired_patch, format_duration = self._normalize_with_retry(
+                    self._model_text(repair_result.output), task
+                )
+                total_duration += repair_result.duration_ms + format_duration
+                repaired_verification = verify_patch(task, repaired_patch)
+                repaired_passed = bool(
+                    repaired_verification and repaired_verification[0]
+                )
+                patch = select_patch(
+                    patch,
+                    patch_passed,
+                    repaired_patch,
+                    repaired_passed,
+                )
+                patch_passed = patch_passed or repaired_passed
+                if repaired_passed:
+                    break
+                current_patch = repaired_patch
+                current_messages = (
+                    repaired_verification[1]
+                    if repaired_verification is not None
+                    else current_messages
+                )
         return ExecutionResult(
             context=request.context,
             status=ExecutionStatus.SUCCESS,
             output=patch.model_dump(),
-            duration_ms=(
-                draft_result.duration_ms
-                + draft_format_duration
-                + critique_result.duration_ms
-                + repair_result.duration_ms
-                + repair_format_duration
-            ),
+            duration_ms=total_duration,
         )
 
     def _execute_model(self, capability_id: str, prompt: str) -> ExecutionResult[Any]:

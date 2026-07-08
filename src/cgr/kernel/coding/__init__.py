@@ -14,7 +14,7 @@ from .coding_prompt import (
 from .coding_task import CodingTask
 from .json_patch_parser import JsonPatchParser
 from .patch_verification import select_patch, verify_patch
-from .python_test_runner import PythonTestRunner
+from .python_test_runner import PythonTestRunner, summarize_python_test_failure
 
 __all__ = [
     "CodeTestCase",
@@ -29,4 +29,5 @@ __all__ = [
     "build_repair_prompt",
     "select_patch",
     "verify_patch",
+    "summarize_python_test_failure",
 ]

@@ -225,6 +225,11 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
     """Run the hard executable coding suite against explicit real providers."""
     parser = argparse.ArgumentParser(description="Run the hard coding A/B suite.")
     parser.add_argument("--max-tasks", type=int, help="Run only the first N tasks.")
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Allow one additional multi-model semantic repair attempt.",
+    )
     args = parser.parse_args(argv)
     try:
         tasks = create_hard_coding_tasks()
@@ -232,7 +237,11 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
             if args.max_tasks <= 0:
                 raise ValueError("--max-tasks must be positive.")
             tasks = tasks[: args.max_tasks]
-        result = _run_real_coding_ab("hard_coding_ab", tasks)
+        result = _run_real_coding_ab(
+            "hard_coding_ab",
+            tasks,
+            multi_repair_attempts=3 if args.retry_failed else 2,
+        )
         print(json.dumps(result.model_dump(mode="json")))
         return 0
     except Exception as exc:
@@ -241,7 +250,9 @@ def coding_ab_hard_main(argv: list[str] | None = None) -> int:
 
 
 def _run_real_coding_ab(
-    suite_name: str, tasks: list[SWETask]
+    suite_name: str,
+    tasks: list[SWETask],
+    multi_repair_attempts: int = 2,
 ) -> SWEEvalResult:
     draft_config = OpenAICompatibleChatConfig.from_env("CGR_DRAFT")
     critic_config = OpenAICompatibleChatConfig.from_env("CGR_CRITIC")
@@ -259,7 +270,9 @@ def _run_real_coding_ab(
     runtime.register_plugin(draft)
     runtime.register_plugin(critic)
     single = SingleModelCodingAgentPlugin(runtime)
-    multi = MultiModelCodingAgentPlugin(runtime)
+    multi = MultiModelCodingAgentPlugin(
+        runtime, max_repair_attempts=multi_repair_attempts
+    )
     runtime.register_plugin(single)
     runtime.register_plugin(multi)
     return SWEABRunner(runtime).run_suite(

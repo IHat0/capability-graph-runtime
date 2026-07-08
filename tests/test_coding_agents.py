@@ -234,7 +234,9 @@ class FeedbackRepairClient:
         messages: list[dict[str, str]],
     ) -> dict[str, Any]:
         self.prompts.append(messages[-1]["content"])
-        files = self._responses[min(len(self.prompts) - 1, 1)]
+        files = self._responses[
+            min(len(self.prompts) - 1, len(self._responses) - 1)
+        ]
         return {
             "choices": [
                 {
@@ -297,3 +299,63 @@ def test_passing_original_is_not_replaced_by_failing_repair() -> None:
 
     assert select_patch(original, True, repair, False) is original
     assert select_patch(original, False, repair, True) is repair
+
+
+def test_multi_agent_second_semantic_repair_fixes_merge_counts() -> None:
+    task = next(
+        task
+        for task in create_hard_coding_tasks()
+        if task.id == "hard.merge_counts"
+    )
+    overwrite = {
+        "counter_utils.py": (
+            "def merge_counts(a, b):\n    return {**a, **b}\n"
+        )
+    }
+    draft_client = FeedbackRepairClient(overwrite, overwrite)
+    draft_client._responses.append(task.expected_files)
+    critic_client = SequencedClient(critique=True)
+    runtime = KernelRuntime()
+    config = OpenAICompatibleChatConfig(
+        api_key="local", model="semantic", base_url="http://localhost"
+    )
+    draft = OpenAICompatibleChatPlugin(
+        config=config,
+        client=draft_client,
+        capability_id="model.code",
+        plugin_id="semantic.draft",
+    )
+    critic = OpenAICompatibleChatPlugin(
+        config=config,
+        client=critic_client,
+        capability_id="model.reason",
+        plugin_id="semantic.critic",
+    )
+    runtime.register_plugin(draft)
+    runtime.register_plugin(critic)
+    agent = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(agent)
+
+    result = runtime.execute(
+        agent.metadata.id,
+        ExecutionRequest(
+            capability=agent.metadata.capabilities[0],
+            context=ExecutionContext(),
+            payload={
+                "issue": task.issue,
+                "files": task.files,
+                "test_files": task.test_files,
+                "test_commands": task.test_commands,
+            },
+        ),
+    )
+
+    assert result.output["files"] == task.expected_files
+    assert len(draft_client.prompts) == 3
+    first_repair = draft_client.prompts[1]
+    second_repair = draft_client.prompts[2]
+    assert "assert result == {'x': 3, 'y': 3}" in first_repair
+    assert "AssertionError" in first_repair
+    assert "tests below are the source of truth" in first_repair
+    assert "Your previous repair still failed" in second_repair
+    assert "Previous repair files" in second_repair

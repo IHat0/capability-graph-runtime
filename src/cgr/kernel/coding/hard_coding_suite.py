@@ -100,8 +100,13 @@ def create_hard_coding_tasks() -> list[SWETask]:
             (
                 "from counter_utils import merge_counts\n"
                 "a = {'x': 1}\nb = {'x': 2, 'y': 3}\n"
-                "assert merge_counts(a, b) == {'x': 3, 'y': 3}\n"
+                "result = merge_counts(a, b)\n"
+                "assert result == {'x': 3, 'y': 3}\n"
                 "assert a == {'x': 1}\nassert b == {'x': 2, 'y': 3}\n"
+                "assert merge_counts({}, {'a': 4}) == {'a': 4}\n"
+                "assert merge_counts({'a': 4}, {}) == {'a': 4}\n"
+                "assert merge_counts({'a': 1, 'b': 2}, "
+                "{'b': 5, 'c': 7}) == {'a': 1, 'b': 7, 'c': 7}\n"
             ),
         ),
         _task(

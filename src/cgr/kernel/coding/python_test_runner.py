@@ -37,12 +37,14 @@ class PythonTestRunner:
                     )
                 except subprocess.TimeoutExpired as exc:
                     messages.append(
-                        f"{test_case.name}: timed out after {timeout_seconds:.2f}s."
+                        f"{test_case.name}: command {test_case.command!r}; timed out "
+                        f"after {timeout_seconds:.2f}s."
                     )
                     messages.extend(self._output_messages(exc.stdout, exc.stderr))
                     return False, messages
                 messages.append(
-                    f"{test_case.name}: exit code {completed.returncode} "
+                    f"{test_case.name}: command {test_case.command!r}; "
+                    f"exit code {completed.returncode} "
                     f"(expected {test_case.expected_exit_code})."
                 )
                 messages.extend(
@@ -66,9 +68,31 @@ class PythonTestRunner:
         stdout: str | bytes | None, stderr: str | bytes | None
     ) -> list[str]:
         messages: list[str] = []
-        for label, output in (("stdout", stdout), ("stderr", stderr)):
+        for label, output, limit in (
+            ("stdout", stdout, 2000),
+            ("stderr", stderr, 4000),
+        ):
             if not output:
                 continue
             text = output.decode(errors="replace") if isinstance(output, bytes) else output
-            messages.append(f"{label}: {text.strip()[-2000:]}")
+            messages.append(f"{label}: {text.strip()[-limit:]}")
         return messages
+
+
+def summarize_python_test_failure(messages: list[str]) -> str:
+    """Extract assertion and traceback signals plus the final diagnostic lines."""
+    lines = [line.strip() for message in messages for line in message.splitlines()]
+    non_empty = [line for line in lines if line]
+    markers = (
+        "AssertionError",
+        "assert ",
+        "E       ",
+        "Traceback",
+        "Expected",
+        "expected",
+        "==",
+    )
+    selected = [line for line in non_empty if any(marker in line for marker in markers)]
+    selected.extend(non_empty[-20:])
+    deduplicated = list(dict.fromkeys(selected))
+    return "\n".join(deduplicated)

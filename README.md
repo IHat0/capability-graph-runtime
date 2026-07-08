@@ -176,7 +176,11 @@ and `CGR_CRITIC_*` provider configuration and is still not official SWE-bench.
 
 ```bash
 cgr-coding-ab-hard
+cgr-coding-ab-hard --max-tasks 4 --retry-failed
 ```
+
+`--retry-failed` allows one additional multi-model semantic repair attempt using
+the executable test source and failure diagnostics.
 
 ## CGR Booster Engine
 
