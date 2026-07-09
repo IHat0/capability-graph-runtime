@@ -1,5 +1,6 @@
 """Temporary-directory Python test execution for local MVP verification."""
 
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -26,7 +27,7 @@ class PythonTestRunner:
             syntax_messages = self._compile_generated_python(files)
             if syntax_messages:
                 return False, syntax_messages
-            self._write_files(root, test_files)
+            self._write_files(root, test_files, enhance_asserts=_can_show_test_source(test_files))
             for test_case in commands:
                 try:
                     completed = subprocess.run(
@@ -58,12 +59,16 @@ class PythonTestRunner:
         return True, messages
 
     @staticmethod
-    def _write_files(root: Path, files: dict[str, str]) -> None:
+    def _write_files(
+        root: Path, files: dict[str, str], enhance_asserts: bool = False
+    ) -> None:
         for relative_name, content in files.items():
             path = (root / relative_name).resolve()
             if not path.is_relative_to(root) or path == root:
                 raise ValueError(f"File path escapes test directory: {relative_name}")
             path.parent.mkdir(parents=True, exist_ok=True)
+            if enhance_asserts and relative_name.endswith(".py"):
+                content = _enhance_simple_equality_asserts(content)
             path.write_text(content, encoding="utf-8")
 
     @staticmethod
@@ -116,6 +121,9 @@ def summarize_python_test_failure(messages: list[str]) -> str:
         "not overwritten",
         "must not be mutated",
         "AssertionError",
+        "Expression:",
+        "Expected:",
+        "Got:",
         "assert ",
     )
     secondary_markers = (
@@ -153,6 +161,44 @@ def summarize_python_test_failure(messages: list[str]) -> str:
     selected.extend(non_empty[-20:])
     deduplicated = list(dict.fromkeys(selected))
     return "\n".join(deduplicated)
+
+
+def _enhance_simple_equality_asserts(source: str) -> str:
+    """Add expected/got messages to simple one-line equality assertions."""
+    transformed: list[str] = []
+    pattern = re.compile(
+        r"^(?P<indent>\s*)assert\s+(?P<left>.+?)\s*==\s*(?P<right>.+?)\s*$"
+    )
+    for line in source.splitlines():
+        match = pattern.match(line)
+        if (
+            match is None
+            or " and " in line
+            or re.search(r"==\s*[A-Za-z_]\w*\s*,", line)
+        ):
+            transformed.append(line)
+            continue
+        indent = match.group("indent")
+        left = match.group("left")
+        right = match.group("right")
+        transformed.extend(
+            [
+                f"{indent}__cgr_actual = {left}",
+                f"{indent}__cgr_expected = {right}",
+                (
+                    f"{indent}assert __cgr_actual == __cgr_expected, "
+                    "f\"Expression:\\n"
+                    f"{left}"
+                    "\\nExpected:\\n{__cgr_expected!r}\\nGot:\\n"
+                    "{__cgr_actual!r}\""
+                ),
+            ]
+        )
+    return "\n".join(transformed) + ("\n" if source.endswith("\n") else "")
+
+
+def _can_show_test_source(test_files: dict[str, str]) -> bool:
+    return not any("hidden" in filename.lower() for filename in test_files)
 
 
 def extract_syntax_error_summary(messages: list[str]) -> str | None:

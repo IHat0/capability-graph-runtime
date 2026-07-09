@@ -165,6 +165,7 @@ tests/test_plugin_lifecycle.py
 tests/test_plugin_loader.py
 tests/test_plugin_registry.py
 tests/test_python_test_runner.py
+tests/test_repo_v0_benchmark.py
 tests/test_router_components.py
 tests/test_runtime_errors.py
 tests/test_runtime_health.py

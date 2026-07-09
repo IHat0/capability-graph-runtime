@@ -1,5 +1,6 @@
 """Shared verification and deterministic selection for coding-agent patches."""
 
+import ast
 import re
 
 from .coding_patch import CodingPatch
@@ -106,6 +107,28 @@ def check_bool_before_string_normalization(
     return None
 
 
+def check_dict_list_contract_shape(
+    files: dict[str, str], task_contract_checklist: list[str]
+) -> str | None:
+    """Reject obvious scalar assignments when a dict-of-lists contract exists."""
+    contract = "\n".join(task_contract_checklist).casefold()
+    if not _contract_requires_dict_list_values(contract):
+        return None
+    for content in files.values():
+        for line in content.splitlines():
+            compact = line.strip()
+            if "setdefault" in compact or ".append(" in compact:
+                continue
+            if re.search(r"\[[^\]]+\]\s*=\s*\[[^\]]*\]", compact):
+                continue
+            if re.search(r"\w+\s*\[[^\]]+\]\s*=\s*[A-Za-z_]\w*\b", compact):
+                return (
+                    "Rejected candidate before tests; contract requires dictionary "
+                    "values to be lists for single and repeated keys."
+                )
+    return None
+
+
 def _first_match_position(pattern: str, text: str) -> int | None:
     match = re.search(pattern, text)
     return match.start() if match is not None else None
@@ -182,7 +205,83 @@ def extract_forbidden_patterns_from_failed_code(
         hints.append("Normalize strings with strip().lower(), not lower() alone.")
     if any(error in summary for error in ("syntaxerror", "indentationerror", "taberror", "nameerror")):
         hints.append("Do not preserve the malformed indentation or typo.")
+    if check_dict_list_contract_shape(files, task_contract_checklist or []) is not None:
+        hints.append(
+            "Expected dictionary values are lists. Store every value in a list, "
+            "even for keys that occur once."
+        )
+        hints.append(
+            "Do not store first occurrence as a scalar. Initialize "
+            "result[key] = [value]."
+        )
+    hints.extend(extract_structural_repair_hints(failure_summary))
     return hints
+
+
+def extract_structural_repair_hints(failure_summary: str) -> list[str]:
+    """Derive generic shape hints from expected/got assertion diagnostics."""
+    expected, got = _extract_expected_got_values(failure_summary)
+    if expected is None or got is None:
+        return []
+    hints: list[str] = []
+    if (
+        isinstance(expected, dict)
+        and isinstance(got, dict)
+        and expected
+        and all(isinstance(value, list) for value in expected.values())
+        and any(not isinstance(got.get(key), list) for key in expected)
+    ):
+        hints.append(
+            "Expected dictionary values are lists. Store every value in a list, "
+            "even for keys that occur once."
+        )
+        hints.append(
+            "Do not store first occurrence as a scalar. Initialize "
+            "result[key] = [value]."
+        )
+    if (
+        isinstance(expected, dict)
+        and any(isinstance(value, list) and len(value) > 1 for value in expected.values())
+    ):
+        hints.append("Repeated keys should append to the existing list.")
+    return hints
+
+
+def _extract_expected_got_values(text: str) -> tuple[object | None, object | None]:
+    block = re.search(
+        r"Expected:\s*\n(?P<expected>.+?)\s*\nGot:\s*\n(?P<got>.+?)(?:\n|$)",
+        text,
+        re.DOTALL,
+    )
+    if block is not None:
+        return _literal(block.group("expected")), _literal(block.group("got"))
+    inline = re.search(
+        r"expected\s+(?P<expected>\{.*?\}),\s+got\s+(?P<got>\{.*?\})",
+        text,
+        re.IGNORECASE,
+    )
+    if inline is not None:
+        return _literal(inline.group("expected")), _literal(inline.group("got"))
+    return None, None
+
+
+def _literal(value: str) -> object | None:
+    try:
+        return ast.literal_eval(value.strip())
+    except (SyntaxError, ValueError):
+        return None
+
+
+def _contract_requires_dict_list_values(contract: str) -> bool:
+    return (
+        ("dictionary" in contract or "dict" in contract or "key maps" in contract)
+        and (
+            "list of values" in contract
+            or "one-item lists" in contract
+            or "maps to a list" in contract
+            or "values are lists" in contract
+        )
+    )
 
 
 def _string_inputs_for_result(examples: list[str], result: str) -> list[str]:

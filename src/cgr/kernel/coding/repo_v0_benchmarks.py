@@ -114,8 +114,12 @@ def create_repo_v0_repo_tasks() -> list[RepoCodingTask]:
                 )
             },
             expected_behavior_summary=(
-                "Repeated keys accumulate lists; blanks and missing values are "
-                "preserved as empty strings; percent/plus decoding works."
+                "parse_query returns a dictionary; each key maps to a list of "
+                "values; repeated keys append values in order; single keys still "
+                "map to one-item lists; blank values are preserved as empty "
+                "strings; keys without equals become empty string values; empty "
+                "query returns empty dict; percent decoding is applied and plus "
+                "handling follows url_utils.decode."
             ),
             tags=["parsing", "multifile"],
         ),

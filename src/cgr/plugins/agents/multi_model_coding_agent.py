@@ -13,6 +13,7 @@ from cgr.kernel.coding import (
     build_repair_plan_prompt,
     build_repair_prompt,
     check_bool_before_string_normalization,
+    check_dict_list_contract_shape,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -127,9 +128,14 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         draft_bool_guard = check_bool_before_string_normalization(
             draft_patch.files, task_contract_checklist
         )
+        draft_shape_guard = check_dict_list_contract_shape(
+            draft_patch.files, task_contract_checklist
+        )
         draft_verification = (
             (False, [draft_bool_guard])
             if draft_bool_guard is not None
+            else (False, [draft_shape_guard])
+            if draft_shape_guard is not None
             else verify_patch(task, draft_patch)
         )
         candidates: list[tuple[str, CodingPatch, bool]] = [
@@ -158,7 +164,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         final_selection_reason = "Selected the best verified multi-model candidate."
         bool_guard_applied = draft_bool_guard is not None
         rejected_candidates_before_tests: list[str] = (
-            ["candidate_1"] if draft_bool_guard is not None else []
+            ["candidate_1"]
+            if draft_bool_guard is not None or draft_shape_guard is not None
+            else []
         )
         if draft_verification is not None and draft_verification[0]:
             final_verification = verify_patch(task, draft_patch)
@@ -306,6 +314,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repair_bool_guard = check_bool_before_string_normalization(
                     repaired_patch.files, task_contract_checklist
                 )
+                repair_shape_guard = check_dict_list_contract_shape(
+                    repaired_patch.files, task_contract_checklist
+                )
                 if repair_bool_guard is not None:
                     bool_guard_applied = True
                     rejected_candidates_before_tests.append(candidate_id)
@@ -317,6 +328,17 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     latest_failures[candidate_id] = repair_bool_guard
                     current_patch = repaired_patch
                     current_messages = [repair_bool_guard]
+                    continue
+                if repair_shape_guard is not None:
+                    rejected_candidates_before_tests.append(candidate_id)
+                    verifier_messages.append(repair_shape_guard)
+                    candidates.append((candidate_id, repaired_patch, False))
+                    known_failures.append(
+                        (candidate_id, repaired_patch.files, repair_shape_guard)
+                    )
+                    latest_failures[candidate_id] = repair_shape_guard
+                    current_patch = repaired_patch
+                    current_messages = [repair_shape_guard]
                     continue
                 coverage_missing = check_example_literal_coverage(
                     repaired_patch.files, test_io_examples
@@ -732,14 +754,32 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             marker in context
             for marker in ("merge", "counts", "overlapping", "summed", "dictionary", "mapping")
         )
+        parser_context = any(
+            marker in context for marker in ("parse", "normalize", "accepted value")
+        )
+        data_shape_context = any(
+            marker in context
+            for marker in (
+                "dict values",
+                "dictionary values",
+                "list of values",
+                "one-item lists",
+                "maps to a list",
+                "wrong nesting",
+            )
+        )
+        if attempt == 2 and data_shape_context:
+            return "data-shape contract repair", (
+                "Focus only on matching the data shape required by expected "
+                "outputs. If expected dictionary values are lists, initialize "
+                "and return lists consistently. Do not special-case only the "
+                "visible input; implement the general rule. "
+            )
         if attempt == 2 and merge_context:
             return "loop-based implementation", (
                 "Repair variant 2: use an explicit for-loop over the second input "
                 "when combining mappings. "
             )
-        parser_context = any(
-            marker in context for marker in ("parse", "normalize", "accepted value")
-        )
         if attempt >= 3 and (test_io_examples or truthy_examples or falsy_examples):
             parser_instruction = (
                 " Build explicit accepted-value sets from the examples."

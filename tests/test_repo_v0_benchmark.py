@@ -3,9 +3,14 @@ from typing import Any
 
 from cgr.apps.cli import main as cli
 from cgr.kernel.coding import (
+    CodeTestCase,
     CodingPatchNormalizationError,
     CodingPatchNormalizer,
     PythonTestRunner,
+    check_dict_list_contract_shape,
+    extract_forbidden_patterns_from_failed_code,
+    extract_structural_repair_hints,
+    extract_task_contract_checklist,
 )
 from cgr.kernel.coding.repo_v0_benchmarks import (
     RepoCodingTask,
@@ -48,6 +53,60 @@ def test_repo_v0_representation_converts_to_swe_task() -> None:
     assert "allowed file paths" in swe_task.issue
 
 
+def test_equality_assertion_summary_includes_expression_expected_and_got() -> None:
+    files = {
+        "src/query_parser.py": (
+            "def parse_query(query):\n"
+            "    return {'a': '', 'b': '2'}\n"
+        )
+    }
+    tests = {
+        "visible_tests.py": (
+            "from src.query_parser import parse_query\n"
+            "assert parse_query('a=&b=2') == {'a': [''], 'b': ['2']}\n"
+        )
+    }
+
+    passed, messages = PythonTestRunner().run(
+        files,
+        tests,
+        [CodeTestCase(name="visible", command=["python", "visible_tests.py"])],
+    )
+    text = "\n".join(messages)
+
+    assert passed is False
+    assert "Expression:" in text
+    assert "parse_query('a=&b=2')" in text
+    assert "Expected:" in text
+    assert "{'a': [''], 'b': ['2']}" in text
+    assert "Got:" in text
+    assert "{'a': '', 'b': '2'}" in text
+
+
+def test_dict_list_expected_got_mismatch_produces_structural_hint() -> None:
+    diagnostic = (
+        "Expression:\nparse_query('a=&b=2')\n"
+        "Expected:\n{'a': [''], 'b': ['2']}\n"
+        "Got:\n{'a': '', 'b': '2'}"
+    )
+
+    hints = extract_structural_repair_hints(diagnostic)
+
+    assert (
+        "Expected dictionary values are lists. Store every value in a list, "
+        "even for keys that occur once."
+    ) in hints
+    assert "Do not store first occurrence as a scalar. Initialize result[key] = [value]." in hints
+
+
+def test_repo_query_contract_checklist_mentions_one_item_lists() -> None:
+    task = create_repo_v0_tasks()[0]
+    checklist = extract_task_contract_checklist(task.issue)
+
+    assert any("each key maps to a list of values" in item for item in checklist)
+    assert any("single keys still map to one-item lists" in item for item in checklist)
+
+
 def test_disallowed_file_edits_are_rejected() -> None:
     task = create_repo_v0_tasks()[0]
 
@@ -60,6 +119,39 @@ def test_disallowed_file_edits_are_rejected() -> None:
         assert "unknown filename" in str(exc)
     else:
         raise AssertionError("disallowed edit should be rejected")
+
+
+def test_dict_list_contract_rejects_scalar_first_assignment() -> None:
+    task = create_repo_v0_tasks()[0]
+    checklist = extract_task_contract_checklist(task.issue)
+    bad = {
+        "src/query_parser.py": (
+            "def parse_query(query):\n"
+            "    result = {}\n"
+            "    result[key] = value\n"
+            "    return result\n"
+        )
+    }
+    good = {
+        "src/query_parser.py": (
+            "def parse_query(query):\n"
+            "    result = {}\n"
+            "    result[key] = [value]\n"
+            "    return result\n"
+        )
+    }
+
+    assert check_dict_list_contract_shape(bad, checklist) == (
+        "Rejected candidate before tests; contract requires dictionary values "
+        "to be lists for single and repeated keys."
+    )
+    assert check_dict_list_contract_shape(good, checklist) is None
+    hints = extract_forbidden_patterns_from_failed_code(
+        bad,
+        "Expression:\nx\nExpected:\n{'a': ['']}\nGot:\n{'a': ''}",
+        task_contract_checklist=checklist,
+    )
+    assert any("dictionary values are lists" in hint for hint in hints)
 
 
 def test_malformed_json_candidate_is_rejected() -> None:
@@ -175,6 +267,44 @@ def test_visible_failure_and_safe_hidden_summary_reach_repair_prompt() -> None:
     assert result.final_exact_repo_verification_passed is True
     assert result.allowed_files_to_edit == task.allowed_files_to_edit
     assert result.changed_files == sorted(task.expected_files)
+
+
+def test_repo_multi_uses_data_shape_repair_variant() -> None:
+    task = create_repo_v0_tasks()[0]
+    scalar_first = {
+        "src/query_parser.py": (
+            "from src.url_utils import decode\n\n"
+            "def parse_query(query):\n"
+            "    result = {}\n"
+            "    for part in query.split('&'):\n"
+            "        if not part:\n            continue\n"
+            "        key, _, value = part.partition('=')\n"
+            "        key = decode(key); value = decode(value)\n"
+            "        if key in result:\n"
+            "            if isinstance(result[key], list):\n"
+            "                result[key].append(value)\n"
+            "            else:\n"
+            "                result[key] = [result[key], value]\n"
+            "        else:\n"
+            "            result[key] = value\n"
+            "    return result\n"
+        )
+    }
+    client = _RepoRepairClient(scalar_first, task.expected_files)
+    client.responses = [scalar_first, scalar_first, task.expected_files]
+    runtime, _, multi = _runtime_with_repo_agents(client)
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_multi", multi.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.selected_candidate_id == "repair_2"
+    assert result.repair_variant_names is not None
+    assert "data-shape contract repair" in result.repair_variant_names
+    assert result.forbidden_pattern_hints is not None
+    assert any("dictionary values are lists" in hint for hint in result.forbidden_pattern_hints)
+    assert result.final_exact_repo_verification_passed is True
 
 
 def test_repo_multi_monotonic_fallback_works() -> None:

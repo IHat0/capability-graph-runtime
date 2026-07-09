@@ -11,6 +11,7 @@ from cgr.kernel.coding import (
     build_patch_prompt,
     build_repair_prompt,
     check_bool_before_string_normalization,
+    check_dict_list_contract_shape,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -110,9 +111,14 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         bool_guard = check_bool_before_string_normalization(
             patch.files, task_contract_checklist
         )
+        shape_guard = check_dict_list_contract_shape(
+            patch.files, task_contract_checklist
+        )
         verification = (
             (False, [bool_guard])
             if bool_guard is not None
+            else (False, [shape_guard])
+            if shape_guard is not None
             else verify_patch(task, patch)
         )
         duration_ms = model_result.duration_ms + format_duration
@@ -147,11 +153,17 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repair_bool_guard = check_bool_before_string_normalization(
                 repaired.files, task_contract_checklist
             )
+            repair_shape_guard = check_dict_list_contract_shape(
+                repaired.files, task_contract_checklist
+            )
             coverage_missing = check_example_literal_coverage(
                 repaired.files, test_io_examples
             )
             if repair_bool_guard is not None:
                 verifier_messages.append(repair_bool_guard)
+                repaired_passed = False
+            elif repair_shape_guard is not None:
+                verifier_messages.append(repair_shape_guard)
                 repaired_passed = False
             elif coverage_missing:
                 coverage_missing_by_candidate["repair_1"] = coverage_missing
