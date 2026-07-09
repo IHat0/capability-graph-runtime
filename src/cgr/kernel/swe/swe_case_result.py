@@ -71,3 +71,7 @@ class SWECaseResult(BaseModel):
     repo_test_command_summaries: list[str] | None = None
     final_exact_repo_verification_passed: bool | None = None
     final_exact_repo_verification_summary: str | None = None
+    baseline_fallback_used: bool | None = None
+    baseline_fallback_score: float | None = None
+    baseline_fallback_candidate_id: str | None = None
+    baseline_fallback_final_exact_repo_verification_passed: bool | None = None

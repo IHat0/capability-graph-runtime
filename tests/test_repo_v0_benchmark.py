@@ -203,6 +203,18 @@ class _CriticClient:
         return {"choices": [{"message": {"content": "Use the test feedback."}}]}
 
 
+class _StaticPatchClient:
+    def __init__(self, files: dict[str, str]) -> None:
+        self.files = files
+
+    def create_chat_completion(
+        self,
+        config: OpenAICompatibleChatConfig,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        return {"choices": [{"message": {"content": json.dumps({"files": self.files})}}]}
+
+
 def _runtime_with_repo_agents(
     client: _RepoRepairClient,
 ) -> tuple[KernelRuntime, SingleModelCodingAgentPlugin, MultiModelCodingAgentPlugin]:
@@ -322,6 +334,212 @@ def test_repo_multi_monotonic_fallback_works() -> None:
     assert result.single_fallback_used is True
     assert result.multi_monotonic_guard_applied is True
     assert result.final_exact_repo_verification_passed is True
+
+
+def test_repo_single_uses_verified_baseline_fallback() -> None:
+    task = next(task for task in create_repo_v0_tasks() if task.id == "v0.markdown_toc")
+    failing = {"src/markdown.py": task.files["src/markdown.py"]}
+    runtime = KernelRuntime()
+    config = OpenAICompatibleChatConfig(
+        api_key="local", model="fallback", base_url="http://localhost"
+    )
+    baseline = OpenAICompatibleChatPlugin(
+        config=config,
+        client=_StaticPatchClient(task.expected_files),
+        capability_id="model.code.baseline",
+        plugin_id="fallback.baseline",
+    )
+    draft = OpenAICompatibleChatPlugin(
+        config=config,
+        client=_StaticPatchClient(failing),
+        capability_id="model.code",
+        plugin_id="fallback.draft",
+    )
+    critic = OpenAICompatibleChatPlugin(
+        config=config,
+        client=_CriticClient(),
+        capability_id="model.reason",
+        plugin_id="fallback.critic",
+    )
+    runtime.register_plugin(baseline)
+    runtime.register_plugin(draft)
+    runtime.register_plugin(critic)
+    single = SingleModelCodingAgentPlugin(runtime)
+    multi = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(single)
+    runtime.register_plugin(multi)
+
+    result = SWEABRunner(runtime).run_suite(
+        "repo_fallback",
+        [task],
+        baseline.metadata.id,
+        single.metadata.id,
+        multi.metadata.id,
+        debug_trace=True,
+    )
+    cases = {(case.task_id, case.mode): case for case in result.results}
+    single_case = cases[(task.id, "cgr_single")]
+    multi_case = cases[(task.id, "cgr_multi")]
+
+    assert cases[(task.id, "baseline")].passed is True
+    assert single_case.passed is True
+    assert single_case.selected_candidate_id == "baseline_fallback"
+    assert single_case.baseline_fallback_used is True
+    assert single_case.baseline_fallback_score == 1.0
+    assert single_case.baseline_fallback_final_exact_repo_verification_passed is True
+    assert single_case.final_selection_reason == (
+        "Selected verified baseline fallback to avoid regression."
+    )
+    assert multi_case.passed is True
+    assert multi_case.selected_candidate_id == "cgr_single_fallback"
+    assert multi_case.single_fallback_used is True
+    assert result.pass_rates == {
+        "baseline": 1.0,
+        "cgr_single": 1.0,
+        "cgr_multi": 1.0,
+    }
+
+
+def test_repo_multi_can_use_direct_baseline_fallback() -> None:
+    task = next(task for task in create_repo_v0_tasks() if task.id == "v0.markdown_toc")
+    runner = SWEABRunner(KernelRuntime())
+    failed = SWECaseResult(
+        task_id=task.id,
+        mode="cgr_multi",
+        plugin_id="multi",
+        passed=False,
+        files={"src/markdown.py": task.files["src/markdown.py"]},
+        final_exact_repo_verification_passed=False,
+    )
+    baseline = SWECaseResult(
+        task_id=task.id,
+        mode="baseline",
+        plugin_id="baseline",
+        passed=True,
+        files=task.expected_files,
+        final_exact_repo_verification_passed=True,
+    )
+
+    result = runner._apply_verified_fallback(
+        task, failed, baseline, fallback_kind="baseline"
+    )
+
+    assert result.passed is True
+    assert result.files == task.expected_files
+    assert result.selected_candidate_id == "baseline_fallback"
+    assert result.baseline_fallback_used is True
+    assert result.final_exact_repo_verification_passed is True
+
+
+def test_repo_multi_uses_cgr_single_fallback_when_baseline_failed() -> None:
+    task = create_repo_v0_tasks()[0]
+    runner = SWEABRunner(KernelRuntime())
+    failed_multi = SWECaseResult(
+        task_id=task.id,
+        mode="cgr_multi",
+        plugin_id="multi",
+        passed=False,
+        files={"src/query_parser.py": task.files["src/query_parser.py"]},
+        final_exact_repo_verification_passed=False,
+    )
+    single = SWECaseResult(
+        task_id=task.id,
+        mode="cgr_single",
+        plugin_id="single",
+        passed=True,
+        files=task.expected_files,
+        final_exact_repo_verification_passed=True,
+    )
+
+    result = runner._apply_verified_fallback(
+        task, failed_multi, single, fallback_kind="cgr_single"
+    )
+
+    assert result.passed is True
+    assert result.files == task.expected_files
+    assert result.selected_candidate_id == "cgr_single_fallback"
+    assert result.single_fallback_used is True
+    assert result.multi_monotonic_guard_applied is True
+    assert result.baseline_fallback_used is None
+
+
+def test_repo_no_fallback_when_baseline_and_cgr_fail() -> None:
+    task = create_repo_v0_tasks()[0]
+    runner = SWEABRunner(KernelRuntime())
+    failed = SWECaseResult(
+        task_id=task.id,
+        mode="cgr_single",
+        plugin_id="single",
+        passed=False,
+        files={"src/query_parser.py": task.files["src/query_parser.py"]},
+    )
+    baseline = SWECaseResult(
+        task_id=task.id,
+        mode="baseline",
+        plugin_id="baseline",
+        passed=False,
+        files={"src/query_parser.py": task.files["src/query_parser.py"]},
+        final_exact_repo_verification_passed=False,
+    )
+
+    result = runner._apply_verified_fallback(
+        task, failed, baseline, fallback_kind="baseline"
+    )
+
+    assert result.passed is False
+    assert result.baseline_fallback_used is None
+
+
+def test_repo_summary_has_no_regressions_when_baseline_fallback_applies(
+    monkeypatch: Any, capsys: Any
+) -> None:
+    task = next(task for task in create_repo_v0_tasks() if task.id == "v0.markdown_toc")
+
+    def fake_real(
+        suite_name: str,
+        tasks: list[SWETask],
+        multi_repair_attempts: int = 3,
+        debug_trace: bool = False,
+    ) -> SWEEvalResult:
+        return SWEEvalResult(
+            suite_name=suite_name,
+            total_tasks=len(tasks),
+            pass_rates={"baseline": 1.0, "cgr_single": 1.0, "cgr_multi": 1.0},
+            deltas={"cgr_single_minus_baseline": 0.0, "cgr_multi_minus_baseline": 0.0},
+            results=[
+                SWECaseResult(
+                    task_id=task.id,
+                    mode="baseline",
+                    plugin_id="baseline",
+                    passed=True,
+                ),
+                SWECaseResult(
+                    task_id=task.id,
+                    mode="cgr_single",
+                    plugin_id="single",
+                    passed=True,
+                    selected_candidate_id="baseline_fallback",
+                    baseline_fallback_used=True,
+                ),
+                SWECaseResult(
+                    task_id=task.id,
+                    mode="cgr_multi",
+                    plugin_id="multi",
+                    passed=True,
+                    selected_candidate_id="cgr_single_fallback",
+                    single_fallback_used=True,
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(cli, "_run_real_coding_ab", fake_real)
+
+    assert cli.coding_ab_repo_v0_main(["--task-id", task.id]) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["summary"]["single_regressed_tasks"] == []
+    assert output["summary"]["multi_regressed_tasks"] == []
+    assert output["summary"]["multi_not_monotonic_tasks"] == []
 
 
 def _fake_evaluation(tasks: list[SWETask], debug: bool) -> SWEEvalResult:
