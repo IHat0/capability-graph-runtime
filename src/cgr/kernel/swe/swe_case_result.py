@@ -82,3 +82,4 @@ class SWECaseResult(BaseModel):
     placeholder_filename_remapped: bool | None = None
     placeholder_filename_original: str | None = None
     placeholder_filename_target: str | None = None
+    router_param_rejection_hints: list[str] | None = None

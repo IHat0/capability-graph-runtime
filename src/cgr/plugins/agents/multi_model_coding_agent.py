@@ -16,6 +16,7 @@ from cgr.kernel.coding import (
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
+    check_router_param_literal_matching,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -142,6 +143,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         draft_none_guard = check_none_overwrite_config_merge(
             draft_patch.files, task_contract_checklist
         )
+        draft_router_guard = check_router_param_literal_matching(
+            draft_patch.files, task_contract_checklist
+        )
         draft_verification = (
             (False, [draft_bool_guard])
             if draft_bool_guard is not None
@@ -149,6 +153,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             if draft_shape_guard is not None
             else (False, [draft_none_guard])
             if draft_none_guard is not None
+            else (False, [draft_router_guard])
+            if draft_router_guard is not None
             else verify_patch(task, draft_patch)
         )
         candidates: list[tuple[str, CodingPatch, bool]] = [
@@ -167,6 +173,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         expected_got_hints: list[str] = []
         literal_format_hints: list[str] = []
         repo_semantic_repair_variants: list[str] = []
+        router_param_rejection_hints: list[str] = (
+            [draft_router_guard] if draft_router_guard is not None else []
+        )
         repeated_rejections = 0
         repair_plan = ""
         latest_failures: dict[str, str] = {}
@@ -185,6 +194,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 draft_bool_guard is not None
                 or draft_shape_guard is not None
                 or draft_none_guard is not None
+                or draft_router_guard is not None
             )
             else []
         )
@@ -319,6 +329,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     "stateful clock simulation repair",
                     "full-initial token bucket repair",
                     "path-parameter router repair",
+                    "deterministic segment router implementation",
                     "data-shape contract repair",
                     "literal duplicate suffix implementation",
                 }:
@@ -371,6 +382,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repair_none_guard = check_none_overwrite_config_merge(
                     repaired_patch.files, task_contract_checklist
                 )
+                repair_router_guard = check_router_param_literal_matching(
+                    repaired_patch.files, task_contract_checklist
+                )
                 repair_suffix_guard = check_duplicate_suffix_format(
                     repaired_patch.files, literal_format_hints
                 )
@@ -407,6 +421,18 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     latest_failures[candidate_id] = repair_none_guard
                     current_patch = repaired_patch
                     current_messages = [repair_none_guard]
+                    continue
+                if repair_router_guard is not None:
+                    rejected_candidates_before_tests.append(candidate_id)
+                    router_param_rejection_hints.append(repair_router_guard)
+                    verifier_messages.append(repair_router_guard)
+                    candidates.append((candidate_id, repaired_patch, False))
+                    known_failures.append(
+                        (candidate_id, repaired_patch.files, repair_router_guard)
+                    )
+                    latest_failures[candidate_id] = repair_router_guard
+                    current_patch = repaired_patch
+                    current_messages = [repair_router_guard]
                     continue
                 if repair_suffix_guard is not None:
                     rejected_candidates_before_tests.append(candidate_id)
@@ -608,6 +634,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             expected_got_hints,
             repo_semantic_repair_variants,
             literal_format_hints,
+            router_param_rejection_hints,
         )
         return ExecutionResult(
             context=request.context,
@@ -705,6 +732,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         expected_got_hints: list[str] | None = None,
         repo_semantic_repair_variants: list[str] | None = None,
         literal_format_hints: list[str] | None = None,
+        router_param_rejection_hints: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -822,6 +850,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "repo_contract_hints": repo_contract_hints or [],
             "expected_got_hints": expected_got_hints or [],
             "literal_format_hints": literal_format_hints or [],
+            "router_param_rejection_hints": router_param_rejection_hints or [],
             **_placeholder_trace_fields(
                 next(
                     candidate
@@ -938,9 +967,33 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             )
         if attempt == 2 and router_context:
             return "path-parameter router repair", (
-                "Do not use regex fullmatch directly on ':id'. Implement "
-                "segment-by-segment matching. If pattern segment starts with ':', "
-                "capture the path segment under that name. "
+                "Do not use re.fullmatch for :param matching. Do not treat ':id' "
+                "literally. Implement segment-by-segment matching. Use this exact "
+                "algorithm:\n"
+                "1. Normalize both pattern and path.\n"
+                "2. Split both into non-empty slash-separated segments.\n"
+                "3. If segment counts differ, no match.\n"
+                "4. For each pair:\n"
+                "   - if pattern segment starts with ':', capture "
+                "params[pattern_segment[1:]] = path_segment\n"
+                "   - else pattern segment must equal path segment\n"
+                "5. If all segments match, return handler, params.\n"
+                "6. Try static routes before parameterized routes.\n"
+                "Do not use regex fullmatch directly on ':id'. "
+            )
+        if attempt >= 3 and router_context:
+            return "deterministic segment router implementation", (
+                "Repair variant: deterministic segment router implementation. "
+                "Add a small helper def _match_pattern(pattern, path): or an "
+                "equivalent helper. Avoid regex entirely unless you explicitly "
+                "convert param segments. Normalize both pattern and path, split "
+                "into non-empty slash-separated segments, reject unequal lengths, "
+                "capture segments whose pattern segment starts with ':' into a "
+                "params dict, require static segments to be equal, and return "
+                "handler, params when all segments match. Try routes without ':' "
+                "before routes with ':', so static routes outrank param routes. "
+                "Do not use re.fullmatch for :param matching. Do not treat ':id' "
+                "literally. Implement segment-by-segment matching. "
             )
         if attempt == 2 and data_shape_context:
             return "data-shape contract repair", (

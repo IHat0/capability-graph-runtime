@@ -12,6 +12,7 @@ from cgr.kernel.coding import (
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
+    check_router_param_literal_matching,
     extract_forbidden_patterns_from_failed_code,
     extract_literal_format_hints,
     extract_repo_contract_repair_hints,
@@ -254,6 +255,77 @@ def test_router_contract_produces_path_param_segment_hints() -> None:
     assert "Static routes outrank param routes." in hints
 
 
+def test_router_regex_literal_candidate_is_rejected_for_path_params() -> None:
+    bad = {
+        "src/router.py": (
+            "import re\n"
+            "from src.matching import normalize\n\n"
+            "def match_route(routes, path):\n"
+            "    path = normalize(path)\n"
+            "    for pattern, handler in routes:\n"
+            "        if re.fullmatch(normalize(pattern), path):\n"
+            "            return handler, {}\n"
+            "    return None\n"
+        )
+    }
+
+    assert check_router_param_literal_matching(
+        bad, ["Path params are captured and static routes outrank parameter routes"]
+    ) == (
+        "Rejected candidate before tests; ':param' routes cannot be matched as "
+        "literal regex strings. Use segment-by-segment matching and capture params."
+    )
+
+
+def test_router_empty_param_candidate_is_rejected_for_path_params() -> None:
+    bad = {
+        "src/router.py": (
+            "from src.matching import normalize\n\n"
+            "def match_route(routes, path):\n"
+            "    path = normalize(path)\n"
+            "    for pattern, handler in routes:\n"
+            "        if normalize(pattern) == path:\n"
+            "            return handler, {}\n"
+            "    return None\n"
+        )
+    }
+
+    assert check_router_param_literal_matching(
+        bad, ["Path params are captured and static routes outrank parameter routes"]
+    ) == (
+        "Rejected candidate before tests; ':param' routes cannot be matched as "
+        "literal regex strings. Use segment-by-segment matching and capture params."
+    )
+
+
+def test_router_filename_placeholder_remaps_to_allowed_router_path() -> None:
+    task = next(task for task in create_repo_v0_tasks() if task.id == "v0.router_path_params")
+
+    patch = CodingPatchNormalizer().normalize(
+        json.dumps(
+            {
+                "files": {
+                    "filename.py": (
+                        "from src.matching import normalize\n\n"
+                        "def match_route(routes, path):\n"
+                        "    return None\n"
+                    )
+                }
+            }
+        ),
+        set(task.allowed_files_to_edit),
+    )
+
+    assert patch.files == {
+        "src/router.py": (
+            "from src.matching import normalize\n\n"
+            "def match_route(routes, path):\n"
+            "    return None\n"
+        )
+    }
+    assert patch.placeholder_filename_remapped is True
+
+
 def test_cart_contract_produces_discount_amount_subtraction_hint() -> None:
     hints = extract_repo_contract_repair_hints(
         ["Compute subtotal, apply discount before tax, avoid mutating input"]
@@ -379,6 +451,17 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     assert bucket_variant == "full-initial token bucket repair"
     assert router_variant_name == "path-parameter router repair"
     assert "segment-by-segment matching" in router_variant_prompt
+    assert "Do not use re.fullmatch for :param matching." in router_variant_prompt
+    assert "1. Normalize both pattern and path." in router_variant_prompt
+    assert "6. Try static routes before parameterized routes." in router_variant_prompt
+    deterministic_router_name, deterministic_router_prompt = (
+        MultiModelCodingAgentPlugin._variant_instruction(
+            _coding_task_from_swe(tasks["v0.router_path_params"]), 3, [], [], []
+        )
+    )
+    assert deterministic_router_name == "deterministic segment router implementation"
+    assert "def _match_pattern(pattern, path)" in deterministic_router_prompt
+    assert "static routes outrank param routes" in deterministic_router_prompt
     assert literal_variant_name == "literal duplicate suffix implementation"
     assert "Do not mutate the base slug inside the loop." in literal_variant_prompt
 
@@ -588,6 +671,48 @@ def test_repo_multi_uses_data_shape_repair_variant() -> None:
     assert result.forbidden_pattern_hints is not None
     assert any("dictionary values are lists" in hint for hint in result.forbidden_pattern_hints)
     assert result.final_exact_repo_verification_passed is True
+
+
+def test_repo_single_accepts_segment_router_candidate() -> None:
+    task = next(task for task in create_repo_v0_tasks() if task.id == "v0.router_path_params")
+    segment_router = {
+        "src/router.py": (
+            "from src.matching import normalize\n\n"
+            "def _parts(value):\n"
+            "    return [part for part in normalize(value).split('/') if part]\n\n"
+            "def _match_pattern(pattern, path):\n"
+            "    pattern_parts = _parts(pattern)\n"
+            "    path_parts = _parts(path)\n"
+            "    if len(pattern_parts) != len(path_parts):\n"
+            "        return None\n"
+            "    params = {}\n"
+            "    for pattern_segment, path_segment in zip(pattern_parts, path_parts):\n"
+            "        if pattern_segment.startswith(':'):\n"
+            "            params[pattern_segment[1:]] = path_segment\n"
+            "        elif pattern_segment != path_segment:\n"
+            "            return None\n"
+            "    return params\n\n"
+            "def match_route(routes, path):\n"
+            "    ordered = sorted(routes, key=lambda route: ':' in route[0])\n"
+            "    for pattern, handler in ordered:\n"
+            "        params = _match_pattern(pattern, path)\n"
+            "        if params is not None:\n"
+            "            return handler, params\n"
+            "    return None\n"
+        )
+    }
+    runtime, single, _ = _runtime_with_repo_agents(
+        _RepoRepairClient(segment_router, segment_router)
+    )
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_single", single.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.hidden_source_included is False
+    assert result.final_exact_repo_verification_passed is True
+    assert result.router_param_rejection_hints == []
 
 
 def test_repo_multi_locks_literal_duplicate_suffix_format() -> None:

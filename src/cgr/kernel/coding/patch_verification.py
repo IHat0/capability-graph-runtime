@@ -173,6 +173,29 @@ def check_none_overwrite_config_merge(
     return None
 
 
+ROUTER_PARAM_LITERAL_REJECTION = (
+    "Rejected candidate before tests; ':param' routes cannot be matched as "
+    "literal regex strings. Use segment-by-segment matching and capture params."
+)
+
+
+def check_router_param_literal_matching(
+    files: dict[str, str], task_contract_checklist: list[str]
+) -> str | None:
+    """Reject path-param routers that treat ':id' as a literal regex segment."""
+    contract = "\n".join(task_contract_checklist).casefold()
+    if not _router_path_param_context(contract):
+        return None
+    for content in files.values():
+        if _router_uses_segment_matching(content) or _router_compiles_param_regex(
+            content
+        ):
+            continue
+        if _uses_literal_re_fullmatch(content) or _returns_empty_params_only(content):
+            return ROUTER_PARAM_LITERAL_REJECTION
+    return None
+
+
 def _first_match_position(pattern: str, text: str) -> int | None:
     match = re.search(pattern, text)
     return match.start() if match is not None else None
@@ -276,6 +299,8 @@ def extract_forbidden_patterns_from_failed_code(
         and "consume" in contract
     ):
         hints.append("Initialize tokens to capacity unless contract says empty.")
+    if check_router_param_literal_matching(files, task_contract_checklist or []) is not None:
+        hints.append(ROUTER_PARAM_LITERAL_REJECTION)
     hints.extend(extract_structural_repair_hints(failure_summary))
     hints.extend(extract_literal_format_hints(failure_summary))
     hints.extend(extract_repo_contract_repair_hints(task_contract_checklist or []))
@@ -582,6 +607,33 @@ def _router_path_param_context(contract: str) -> bool:
         ("path params" in contract or "path parameters" in contract or ":id" in contract)
         and ("route" in contract or "router" in contract)
     )
+
+
+def _uses_literal_re_fullmatch(content: str) -> bool:
+    return bool(
+        re.search(
+            r"re\.fullmatch\s*\(\s*(?:normalize\s*\(\s*pattern\s*\)|pattern)\s*,\s*path\s*\)",
+            content,
+        )
+    )
+
+
+def _router_uses_segment_matching(content: str) -> bool:
+    return bool(
+        re.search(r"\.split\s*\(\s*['\"]/['\"]\s*\)", content)
+        and re.search(r"\.startswith\s*\(\s*['\"]:", content)
+    )
+
+
+def _router_compiles_param_regex(content: str) -> bool:
+    return "?P<" in content or bool(
+        re.search(r"re\.sub\s*\([^)]*:", content, re.DOTALL)
+        and re.search(r"re\.fullmatch\s*\(", content)
+    )
+
+
+def _returns_empty_params_only(content: str) -> bool:
+    return "return handler, {}" in content and "params" not in content
 
 
 def _unique(values: list[str]) -> list[str]:

@@ -14,6 +14,7 @@ from cgr.kernel.coding import (
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
+    check_router_param_literal_matching,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -125,6 +126,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         none_guard = check_none_overwrite_config_merge(
             patch.files, task_contract_checklist
         )
+        router_guard = check_router_param_literal_matching(
+            patch.files, task_contract_checklist
+        )
         verification = (
             (False, [bool_guard])
             if bool_guard is not None
@@ -132,6 +136,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             if shape_guard is not None
             else (False, [none_guard])
             if none_guard is not None
+            else (False, [router_guard])
+            if router_guard is not None
             else verify_patch(task, patch)
         )
         duration_ms = model_result.duration_ms + format_duration
@@ -144,6 +150,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         forbidden_hints: list[str] = []
         expected_got_hints: list[str] = []
         literal_format_hints: list[str] = []
+        router_param_rejection_hints: list[str] = (
+            [router_guard] if router_guard is not None else []
+        )
         if verification is not None and not verification[0]:
             failure_summary = summarize_python_test_failure(verification[1])
             expected_got_hints = extract_structural_repair_hints(failure_summary)
@@ -176,6 +185,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repair_none_guard = check_none_overwrite_config_merge(
                 repaired.files, task_contract_checklist
             )
+            repair_router_guard = check_router_param_literal_matching(
+                repaired.files, task_contract_checklist
+            )
             repair_suffix_guard = check_duplicate_suffix_format(
                 repaired.files, literal_format_hints
             )
@@ -190,6 +202,10 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repaired_passed = False
             elif repair_none_guard is not None:
                 verifier_messages.append(repair_none_guard)
+                repaired_passed = False
+            elif repair_router_guard is not None:
+                router_param_rejection_hints.append(repair_router_guard)
+                verifier_messages.append(repair_router_guard)
                 repaired_passed = False
             elif repair_suffix_guard is not None:
                 verifier_messages.append(repair_suffix_guard)
@@ -262,6 +278,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repo_contract_hints,
             expected_got_hints,
             literal_format_hints,
+            router_param_rejection_hints,
         )
         output.update(_placeholder_trace_fields(patch))
         return ExecutionResult(
@@ -328,6 +345,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repo_contract_hints: list[str],
         expected_got_hints: list[str],
         literal_format_hints: list[str],
+        router_param_rejection_hints: list[str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -433,6 +451,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "repo_contract_hints": repo_contract_hints,
             "expected_got_hints": expected_got_hints,
             "literal_format_hints": literal_format_hints,
+            "router_param_rejection_hints": router_param_rejection_hints,
             **_placeholder_trace_fields(
                 next(
                     candidate

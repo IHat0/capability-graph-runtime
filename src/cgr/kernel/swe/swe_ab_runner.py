@@ -378,6 +378,9 @@ class SWEABRunner:
             "repo_contract_hints": trace.get("repo_contract_hints"),
             "expected_got_hints": trace.get("expected_got_hints"),
             "literal_format_hints": trace.get("literal_format_hints"),
+            "router_param_rejection_hints": trace.get(
+                "router_param_rejection_hints"
+            ),
             "placeholder_filename_remapped": trace.get(
                 "placeholder_filename_remapped"
             ),
