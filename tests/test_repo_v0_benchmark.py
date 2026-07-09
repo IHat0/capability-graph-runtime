@@ -298,6 +298,69 @@ def test_router_empty_param_candidate_is_rejected_for_path_params() -> None:
     )
 
 
+def test_router_static_tuple_helper_candidate_is_rejected() -> None:
+    bad = {
+        "src/router.py": (
+            "from src.matching import normalize\n\n"
+            "def _match_pattern(pattern, path):\n"
+            "    pattern_segments = pattern.split('/')\n"
+            "    path_segments = path.split('/')\n"
+            "    params = {}\n"
+            "    for p_segment, p_path in zip(pattern_segments, path_segments):\n"
+            "        if p_segment.startswith(':'):\n"
+            "            params[p_segment[1:]] = p_path\n"
+            "    return 'static', params\n\n"
+            "def match_route(routes, path):\n"
+            "    path = normalize(path)\n"
+            "    for pattern, handler in routes:\n"
+            "        result = _match_pattern(pattern, path)\n"
+            "        if result:\n"
+            "            return handler, result[1]\n"
+            "    return None\n"
+        )
+    }
+
+    assert check_router_param_literal_matching(
+        bad, ["Path params are captured and static routes outrank parameter routes"]
+    ) == (
+        "Rejected candidate before tests; router matcher should return params dict "
+        "or None, and match_route must accept empty params dict."
+    )
+
+
+def test_router_truthy_helper_result_candidate_is_rejected() -> None:
+    bad = {
+        "src/router.py": (
+            "from src.matching import normalize\n\n"
+            "def _match_pattern(pattern, path):\n"
+            "    pattern_parts = [p for p in normalize(pattern).split('/') if p]\n"
+            "    path_parts = [p for p in normalize(path).split('/') if p]\n"
+            "    if len(pattern_parts) != len(path_parts):\n"
+            "        return None\n"
+            "    params = {}\n"
+            "    for pattern_part, path_part in zip(pattern_parts, path_parts):\n"
+            "        if pattern_part.startswith(':'):\n"
+            "            params[pattern_part[1:]] = path_part\n"
+            "        elif pattern_part != path_part:\n"
+            "            return None\n"
+            "    return params\n\n"
+            "def match_route(routes, path):\n"
+            "    for pattern, handler in routes:\n"
+            "        result = _match_pattern(pattern, path)\n"
+            "        if result:\n"
+            "            return handler, result\n"
+            "    return None\n"
+        )
+    }
+
+    assert check_router_param_literal_matching(
+        bad, ["Path params are captured and static routes outrank parameter routes"]
+    ) == (
+        "Rejected candidate before tests; router matcher should return params dict "
+        "or None, and match_route must accept empty params dict."
+    )
+
+
 def test_router_filename_placeholder_remaps_to_allowed_router_path() -> None:
     task = next(task for task in create_repo_v0_tasks() if task.id == "v0.router_path_params")
 
@@ -353,6 +416,35 @@ def test_token_bucket_first_consume_failure_produces_starts_full_hint() -> None:
     )
 
     assert "Initialize tokens to capacity unless contract says empty." in hints
+
+
+def test_router_hidden_failure_produces_hidden_safe_priority_hints() -> None:
+    hints = extract_forbidden_patterns_from_failed_code(
+        {
+            "src/router.py": (
+                "from src.matching import normalize\n\n"
+                "def _match_pattern(pattern, path):\n"
+                "    return {}\n\n"
+                "def match_route(routes, path):\n"
+                "    for pattern, handler in routes:\n"
+                "        params = _match_pattern(pattern, path)\n"
+                "        if params is not None:\n"
+                "            return handler, params\n"
+                "    return None\n"
+            )
+        },
+        "visible: exit code 0\nHidden scoring also failed. Safe hidden failure summary:\nHidden test command failed.",
+        task_contract_checklist=[
+            "Path params are captured, trailing slash is normalized, static routes outrank parameter routes"
+        ],
+    )
+
+    assert (
+        "Visible passed but hidden failed; check static route priority and trailing "
+        "slash normalization."
+    ) in hints
+    assert "Empty params dict for static routes must be treated as a valid match." in hints
+    assert "Try static routes before param routes." in hints
 
 
 def test_repo_query_contract_checklist_mentions_one_item_lists() -> None:
@@ -454,6 +546,7 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     assert "Do not use re.fullmatch for :param matching." in router_variant_prompt
     assert "1. Normalize both pattern and path." in router_variant_prompt
     assert "6. Try static routes before parameterized routes." in router_variant_prompt
+    assert "params is not None" in router_variant_prompt
     deterministic_router_name, deterministic_router_prompt = (
         MultiModelCodingAgentPlugin._variant_instruction(
             _coding_task_from_swe(tasks["v0.router_path_params"]), 3, [], [], []
@@ -462,6 +555,8 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     assert deterministic_router_name == "deterministic segment router implementation"
     assert "def _match_pattern(pattern, path)" in deterministic_router_prompt
     assert "static routes outrank param routes" in deterministic_router_prompt
+    assert "static_routes + param_routes" in deterministic_router_prompt
+    assert "params is not None" in deterministic_router_prompt
     assert literal_variant_name == "literal duplicate suffix implementation"
     assert "Do not mutate the base slug inside the loop." in literal_variant_prompt
 

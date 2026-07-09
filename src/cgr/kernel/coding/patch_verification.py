@@ -177,6 +177,16 @@ ROUTER_PARAM_LITERAL_REJECTION = (
     "Rejected candidate before tests; ':param' routes cannot be matched as "
     "literal regex strings. Use segment-by-segment matching and capture params."
 )
+ROUTER_PARAM_HELPER_REJECTION = (
+    "Rejected candidate before tests; router matcher should return params dict "
+    "or None, and match_route must accept empty params dict."
+)
+ROUTER_HIDDEN_SAFE_HINTS = [
+    "Visible passed but hidden failed; check static route priority and trailing "
+    "slash normalization.",
+    "Empty params dict for static routes must be treated as a valid match.",
+    "Try static routes before param routes.",
+]
 
 
 def check_router_param_literal_matching(
@@ -187,6 +197,10 @@ def check_router_param_literal_matching(
     if not _router_path_param_context(contract):
         return None
     for content in files.values():
+        if _router_helper_return_shape_bug(content) or _router_truthy_match_check(
+            content
+        ):
+            return ROUTER_PARAM_HELPER_REJECTION
         if _router_uses_segment_matching(content) or _router_compiles_param_regex(
             content
         ):
@@ -300,7 +314,14 @@ def extract_forbidden_patterns_from_failed_code(
     ):
         hints.append("Initialize tokens to capacity unless contract says empty.")
     if check_router_param_literal_matching(files, task_contract_checklist or []) is not None:
-        hints.append(ROUTER_PARAM_LITERAL_REJECTION)
+        hints.append(
+            check_router_param_literal_matching(
+                files, task_contract_checklist or []
+            )
+            or ROUTER_PARAM_LITERAL_REJECTION
+        )
+    if _router_path_param_context(contract) and "hidden scoring also failed" in summary:
+        hints.extend(ROUTER_HIDDEN_SAFE_HINTS)
     hints.extend(extract_structural_repair_hints(failure_summary))
     hints.extend(extract_literal_format_hints(failure_summary))
     hints.extend(extract_repo_contract_repair_hints(task_contract_checklist or []))
@@ -634,6 +655,19 @@ def _router_compiles_param_regex(content: str) -> bool:
 
 def _returns_empty_params_only(content: str) -> bool:
     return "return handler, {}" in content and "params" not in content
+
+
+def _router_helper_return_shape_bug(content: str) -> bool:
+    return bool(re.search(r"return\s+['\"]static['\"]\s*,\s*params\b", content))
+
+
+def _router_truthy_match_check(content: str) -> bool:
+    return bool(
+        re.search(
+            r"(?P<name>[A-Za-z_]\w*)\s*=\s*_match_pattern\s*\([^\n]*\)\s*\n\s*if\s+(?P=name)\s*:",
+            content,
+        )
+    )
 
 
 def _unique(values: list[str]) -> list[str]:
