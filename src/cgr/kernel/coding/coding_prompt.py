@@ -18,6 +18,7 @@ from .test_io_examples import (
 def build_patch_prompt(task: CodingTask, extra_instruction: str = "") -> str:
     """Build a strict full-file JSON patch prompt."""
     files = json.dumps(task.files, indent=2)
+    allowed_files = task.allowed_files_to_edit or list(task.files)
     extra = f"\n{extra_instruction}\n" if extra_instruction else "\n"
     return (
         "Return only valid JSON. No markdown. No explanation outside JSON. "
@@ -27,6 +28,7 @@ def build_patch_prompt(task: CodingTask, extra_instruction: str = "") -> str:
         "Preserve the requested function signatures and return types. Make the "
         "smallest change needed to pass tests. Every changed file value must "
         "contain the complete replacement file.\n"
+        f"Allowed files to edit: {json.dumps(allowed_files)}\n"
         f"Issue:\n{task.issue}\nOriginal files:\n{files}{extra}"
         "Return only valid JSON in the required files shape. No markdown or "
         "explanation outside JSON. Preserve existing filenames unless asked."
@@ -108,6 +110,7 @@ def build_repair_prompt(
         else ""
     )
     known_section = ""
+    allowed_files = task.allowed_files_to_edit or list(task.files)
     if known_failures:
         entries = []
         for index, (candidate_id, files, summary) in enumerate(known_failures, 1):
@@ -157,6 +160,7 @@ def build_repair_prompt(
         "diagnostic says it overwrote or lost expected values. "
         f"{merge_warning}{variant_instruction}\n"
         f"{known_section}{hints_section}\n"
+        f"Allowed files to edit:\n{json.dumps(allowed_files, indent=2)}\n"
         f"Test files (source of truth):\n{json.dumps(task.test_files, indent=2)}\n"
         f"Current generated files:\n{json.dumps(generated_files, indent=2)}"
         f"{previous_section}\nOriginal task:\n{task.issue}\nOriginal files:\n"

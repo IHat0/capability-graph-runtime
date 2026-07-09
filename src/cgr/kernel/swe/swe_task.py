@@ -14,6 +14,7 @@ class SWETask(BaseModel):
     issue: str = Field(min_length=1)
     files: dict[str, str] = Field(min_length=1)
     expected_files: dict[str, str] = Field(min_length=1)
+    allowed_files_to_edit: list[str] = Field(default_factory=list)
     test_files: dict[str, str] = Field(default_factory=dict)
     test_commands: list[CodeTestCase] = Field(default_factory=list)
     visible_test_files: dict[str, str] = Field(default_factory=dict)

@@ -18,10 +18,11 @@ _PREFERRED_MODES: tuple[SWEMode, ...] = (
 
 
 class CodingV1Runner:
-    """Aggregate existing SWE A/B evaluations into a stable v1 report."""
+    """Aggregate existing SWE A/B evaluations into a stable benchmark report."""
 
-    def __init__(self, evaluator: V1Evaluator) -> None:
+    def __init__(self, evaluator: V1Evaluator, suite_name: str = "coding_v1") -> None:
         self._evaluator = evaluator
+        self._suite_name = suite_name
 
     def run(
         self,
@@ -53,7 +54,7 @@ class CodingV1Runner:
         per_task = self._per_task(evaluations, tasks)
         first = evaluations[0] if evaluations else self._empty_result()
         return {
-            "suite_name": "coding_v1",
+            "suite_name": self._suite_name,
             "total_tasks": len(tasks),
             "pass_rates": means,
             "deltas": {

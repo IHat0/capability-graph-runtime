@@ -189,6 +189,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     if final_verification is not None
                     else "No executable verification contract was provided."
                 ),
+                allowed_files_to_edit=task.allowed_files_to_edit,
             )
             return ExecutionResult(
                 context=request.context,
@@ -494,6 +495,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             rejected_candidates_before_tests,
             final_exact_passed,
             final_exact_summary,
+            task.allowed_files_to_edit,
         )
         return ExecutionResult(
             context=request.context,
@@ -545,7 +547,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         self, text: str, task: CodingTask
     ) -> tuple[CodingPatch, float]:
         normalizer = CodingPatchNormalizer()
-        allowed_filenames = set(task.files)
+        allowed_filenames = set(task.allowed_files_to_edit or task.files)
         try:
             return normalizer.normalize(text, allowed_filenames), 0.0
         except CodingPatchNormalizationError:
@@ -586,6 +588,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         rejected_candidates_before_tests: list[str] | None = None,
         final_exact_passed: bool | None = None,
         final_exact_summary: str = "",
+        allowed_files_to_edit: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -676,6 +679,29 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             ),
             "final_exact_verification_passed": final_exact_passed,
             "final_exact_verification_summary": final_exact_summary,
+            "allowed_files_to_edit": allowed_files_to_edit or [],
+            "changed_files": sorted(
+                {
+                    filename
+                    for _, candidate, _ in candidates
+                    for filename in candidate.files
+                }
+            ),
+            "disallowed_file_edits": sorted(
+                {
+                    filename
+                    for _, candidate, _ in candidates
+                    for filename in candidate.files
+                    if allowed_files_to_edit and filename not in allowed_files_to_edit
+                }
+            ),
+            "repo_test_command_summaries": [
+                message
+                for message in verifier_messages
+                if "exit code" in message
+            ][-10:],
+            "final_exact_repo_verification_passed": final_exact_passed,
+            "final_exact_repo_verification_summary": final_exact_summary,
         }
 
     @staticmethod

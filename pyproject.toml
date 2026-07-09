@@ -19,6 +19,7 @@ cgr-coding-ab-local = "cgr.apps.cli.main:coding_ab_local_main"
 cgr-coding-ab-real = "cgr.apps.cli.main:coding_ab_real_main"
 cgr-coding-ab-hard = "cgr.apps.cli.main:coding_ab_hard_main"
 cgr-coding-ab-v1 = "cgr.apps.cli.main:coding_ab_v1_main"
+cgr-coding-ab-repo-v0 = "cgr.apps.cli.main:coding_ab_repo_v0_main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]

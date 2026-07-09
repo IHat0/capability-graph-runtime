@@ -65,3 +65,9 @@ class SWECaseResult(BaseModel):
     rejected_candidates_before_tests: list[str] | None = None
     final_exact_verification_passed: bool | None = None
     final_exact_verification_summary: str | None = None
+    allowed_files_to_edit: list[str] | None = None
+    changed_files: list[str] | None = None
+    disallowed_file_edits: list[str] | None = None
+    repo_test_command_summaries: list[str] | None = None
+    final_exact_repo_verification_passed: bool | None = None
+    final_exact_repo_verification_summary: str | None = None

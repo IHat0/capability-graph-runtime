@@ -40,6 +40,7 @@ src/cgr/kernel/coding/hard_coding_suite.py
 src/cgr/kernel/coding/json_patch_parser.py
 src/cgr/kernel/coding/patch_verification.py
 src/cgr/kernel/coding/python_test_runner.py
+src/cgr/kernel/coding/repo_v0_benchmarks.py
 src/cgr/kernel/coding/task_contract.py
 src/cgr/kernel/coding/test_assertion_checklist.py
 src/cgr/kernel/coding/test_io_examples.py

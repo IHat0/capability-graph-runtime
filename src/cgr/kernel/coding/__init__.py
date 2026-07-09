@@ -15,6 +15,7 @@ from .coding_prompt import (
 from .coding_task import CodingTask
 from .json_patch_parser import JsonPatchParser
 from .patch_verification import (
+    apply_patch_to_task_files,
     check_bool_before_string_normalization,
     extract_forbidden_patterns_from_failed_code,
     patch_fingerprint,
@@ -50,6 +51,7 @@ __all__ = [
     "build_repair_prompt",
     "build_repair_plan_prompt",
     "select_patch",
+    "apply_patch_to_task_files",
     "check_bool_before_string_normalization",
     "extract_forbidden_patterns_from_failed_code",
     "extract_test_assertion_checklist",

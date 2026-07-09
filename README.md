@@ -204,6 +204,25 @@ cgr-coding-ab-v1 > benchmark-results/coding-v1.json
 `--reference-check` runs the bundled reference implementations against both
 visible and hidden tests locally without model credentials or provider calls.
 
+## Repo-style Coding Benchmark v0
+
+`cgr-coding-ab-repo-v0` bridges Coding v1 and SWE-bench-style evaluation. It
+runs small realistic multi-file Python repository tasks with visible tests,
+hidden tests, allowed editable files, and final exact-file verification.
+Unlike Coding v1's isolated function tasks, repo-v0 asks the model to inspect a
+mini repo and return JSON replacement files for only the allowed paths.
+
+```bash
+cgr-coding-ab-repo-v0 --reference-check
+cgr-coding-ab-repo-v0 --max-tasks 3
+cgr-coding-ab-repo-v0 --task-id v0.query_parser_repeated_keys --debug-trace
+cgr-coding-ab-repo-v0 --runs 2 --max-tasks 3
+```
+
+The command uses the same `CGR_DRAFT_*` and `CGR_CRITIC_*` provider
+configuration as the hard and v1 coding benchmarks. Hidden test source is not
+shown to repair prompts; only safe failure summaries are used.
+
 ## CGR Booster Engine
 
 CGR's main product goal is to improve an LLM by wrapping it in orchestration

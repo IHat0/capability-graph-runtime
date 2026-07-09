@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from cgr.kernel.coding import (
+    apply_patch_to_task_files,
     CodingPatch,
     CodingPatchNormalizationError,
     CodingPatchNormalizer,
@@ -92,6 +93,21 @@ class SWEABRunner:
                 ).strip()
             trace_fields["final_exact_verification_passed"] = passed
             trace_fields["final_exact_verification_summary"] = final_summary
+            if task.allowed_files_to_edit:
+                trace_fields["allowed_files_to_edit"] = task.allowed_files_to_edit
+                trace_fields["changed_files"] = sorted(patch.files)
+                trace_fields["disallowed_file_edits"] = sorted(
+                    set(patch.files) - set(task.allowed_files_to_edit)
+                )
+                trace_fields["repo_test_command_summaries"] = [
+                    message
+                    for message in final_messages
+                    if "exit code" in message
+                ]
+                trace_fields["final_exact_repo_verification_passed"] = passed
+                trace_fields["final_exact_repo_verification_summary"] = (
+                    final_summary
+                )
             return SWECaseResult(
                 task_id=task.id,
                 mode=mode,
@@ -115,7 +131,11 @@ class SWEABRunner:
 
     def _run_baseline(self, task: SWETask, plugin_id: str) -> CodingPatch:
         plugin = self._runtime.registry.get(plugin_id)
-        coding_task = CodingTask(issue=task.issue, files=task.files)
+        coding_task = CodingTask(
+            issue=task.issue,
+            files=task.files,
+            allowed_files_to_edit=task.allowed_files_to_edit,
+        )
         result = self._runtime.execute(
             plugin_id,
             ExecutionRequest[ModelRequest](
@@ -136,7 +156,9 @@ class SWEABRunner:
         text = self._model_text(result.output)
         normalizer = CodingPatchNormalizer()
         try:
-            return normalizer.normalize(text, set(task.files))
+            return normalizer.normalize(
+                text, set(task.allowed_files_to_edit or task.files)
+            )
         except CodingPatchNormalizationError:
             retry = self._runtime.execute(
                 plugin_id,
@@ -158,7 +180,8 @@ class SWEABRunner:
                     retry.error or "Baseline format retry execution failed."
                 )
             return normalizer.normalize(
-                self._model_text(retry.output), set(task.files)
+                self._model_text(retry.output),
+                set(task.allowed_files_to_edit or task.files),
             )
 
     @staticmethod
@@ -166,8 +189,16 @@ class SWEABRunner:
         task: SWETask, patch: CodingPatch
     ) -> tuple[bool, list[str]]:
         if task.scoring_test_files and task.scoring_test_commands:
+            files = apply_patch_to_task_files(
+                CodingTask(
+                    issue=task.issue,
+                    files=task.files,
+                    allowed_files_to_edit=task.allowed_files_to_edit,
+                ),
+                patch,
+            )
             passed, messages = PythonTestRunner().run(
-                patch.files,
+                files,
                 task.scoring_test_files,
                 task.scoring_test_commands,
             )
@@ -197,6 +228,7 @@ class SWEABRunner:
                 payload={
                     "issue": task.issue,
                     "files": task.files,
+                    "allowed_files_to_edit": task.allowed_files_to_edit,
                     "test_files": task.prompt_test_files,
                     "test_commands": task.prompt_test_commands,
                     "hidden_test_files": task.hidden_test_files,
@@ -285,6 +317,18 @@ class SWEABRunner:
             ),
             "final_exact_verification_summary": trace.get(
                 "final_exact_verification_summary"
+            ),
+            "allowed_files_to_edit": trace.get("allowed_files_to_edit"),
+            "changed_files": trace.get("changed_files"),
+            "disallowed_file_edits": trace.get("disallowed_file_edits"),
+            "repo_test_command_summaries": trace.get(
+                "repo_test_command_summaries"
+            ),
+            "final_exact_repo_verification_passed": trace.get(
+                "final_exact_repo_verification_passed"
+            ),
+            "final_exact_repo_verification_summary": trace.get(
+                "final_exact_repo_verification_summary"
             ),
         }
 

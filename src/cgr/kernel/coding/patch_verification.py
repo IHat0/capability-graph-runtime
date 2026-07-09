@@ -13,15 +13,16 @@ def verify_patch(
     """Run task tests when available, otherwise report no verification contract."""
     if not task.test_files or not task.test_commands:
         return None
+    files = apply_patch_to_task_files(task, patch)
     visible = PythonTestRunner().run(
-        patch.files,
+        files,
         task.test_files,
         task.test_commands,
     )
     if not visible[0] or not task.hidden_test_files or not task.hidden_test_commands:
         return visible
     hidden = PythonTestRunner().run(
-        patch.files,
+        files,
         task.hidden_test_files,
         task.hidden_test_commands,
     )
@@ -45,6 +46,13 @@ def select_patch(
     if original_passed != repaired_passed:
         return original if original_passed else repaired
     return min((original, repaired), key=_patch_size)
+
+
+def apply_patch_to_task_files(
+    task: CodingTask, patch: CodingPatch
+) -> dict[str, str]:
+    """Overlay generated replacement files onto the original task repo files."""
+    return {**task.files, **patch.files}
 
 
 def _patch_size(patch: CodingPatch) -> tuple[int, int]:

@@ -217,6 +217,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             bool_guard is not None,
             final_exact_passed,
             final_exact_summary,
+            task.allowed_files_to_edit,
         )
         return ExecutionResult(
             context=request.context,
@@ -249,7 +250,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         self, text: str, task: CodingTask
     ) -> tuple[CodingPatch, float]:
         normalizer = CodingPatchNormalizer()
-        allowed_filenames = set(task.files)
+        allowed_filenames = set(task.allowed_files_to_edit or task.files)
         try:
             return normalizer.normalize(text, allowed_filenames), 0.0
         except CodingPatchNormalizationError:
@@ -278,6 +279,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         bool_guard_applied: bool,
         final_exact_passed: bool | None,
         final_exact_summary: str,
+        allowed_files_to_edit: list[str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -356,6 +358,29 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             ],
             "final_exact_verification_passed": final_exact_passed,
             "final_exact_verification_summary": final_exact_summary,
+            "allowed_files_to_edit": allowed_files_to_edit,
+            "changed_files": sorted(
+                {
+                    filename
+                    for _, candidate, _ in candidates
+                    for filename in candidate.files
+                }
+            ),
+            "disallowed_file_edits": sorted(
+                {
+                    filename
+                    for _, candidate, _ in candidates
+                    for filename in candidate.files
+                    if allowed_files_to_edit and filename not in allowed_files_to_edit
+                }
+            ),
+            "repo_test_command_summaries": [
+                message
+                for message in verifier_messages
+                if "exit code" in message
+            ][-10:],
+            "final_exact_repo_verification_passed": final_exact_passed,
+            "final_exact_repo_verification_summary": final_exact_summary,
         }
 
     @staticmethod
