@@ -354,7 +354,8 @@ def create_repo_v0_repo_tasks() -> list[RepoCodingTask]:
                     "from src.config import resolve_config\n"
                     "result = resolve_config({'db': {'host':'localhost','port':1}}, "
                     "{'db': {'port':2}}, {'db': {'user':'u'}}, {'db': {'host': None}})\n"
-                    "assert result == {'db': {'host':'localhost','port':2,'user':'u'}}\n"
+                    "expected = {'db': {'host':'localhost','port':2,'user':'u'}}\n"
+                    "assert result == expected, f'hidden config precedence: expected {expected!r}, got {result!r}'\n"
                 )
             },
             test_commands=[["python", "visible_tests.py"], ["python", "hidden_tests.py"]],
@@ -527,7 +528,8 @@ def create_repo_v0_repo_tasks() -> list[RepoCodingTask]:
             hidden_test_files={
                 "hidden_tests.py": (
                     "from src.cart import total\n"
-                    "assert total([{'price':.1,'qty':3}], tax_rate=.1) == .33\n"
+                    "actual = total([{'price':.1,'qty':3}], tax_rate=.1)\n"
+                    "assert actual == .33, f'hidden cart rounding: expected {0.33!r}, got {actual!r}'\n"
                 )
             },
             test_commands=[["python", "visible_tests.py"], ["python", "hidden_tests.py"]],
@@ -583,8 +585,11 @@ def create_repo_v0_repo_tasks() -> list[RepoCodingTask]:
                     "from src.token_bucket import TokenBucket\n"
                     "time=[0]\n"
                     "b=TokenBucket(2, 10, clock=lambda: time[0])\n"
-                    "time[0]=10; assert b.consume(2) is True\n"
-                    "assert b.consume(1) is False\n"
+                    "time[0]=10\n"
+                    "actual_first = b.consume(2)\n"
+                    "assert actual_first is True, f'hidden token bucket first consume: expected True, got {actual_first!r}'\n"
+                    "actual_second = b.consume(1)\n"
+                    "assert actual_second is False, f'hidden token bucket capacity cap: expected False, got {actual_second!r}'\n"
                 )
             },
             test_commands=[["python", "visible_tests.py"], ["python", "hidden_tests.py"]],
@@ -646,7 +651,9 @@ def create_repo_v0_repo_tasks() -> list[RepoCodingTask]:
                 "hidden_tests.py": (
                     "from src.markdown import toc\n"
                     "doc='```\\n# Not Heading\\n```\\n# Hello, World!\\n# Hello World'\n"
-                    "assert toc(doc) == [('Hello, World!','hello-world'),('Hello World','hello-world-1')]\n"
+                    "actual = toc(doc)\n"
+                    "expected = [('Hello, World!','hello-world'),('Hello World','hello-world-1')]\n"
+                    "assert actual == expected, f'hidden markdown toc: expected {expected!r}, got {actual!r}'\n"
                 )
             },
             test_commands=[["python", "visible_tests.py"], ["python", "hidden_tests.py"]],

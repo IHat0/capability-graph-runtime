@@ -4,11 +4,14 @@ from typing import Any
 from cgr.apps.cli import main as cli
 from cgr.kernel.coding import (
     CodeTestCase,
+    CodingTask,
     CodingPatchNormalizationError,
     CodingPatchNormalizer,
     PythonTestRunner,
+    safe_hidden_failure_summary,
     check_dict_list_contract_shape,
     extract_forbidden_patterns_from_failed_code,
+    extract_repo_contract_repair_hints,
     extract_structural_repair_hints,
     extract_task_contract_checklist,
 )
@@ -25,6 +28,18 @@ from cgr.plugins.providers.openai_compatible import (
     OpenAICompatibleChatConfig,
     OpenAICompatibleChatPlugin,
 )
+
+
+def _coding_task_from_swe(task: SWETask) -> CodingTask:
+    return CodingTask(
+        issue=task.issue,
+        files=task.files,
+        allowed_files_to_edit=task.allowed_files_to_edit,
+        test_files=task.prompt_test_files,
+        test_commands=task.prompt_test_commands,
+        hidden_test_files=task.hidden_test_files,
+        hidden_test_commands=task.hidden_test_commands,
+    )
 
 
 def test_repo_v0_catalog_has_ten_reference_passing_tasks() -> None:
@@ -99,6 +114,56 @@ def test_dict_list_expected_got_mismatch_produces_structural_hint() -> None:
     assert "Do not store first occurrence as a scalar. Initialize result[key] = [value]." in hints
 
 
+def test_markdown_suffix_mismatch_produces_first_occurrence_hint() -> None:
+    diagnostic = (
+        "Expression:\ntoc('# Intro\\n## Intro')\n"
+        "Expected:\n[('Intro', 'intro'), ('Intro', 'intro-1')]\n"
+        "Got:\n[('Intro', 'intro-1'), ('Intro', 'intro-2')]"
+    )
+
+    hints = extract_structural_repair_hints(diagnostic)
+
+    assert (
+        "The first occurrence should keep the base value. Numeric suffixes "
+        "start only on duplicates."
+    ) in hints
+    assert any("Track seen base values" in hint for hint in hints)
+
+
+def test_repo_contract_hints_cover_remaining_semantic_patterns() -> None:
+    config_hints = extract_repo_contract_repair_hints(
+        [
+            "Later sources override earlier sources, nested dictionaries merge",
+            "None values do not override existing values",
+        ]
+    )
+    cart_hints = extract_repo_contract_repair_hints(
+        ["Compute subtotal, apply discount before tax, and round final total"]
+    )
+    bucket_hints = extract_repo_contract_repair_hints(
+        ["Use injectable clock, refill by elapsed time, cap at capacity"]
+    )
+    markdown_hints = extract_repo_contract_repair_hints(
+        ["deduplicate slugs with numeric suffixes"]
+    )
+
+    assert any("pure recursive merge" in hint for hint in config_hints)
+    assert any("Apply discount before tax" in hint for hint in cart_hints)
+    assert any("injected clock" in hint for hint in bucket_hints)
+    assert any("unsuffixed base value" in hint for hint in markdown_hints)
+
+
+def test_config_nested_expected_output_produces_recursive_merge_hint() -> None:
+    diagnostic = (
+        "Expected:\n{'db': {'host': 'localhost', 'port': 2, 'user': 'u'}}\n"
+        "Got:\n{'db': {'host': None}}"
+    )
+
+    hints = extract_structural_repair_hints(diagnostic)
+
+    assert any("Recursively merge nested dictionaries" in hint for hint in hints)
+
+
 def test_repo_query_contract_checklist_mentions_one_item_lists() -> None:
     task = create_repo_v0_tasks()[0]
     checklist = extract_task_contract_checklist(task.issue)
@@ -154,6 +219,28 @@ def test_dict_list_contract_rejects_scalar_first_assignment() -> None:
     assert any("dictionary values are lists" in hint for hint in hints)
 
 
+def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
+    tasks = {task.id: task for task in create_repo_v0_tasks()}
+
+    markdown_variant = MultiModelCodingAgentPlugin._variant_instruction(
+        _coding_task_from_swe(tasks["v0.markdown_toc"]), 2, [], [], []
+    )[0]
+    config_variant = MultiModelCodingAgentPlugin._variant_instruction(
+        _coding_task_from_swe(tasks["v0.config_loader_precedence"]), 2, [], [], []
+    )[0]
+    cart_variant = MultiModelCodingAgentPlugin._variant_instruction(
+        _coding_task_from_swe(tasks["v0.shopping_cart_totals"]), 2, [], [], []
+    )[0]
+    bucket_variant = MultiModelCodingAgentPlugin._variant_instruction(
+        _coding_task_from_swe(tasks["v0.token_bucket_clock"]), 2, [], [], []
+    )[0]
+
+    assert markdown_variant == "duplicate-name suffix repair"
+    assert config_variant == "recursive precedence merge"
+    assert cart_variant == "formula/order-of-operations repair"
+    assert bucket_variant == "stateful clock simulation repair"
+
+
 def test_malformed_json_candidate_is_rejected() -> None:
     task = create_repo_v0_tasks()[0]
 
@@ -177,6 +264,22 @@ def test_syntax_invalid_repo_candidate_fails_exact_verification() -> None:
     assert passed is False
     assert "SyntaxError" in "\n".join(messages)
     assert "Final selected candidate failed exact-file verification" in messages[0]
+
+
+def test_hidden_safe_summary_keeps_expected_got_without_hidden_source() -> None:
+    messages = [
+        "Test command 'hidden' exit code 1.\n"
+        "stdout:\n\nstderr:\n"
+        "AssertionError: hidden config precedence: expected {'db': {'port': 2}}, "
+        "got {'db': {'port': 1}}\n"
+        "assert result == expected, f'hidden source line should stay private'\n"
+    ]
+
+    summary = safe_hidden_failure_summary(messages)
+
+    assert "expected {'db': {'port': 2}}" in summary
+    assert "got {'db': {'port': 1}}" in summary
+    assert "hidden source line should stay private" not in summary
 
 
 class _RepoRepairClient:

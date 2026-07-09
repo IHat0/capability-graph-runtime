@@ -16,6 +16,8 @@ from cgr.kernel.coding import (
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
+    extract_repo_contract_repair_hints,
+    extract_structural_repair_hints,
     extract_syntax_error_summary,
     extract_task_contract_checklist,
     extract_test_assertion_checklist,
@@ -98,6 +100,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         task_contract_checklist = extract_task_contract_checklist(task.issue)
+        repo_contract_hints = extract_repo_contract_repair_hints(
+            task_contract_checklist
+        )
         test_io_examples = extract_test_io_examples(task.test_files)
         truthy_examples, falsy_examples = _merge_boolean_examples(
             classify_boolean_string_examples(test_io_examples),
@@ -129,8 +134,10 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         verifier_messages = verification[1] if verification is not None else []
         coverage_missing_by_candidate: dict[str, list[str]] = {}
         forbidden_hints: list[str] = []
+        expected_got_hints: list[str] = []
         if verification is not None and not verification[0]:
             failure_summary = summarize_python_test_failure(verification[1])
+            expected_got_hints = extract_structural_repair_hints(failure_summary)
             forbidden_hints = extract_forbidden_patterns_from_failed_code(
                 patch.files,
                 failure_summary,
@@ -230,6 +237,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             final_exact_passed,
             final_exact_summary,
             task.allowed_files_to_edit,
+            repo_contract_hints,
+            expected_got_hints,
         )
         return ExecutionResult(
             context=request.context,
@@ -292,6 +301,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         final_exact_passed: bool | None,
         final_exact_summary: str,
         allowed_files_to_edit: list[str],
+        repo_contract_hints: list[str],
+        expected_got_hints: list[str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -393,6 +404,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             ][-10:],
             "final_exact_repo_verification_passed": final_exact_passed,
             "final_exact_repo_verification_summary": final_exact_summary,
+            "repo_semantic_repair_variants": [],
+            "repo_contract_hints": repo_contract_hints,
+            "expected_got_hints": expected_got_hints,
         }
 
     @staticmethod

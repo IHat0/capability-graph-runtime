@@ -18,6 +18,8 @@ from cgr.kernel.coding import (
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
+    extract_repo_contract_repair_hints,
+    extract_structural_repair_hints,
     extract_syntax_error_summary,
     extract_task_contract_checklist,
     extract_test_assertion_checklist,
@@ -114,6 +116,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         task = self._parse_task(request.payload)
         test_assertion_checklist = extract_test_assertion_checklist(task.test_files)
         task_contract_checklist = extract_task_contract_checklist(task.issue)
+        repo_contract_hints = extract_repo_contract_repair_hints(
+            task_contract_checklist
+        )
         test_io_examples = extract_test_io_examples(task.test_files)
         truthy_examples, falsy_examples = _merge_boolean_examples(
             classify_boolean_string_examples(test_io_examples),
@@ -151,6 +156,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repair_prompts: list[str] = []
         known_failures: list[tuple[str, dict[str, str], str]] = []
         forbidden_hints: list[str] = []
+        expected_got_hints: list[str] = []
+        repo_semantic_repair_variants: list[str] = []
         repeated_rejections = 0
         repair_plan = ""
         latest_failures: dict[str, str] = {}
@@ -198,6 +205,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     else "No executable verification contract was provided."
                 ),
                 allowed_files_to_edit=task.allowed_files_to_edit,
+                repo_contract_hints=repo_contract_hints,
             )
             return ExecutionResult(
                 context=request.context,
@@ -214,6 +222,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             failed_required_examples.extend(
                 infer_failed_test_io_examples(test_io_examples, draft_summary)
             )
+            for hint in extract_structural_repair_hints(draft_summary):
+                if hint not in expected_got_hints:
+                    expected_got_hints.append(hint)
             forbidden_hints.extend(
                 extract_forbidden_patterns_from_failed_code(
                     draft_patch.files,
@@ -271,7 +282,23 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     truthy_examples,
                     falsy_examples,
                 )
+                if extract_syntax_error_summary(current_messages):
+                    variant_name = "syntax-focused repair"
+                    variant_instruction = (
+                        "Repair variant: produce complete, parseable full files "
+                        "first. Close any unterminated string literal, fix malformed "
+                        "indentation, and do not preserve syntax typos. Then satisfy "
+                        "the tests. "
+                    )
                 repair_variant_names.append(variant_name)
+                if variant_name in {
+                    "duplicate-name suffix repair",
+                    "recursive precedence merge",
+                    "formula/order-of-operations repair",
+                    "stateful clock simulation repair",
+                    "data-shape contract repair",
+                }:
+                    repo_semantic_repair_variants.append(variant_name)
                 repair_prompt = build_repair_prompt(
                     task,
                     current_patch.files,
@@ -400,6 +427,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 ):
                     if example not in failed_required_examples:
                         failed_required_examples.append(example)
+                for hint in extract_structural_repair_hints(failure_summary):
+                    if hint not in expected_got_hints:
+                        expected_got_hints.append(hint)
                 for hint in extract_forbidden_patterns_from_failed_code(
                     repaired_patch.files,
                     failure_summary,
@@ -518,6 +548,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             final_exact_passed,
             final_exact_summary,
             task.allowed_files_to_edit,
+            repo_contract_hints,
+            expected_got_hints,
+            repo_semantic_repair_variants,
         )
         return ExecutionResult(
             context=request.context,
@@ -611,6 +644,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         final_exact_passed: bool | None = None,
         final_exact_summary: str = "",
         allowed_files_to_edit: list[str] | None = None,
+        repo_contract_hints: list[str] | None = None,
+        expected_got_hints: list[str] | None = None,
+        repo_semantic_repair_variants: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -724,6 +760,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             ][-10:],
             "final_exact_repo_verification_passed": final_exact_passed,
             "final_exact_repo_verification_summary": final_exact_summary,
+            "repo_semantic_repair_variants": repo_semantic_repair_variants or [],
+            "repo_contract_hints": repo_contract_hints or [],
+            "expected_got_hints": expected_got_hints or [],
         }
 
     @staticmethod
@@ -768,6 +807,56 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 "wrong nesting",
             )
         )
+        duplicate_context = any(
+            marker in context
+            for marker in ("duplicate", "deduplicate", "slug", "suffix", "heading")
+        )
+        recursive_context = any(
+            marker in context
+            for marker in (
+                "config",
+                "precedence",
+                "nested",
+                "recursive",
+                "none does not override",
+                "later sources override",
+            )
+        )
+        formula_context = any(
+            marker in context
+            for marker in ("discount", "tax", "subtotal", "round final")
+        )
+        stateful_clock_context = any(
+            marker in context
+            for marker in ("clock", "refill", "capacity", "consume", "token")
+        )
+        if attempt == 2 and duplicate_context:
+            return "duplicate-name suffix repair", (
+                "Use the unsuffixed base value for the first occurrence. Add -1, "
+                "-2, etc. only for later duplicates. Track seen base values, choose "
+                "the output value before incrementing the count, and ignore headings "
+                "inside fenced code blocks when the tests require it. "
+            )
+        if attempt == 2 and recursive_context:
+            return "recursive precedence merge", (
+                "Implement a pure recursive merge. Copy dictionaries instead of "
+                "mutating inputs. Apply sources in precedence order. Later sources "
+                "override earlier sources, nested dictionaries merge recursively, "
+                "and None values should not override existing values unless the "
+                "task explicitly allows it. "
+            )
+        if attempt == 2 and formula_context:
+            return "formula/order-of-operations repair", (
+                "Focus on the arithmetic contract. Compute subtotal without "
+                "mutating inputs. Apply discount before tax, tax after discount, "
+                "and round only the final result. "
+            )
+        if attempt == 2 and stateful_clock_context:
+            return "stateful clock simulation repair", (
+                "Use the injected clock as the only time source. Track last refill "
+                "time. Refill by elapsed time multiplied by rate, cap tokens at "
+                "capacity, and perform refill before consume checks. "
+            )
         if attempt == 2 and data_shape_context:
             return "data-shape contract repair", (
                 "Focus only on matching the data shape required by expected "

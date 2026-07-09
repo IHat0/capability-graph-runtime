@@ -232,5 +232,10 @@ def safe_hidden_failure_summary(messages: list[str]) -> str:
         "expected",
         "got",
     )
-    selected = [line for line in lines if any(marker in line for marker in safe_markers)]
+    selected = [
+        line
+        for line in lines
+        if not line.startswith("assert ")
+        and any(marker in line for marker in safe_markers)
+    ]
     return "\n".join(dict.fromkeys(selected))[-2000:] or "Hidden test command failed."

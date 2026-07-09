@@ -363,6 +363,11 @@ class SWEABRunner:
             "baseline_fallback_final_exact_repo_verification_passed": trace.get(
                 "baseline_fallback_final_exact_repo_verification_passed"
             ),
+            "repo_semantic_repair_variants": trace.get(
+                "repo_semantic_repair_variants"
+            ),
+            "repo_contract_hints": trace.get("repo_contract_hints"),
+            "expected_got_hints": trace.get("expected_got_hints"),
         }
 
     def _apply_verified_fallback(

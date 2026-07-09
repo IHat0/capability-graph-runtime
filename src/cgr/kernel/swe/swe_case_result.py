@@ -75,3 +75,6 @@ class SWECaseResult(BaseModel):
     baseline_fallback_score: float | None = None
     baseline_fallback_candidate_id: str | None = None
     baseline_fallback_final_exact_repo_verification_passed: bool | None = None
+    repo_semantic_repair_variants: list[str] | None = None
+    repo_contract_hints: list[str] | None = None
+    expected_got_hints: list[str] | None = None

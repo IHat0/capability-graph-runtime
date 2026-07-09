@@ -215,6 +215,8 @@ def extract_forbidden_patterns_from_failed_code(
             "result[key] = [value]."
         )
     hints.extend(extract_structural_repair_hints(failure_summary))
+    hints.extend(extract_repo_contract_repair_hints(task_contract_checklist or []))
+    hints = _unique(hints)
     return hints
 
 
@@ -244,7 +246,62 @@ def extract_structural_repair_hints(failure_summary: str) -> list[str]:
         and any(isinstance(value, list) and len(value) > 1 for value in expected.values())
     ):
         hints.append("Repeated keys should append to the existing list.")
-    return hints
+    if _duplicate_suffix_mismatch(expected, got):
+        hints.extend(
+            [
+                "The first occurrence should keep the base value. Numeric suffixes "
+                "start only on duplicates.",
+                "Track seen base values. If a base value has not appeared, use the "
+                "base value. If it has appeared n times, use f\"{base}-{n}\". "
+                "Increment the count after choosing the output value.",
+            ]
+        )
+    if _nested_dict_expected(expected) and _nested_dict_mismatch(expected, got):
+        hints.append(
+            "Do not replace nested dictionaries wholesale. Recursively merge nested "
+            "dictionaries preserving earlier nested keys unless overridden."
+        )
+    return _unique(hints)
+
+
+def extract_repo_contract_repair_hints(
+    task_contract_checklist: list[str],
+) -> list[str]:
+    """Derive repo-style semantic repair hints from task contract wording."""
+    contract = "\n".join(task_contract_checklist).lower()
+    hints: list[str] = []
+    if _duplicate_suffix_context(contract):
+        hints.extend(
+            [
+                "For duplicate names or slugs, use the unsuffixed base value for "
+                "the first occurrence and add -1, -2, etc. only for later "
+                "duplicates.",
+                "Track seen base slugs; choose the output slug before incrementing "
+                "the duplicate counter.",
+            ]
+        )
+    if _recursive_merge_context(contract):
+        hints.extend(
+            [
+                "Implement a pure recursive merge. Copy dictionaries instead of "
+                "mutating inputs. Apply sources in precedence order.",
+                "Later sources override earlier sources, nested dictionaries should "
+                "be recursively merged, and None values should not override existing "
+                "values unless explicitly allowed.",
+            ]
+        )
+    if _formula_order_context(contract):
+        hints.append(
+            "Compute subtotal without mutating items. Apply discount before tax. "
+            "Apply tax after discount. Round the final result only."
+        )
+    if _stateful_clock_context(contract):
+        hints.append(
+            "Use the injected clock as the only time source. Track last refill time. "
+            "Refill by elapsed time multiplied by rate, cap tokens at capacity, and "
+            "run refill before consume."
+        )
+    return _unique(hints)
 
 
 def _extract_expected_got_values(text: str) -> tuple[object | None, object | None]:
@@ -282,6 +339,90 @@ def _contract_requires_dict_list_values(contract: str) -> bool:
             or "values are lists" in contract
         )
     )
+
+
+def _duplicate_suffix_mismatch(expected: object, got: object) -> bool:
+    if not isinstance(expected, list) or not isinstance(got, list):
+        return False
+    if not expected or not got:
+        return False
+    expected_values = _second_string_values(expected)
+    got_values = _second_string_values(got)
+    if not expected_values or not got_values:
+        return False
+    first_expected = expected_values[0]
+    first_got = got_values[0]
+    if re.search(r"-\d+$", first_expected):
+        return False
+    return _base_with_numeric_suffix(first_got) == first_expected
+
+
+def _second_string_values(values: list[object]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if (
+            isinstance(value, (tuple, list))
+            and len(value) >= 2
+            and isinstance(value[1], str)
+        ):
+            result.append(value[1])
+    return result
+
+
+def _base_with_numeric_suffix(value: str) -> str | None:
+    match = re.match(r"(?P<base>.+)-\d+$", value)
+    return match.group("base") if match is not None else None
+
+
+def _nested_dict_expected(value: object) -> bool:
+    return isinstance(value, dict) and any(
+        isinstance(child, dict) for child in value.values()
+    )
+
+
+def _nested_dict_mismatch(expected: object, got: object) -> bool:
+    if not isinstance(expected, dict):
+        return False
+    return not isinstance(got, dict) or expected != got
+
+
+def _duplicate_suffix_context(contract: str) -> bool:
+    return (
+        ("duplicate" in contract or "deduplicate" in contract)
+        and ("slug" in contract or "suffix" in contract or "name" in contract)
+    )
+
+
+def _recursive_merge_context(contract: str) -> bool:
+    return (
+        ("config" in contract or "precedence" in contract or "merge" in contract)
+        and ("nested" in contract or "dict" in contract or "dictionary" in contract)
+    ) or (
+        "none values do not override" in contract
+        or "later sources override earlier sources" in contract
+    )
+
+
+def _formula_order_context(contract: str) -> bool:
+    return (
+        ("discount" in contract and "tax" in contract)
+        or ("subtotal" in contract and "round" in contract)
+    )
+
+
+def _stateful_clock_context(contract: str) -> bool:
+    return (
+        ("clock" in contract or "time" in contract)
+        and ("refill" in contract or "capacity" in contract or "consume" in contract)
+    )
+
+
+def _unique(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result
 
 
 def _string_inputs_for_result(examples: list[str], result: str) -> list[str]:
