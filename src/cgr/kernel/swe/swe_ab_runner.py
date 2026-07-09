@@ -118,6 +118,15 @@ class SWEABRunner:
                 ).strip()
             trace_fields["final_exact_verification_passed"] = passed
             trace_fields["final_exact_verification_summary"] = final_summary
+            trace_fields["placeholder_filename_remapped"] = (
+                patch.placeholder_filename_remapped
+            )
+            trace_fields["placeholder_filename_original"] = (
+                patch.placeholder_filename_original
+            )
+            trace_fields["placeholder_filename_target"] = (
+                patch.placeholder_filename_target
+            )
             if task.allowed_files_to_edit:
                 trace_fields["allowed_files_to_edit"] = task.allowed_files_to_edit
                 trace_fields["changed_files"] = sorted(patch.files)
@@ -369,6 +378,15 @@ class SWEABRunner:
             "repo_contract_hints": trace.get("repo_contract_hints"),
             "expected_got_hints": trace.get("expected_got_hints"),
             "literal_format_hints": trace.get("literal_format_hints"),
+            "placeholder_filename_remapped": trace.get(
+                "placeholder_filename_remapped"
+            ),
+            "placeholder_filename_original": trace.get(
+                "placeholder_filename_original"
+            ),
+            "placeholder_filename_target": trace.get(
+                "placeholder_filename_target"
+            ),
         }
 
     def _apply_verified_fallback(

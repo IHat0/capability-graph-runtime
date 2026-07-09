@@ -155,6 +155,24 @@ def check_duplicate_suffix_format(
     return None
 
 
+def check_none_overwrite_config_merge(
+    files: dict[str, str], task_contract_checklist: list[str]
+) -> str | None:
+    """Reject obvious config merges that assign None values as overrides."""
+    contract = "\n".join(task_contract_checklist).casefold()
+    if not _none_skip_context(contract):
+        return None
+    for content in files.values():
+        if "value is None" in content or "value != None" in content:
+            continue
+        if re.search(r"\w+\s*\[\s*key\s*\]\s*=\s*value\b", content):
+            return (
+                "Rejected candidate before tests; None values must not override "
+                "existing non-None config values."
+            )
+    return None
+
+
 def _first_match_position(pattern: str, text: str) -> int | None:
     match = re.search(pattern, text)
     return match.start() if match is not None else None
@@ -240,6 +258,24 @@ def extract_forbidden_patterns_from_failed_code(
             "Do not store first occurrence as a scalar. Initialize "
             "result[key] = [value]."
         )
+    if check_none_overwrite_config_merge(files, task_contract_checklist or []) is not None:
+        hints.append("Do not let None override an existing non-None value.")
+        hints.append(
+            "When merging config sources, skip None values unless the contract "
+            "explicitly allows None overrides."
+        )
+    if "discount_amount" in code and ("discount" in contract or "tax" in contract):
+        hints.append(
+            "discount_amount may return the discount amount, not the discounted "
+            "subtotal. Compute subtotal - discount_amount(subtotal, rate), then "
+            "apply tax."
+        )
+    if (
+        re.search(r"self\.tokens\s*=\s*0\b", code)
+        and "capacity" in contract
+        and "consume" in contract
+    ):
+        hints.append("Initialize tokens to capacity unless contract says empty.")
     hints.extend(extract_structural_repair_hints(failure_summary))
     hints.extend(extract_literal_format_hints(failure_summary))
     hints.extend(extract_repo_contract_repair_hints(task_contract_checklist or []))
@@ -289,6 +325,14 @@ def extract_structural_repair_hints(failure_summary: str) -> list[str]:
             "Do not replace nested dictionaries wholesale. Recursively merge nested "
             "dictionaries preserving earlier nested keys unless overridden."
         )
+    if _none_overwrote_non_none(expected, got):
+        hints.append("Do not let None override an existing non-None value.")
+        hints.append(
+            "When merging config sources, skip None values unless the contract "
+            "explicitly allows None overrides."
+        )
+    if isinstance(expected, (int, float)) and isinstance(got, (int, float)):
+        hints.append(f"Expected final value {expected!r}, but got {got!r}.")
     return _unique(hints)
 
 
@@ -325,15 +369,39 @@ def extract_repo_contract_repair_hints(
             ]
         )
     if _formula_order_context(contract):
-        hints.append(
-            "Compute subtotal without mutating items. Apply discount before tax. "
-            "Apply tax after discount. Round the final result only."
+        hints.extend(
+            [
+                "Compute subtotal without mutating items. Apply discount before "
+                "tax. Apply tax after discount. Round the final result only.",
+                "discount_amount may return the discount amount, not the "
+                "discounted subtotal. Compute subtotal - "
+                "discount_amount(subtotal, rate), then apply tax.",
+                "Input items must not be mutated.",
+            ]
         )
     if _stateful_clock_context(contract):
-        hints.append(
-            "Use the injected clock as the only time source. Track last refill time. "
-            "Refill by elapsed time multiplied by rate, cap tokens at capacity, and "
-            "run refill before consume."
+        hints.extend(
+            [
+                "Initialize tokens to capacity unless contract says empty.",
+                "Use the injected clock as the only time source.",
+                "Track last refill timestamp.",
+                "Before every consume, refill by elapsed time multiplied by rate.",
+                "Cap tokens at capacity.",
+                "If enough tokens, subtract and return True.",
+                "If insufficient, return False without subtracting.",
+            ]
+        )
+    if _router_path_param_context(contract):
+        hints.extend(
+            [
+                "Patterns with :name are path parameters.",
+                "Split pattern and path into segments.",
+                "Static segments must match exactly.",
+                "Param segments capture value without slash.",
+                "Return handler and params dict.",
+                "Static routes outrank param routes.",
+                "Normalize trailing slashes consistently.",
+            ]
         )
     return _unique(hints)
 
@@ -457,6 +525,19 @@ def _nested_dict_mismatch(expected: object, got: object) -> bool:
     return not isinstance(got, dict) or expected != got
 
 
+def _none_overwrote_non_none(expected: object, got: object) -> bool:
+    if isinstance(expected, dict) and isinstance(got, dict):
+        for key, expected_value in expected.items():
+            if key not in got:
+                continue
+            got_value = got[key]
+            if expected_value is not None and got_value is None:
+                return True
+            if _none_overwrote_non_none(expected_value, got_value):
+                return True
+    return False
+
+
 def _duplicate_suffix_context(contract: str) -> bool:
     return (
         ("duplicate" in contract or "deduplicate" in contract)
@@ -474,6 +555,14 @@ def _recursive_merge_context(contract: str) -> bool:
     )
 
 
+def _none_skip_context(contract: str) -> bool:
+    return (
+        "none values do not override" in contract
+        or "none does not override" in contract
+        or ("config" in contract and "none" in contract and "override" in contract)
+    )
+
+
 def _formula_order_context(contract: str) -> bool:
     return (
         ("discount" in contract and "tax" in contract)
@@ -485,6 +574,13 @@ def _stateful_clock_context(contract: str) -> bool:
     return (
         ("clock" in contract or "time" in contract)
         and ("refill" in contract or "capacity" in contract or "consume" in contract)
+    )
+
+
+def _router_path_param_context(contract: str) -> bool:
+    return (
+        ("path params" in contract or "path parameters" in contract or ":id" in contract)
+        and ("route" in contract or "router" in contract)
     )
 
 

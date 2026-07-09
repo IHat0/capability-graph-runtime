@@ -13,6 +13,7 @@ from cgr.kernel.coding import (
     check_bool_before_string_normalization,
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
+    check_none_overwrite_config_merge,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -121,11 +122,16 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         shape_guard = check_dict_list_contract_shape(
             patch.files, task_contract_checklist
         )
+        none_guard = check_none_overwrite_config_merge(
+            patch.files, task_contract_checklist
+        )
         verification = (
             (False, [bool_guard])
             if bool_guard is not None
             else (False, [shape_guard])
             if shape_guard is not None
+            else (False, [none_guard])
+            if none_guard is not None
             else verify_patch(task, patch)
         )
         duration_ms = model_result.duration_ms + format_duration
@@ -167,6 +173,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repair_shape_guard = check_dict_list_contract_shape(
                 repaired.files, task_contract_checklist
             )
+            repair_none_guard = check_none_overwrite_config_merge(
+                repaired.files, task_contract_checklist
+            )
             repair_suffix_guard = check_duplicate_suffix_format(
                 repaired.files, literal_format_hints
             )
@@ -178,6 +187,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repaired_passed = False
             elif repair_shape_guard is not None:
                 verifier_messages.append(repair_shape_guard)
+                repaired_passed = False
+            elif repair_none_guard is not None:
+                verifier_messages.append(repair_none_guard)
                 repaired_passed = False
             elif repair_suffix_guard is not None:
                 verifier_messages.append(repair_suffix_guard)
@@ -251,6 +263,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             expected_got_hints,
             literal_format_hints,
         )
+        output.update(_placeholder_trace_fields(patch))
         return ExecutionResult(
             context=request.context,
             status=ExecutionStatus.SUCCESS,
@@ -420,6 +433,13 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "repo_contract_hints": repo_contract_hints,
             "expected_got_hints": expected_got_hints,
             "literal_format_hints": literal_format_hints,
+            **_placeholder_trace_fields(
+                next(
+                    candidate
+                    for candidate_id, candidate, _ in candidates
+                    if candidate_id == selected_id
+                )
+            ),
         }
 
     @staticmethod
@@ -455,3 +475,11 @@ def _unique(values: list[str]) -> list[str]:
         if value not in result:
             result.append(value)
     return result
+
+
+def _placeholder_trace_fields(patch: CodingPatch) -> dict[str, Any]:
+    return {
+        "placeholder_filename_remapped": patch.placeholder_filename_remapped,
+        "placeholder_filename_original": patch.placeholder_filename_original,
+        "placeholder_filename_target": patch.placeholder_filename_target,
+    }

@@ -15,6 +15,7 @@ from cgr.kernel.coding import (
     check_bool_before_string_normalization,
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
+    check_none_overwrite_config_merge,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -138,11 +139,16 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         draft_shape_guard = check_dict_list_contract_shape(
             draft_patch.files, task_contract_checklist
         )
+        draft_none_guard = check_none_overwrite_config_merge(
+            draft_patch.files, task_contract_checklist
+        )
         draft_verification = (
             (False, [draft_bool_guard])
             if draft_bool_guard is not None
             else (False, [draft_shape_guard])
             if draft_shape_guard is not None
+            else (False, [draft_none_guard])
+            if draft_none_guard is not None
             else verify_patch(task, draft_patch)
         )
         candidates: list[tuple[str, CodingPatch, bool]] = [
@@ -175,12 +181,17 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         bool_guard_applied = draft_bool_guard is not None
         rejected_candidates_before_tests: list[str] = (
             ["candidate_1"]
-            if draft_bool_guard is not None or draft_shape_guard is not None
+            if (
+                draft_bool_guard is not None
+                or draft_shape_guard is not None
+                or draft_none_guard is not None
+            )
             else []
         )
         if draft_verification is not None and draft_verification[0]:
             final_verification = verify_patch(task, draft_patch)
             output = draft_patch.model_dump()
+            output.update(_placeholder_trace_fields(draft_patch))
             output["_trace"] = self._trace(
                 candidates,
                 "candidate_1",
@@ -302,8 +313,12 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 if variant_name in {
                     "duplicate-name suffix repair",
                     "recursive precedence merge",
+                    "none-skipping recursive config merge",
                     "formula/order-of-operations repair",
+                    "discount-amount semantics repair",
                     "stateful clock simulation repair",
+                    "full-initial token bucket repair",
+                    "path-parameter router repair",
                     "data-shape contract repair",
                     "literal duplicate suffix implementation",
                 }:
@@ -353,6 +368,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repair_shape_guard = check_dict_list_contract_shape(
                     repaired_patch.files, task_contract_checklist
                 )
+                repair_none_guard = check_none_overwrite_config_merge(
+                    repaired_patch.files, task_contract_checklist
+                )
                 repair_suffix_guard = check_duplicate_suffix_format(
                     repaired_patch.files, literal_format_hints
                 )
@@ -378,6 +396,17 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     latest_failures[candidate_id] = repair_shape_guard
                     current_patch = repaired_patch
                     current_messages = [repair_shape_guard]
+                    continue
+                if repair_none_guard is not None:
+                    rejected_candidates_before_tests.append(candidate_id)
+                    verifier_messages.append(repair_none_guard)
+                    candidates.append((candidate_id, repaired_patch, False))
+                    known_failures.append(
+                        (candidate_id, repaired_patch.files, repair_none_guard)
+                    )
+                    latest_failures[candidate_id] = repair_none_guard
+                    current_patch = repaired_patch
+                    current_messages = [repair_none_guard]
                     continue
                 if repair_suffix_guard is not None:
                     rejected_candidates_before_tests.append(candidate_id)
@@ -545,6 +574,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 "exact-file verification."
             )
         output = patch.model_dump()
+        output.update(_placeholder_trace_fields(patch))
         output["_trace"] = self._trace(
             candidates,
             selected_id,
@@ -792,6 +822,13 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "repo_contract_hints": repo_contract_hints or [],
             "expected_got_hints": expected_got_hints or [],
             "literal_format_hints": literal_format_hints or [],
+            **_placeholder_trace_fields(
+                next(
+                    candidate
+                    for candidate_id, candidate, _ in candidates
+                    if candidate_id == selected_id
+                )
+            ),
         }
 
     @staticmethod
@@ -860,6 +897,10 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             marker in context
             for marker in ("clock", "refill", "capacity", "consume", "token")
         )
+        router_context = any(
+            marker in context
+            for marker in ("path params", "path parameters", ":id", ":name", "route")
+        ) and ("router" in context or "routes" in context)
         if attempt == 2 and duplicate_context:
             suffix_instruction = (
                 " Use the unsuffixed base slug for the first occurrence. For "
@@ -877,24 +918,29 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 f"{suffix_instruction} "
             )
         if attempt == 2 and recursive_context:
-            return "recursive precedence merge", (
+            return "none-skipping recursive config merge", (
                 "Implement a pure recursive merge. Copy dictionaries instead of "
-                "mutating inputs. Apply sources in precedence order. Later sources "
-                "override earlier sources, nested dictionaries merge recursively, "
-                "and None values should not override existing values unless the "
-                "task explicitly allows it. "
+                "mutating inputs. Apply sources in precedence order. Skip values "
+                "that are None so they do not override existing non-None values. "
+                "Nested dictionaries merge recursively. "
             )
         if attempt == 2 and formula_context:
-            return "formula/order-of-operations repair", (
-                "Focus on the arithmetic contract. Compute subtotal without "
-                "mutating inputs. Apply discount before tax, tax after discount, "
-                "and round only the final result. "
+            return "discount-amount semantics repair", (
+                "Compute subtotal without mutating items. Compute discount = "
+                "discount_amount(subtotal, discount_rate). Compute discounted = "
+                "subtotal - discount. Then apply tax: discounted * "
+                "(1 + tax_rate). Round only the final result. "
             )
         if attempt == 2 and stateful_clock_context:
-            return "stateful clock simulation repair", (
-                "Use the injected clock as the only time source. Track last refill "
-                "time. Refill by elapsed time multiplied by rate, cap tokens at "
-                "capacity, and perform refill before consume checks. "
+            return "full-initial token bucket repair", (
+                "Initialize tokens to capacity. Refill before checking consumption. "
+                "Cap tokens at capacity. Use only the injected clock. "
+            )
+        if attempt == 2 and router_context:
+            return "path-parameter router repair", (
+                "Do not use regex fullmatch directly on ':id'. Implement "
+                "segment-by-segment matching. If pattern segment starts with ':', "
+                "capture the path segment under that name. "
             )
         if attempt == 2 and data_shape_context:
             return "data-shape contract repair", (
@@ -976,3 +1022,11 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         if not isinstance(output, dict) or not isinstance(output.get("text"), str):
             raise RuntimeError("Model response did not contain text.")
         return output["text"]
+
+
+def _placeholder_trace_fields(patch: CodingPatch) -> dict[str, Any]:
+    return {
+        "placeholder_filename_remapped": patch.placeholder_filename_remapped,
+        "placeholder_filename_original": patch.placeholder_filename_original,
+        "placeholder_filename_target": patch.placeholder_filename_target,
+    }

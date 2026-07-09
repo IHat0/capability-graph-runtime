@@ -20,6 +20,14 @@ class CodingPatchNormalizer:
     """Normalize common model output variants into a validated CodingPatch."""
 
     _FENCED_JSON = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+    _PLACEHOLDER_FILENAMES = {
+        "filename.py",
+        "main.py",
+        "solution.py",
+        "answer.py",
+        "fixed.py",
+        "file.py",
+    }
 
     def normalize(
         self,
@@ -71,8 +79,9 @@ class CodingPatchNormalizer:
             return None
         return self._validate_files(files, allowed_filenames, explanation)
 
-    @staticmethod
+    @classmethod
     def _validate_files(
+        cls,
         files: dict[Any, Any],
         allowed_filenames: set[str] | None,
         explanation: Any = "",
@@ -81,8 +90,26 @@ class CodingPatchNormalizer:
             raise CodingPatchNormalizationError(
                 "Coding patch files must not be empty.", json.dumps({"files": files})
             )
+        remapped = False
+        remapped_original: str | None = None
+        remapped_target: str | None = None
+        normalized_input = dict(files)
+        if allowed_filenames is not None and len(allowed_filenames) == 1 and len(files) == 1:
+            only_filename, only_content = next(iter(files.items()))
+            if (
+                isinstance(only_filename, str)
+                and only_filename.strip().lower() in cls._PLACEHOLDER_FILENAMES
+                and isinstance(only_content, str)
+                and cls._looks_like_python(only_content)
+            ):
+                target = next(iter(allowed_filenames))
+                normalized_input = {target: only_content}
+                remapped = True
+                remapped_original = only_filename
+                remapped_target = target
+
         normalized: dict[str, str] = {}
-        for filename, content in files.items():
+        for filename, content in normalized_input.items():
             if not isinstance(filename, str) or not filename.strip():
                 raise CodingPatchNormalizationError(
                     "Coding patch filenames must be non-empty strings.",
@@ -102,6 +129,9 @@ class CodingPatchNormalizer:
         return CodingPatch(
             files=normalized,
             explanation=explanation if isinstance(explanation, str) else "",
+            placeholder_filename_remapped=remapped,
+            placeholder_filename_original=remapped_original,
+            placeholder_filename_target=remapped_target,
         )
 
     @staticmethod

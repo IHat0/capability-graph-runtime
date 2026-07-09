@@ -10,3 +10,6 @@ class CodingPatch(BaseModel):
 
     files: dict[str, str] = Field(min_length=1)
     explanation: str = ""
+    placeholder_filename_remapped: bool = False
+    placeholder_filename_original: str | None = None
+    placeholder_filename_target: str | None = None

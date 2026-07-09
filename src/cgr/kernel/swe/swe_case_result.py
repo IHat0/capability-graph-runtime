@@ -79,3 +79,6 @@ class SWECaseResult(BaseModel):
     repo_contract_hints: list[str] | None = None
     expected_got_hints: list[str] | None = None
     literal_format_hints: list[str] | None = None
+    placeholder_filename_remapped: bool | None = None
+    placeholder_filename_original: str | None = None
+    placeholder_filename_target: str | None = None

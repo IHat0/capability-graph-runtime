@@ -11,6 +11,7 @@ from cgr.kernel.coding import (
     safe_hidden_failure_summary,
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
+    check_none_overwrite_config_merge,
     extract_forbidden_patterns_from_failed_code,
     extract_literal_format_hints,
     extract_repo_contract_repair_hints,
@@ -173,13 +174,17 @@ def test_repo_contract_hints_cover_remaining_semantic_patterns() -> None:
     bucket_hints = extract_repo_contract_repair_hints(
         ["Use injectable clock, refill by elapsed time, cap at capacity"]
     )
+    router_hints = extract_repo_contract_repair_hints(
+        ["Router path params are captured and static routes outrank parameter routes"]
+    )
     markdown_hints = extract_repo_contract_repair_hints(
         ["deduplicate slugs with numeric suffixes"]
     )
 
     assert any("pure recursive merge" in hint for hint in config_hints)
-    assert any("Apply discount before tax" in hint for hint in cart_hints)
+    assert any("discount_amount may return the discount amount" in hint for hint in cart_hints)
     assert any("injected clock" in hint for hint in bucket_hints)
+    assert any("Patterns with :name are path parameters" in hint for hint in router_hints)
     assert any("unsuffixed base value" in hint for hint in markdown_hints)
 
 
@@ -192,6 +197,90 @@ def test_config_nested_expected_output_produces_recursive_merge_hint() -> None:
     hints = extract_structural_repair_hints(diagnostic)
 
     assert any("Recursively merge nested dictionaries" in hint for hint in hints)
+
+
+def test_config_none_expected_got_mismatch_produces_none_skip_hint() -> None:
+    diagnostic = (
+        "Expected:\n{'db': {'host': 'localhost', 'port': 2, 'user': 'u'}}\n"
+        "Got:\n{'db': {'host': None, 'port': 2, 'user': 'u'}}"
+    )
+
+    hints = extract_structural_repair_hints(diagnostic)
+
+    assert "Do not let None override an existing non-None value." in hints
+    assert (
+        "When merging config sources, skip None values unless the contract "
+        "explicitly allows None overrides."
+    ) in hints
+
+
+def test_config_none_overwrite_guard_rejects_unsafe_assignment() -> None:
+    checklist = ["None values do not override existing values"]
+    bad = {
+        "src/config.py": (
+            "def merge(source):\n"
+            "    result = {}\n"
+            "    for key, value in source.items():\n"
+            "        result[key] = value\n"
+            "    return result\n"
+        )
+    }
+    good = {
+        "src/config.py": (
+            "def merge(source):\n"
+            "    result = {}\n"
+            "    for key, value in source.items():\n"
+            "        if value is None:\n"
+            "            continue\n"
+            "        result[key] = value\n"
+            "    return result\n"
+        )
+    }
+
+    assert check_none_overwrite_config_merge(bad, checklist) == (
+        "Rejected candidate before tests; None values must not override "
+        "existing non-None config values."
+    )
+    assert check_none_overwrite_config_merge(good, checklist) is None
+
+
+def test_router_contract_produces_path_param_segment_hints() -> None:
+    hints = extract_repo_contract_repair_hints(
+        ["Path params are captured, static routes outrank parameter routes"]
+    )
+
+    assert "Split pattern and path into segments." in hints
+    assert "Param segments capture value without slash." in hints
+    assert "Static routes outrank param routes." in hints
+
+
+def test_cart_contract_produces_discount_amount_subtraction_hint() -> None:
+    hints = extract_repo_contract_repair_hints(
+        ["Compute subtotal, apply discount before tax, avoid mutating input"]
+    )
+
+    assert any("subtotal - discount_amount(subtotal, rate)" in hint for hint in hints)
+    assert "Input items must not be mutated." in hints
+
+
+def test_token_bucket_first_consume_failure_produces_starts_full_hint() -> None:
+    hints = extract_forbidden_patterns_from_failed_code(
+        {
+            "src/token_bucket.py": (
+                "class TokenBucket:\n"
+                "    def __init__(self, capacity, refill_rate):\n"
+                "        self.tokens = 0\n"
+                "    def consume(self, n=1):\n"
+                "        return False\n"
+            )
+        },
+        "hidden token bucket first consume: expected True, got False",
+        task_contract_checklist=[
+            "Use injectable clock, refill by elapsed time, cap at capacity, and return bool from consume"
+        ],
+    )
+
+    assert "Initialize tokens to capacity unless contract says empty." in hints
 
 
 def test_repo_query_contract_checklist_mentions_one_item_lists() -> None:
@@ -276,9 +365,20 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     )
 
     assert markdown_variant == "duplicate-name suffix repair"
-    assert config_variant == "recursive precedence merge"
-    assert cart_variant == "formula/order-of-operations repair"
-    assert bucket_variant == "stateful clock simulation repair"
+    router_variant_name, router_variant_prompt = (
+        MultiModelCodingAgentPlugin._variant_instruction(
+            _coding_task_from_swe(tasks["v0.router_path_params"]), 2, [], [], []
+        )
+    )
+
+    assert config_variant == "none-skipping recursive config merge"
+    assert "Skip values that are None" in MultiModelCodingAgentPlugin._variant_instruction(
+        _coding_task_from_swe(tasks["v0.config_loader_precedence"]), 2, [], [], []
+    )[1]
+    assert cart_variant == "discount-amount semantics repair"
+    assert bucket_variant == "full-initial token bucket repair"
+    assert router_variant_name == "path-parameter router repair"
+    assert "segment-by-segment matching" in router_variant_prompt
     assert literal_variant_name == "literal duplicate suffix implementation"
     assert "Do not mutate the base slug inside the loop." in literal_variant_prompt
 

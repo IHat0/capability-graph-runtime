@@ -7,6 +7,7 @@ from cgr.kernel.coding import (
     CodeTestCase,
     CodingPatchNormalizationError,
     CodingPatchNormalizer,
+    PythonTestRunner,
 )
 from cgr.kernel.contracts import ExecutionContext, ExecutionRequest
 from cgr.kernel.runtime import KernelRuntime
@@ -52,6 +53,66 @@ def test_normalizer_wraps_raw_python_for_single_allowed_file() -> None:
     )
 
     assert patch.files == {"app.py": "def answer():\n    return 42\n"}
+
+
+def test_normalizer_remaps_filename_placeholder_for_single_allowed_file() -> None:
+    patch = CodingPatchNormalizer().normalize(
+        '{"files":{"filename.py":"def answer():\\n    return 42\\n"}}',
+        {"src/router.py"},
+    )
+
+    assert patch.files == {"src/router.py": "def answer():\n    return 42\n"}
+    assert patch.placeholder_filename_remapped is True
+    assert patch.placeholder_filename_original == "filename.py"
+    assert patch.placeholder_filename_target == "src/router.py"
+
+
+def test_normalizer_remaps_solution_placeholder_for_single_allowed_file() -> None:
+    patch = CodingPatchNormalizer().normalize(
+        '{"files":{"solution.py":"VALUE = 7\\n"}}',
+        {"src/config.py"},
+    )
+
+    assert patch.files == {"src/config.py": "VALUE = 7\n"}
+    assert patch.placeholder_filename_remapped is True
+    assert patch.placeholder_filename_original == "solution.py"
+    assert patch.placeholder_filename_target == "src/config.py"
+
+
+def test_normalizer_does_not_remap_placeholder_with_multiple_allowed_files() -> None:
+    with pytest.raises(ValueError, match="unknown filename"):
+        CodingPatchNormalizer().normalize(
+            '{"files":{"filename.py":"def answer():\\n    return 42\\n"}}',
+            {"src/a.py", "src/b.py"},
+        )
+
+
+def test_normalizer_rejects_non_placeholder_unknown_file() -> None:
+    with pytest.raises(ValueError, match="unknown filename"):
+        CodingPatchNormalizer().normalize(
+            '{"files":{"mystery.py":"def answer():\\n    return 42\\n"}}',
+            {"src/app.py"},
+        )
+
+
+def test_remapped_placeholder_candidate_is_tested_normally() -> None:
+    patch = CodingPatchNormalizer().normalize(
+        '{"files":{"filename.py":"def answer():\\n    return 42\\n"}}',
+        {"src/app.py"},
+    )
+
+    passed, messages = PythonTestRunner().run(
+        patch.files,
+        {
+            "visible_tests.py": (
+                "from src.app import answer\n"
+                "assert answer() == 42\n"
+            )
+        },
+        [CodeTestCase(name="visible", command=["python", "visible_tests.py"])],
+    )
+
+    assert passed, messages
 
 
 def test_normalizer_rejects_empty_and_unknown_files() -> None:
