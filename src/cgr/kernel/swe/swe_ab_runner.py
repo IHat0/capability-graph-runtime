@@ -368,6 +368,7 @@ class SWEABRunner:
             ),
             "repo_contract_hints": trace.get("repo_contract_hints"),
             "expected_got_hints": trace.get("expected_got_hints"),
+            "literal_format_hints": trace.get("literal_format_hints"),
         }
 
     def _apply_verified_fallback(

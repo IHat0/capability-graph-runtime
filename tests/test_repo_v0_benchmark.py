@@ -10,7 +10,9 @@ from cgr.kernel.coding import (
     PythonTestRunner,
     safe_hidden_failure_summary,
     check_dict_list_contract_shape,
+    check_duplicate_suffix_format,
     extract_forbidden_patterns_from_failed_code,
+    extract_literal_format_hints,
     extract_repo_contract_repair_hints,
     extract_structural_repair_hints,
     extract_task_contract_checklist,
@@ -130,6 +132,34 @@ def test_markdown_suffix_mismatch_produces_first_occurrence_hint() -> None:
     assert any("Track seen base values" in hint for hint in hints)
 
 
+def test_literal_suffix_format_hints_are_extracted_from_expected_output() -> None:
+    diagnostic = (
+        "Expected:\n[('Intro', 'intro'), ('Intro', 'intro-1')]\n"
+        "Got:\n[('Intro', 'intro'), ('Intro', 'intro1')]"
+    )
+
+    hints = extract_literal_format_hints(diagnostic)
+
+    assert "Use hyphen-number suffixes such as intro-1." in hints
+    assert "Do not concatenate numbers directly as intro1." in hints
+    assert "Expected duplicate suffix format is hyphen-number." in hints
+
+
+def test_duplicate_suffix_format_guard_rejects_direct_numeric_concat() -> None:
+    hints = ["Expected duplicate suffix format is hyphen-number."]
+    append_bad = {"src/markdown.py": "slug += str(count)\n"}
+    fstring_bad = {"src/markdown.py": 'slug = f"{slug}{count}"\n'}
+    good = {"src/markdown.py": 'candidate = f"{base_slug}-{count}"\n'}
+
+    expected = (
+        "Rejected candidate before tests; expected duplicate suffix format "
+        "is '-N', not direct numeric concatenation."
+    )
+    assert check_duplicate_suffix_format(append_bad, hints) == expected
+    assert check_duplicate_suffix_format(fstring_bad, hints) == expected
+    assert check_duplicate_suffix_format(good, hints) is None
+
+
 def test_repo_contract_hints_cover_remaining_semantic_patterns() -> None:
     config_hints = extract_repo_contract_repair_hints(
         [
@@ -234,11 +264,23 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     bucket_variant = MultiModelCodingAgentPlugin._variant_instruction(
         _coding_task_from_swe(tasks["v0.token_bucket_clock"]), 2, [], [], []
     )[0]
+    literal_variant_name, literal_variant_prompt = (
+        MultiModelCodingAgentPlugin._variant_instruction(
+            _coding_task_from_swe(tasks["v0.markdown_toc"]),
+            3,
+            [],
+            [],
+            [],
+            ["Expected duplicate suffix format is hyphen-number."],
+        )
+    )
 
     assert markdown_variant == "duplicate-name suffix repair"
     assert config_variant == "recursive precedence merge"
     assert cart_variant == "formula/order-of-operations repair"
     assert bucket_variant == "stateful clock simulation repair"
+    assert literal_variant_name == "literal duplicate suffix implementation"
+    assert "Do not mutate the base slug inside the loop." in literal_variant_prompt
 
 
 def test_malformed_json_candidate_is_rejected() -> None:
@@ -316,6 +358,32 @@ class _StaticPatchClient:
         messages: list[dict[str, str]],
     ) -> dict[str, Any]:
         return {"choices": [{"message": {"content": json.dumps({"files": self.files})}}]}
+
+
+class _MarkdownSuffixClient:
+    def __init__(self, bad_files: dict[str, str], fixed_files: dict[str, str]) -> None:
+        self.bad_files = bad_files
+        self.fixed_files = fixed_files
+        self.prompts: list[str] = []
+
+    def create_chat_completion(
+        self,
+        config: OpenAICompatibleChatConfig,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        prompt = messages[-1]["content"]
+        self.prompts.append(prompt)
+        if (
+            "literal duplicate suffix implementation" in prompt
+            and "Do not mutate the base slug inside the loop." in prompt
+        ):
+            files = self.fixed_files
+        else:
+            files = {
+                filename: content + f"# bad suffix attempt {len(self.prompts)}\n"
+                for filename, content in self.bad_files.items()
+            }
+        return {"choices": [{"message": {"content": json.dumps({"files": files})}}]}
 
 
 def _runtime_with_repo_agents(
@@ -419,6 +487,73 @@ def test_repo_multi_uses_data_shape_repair_variant() -> None:
     assert "data-shape contract repair" in result.repair_variant_names
     assert result.forbidden_pattern_hints is not None
     assert any("dictionary values are lists" in hint for hint in result.forbidden_pattern_hints)
+    assert result.final_exact_repo_verification_passed is True
+
+
+def test_repo_multi_locks_literal_duplicate_suffix_format() -> None:
+    task = next(task for task in create_repo_v0_tasks() if task.id == "v0.markdown_toc")
+    direct_suffix = {
+        "src/markdown.py": (
+            "from src.slugify import slugify\n\n"
+            "def toc(markdown):\n"
+            "    entries=[]; counts={}; in_code=False\n"
+            "    for line in markdown.splitlines():\n"
+            "        if line.startswith('```'):\n"
+            "            in_code = not in_code; continue\n"
+            "        if in_code or not line.startswith('#'):\n"
+            "            continue\n"
+            "        title=line.lstrip('#').strip(); base_slug=slugify(title)\n"
+            "        count=counts.get(base_slug, 0)\n"
+            "        slug=base_slug\n"
+            "        if count:\n"
+            "            slug += str(count)\n"
+            "        counts[base_slug]=count+1\n"
+            "        entries.append((title, slug))\n"
+            "    return entries\n"
+        )
+    }
+    client = _MarkdownSuffixClient(direct_suffix, task.expected_files)
+    runtime = KernelRuntime()
+    config = OpenAICompatibleChatConfig(
+        api_key="local", model="markdown", base_url="http://localhost"
+    )
+    runtime.register_plugin(
+        OpenAICompatibleChatPlugin(
+            config=config,
+            client=client,
+            capability_id="model.code",
+            plugin_id="markdown.draft",
+        )
+    )
+    runtime.register_plugin(
+        OpenAICompatibleChatPlugin(
+            config=config,
+            client=_CriticClient(),
+            capability_id="model.reason",
+            plugin_id="markdown.critic",
+        )
+    )
+    multi = MultiModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(multi)
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_multi", multi.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.selected_candidate_id == "repair_3"
+    assert result.literal_format_hints is not None
+    assert "Use hyphen-number suffixes such as intro-1." in result.literal_format_hints
+    assert result.rejected_candidates_before_tests is not None
+    assert "repair_1" in result.rejected_candidates_before_tests
+    assert "repair_2" in result.rejected_candidates_before_tests
+    assert result.repair_variant_names is not None
+    assert "literal duplicate suffix implementation" in result.repair_variant_names
+    assert any(
+        "Do not mutate the base slug inside the loop." in prompt
+        for prompt in client.prompts
+    )
+    assert result.hidden_source_included is False
     assert result.final_exact_repo_verification_passed is True
 
 

@@ -12,10 +12,12 @@ from cgr.kernel.coding import (
     build_repair_prompt,
     check_bool_before_string_normalization,
     check_dict_list_contract_shape,
+    check_duplicate_suffix_format,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
+    extract_literal_format_hints,
     extract_repo_contract_repair_hints,
     extract_structural_repair_hints,
     extract_syntax_error_summary,
@@ -135,9 +137,11 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         coverage_missing_by_candidate: dict[str, list[str]] = {}
         forbidden_hints: list[str] = []
         expected_got_hints: list[str] = []
+        literal_format_hints: list[str] = []
         if verification is not None and not verification[0]:
             failure_summary = summarize_python_test_failure(verification[1])
             expected_got_hints = extract_structural_repair_hints(failure_summary)
+            literal_format_hints = extract_literal_format_hints(failure_summary)
             forbidden_hints = extract_forbidden_patterns_from_failed_code(
                 patch.files,
                 failure_summary,
@@ -163,6 +167,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repair_shape_guard = check_dict_list_contract_shape(
                 repaired.files, task_contract_checklist
             )
+            repair_suffix_guard = check_duplicate_suffix_format(
+                repaired.files, literal_format_hints
+            )
             coverage_missing = check_example_literal_coverage(
                 repaired.files, test_io_examples
             )
@@ -171,6 +178,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repaired_passed = False
             elif repair_shape_guard is not None:
                 verifier_messages.append(repair_shape_guard)
+                repaired_passed = False
+            elif repair_suffix_guard is not None:
+                verifier_messages.append(repair_suffix_guard)
                 repaired_passed = False
             elif coverage_missing:
                 coverage_missing_by_candidate["repair_1"] = coverage_missing
@@ -239,6 +249,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             task.allowed_files_to_edit,
             repo_contract_hints,
             expected_got_hints,
+            literal_format_hints,
         )
         return ExecutionResult(
             context=request.context,
@@ -303,6 +314,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         allowed_files_to_edit: list[str],
         repo_contract_hints: list[str],
         expected_got_hints: list[str],
+        literal_format_hints: list[str],
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -407,6 +419,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "repo_semantic_repair_variants": [],
             "repo_contract_hints": repo_contract_hints,
             "expected_got_hints": expected_got_hints,
+            "literal_format_hints": literal_format_hints,
         }
 
     @staticmethod

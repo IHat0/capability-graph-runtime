@@ -141,6 +141,7 @@ def summarize_python_test_failure(messages: list[str]) -> str:
         for line in non_empty
         if "AssertionError:" in line and "expected" in line and "got" in line
     ]
+    selected.extend(_expected_got_context_lines(non_empty))
     selected.extend(
         line
         for line in non_empty
@@ -161,6 +162,29 @@ def summarize_python_test_failure(messages: list[str]) -> str:
     selected.extend(non_empty[-20:])
     deduplicated = list(dict.fromkeys(selected))
     return "\n".join(deduplicated)
+
+
+def _expected_got_context_lines(lines: list[str]) -> list[str]:
+    """Preserve Expected/Got blocks with their values still adjacent."""
+    for index, line in enumerate(lines):
+        if line != "Expected:" or index + 1 >= len(lines):
+            continue
+        got_index = next(
+            (
+                candidate_index
+                for candidate_index in range(index + 2, min(index + 6, len(lines)))
+                if lines[candidate_index] == "Got:"
+            ),
+            None,
+        )
+        if got_index is None or got_index + 1 >= len(lines):
+            continue
+        context: list[str] = []
+        if index >= 1 and lines[index - 1] != "AssertionError: Expression:":
+            context.extend(["Expression:", lines[index - 1]])
+        context.extend([line, lines[index + 1], "Got:", lines[got_index + 1]])
+        return context
+    return []
 
 
 def _enhance_simple_equality_asserts(source: str) -> str:

@@ -129,6 +129,32 @@ def check_dict_list_contract_shape(
     return None
 
 
+def check_duplicate_suffix_format(
+    files: dict[str, str], literal_format_hints: list[str]
+) -> str | None:
+    """Reject direct numeric suffix concatenation when expected uses '-N'."""
+    if not any("hyphen-number" in hint for hint in literal_format_hints):
+        return None
+    direct_suffix_patterns = (
+        r"\w+\s*\+=\s*str\s*\(\s*\w+\s*\)",
+        r"\w+\s*=\s*\w+\s*\+\s*str\s*\(\s*\w+\s*\)",
+        r"f[\"'][^\"']*\{\s*\w+\s*\}\s*\{\s*\w+\s*\}[^\"']*[\"']",
+    )
+    hyphen_suffix_patterns = (
+        r"f[\"'][^\"']*\{\s*\w+\s*\}-\{\s*\w+\s*\}[^\"']*[\"']",
+        r"\w+\s*\+\s*[\"']-[\"']\s*\+\s*str\s*\(\s*\w+\s*\)",
+    )
+    for content in files.values():
+        if any(re.search(pattern, content) for pattern in hyphen_suffix_patterns):
+            continue
+        if any(re.search(pattern, content) for pattern in direct_suffix_patterns):
+            return (
+                "Rejected candidate before tests; expected duplicate suffix "
+                "format is '-N', not direct numeric concatenation."
+            )
+    return None
+
+
 def _first_match_position(pattern: str, text: str) -> int | None:
     match = re.search(pattern, text)
     return match.start() if match is not None else None
@@ -215,6 +241,7 @@ def extract_forbidden_patterns_from_failed_code(
             "result[key] = [value]."
         )
     hints.extend(extract_structural_repair_hints(failure_summary))
+    hints.extend(extract_literal_format_hints(failure_summary))
     hints.extend(extract_repo_contract_repair_hints(task_contract_checklist or []))
     hints = _unique(hints)
     return hints
@@ -256,12 +283,19 @@ def extract_structural_repair_hints(failure_summary: str) -> list[str]:
                 "Increment the count after choosing the output value.",
             ]
         )
+    hints.extend(_literal_suffix_hints(expected))
     if _nested_dict_expected(expected) and _nested_dict_mismatch(expected, got):
         hints.append(
             "Do not replace nested dictionaries wholesale. Recursively merge nested "
             "dictionaries preserving earlier nested keys unless overridden."
         )
     return _unique(hints)
+
+
+def extract_literal_format_hints(failure_summary: str) -> list[str]:
+    """Infer exact literal formatting rules from expected assertion values."""
+    expected, _ = _extract_expected_got_values(failure_summary)
+    return _literal_suffix_hints(expected)
 
 
 def extract_repo_contract_repair_hints(
@@ -367,6 +401,43 @@ def _second_string_values(values: list[object]) -> list[str]:
         ):
             result.append(value[1])
     return result
+
+
+def _all_string_values(value: object) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        for key, child in value.items():
+            values.extend(_all_string_values(key))
+            values.extend(_all_string_values(child))
+        return values
+    if isinstance(value, (list, tuple, set)):
+        for child in value:
+            values.extend(_all_string_values(child))
+    return values
+
+
+def _literal_suffix_hints(expected: object) -> list[str]:
+    values = _all_string_values(expected)
+    value_set = set(values)
+    examples: list[str] = []
+    for value in values:
+        match = re.match(r"(?P<base>.+)-(?P<number>[1-9]\d*)$", value)
+        if match is None:
+            continue
+        base = match.group("base")
+        if base in value_set:
+            examples.append(value)
+    if not examples:
+        return []
+    example = examples[0]
+    direct = example.replace("-", "", 1)
+    return [
+        f"Use hyphen-number suffixes such as {example}.",
+        f"Do not concatenate numbers directly as {direct}.",
+        "Expected duplicate suffix format is hyphen-number.",
+    ]
 
 
 def _base_with_numeric_suffix(value: str) -> str | None:

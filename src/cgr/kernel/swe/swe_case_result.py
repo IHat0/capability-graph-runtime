@@ -78,3 +78,4 @@ class SWECaseResult(BaseModel):
     repo_semantic_repair_variants: list[str] | None = None
     repo_contract_hints: list[str] | None = None
     expected_got_hints: list[str] | None = None
+    literal_format_hints: list[str] | None = None

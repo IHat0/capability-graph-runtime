@@ -14,10 +14,12 @@ from cgr.kernel.coding import (
     build_repair_prompt,
     check_bool_before_string_normalization,
     check_dict_list_contract_shape,
+    check_duplicate_suffix_format,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
     extract_forbidden_patterns_from_failed_code,
+    extract_literal_format_hints,
     extract_repo_contract_repair_hints,
     extract_structural_repair_hints,
     extract_syntax_error_summary,
@@ -157,6 +159,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         known_failures: list[tuple[str, dict[str, str], str]] = []
         forbidden_hints: list[str] = []
         expected_got_hints: list[str] = []
+        literal_format_hints: list[str] = []
         repo_semantic_repair_variants: list[str] = []
         repeated_rejections = 0
         repair_plan = ""
@@ -206,6 +209,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 ),
                 allowed_files_to_edit=task.allowed_files_to_edit,
                 repo_contract_hints=repo_contract_hints,
+                literal_format_hints=literal_format_hints,
             )
             return ExecutionResult(
                 context=request.context,
@@ -225,6 +229,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             for hint in extract_structural_repair_hints(draft_summary):
                 if hint not in expected_got_hints:
                     expected_got_hints.append(hint)
+            for hint in extract_literal_format_hints(draft_summary):
+                if hint not in literal_format_hints:
+                    literal_format_hints.append(hint)
             forbidden_hints.extend(
                 extract_forbidden_patterns_from_failed_code(
                     draft_patch.files,
@@ -281,6 +288,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     test_io_examples,
                     truthy_examples,
                     falsy_examples,
+                    literal_format_hints,
                 )
                 if extract_syntax_error_summary(current_messages):
                     variant_name = "syntax-focused repair"
@@ -297,6 +305,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     "formula/order-of-operations repair",
                     "stateful clock simulation repair",
                     "data-shape contract repair",
+                    "literal duplicate suffix implementation",
                 }:
                     repo_semantic_repair_variants.append(variant_name)
                 repair_prompt = build_repair_prompt(
@@ -344,6 +353,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repair_shape_guard = check_dict_list_contract_shape(
                     repaired_patch.files, task_contract_checklist
                 )
+                repair_suffix_guard = check_duplicate_suffix_format(
+                    repaired_patch.files, literal_format_hints
+                )
                 if repair_bool_guard is not None:
                     bool_guard_applied = True
                     rejected_candidates_before_tests.append(candidate_id)
@@ -366,6 +378,17 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     latest_failures[candidate_id] = repair_shape_guard
                     current_patch = repaired_patch
                     current_messages = [repair_shape_guard]
+                    continue
+                if repair_suffix_guard is not None:
+                    rejected_candidates_before_tests.append(candidate_id)
+                    verifier_messages.append(repair_suffix_guard)
+                    candidates.append((candidate_id, repaired_patch, False))
+                    known_failures.append(
+                        (candidate_id, repaired_patch.files, repair_suffix_guard)
+                    )
+                    latest_failures[candidate_id] = repair_suffix_guard
+                    current_patch = repaired_patch
+                    current_messages = [repair_suffix_guard]
                     continue
                 coverage_missing = check_example_literal_coverage(
                     repaired_patch.files, test_io_examples
@@ -430,6 +453,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 for hint in extract_structural_repair_hints(failure_summary):
                     if hint not in expected_got_hints:
                         expected_got_hints.append(hint)
+                for hint in extract_literal_format_hints(failure_summary):
+                    if hint not in literal_format_hints:
+                        literal_format_hints.append(hint)
                 for hint in extract_forbidden_patterns_from_failed_code(
                     repaired_patch.files,
                     failure_summary,
@@ -551,6 +577,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repo_contract_hints,
             expected_got_hints,
             repo_semantic_repair_variants,
+            literal_format_hints,
         )
         return ExecutionResult(
             context=request.context,
@@ -647,6 +674,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         repo_contract_hints: list[str] | None = None,
         expected_got_hints: list[str] | None = None,
         repo_semantic_repair_variants: list[str] | None = None,
+        literal_format_hints: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "attempts_count": len(candidates),
@@ -763,6 +791,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "repo_semantic_repair_variants": repo_semantic_repair_variants or [],
             "repo_contract_hints": repo_contract_hints or [],
             "expected_got_hints": expected_got_hints or [],
+            "literal_format_hints": literal_format_hints or [],
         }
 
     @staticmethod
@@ -780,6 +809,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         test_io_examples: list[str],
         truthy_examples: list[str],
         falsy_examples: list[str],
+        literal_format_hints: list[str] | None = None,
     ) -> tuple[str, str]:
         if attempt == 1:
             return (
@@ -831,11 +861,20 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             for marker in ("clock", "refill", "capacity", "consume", "token")
         )
         if attempt == 2 and duplicate_context:
+            suffix_instruction = (
+                " Use the unsuffixed base slug for the first occurrence. For "
+                "duplicates, compute candidate = f'{base}-{count}'. Do not mutate "
+                "the base slug inside the loop. Do not do slug += str(count). Keep "
+                "base_slug separate from candidate_slug."
+                if literal_format_hints
+                else ""
+            )
             return "duplicate-name suffix repair", (
                 "Use the unsuffixed base value for the first occurrence. Add -1, "
                 "-2, etc. only for later duplicates. Track seen base values, choose "
                 "the output value before incrementing the count, and ignore headings "
                 "inside fenced code blocks when the tests require it. "
+                f"{suffix_instruction} "
             )
         if attempt == 2 and recursive_context:
             return "recursive precedence merge", (
@@ -868,6 +907,26 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             return "loop-based implementation", (
                 "Repair variant 2: use an explicit for-loop over the second input "
                 "when combining mappings. "
+            )
+        if attempt >= 3 and duplicate_context and literal_format_hints:
+            return "literal duplicate suffix implementation", (
+                "Repair variant: literal duplicate suffix implementation. "
+                "Implement the duplicate suffix algorithm exactly and generically:\n"
+                "counts = {}\n"
+                "for each item:\n"
+                "    base = normalize(item)\n"
+                "    n = counts.get(base, 0)\n"
+                "    if n == 0:\n"
+                "        output = base\n"
+                "    else:\n"
+                "        output = f\"{base}-{n}\"\n"
+                "    counts[base] = n + 1\n"
+                "Use the unsuffixed base slug for the first occurrence. For "
+                "duplicates, compute candidate = f'{base}-{count}'. Do not mutate "
+                "the base slug inside the loop. Do not do slug += str(count). Keep "
+                "base_slug separate from candidate_slug. For markdown-like TOC "
+                "tasks, preserve heading parsing and fenced-code ignoring while "
+                "using this duplicate suffix algorithm. "
             )
         if attempt >= 3 and (test_io_examples or truthy_examples or falsy_examples):
             parser_instruction = (
