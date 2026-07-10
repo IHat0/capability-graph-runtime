@@ -13,6 +13,7 @@ from cgr.kernel.coding import (
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
     check_router_param_literal_matching,
+    config_recursive_merge_debug_fields,
     extract_forbidden_patterns_from_failed_code,
     extract_literal_format_hints,
     extract_repo_contract_repair_hints,
@@ -281,8 +282,9 @@ def test_config_shallow_update_candidate_is_rejected() -> None:
     }
 
     assert check_none_overwrite_config_merge(bad, checklist) == (
-        "Rejected candidate before tests; shallow dict.update cannot satisfy "
-        "recursive None-skipping config merge."
+        "Rejected candidate before tests; every config source must pass through "
+        "the recursive None-skipping merge helper. Do not duplicate top-level "
+        "merge logic in resolve_config."
     )
 
 
@@ -302,6 +304,109 @@ def test_config_assignment_without_none_guard_is_rejected() -> None:
         "Rejected candidate before tests; None values must not override "
         "existing non-None config values."
     )
+
+
+def test_config_manual_top_level_merge_is_rejected_but_helper_assignment_is_valid() -> None:
+    checklist = [
+        "Config precedence uses nested recursive merge; later sources override; "
+        "None values do not override"
+    ]
+    helper = (
+        "def _merge(base, incoming):\n"
+        "    result = dict(base)\n"
+        "    for key, value in incoming.items():\n"
+        "        if value is None:\n"
+        "            continue\n"
+        "        if isinstance(value, dict) and isinstance(result.get(key), dict):\n"
+        "            result[key] = _merge(result[key], value)\n"
+        "        elif isinstance(value, dict):\n"
+        "            result[key] = _merge({}, value)\n"
+        "        else:\n"
+        "            result[key] = value\n"
+        "    return result\n\n"
+    )
+    manual = {
+        "src/config.py": helper
+        + "def resolve_config(defaults, file_config, env_config, overrides):\n"
+        "    result = {}\n"
+        "    for source in (defaults, file_config, env_config, overrides):\n"
+        "        if source is not None:\n"
+        "            for key, value in source.items():\n"
+        "                result[key] = value\n"
+        "    return result\n"
+    }
+    routed = {
+        "src/config.py": helper
+        + "def resolve_config(defaults, file_config, env_config, overrides):\n"
+        "    result = {}\n"
+        "    for source in (defaults, file_config, env_config, overrides):\n"
+        "        if source is not None:\n"
+        "            result = _merge(result, source)\n"
+        "    return result\n"
+    }
+
+    assert check_none_overwrite_config_merge(manual, checklist) == (
+        "Rejected candidate before tests; every config source must pass through "
+        "the recursive None-skipping merge helper. Do not duplicate top-level "
+        "merge logic in resolve_config."
+    )
+    assert check_none_overwrite_config_merge(routed, checklist) is None
+    assert config_recursive_merge_debug_fields(routed, checklist) == {
+        "all_sources_use_recursive_merge": True,
+        "top_level_none_guard_enforced": True,
+        "config_manual_merge_rejected": False,
+        "config_recursive_helper_detected": True,
+    }
+
+
+def test_all_sources_recursive_config_merge_preserves_inputs_and_none_rules() -> None:
+    files = {
+        "src/config.py": (
+            "def _merge(base, incoming):\n"
+            "    result = dict(base)\n"
+            "    for key, value in incoming.items():\n"
+            "        if value is None:\n"
+            "            continue\n"
+            "        if isinstance(value, dict) and isinstance(result.get(key), dict):\n"
+            "            result[key] = _merge(result[key], value)\n"
+            "        elif isinstance(value, dict):\n"
+            "            result[key] = _merge({}, value)\n"
+            "        else:\n"
+            "            result[key] = value\n"
+            "    return result\n\n"
+            "def resolve_config(defaults, file_config, env_config, overrides):\n"
+            "    result = {}\n"
+            "    for source in (defaults, file_config, env_config, overrides):\n"
+            "        if source is not None:\n"
+            "            result = _merge(result, source)\n"
+            "    return result\n"
+        )
+    }
+    tests = {
+        "visible_tests.py": (
+            "from copy import deepcopy\n"
+            "from src.config import resolve_config\n"
+            "defaults={'db': {'host': 'localhost', 'port': 1}}\n"
+            "file_config={'db': {'host': None, 'port': 2}}\n"
+            "env_config={'db': {'user': 'u'}}\n"
+            "sources=deepcopy((defaults, file_config, env_config))\n"
+            "expected={'db': {'host': 'localhost', 'port': 2, 'user': 'u'}}\n"
+            "actual=resolve_config(defaults, file_config, env_config, None)\n"
+            "assert actual == expected\n"
+            "top_expected={'host': 'localhost'}\n"
+            "top_actual=resolve_config({'host': 'localhost'}, {}, {}, {'host': None})\n"
+            "assert top_actual == top_expected\n"
+            "assert (defaults, file_config, env_config) == tuple(sources)\n"
+        )
+    }
+
+    passed, messages = PythonTestRunner().run(
+        files,
+        tests,
+        [CodeTestCase(name="visible", command=["python", "visible_tests.py"])],
+    )
+
+    assert passed, messages
 
 
 def test_router_contract_produces_path_param_segment_hints() -> None:
@@ -594,7 +699,7 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
         )
     )
 
-    assert config_variant == "none-skipping recursive config merge"
+    assert config_variant == "deterministic all-sources recursive config merge"
     config_prompt = MultiModelCodingAgentPlugin._variant_instruction(
         _coding_task_from_swe(tasks["v0.config_loader_precedence"]), 2, [], [], []
     )[1]
@@ -606,7 +711,7 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
             _coding_task_from_swe(tasks["v0.config_loader_precedence"]), 3, [], [], []
         )
     )
-    assert deterministic_config_name == "deterministic none-skipping recursive merge"
+    assert deterministic_config_name == "deterministic all-sources recursive config merge"
     assert "def _merge(base, incoming):" in deterministic_config_prompt
     assert "defaults, file_config, env_config, overrides" in deterministic_config_prompt
     assert cart_variant == "discount-amount semantics repair"
@@ -928,6 +1033,10 @@ def test_repo_single_accepts_deterministic_config_candidate() -> None:
     assert result.passed is True
     assert result.hidden_source_included is False
     assert result.final_exact_repo_verification_passed is True
+    assert result.all_sources_use_recursive_merge is True
+    assert result.top_level_none_guard_enforced is True
+    assert result.config_manual_merge_rejected is False
+    assert result.config_recursive_helper_detected is True
 
 
 def test_repo_multi_recovers_malformed_config_patch_with_format_retry() -> None:

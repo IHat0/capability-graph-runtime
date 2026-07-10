@@ -17,6 +17,7 @@ from cgr.kernel.coding import (
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
     check_router_param_literal_matching,
+    config_recursive_merge_debug_fields,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -326,6 +327,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     "recursive precedence merge",
                     "none-skipping recursive config merge",
                     "deterministic none-skipping recursive merge",
+                    "deterministic all-sources recursive config merge",
                     "formula/order-of-operations repair",
                     "discount-amount semantics repair",
                     "stateful clock simulation repair",
@@ -883,6 +885,14 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "expected_got_hints": expected_got_hints or [],
             "literal_format_hints": literal_format_hints or [],
             "router_param_rejection_hints": router_param_rejection_hints or [],
+            **config_recursive_merge_debug_fields(
+                next(
+                    candidate.files
+                    for candidate_id, candidate, _ in candidates
+                    if candidate_id == selected_id
+                ),
+                task_contract_checklist or [],
+            ),
             **_placeholder_trace_fields(
                 next(
                     candidate
@@ -979,13 +989,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 f"{suffix_instruction} "
             )
         if attempt == 2 and recursive_context:
-            return "none-skipping recursive config merge", (
-                "Implement a pure recursive merge. Do not use "
-                "result[key].update(value). Do not mutate inputs. Copy "
-                "dictionaries. Skip value is None before assigning. Recursively "
-                "merge nested dictionaries. Apply sources in this order: "
-                "defaults, file_config, env_config, overrides. Use this exact "
-                "algorithm:\n"
+            return "deterministic all-sources recursive config merge", (
+                "Repair variant: deterministic all-sources recursive config merge. "
+                "Use this exact algorithm:\n"
                 "def _merge(base, incoming):\n"
                 "    result = dict(base)\n"
                 "    for key, value in incoming.items():\n"
@@ -1004,13 +1010,25 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 "def resolve_config(defaults, file_config, env_config, overrides):\n"
                 "    result = {}\n"
                 "    for source in (defaults, file_config, env_config, overrides):\n"
-                "        if source:\n"
+                "        if source is not None:\n"
                 "            result = _merge(result, source)\n"
-                "    return result\n"
+                "    return result\n\n"
+                "Define one recursive helper named _merge or equivalent. The helper "
+                "must skip value is None before any assignment. Skip value is None "
+                "before assigning. Every source must "
+                "be applied using result = _merge(result, source). resolve_config "
+                "must not manually loop over source.items() and must not contain "
+                "result[key] = value. Do not use result[key].update(value). Do not "
+                "use dict.update or shallow update. Do "
+                "not mutate input dictionaries. Apply sources in this exact order: "
+                "defaults, file_config, env_config, overrides. Do not duplicate "
+                "merge logic inside resolve_config. All source values, including "
+                "top-level values, must pass through the recursive None-skipping "
+                "helper."
             )
         if attempt >= 3 and recursive_context:
-            return "deterministic none-skipping recursive merge", (
-                "Repair variant: deterministic none-skipping recursive merge. "
+            return "deterministic all-sources recursive config merge", (
+                "Repair variant: deterministic all-sources recursive config merge. "
                 "Use this exact helper pattern:\n"
                 "def _merge(base, incoming):\n"
                 "    result = dict(base)\n"
@@ -1030,14 +1048,15 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 "def resolve_config(defaults, file_config, env_config, overrides):\n"
                 "    result = {}\n"
                 "    for source in (defaults, file_config, env_config, overrides):\n"
-                "        if source:\n"
+                "        if source is not None:\n"
                 "            result = _merge(result, source)\n"
                 "    return result\n"
-                "Do not use result[key].update(value). Do not mutate inputs. "
-                "Copy dictionaries. Skip value is None before assigning, including "
-                "inside nested dictionaries. Recursively merge nested dictionaries. "
-                "Apply sources in this order: defaults, file_config, env_config, "
-                "overrides. "
+                "Every source must use result = _merge(result, source). Do not "
+                "duplicate merge logic inside resolve_config. resolve_config must "
+                "not loop over source.items() or assign result[key] = value. All "
+                "top-level and nested values must pass through the None-skipping "
+                "helper. Do not use dict.update. Do not mutate inputs. Apply sources "
+                "in this exact order: defaults, file_config, env_config, overrides."
             )
         if attempt == 2 and formula_context:
             return "discount-amount semantics repair", (

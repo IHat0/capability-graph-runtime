@@ -162,30 +162,176 @@ def check_none_overwrite_config_merge(
     contract = "\n".join(task_contract_checklist).casefold()
     if not _none_skip_context(contract):
         return None
-    for content in files.values():
-        if _shallow_config_update(content) and not _uses_recursive_merge_helper(
-            content
-        ):
-            return (
-                "Rejected candidate before tests; shallow dict.update cannot "
-                "satisfy recursive None-skipping config merge."
-            )
-        if re.search(r"\w+\s*\[\s*key\s*\]\s*=\s*value\b", content):
-            guard_index = _first_match_position(r"\bif\s+value\s+is\s+None\s*:", content)
-            assignment_index = _first_match_position(
-                r"\w+\s*\[\s*key\s*\]\s*=\s*value\b", content
-            )
-            if (
-                guard_index is not None
-                and assignment_index is not None
-                and guard_index < assignment_index
-            ):
+    if not _all_sources_recursive_context(contract):
+        for content in files.values():
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
                 continue
-            return (
-                "Rejected candidate before tests; None values must not override "
-                "existing non-None config values."
-            )
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if _function_assigns_value(node) and not _function_skips_none(node):
+                    return (
+                        "Rejected candidate before tests; None values must not "
+                        "override existing non-None config values."
+                    )
+        return None
+    shape = config_recursive_merge_debug_fields(files, task_contract_checklist)
+    if shape["config_manual_merge_rejected"]:
+        return CONFIG_ALL_SOURCES_REJECTION
     return None
+
+
+CONFIG_ALL_SOURCES_REJECTION = (
+    "Rejected candidate before tests; every config source must pass through the "
+    "recursive None-skipping merge helper. Do not duplicate top-level merge logic "
+    "in resolve_config."
+)
+
+
+def config_recursive_merge_debug_fields(
+    files: dict[str, str], task_contract_checklist: list[str]
+) -> dict[str, bool]:
+    """Describe whether config sources use one guarded recursive merge path."""
+    contract = "\n".join(task_contract_checklist).casefold()
+    inactive = {
+        "all_sources_use_recursive_merge": False,
+        "top_level_none_guard_enforced": False,
+        "config_manual_merge_rejected": False,
+        "config_recursive_helper_detected": False,
+    }
+    if not _none_skip_context(contract) or not _all_sources_recursive_context(contract):
+        return inactive
+    for content in files.values():
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            continue
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        resolve = functions.get("resolve_config")
+        helpers = {
+            name: node
+            for name, node in functions.items()
+            if name != "resolve_config" and "merge" in name.casefold()
+        }
+        guarded_helpers = {
+            name
+            for name, node in helpers.items()
+            if _function_skips_none(node) and _function_recursively_merges(node, name)
+        }
+        helper_detected = bool(guarded_helpers)
+        all_sources = bool(
+            resolve is not None
+            and guarded_helpers
+            and _resolve_routes_all_sources(resolve, guarded_helpers)
+        )
+        manual_merge = bool(
+            resolve is not None and _resolve_contains_manual_merge(resolve)
+        )
+        shallow_update = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+            for node in ast.walk(tree)
+        )
+        rejected = shallow_update or manual_merge or not all_sources
+        return {
+            "all_sources_use_recursive_merge": all_sources,
+            "top_level_none_guard_enforced": all_sources and helper_detected,
+            "config_manual_merge_rejected": rejected,
+            "config_recursive_helper_detected": helper_detected,
+        }
+    return {**inactive, "config_manual_merge_rejected": True}
+
+
+def _function_skips_none(node: ast.AST) -> bool:
+    return any(
+        isinstance(item, ast.If)
+        and isinstance(item.test, ast.Compare)
+        and isinstance(item.test.left, ast.Name)
+        and item.test.left.id == "value"
+        and any(isinstance(operator, ast.Is) for operator in item.test.ops)
+        and any(
+            isinstance(comparator, ast.Constant) and comparator.value is None
+            for comparator in item.test.comparators
+        )
+        and any(isinstance(statement, ast.Continue) for statement in item.body)
+        for item in ast.walk(node)
+    )
+
+
+def _function_assigns_value(node: ast.AST) -> bool:
+    return any(
+        isinstance(item, ast.Assign)
+        and isinstance(item.value, ast.Name)
+        and item.value.id == "value"
+        and any(isinstance(target, ast.Subscript) for target in item.targets)
+        for item in ast.walk(node)
+    )
+
+
+def _function_recursively_merges(node: ast.AST, helper_name: str) -> bool:
+    return any(
+        isinstance(item, ast.Call)
+        and isinstance(item.func, ast.Name)
+        and item.func.id == helper_name
+        for item in ast.walk(node)
+    )
+
+
+def _resolve_routes_all_sources(
+    resolve: ast.AST, guarded_helpers: set[str]
+) -> bool:
+    expected_sources = {"defaults", "file_config", "env_config", "overrides"}
+    for loop in (node for node in ast.walk(resolve) if isinstance(node, ast.For)):
+        if not isinstance(loop.target, ast.Name) or loop.target.id != "source":
+            continue
+        source_names = {
+            element.id
+            for element in getattr(loop.iter, "elts", [])
+            if isinstance(element, ast.Name)
+        }
+        if source_names != expected_sources:
+            continue
+        for item in ast.walk(loop):
+            if not isinstance(item, ast.Assign) or len(item.targets) != 1:
+                continue
+            target = item.targets[0]
+            call = item.value
+            if (
+                isinstance(target, ast.Name)
+                and target.id == "result"
+                and isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in guarded_helpers
+                and len(call.args) == 2
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == "result"
+                and isinstance(call.args[1], ast.Name)
+                and call.args[1].id == "source"
+            ):
+                return True
+    return False
+
+
+def _resolve_contains_manual_merge(resolve: ast.AST) -> bool:
+    return any(
+        (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"items", "update"}
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Subscript) for target in node.targets)
+        )
+        for node in ast.walk(resolve)
+    )
 
 
 ROUTER_PARAM_LITERAL_REJECTION = (
@@ -701,6 +847,18 @@ def _none_skip_context(contract: str) -> bool:
         "none values do not override" in contract
         or "none does not override" in contract
         or ("config" in contract and "none" in contract and "override" in contract)
+    )
+
+
+def _all_sources_recursive_context(contract: str) -> bool:
+    return (
+        "config" in contract
+        or "precedence" in contract
+        or "later sources override" in contract
+    ) and (
+        "nested" in contract
+        or "recursive" in contract
+        or "none values do not override" in contract
     )
 
 

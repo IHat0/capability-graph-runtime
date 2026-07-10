@@ -89,3 +89,7 @@ class SWECaseResult(BaseModel):
     format_retry_raw_output_preview: str | None = None
     raw_python_single_file_fallback_used: bool | None = None
     router_param_rejection_hints: list[str] | None = None
+    all_sources_use_recursive_merge: bool | None = None
+    top_level_none_guard_enforced: bool | None = None
+    config_manual_merge_rejected: bool | None = None
+    config_recursive_helper_detected: bool | None = None

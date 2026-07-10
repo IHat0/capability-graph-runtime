@@ -395,6 +395,18 @@ class SWEABRunner:
             "router_param_rejection_hints": trace.get(
                 "router_param_rejection_hints"
             ),
+            "all_sources_use_recursive_merge": trace.get(
+                "all_sources_use_recursive_merge"
+            ),
+            "top_level_none_guard_enforced": trace.get(
+                "top_level_none_guard_enforced"
+            ),
+            "config_manual_merge_rejected": trace.get(
+                "config_manual_merge_rejected"
+            ),
+            "config_recursive_helper_detected": trace.get(
+                "config_recursive_helper_detected"
+            ),
             "placeholder_filename_remapped": trace.get(
                 "placeholder_filename_remapped"
             ),

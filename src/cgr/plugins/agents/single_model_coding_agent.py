@@ -15,6 +15,7 @@ from cgr.kernel.coding import (
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
     check_router_param_literal_matching,
+    config_recursive_merge_debug_fields,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -483,6 +484,14 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "expected_got_hints": expected_got_hints,
             "literal_format_hints": literal_format_hints,
             "router_param_rejection_hints": router_param_rejection_hints,
+            **config_recursive_merge_debug_fields(
+                next(
+                    candidate.files
+                    for candidate_id, candidate, _ in candidates
+                    if candidate_id == selected_id
+                ),
+                task_contract_checklist,
+            ),
             **_placeholder_trace_fields(
                 next(
                     candidate
