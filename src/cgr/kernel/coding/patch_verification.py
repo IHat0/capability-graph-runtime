@@ -189,6 +189,190 @@ CONFIG_ALL_SOURCES_REJECTION = (
     "in resolve_config."
 )
 
+CART_MUTATION_REJECTION = (
+    "Rejected candidate before tests; cart total must not mutate input items or "
+    "assign derived fields such as line_total."
+)
+CART_DISCOUNT_REJECTION = (
+    "Rejected candidate before tests; discount_amount returns the discount amount. "
+    "Subtract it from subtotal before applying tax."
+)
+CART_PARTIAL_REJECTION = (
+    "Rejected candidate before tests; the candidate fixed only one cart "
+    "requirement. It must both avoid input mutation and subtract discount_amount "
+    "from subtotal."
+)
+CART_ORDER_REJECTION = (
+    "Rejected candidate before tests; subtract the discount amount before applying "
+    "tax, and round only the final total."
+)
+
+
+def check_cart_total_contract(
+    files: dict[str, str], task_contract_checklist: list[str]
+) -> str | None:
+    """Reject partial cart repairs before spending an executable test run."""
+    shape = cart_total_debug_fields(files, task_contract_checklist)
+    if not shape["cart_contract_detected"]:
+        return None
+    mutation = shape["cart_input_mutation_detected"]
+    subtraction = shape["cart_discount_subtraction_detected"]
+    if mutation and not subtraction:
+        return CART_PARTIAL_REJECTION
+    if mutation:
+        return CART_MUTATION_REJECTION
+    if not subtraction:
+        return CART_DISCOUNT_REJECTION
+    if not shape["cart_tax_after_discount_detected"]:
+        return CART_ORDER_REJECTION
+    if not shape["cart_final_only_rounding_detected"]:
+        return CART_ORDER_REJECTION
+    return None
+
+
+def cart_total_debug_fields(
+    files: dict[str, str], task_contract_checklist: list[str]
+) -> dict[str, bool]:
+    """Analyze the combined non-mutation and discount-subtraction cart contract."""
+    contract = "\n".join(task_contract_checklist).casefold()
+    content = "\n".join(files.values())
+    detected = _cart_combined_context(contract, content.casefold())
+    result = {
+        "cart_contract_detected": detected,
+        "cart_input_mutation_detected": False,
+        "cart_discount_subtraction_detected": False,
+        "cart_tax_after_discount_detected": False,
+        "cart_final_only_rounding_detected": False,
+        "cart_combined_contract_satisfied": False,
+    }
+    if not detected:
+        return result
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return result
+    total_function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "total"
+        ),
+        None,
+    )
+    if total_function is None:
+        return result
+    item_names = {
+        node.target.id
+        for node in ast.walk(total_function)
+        if isinstance(node, (ast.For, ast.comprehension))
+        and isinstance(node.target, ast.Name)
+        and isinstance(node.iter, ast.Name)
+        and node.iter.id == "items"
+    }
+    mutation = any(
+        isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        and any(
+            _subscript_root_name(target) in item_names
+            for target in _assignment_targets(node)
+        )
+        for node in ast.walk(total_function)
+    )
+    discount_names = {
+        target.id
+        for node in ast.walk(total_function)
+        if isinstance(node, ast.Assign)
+        and _is_discount_amount_call(node.value)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    subtraction_nodes = [
+        node
+        for node in ast.walk(total_function)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Sub)
+        and _contains_name(node.left, "subtotal")
+        and (
+            _contains_discount_call(node.right)
+            or any(_contains_name(node.right, name) for name in discount_names)
+        )
+    ]
+    discounted_names = {
+        target.id
+        for node in ast.walk(total_function)
+        if isinstance(node, ast.Assign)
+        and node.value in subtraction_nodes
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    tax_after_discount = any(
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Mult)
+        and (
+            any(subtraction in ast.walk(node) for subtraction in subtraction_nodes)
+            or any(_contains_name(node, name) for name in discounted_names)
+        )
+        and _contains_name(node, "tax_rate")
+        for node in ast.walk(total_function)
+    )
+    round_calls = [
+        node
+        for node in ast.walk(total_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "round"
+    ]
+    returned_nodes = {
+        id(child)
+        for node in ast.walk(total_function)
+        if isinstance(node, ast.Return) and node.value is not None
+        for child in ast.walk(node.value)
+    }
+    final_rounding = len(round_calls) == 1 and id(round_calls[0]) in returned_nodes
+    result.update(
+        {
+            "cart_input_mutation_detected": mutation,
+            "cart_discount_subtraction_detected": bool(subtraction_nodes),
+            "cart_tax_after_discount_detected": tax_after_discount,
+            "cart_final_only_rounding_detected": final_rounding,
+        }
+    )
+    result["cart_combined_contract_satisfied"] = bool(
+        not mutation and subtraction_nodes and tax_after_discount and final_rounding
+    )
+    return result
+
+
+def _assignment_targets(node: ast.AST) -> list[ast.AST]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        return [node.target]
+    return []
+
+
+def _subscript_root_name(node: ast.AST) -> str | None:
+    current = node
+    while isinstance(current, ast.Subscript):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else None
+
+
+def _is_discount_amount_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "discount_amount"
+    )
+
+
+def _contains_discount_call(node: ast.AST) -> bool:
+    return any(_is_discount_amount_call(child) for child in ast.walk(node))
+
+
+def _contains_name(node: ast.AST, name: str) -> bool:
+    return any(isinstance(child, ast.Name) and child.id == name for child in ast.walk(node))
+
 
 def config_recursive_merge_debug_fields(
     files: dict[str, str], task_contract_checklist: list[str]
@@ -880,6 +1064,16 @@ def _formula_order_context(contract: str) -> bool:
     return (
         ("discount" in contract and "tax" in contract)
         or ("subtotal" in contract and "round" in contract)
+    )
+
+
+def _cart_combined_context(contract: str, code: str) -> bool:
+    return (
+        ("cart" in contract or "shopping" in contract or "checkout" in contract)
+        and "discount" in contract
+        and "tax" in contract
+        and ("mutat" in contract or "unchanged" in contract)
+        and "discount_amount" in code
     )
 
 

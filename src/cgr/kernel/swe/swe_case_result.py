@@ -93,3 +93,8 @@ class SWECaseResult(BaseModel):
     top_level_none_guard_enforced: bool | None = None
     config_manual_merge_rejected: bool | None = None
     config_recursive_helper_detected: bool | None = None
+    cart_input_mutation_detected: bool | None = None
+    cart_discount_subtraction_detected: bool | None = None
+    cart_tax_after_discount_detected: bool | None = None
+    cart_final_only_rounding_detected: bool | None = None
+    cart_combined_contract_satisfied: bool | None = None

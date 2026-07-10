@@ -11,11 +11,13 @@ from cgr.kernel.coding import (
     build_patch_prompt,
     build_repair_prompt,
     check_bool_before_string_normalization,
+    check_cart_total_contract,
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
     check_router_param_literal_matching,
     config_recursive_merge_debug_fields,
+    cart_total_debug_fields,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -130,6 +132,7 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         router_guard = check_router_param_literal_matching(
             patch.files, task_contract_checklist
         )
+        cart_guard = check_cart_total_contract(patch.files, task_contract_checklist)
         verification = (
             (False, [bool_guard])
             if bool_guard is not None
@@ -139,6 +142,8 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             if none_guard is not None
             else (False, [router_guard])
             if router_guard is not None
+            else (False, [cart_guard])
+            if cart_guard is not None
             else verify_patch(task, patch)
         )
         duration_ms = model_result.duration_ms + format_duration
@@ -189,6 +194,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             repair_router_guard = check_router_param_literal_matching(
                 repaired.files, task_contract_checklist
             )
+            repair_cart_guard = check_cart_total_contract(
+                repaired.files, task_contract_checklist
+            )
             repair_suffix_guard = check_duplicate_suffix_format(
                 repaired.files, literal_format_hints
             )
@@ -207,6 +215,9 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             elif repair_router_guard is not None:
                 router_param_rejection_hints.append(repair_router_guard)
                 verifier_messages.append(repair_router_guard)
+                repaired_passed = False
+            elif repair_cart_guard is not None:
+                verifier_messages.append(repair_cart_guard)
                 repaired_passed = False
             elif repair_suffix_guard is not None:
                 verifier_messages.append(repair_suffix_guard)
@@ -485,6 +496,14 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             "literal_format_hints": literal_format_hints,
             "router_param_rejection_hints": router_param_rejection_hints,
             **config_recursive_merge_debug_fields(
+                next(
+                    candidate.files
+                    for candidate_id, candidate, _ in candidates
+                    if candidate_id == selected_id
+                ),
+                task_contract_checklist,
+            ),
+            **cart_total_debug_fields(
                 next(
                     candidate.files
                     for candidate_id, candidate, _ in candidates

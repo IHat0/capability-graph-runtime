@@ -407,6 +407,21 @@ class SWEABRunner:
             "config_recursive_helper_detected": trace.get(
                 "config_recursive_helper_detected"
             ),
+            "cart_input_mutation_detected": trace.get(
+                "cart_input_mutation_detected"
+            ),
+            "cart_discount_subtraction_detected": trace.get(
+                "cart_discount_subtraction_detected"
+            ),
+            "cart_tax_after_discount_detected": trace.get(
+                "cart_tax_after_discount_detected"
+            ),
+            "cart_final_only_rounding_detected": trace.get(
+                "cart_final_only_rounding_detected"
+            ),
+            "cart_combined_contract_satisfied": trace.get(
+                "cart_combined_contract_satisfied"
+            ),
             "placeholder_filename_remapped": trace.get(
                 "placeholder_filename_remapped"
             ),

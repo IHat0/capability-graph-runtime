@@ -10,10 +10,12 @@ from cgr.kernel.coding import (
     PythonTestRunner,
     safe_hidden_failure_summary,
     check_dict_list_contract_shape,
+    check_cart_total_contract,
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
     check_router_param_literal_matching,
     config_recursive_merge_debug_fields,
+    cart_total_debug_fields,
     extract_forbidden_patterns_from_failed_code,
     extract_literal_format_hints,
     extract_repo_contract_repair_hints,
@@ -562,6 +564,112 @@ def test_cart_contract_produces_discount_amount_subtraction_hint() -> None:
     assert "Input items must not be mutated." in hints
 
 
+def _cart_candidate(body: str) -> dict[str, str]:
+    return {"src/cart.py": "from src.discounts import discount_amount\n\n" + body}
+
+
+def test_cart_contract_rejects_partial_repairs_and_accepts_combined_shape() -> None:
+    checklist = [
+        "Shopping cart total applies discount before tax, avoids mutating input "
+        "items, and rounds only the final total"
+    ]
+    baseline = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    subtotal = 0\n"
+        "    for item in items:\n"
+        "        item['line_total'] = item['price'] * item.get('qty', 1)\n"
+        "        subtotal += item['line_total']\n"
+        "    discounted_subtotal = discount_amount(subtotal, discount_rate)\n"
+        "    return round(discounted_subtotal * (1 + tax_rate), 2)\n"
+    )
+    subtraction_only = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    subtotal = 0\n"
+        "    for item in items:\n"
+        "        item['line_total'] = item['price'] * item.get('qty', 1)\n"
+        "        subtotal += item['line_total']\n"
+        "    discounted_subtotal = subtotal - discount_amount(subtotal, discount_rate)\n"
+        "    return round(discounted_subtotal * (1 + tax_rate), 2)\n"
+    )
+    mutation_only = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    subtotal = sum(item['price'] * item.get('qty', 1) for item in items)\n"
+        "    discounted_subtotal = discount_amount(subtotal, discount_rate)\n"
+        "    return round(discounted_subtotal * (1 + tax_rate), 2)\n"
+    )
+    combined = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    subtotal = sum(item['price'] * item.get('qty', 1) for item in items)\n"
+        "    discount = discount_amount(subtotal, discount_rate)\n"
+        "    discounted_subtotal = subtotal - discount\n"
+        "    total_with_tax = discounted_subtotal * (1 + tax_rate)\n"
+        "    return round(total_with_tax, 2)\n"
+    )
+
+    assert "fixed only one cart requirement" in (
+        check_cart_total_contract(baseline, checklist) or ""
+    )
+    assert "must not mutate input items" in (
+        check_cart_total_contract(subtraction_only, checklist) or ""
+    )
+    assert "discount_amount returns the discount amount" in (
+        check_cart_total_contract(mutation_only, checklist) or ""
+    )
+    assert check_cart_total_contract(combined, checklist) is None
+    assert cart_total_debug_fields(subtraction_only, checklist)[
+        "cart_input_mutation_detected"
+    ] is True
+    assert cart_total_debug_fields(subtraction_only, checklist)[
+        "cart_discount_subtraction_detected"
+    ] is True
+    assert cart_total_debug_fields(mutation_only, checklist)[
+        "cart_discount_subtraction_detected"
+    ] is False
+    assert cart_total_debug_fields(combined, checklist) == {
+        "cart_contract_detected": True,
+        "cart_input_mutation_detected": False,
+        "cart_discount_subtraction_detected": True,
+        "cart_tax_after_discount_detected": True,
+        "cart_final_only_rounding_detected": True,
+        "cart_combined_contract_satisfied": True,
+    }
+
+
+def test_combined_cart_calculation_and_non_mutation_edge_cases() -> None:
+    task = next(
+        task for task in create_repo_v0_tasks() if task.id == "v0.shopping_cart_totals"
+    )
+    tests = {
+        "cart_contract_tests.py": (
+            "from copy import deepcopy\n"
+            "from src.cart import total\n"
+            "items=[{'price': 10, 'qty': 2}, {'price': 5}]\n"
+            "original=deepcopy(items)\n"
+            "actual=total(items, discount_rate=0.1, tax_rate=0.2)\n"
+            "expected=27.0\n"
+            "assert actual == expected\n"
+            "assert items == original\n"
+            "empty_actual=total([], discount_rate=0.1, tax_rate=0.2)\n"
+            "assert empty_actual == 0\n"
+            "assert total(items, discount_rate=0, tax_rate=0.2) == 30.0\n"
+            "assert total(items, discount_rate=0.1, tax_rate=0) == 22.5\n"
+            "assert total(items, discount_rate=0, tax_rate=0) == 25\n"
+            "fractional=[{'price': 1.234}, {'price': 0.1, 'qty': 3}]\n"
+            "fractional_original=deepcopy(fractional)\n"
+            "assert total(fractional) == 1.53\n"
+            "assert fractional == fractional_original\n"
+        )
+    }
+
+    passed, messages = PythonTestRunner().run(
+        {**task.files, **task.expected_files},
+        tests,
+        [CodeTestCase(name="cart", command=["python", "cart_contract_tests.py"])],
+    )
+
+    assert passed, messages
+
+
 def test_token_bucket_first_consume_failure_produces_starts_full_hint() -> None:
     hints = extract_forbidden_patterns_from_failed_code(
         {
@@ -675,9 +783,9 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     config_variant = MultiModelCodingAgentPlugin._variant_instruction(
         _coding_task_from_swe(tasks["v0.config_loader_precedence"]), 2, [], [], []
     )[0]
-    cart_variant = MultiModelCodingAgentPlugin._variant_instruction(
-        _coding_task_from_swe(tasks["v0.shopping_cart_totals"]), 2, [], [], []
-    )[0]
+    cart_variant, cart_prompt = MultiModelCodingAgentPlugin._variant_instruction(
+        _coding_task_from_swe(tasks["v0.shopping_cart_totals"]), 1, [], [], []
+    )
     bucket_variant = MultiModelCodingAgentPlugin._variant_instruction(
         _coding_task_from_swe(tasks["v0.token_bucket_clock"]), 2, [], [], []
     )[0]
@@ -714,7 +822,10 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     assert deterministic_config_name == "deterministic all-sources recursive config merge"
     assert "def _merge(base, incoming):" in deterministic_config_prompt
     assert "defaults, file_config, env_config, overrides" in deterministic_config_prompt
-    assert cart_variant == "discount-amount semantics repair"
+    assert cart_variant == "deterministic non-mutating discount-subtraction cart total"
+    assert "There are two independent requirements" in cart_prompt
+    assert "A candidate fixing only one requirement is still invalid." in cart_prompt
+    assert "discounted_subtotal = subtotal - discount" in cart_prompt
     assert bucket_variant == "full-initial token bucket repair"
     assert router_variant_name == "path-parameter router repair"
     assert "segment-by-segment matching" in router_variant_prompt
@@ -1069,6 +1180,64 @@ def test_repo_multi_recovers_malformed_config_patch_with_format_retry() -> None:
     assert result.format_retry_allowed_paths == ["src/config.py"]
     assert result.raw_python_single_file_fallback_used is False
     assert "Use the exact allowed path: src/config.py." in client.prompts[1]
+
+
+def test_repo_multi_cart_rejects_partial_repairs_and_selects_combined_repair() -> None:
+    task = next(
+        task for task in create_repo_v0_tasks() if task.id == "v0.shopping_cart_totals"
+    )
+    baseline = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    subtotal = 0\n"
+        "    for item in items:\n"
+        "        item['line_total'] = item['price'] * item.get('qty', 1)\n"
+        "        subtotal += item['line_total']\n"
+        "    discounted_subtotal = discount_amount(subtotal, discount_rate)\n"
+        "    return round(discounted_subtotal * (1 + tax_rate), 2)\n"
+    )
+    subtraction_only = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    subtotal = 0\n"
+        "    for item in items:\n"
+        "        item['line_total'] = item['price'] * item.get('qty', 1)\n"
+        "        subtotal += item['line_total']\n"
+        "    discount = discount_amount(subtotal, discount_rate)\n"
+        "    discounted_subtotal = subtotal - discount\n"
+        "    return round(discounted_subtotal * (1 + tax_rate), 2)\n"
+    )
+    mutation_only = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    subtotal = sum(item['price'] * item.get('qty', 1) for item in items)\n"
+        "    discounted_subtotal = discount_amount(subtotal, discount_rate)\n"
+        "    return round(discounted_subtotal * (1 + tax_rate), 2)\n"
+    )
+    client = _RepoRepairClient(baseline, subtraction_only)
+    client.responses = [
+        baseline,
+        subtraction_only,
+        mutation_only,
+        task.expected_files,
+    ]
+    runtime, _, multi = _runtime_with_repo_agents(client)
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_multi", multi.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.selected_candidate_id == "repair_3"
+    assert result.rejected_candidates_before_tests == [
+        "candidate_1",
+        "repair_1",
+        "repair_2",
+    ]
+    assert result.final_exact_repo_verification_passed is True
+    assert result.cart_input_mutation_detected is False
+    assert result.cart_discount_subtraction_detected is True
+    assert result.cart_tax_after_discount_detected is True
+    assert result.cart_final_only_rounding_detected is True
+    assert result.cart_combined_contract_satisfied is True
+    assert result.hidden_source_included is False
 
 
 def test_repo_multi_uses_compile_gated_raw_fallback_after_failed_format_retry() -> None:

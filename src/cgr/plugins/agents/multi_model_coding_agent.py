@@ -13,11 +13,13 @@ from cgr.kernel.coding import (
     build_repair_plan_prompt,
     build_repair_prompt,
     check_bool_before_string_normalization,
+    check_cart_total_contract,
     check_dict_list_contract_shape,
     check_duplicate_suffix_format,
     check_none_overwrite_config_merge,
     check_router_param_literal_matching,
     config_recursive_merge_debug_fields,
+    cart_total_debug_fields,
     check_example_literal_coverage,
     classify_boolean_contract_examples,
     classify_boolean_string_examples,
@@ -148,6 +150,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         draft_router_guard = check_router_param_literal_matching(
             draft_patch.files, task_contract_checklist
         )
+        draft_cart_guard = check_cart_total_contract(
+            draft_patch.files, task_contract_checklist
+        )
         draft_verification = (
             (False, [draft_bool_guard])
             if draft_bool_guard is not None
@@ -157,6 +162,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             if draft_none_guard is not None
             else (False, [draft_router_guard])
             if draft_router_guard is not None
+            else (False, [draft_cart_guard])
+            if draft_cart_guard is not None
             else verify_patch(task, draft_patch)
         )
         candidates: list[tuple[str, CodingPatch, bool]] = [
@@ -197,6 +204,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 or draft_shape_guard is not None
                 or draft_none_guard is not None
                 or draft_router_guard is not None
+                or draft_cart_guard is not None
             )
             else []
         )
@@ -330,6 +338,8 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     "deterministic all-sources recursive config merge",
                     "formula/order-of-operations repair",
                     "discount-amount semantics repair",
+                    "deterministic non-mutating discount-subtraction cart total",
+                    "test-example-driven combined repair",
                     "stateful clock simulation repair",
                     "full-initial token bucket repair",
                     "path-parameter router repair",
@@ -389,6 +399,9 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 repair_router_guard = check_router_param_literal_matching(
                     repaired_patch.files, task_contract_checklist
                 )
+                repair_cart_guard = check_cart_total_contract(
+                    repaired_patch.files, task_contract_checklist
+                )
                 repair_suffix_guard = check_duplicate_suffix_format(
                     repaired_patch.files, literal_format_hints
                 )
@@ -437,6 +450,17 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     latest_failures[candidate_id] = repair_router_guard
                     current_patch = repaired_patch
                     current_messages = [repair_router_guard]
+                    continue
+                if repair_cart_guard is not None:
+                    rejected_candidates_before_tests.append(candidate_id)
+                    verifier_messages.append(repair_cart_guard)
+                    candidates.append((candidate_id, repaired_patch, False))
+                    known_failures.append(
+                        (candidate_id, repaired_patch.files, repair_cart_guard)
+                    )
+                    latest_failures[candidate_id] = repair_cart_guard
+                    current_patch = repaired_patch
+                    current_messages = [repair_cart_guard]
                     continue
                 if repair_suffix_guard is not None:
                     rejected_candidates_before_tests.append(candidate_id)
@@ -893,6 +917,14 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                 ),
                 task_contract_checklist or [],
             ),
+            **cart_total_debug_fields(
+                next(
+                    candidate.files
+                    for candidate_id, candidate, _ in candidates
+                    if candidate_id == selected_id
+                ),
+                task_contract_checklist or [],
+            ),
             **_placeholder_trace_fields(
                 next(
                     candidate
@@ -919,14 +951,73 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         falsy_examples: list[str],
         literal_format_hints: list[str] | None = None,
     ) -> tuple[str, str]:
+        context = (
+            task.issue
+            + "\n"
+            + "\n".join(task.files.values())
+            + "\n"
+            + "\n".join(task.test_files.values())
+        ).lower()
+        cart_context = (
+            ("cart" in context or "shopping" in context or "checkout" in context)
+            and "discount_amount" in context
+            and "discount" in context
+            and "tax" in context
+            and ("mutat" in context or "unchanged" in context)
+        )
+        if cart_context:
+            combined_warning = (
+                "There are two independent requirements and both must be "
+                "implemented in the same candidate:\n\n"
+                "1. Do not mutate items or add line_total keys.\n"
+                "2. discount_amount returns the amount to subtract, not the "
+                "remaining subtotal.\n\n"
+                "A candidate fixing only one requirement is still invalid.\n\n"
+                "Required calculation:\n\n"
+                "subtotal = sum of price multiplied by quantity\n"
+                "discount = discount_amount(subtotal, discount_rate)\n"
+                "discounted_subtotal = subtotal - discount\n"
+                "final_total = discounted_subtotal multiplied by (1 + tax_rate)\n"
+                "return round(final_total, 2)\n\n"
+                "Prohibited: item['line_total'] assignment; item[\"line_total\"] "
+                "assignment; assigning any derived key to an input item; "
+                "discounted_subtotal = discount_amount(...); total_with_tax = "
+                "discount_amount(...) * (...); applying tax before discount "
+                "subtraction; rounding subtotal or discount before the final result. "
+            )
+            if attempt == 1:
+                return (
+                    "deterministic non-mutating discount-subtraction cart total",
+                    combined_warning
+                    + "Return the complete replacement file. Preserve this import "
+                    "and use this deterministic implementation shape:\n"
+                    "from src.discounts import discount_amount\n\n"
+                    "def total(items, discount_rate=0, tax_rate=0):\n"
+                    "    subtotal = sum(\n"
+                    "        item['price'] * item.get('qty', 1)\n"
+                    "        for item in items\n"
+                    "    )\n"
+                    "    discount = discount_amount(subtotal, discount_rate)\n"
+                    "    discounted_subtotal = subtotal - discount\n"
+                    "    total_with_tax = discounted_subtotal * (1 + tax_rate)\n"
+                    "    return round(total_with_tax, 2)\n",
+                )
+            if attempt == 2:
+                return "test-example-driven combined repair", (
+                    combined_warning
+                    + "Use the required examples to produce a semantically distinct "
+                    "complete replacement file satisfying both requirements."
+                )
+            return "general semantic repair", (
+                combined_warning
+                + "Produce a complete, distinct semantic repair satisfying every "
+                "contract requirement."
+            )
         if attempt == 1:
             return (
                 "minimal semantic patch",
                 "Repair variant 1: make the smallest semantic patch. ",
             )
-        context = (
-            task.issue + "\n" + "\n".join(task.test_files.values())
-        ).lower()
         merge_context = any(
             marker in context
             for marker in ("merge", "counts", "overlapping", "summed", "dictionary", "mapping")
