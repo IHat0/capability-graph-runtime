@@ -324,6 +324,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     "duplicate-name suffix repair",
                     "recursive precedence merge",
                     "none-skipping recursive config merge",
+                    "deterministic none-skipping recursive merge",
                     "formula/order-of-operations repair",
                     "discount-amount semantics repair",
                     "stateful clock simulation repair",
@@ -948,10 +949,64 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             )
         if attempt == 2 and recursive_context:
             return "none-skipping recursive config merge", (
-                "Implement a pure recursive merge. Copy dictionaries instead of "
-                "mutating inputs. Apply sources in precedence order. Skip values "
-                "that are None so they do not override existing non-None values. "
-                "Nested dictionaries merge recursively. "
+                "Implement a pure recursive merge. Do not use "
+                "result[key].update(value). Do not mutate inputs. Copy "
+                "dictionaries. Skip value is None before assigning. Recursively "
+                "merge nested dictionaries. Apply sources in this order: "
+                "defaults, file_config, env_config, overrides. Use this exact "
+                "algorithm:\n"
+                "def _merge(base, incoming):\n"
+                "    result = dict(base)\n"
+                "    for key, value in incoming.items():\n"
+                "        if value is None:\n"
+                "            continue\n"
+                "        if (\n"
+                "            isinstance(value, dict)\n"
+                "            and isinstance(result.get(key), dict)\n"
+                "        ):\n"
+                "            result[key] = _merge(result[key], value)\n"
+                "        elif isinstance(value, dict):\n"
+                "            result[key] = _merge({}, value)\n"
+                "        else:\n"
+                "            result[key] = value\n"
+                "    return result\n\n"
+                "def resolve_config(defaults, file_config, env_config, overrides):\n"
+                "    result = {}\n"
+                "    for source in (defaults, file_config, env_config, overrides):\n"
+                "        if source:\n"
+                "            result = _merge(result, source)\n"
+                "    return result\n"
+            )
+        if attempt >= 3 and recursive_context:
+            return "deterministic none-skipping recursive merge", (
+                "Repair variant: deterministic none-skipping recursive merge. "
+                "Use this exact helper pattern:\n"
+                "def _merge(base, incoming):\n"
+                "    result = dict(base)\n"
+                "    for key, value in incoming.items():\n"
+                "        if value is None:\n"
+                "            continue\n"
+                "        if (\n"
+                "            isinstance(value, dict)\n"
+                "            and isinstance(result.get(key), dict)\n"
+                "        ):\n"
+                "            result[key] = _merge(result[key], value)\n"
+                "        elif isinstance(value, dict):\n"
+                "            result[key] = _merge({}, value)\n"
+                "        else:\n"
+                "            result[key] = value\n"
+                "    return result\n\n"
+                "def resolve_config(defaults, file_config, env_config, overrides):\n"
+                "    result = {}\n"
+                "    for source in (defaults, file_config, env_config, overrides):\n"
+                "        if source:\n"
+                "            result = _merge(result, source)\n"
+                "    return result\n"
+                "Do not use result[key].update(value). Do not mutate inputs. "
+                "Copy dictionaries. Skip value is None before assigning, including "
+                "inside nested dictionaries. Recursively merge nested dictionaries. "
+                "Apply sources in this order: defaults, file_config, env_config, "
+                "overrides. "
             )
         if attempt == 2 and formula_context:
             return "discount-amount semantics repair", (

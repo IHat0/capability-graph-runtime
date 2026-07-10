@@ -163,9 +163,24 @@ def check_none_overwrite_config_merge(
     if not _none_skip_context(contract):
         return None
     for content in files.values():
-        if "value is None" in content or "value != None" in content:
-            continue
+        if _shallow_config_update(content) and not _uses_recursive_merge_helper(
+            content
+        ):
+            return (
+                "Rejected candidate before tests; shallow dict.update cannot "
+                "satisfy recursive None-skipping config merge."
+            )
         if re.search(r"\w+\s*\[\s*key\s*\]\s*=\s*value\b", content):
+            guard_index = _first_match_position(r"\bif\s+value\s+is\s+None\s*:", content)
+            assignment_index = _first_match_position(
+                r"\w+\s*\[\s*key\s*\]\s*=\s*value\b", content
+            )
+            if (
+                guard_index is not None
+                and assignment_index is not None
+                and guard_index < assignment_index
+            ):
+                continue
             return (
                 "Rejected candidate before tests; None values must not override "
                 "existing non-None config values."
@@ -377,6 +392,12 @@ def extract_structural_repair_hints(failure_summary: str) -> list[str]:
             "When merging config sources, skip None values unless the contract "
             "explicitly allows None overrides."
         )
+        hints.append("A None value overwrote an existing non-None config value.")
+        hints.append(
+            "Skip None values before assignment, including inside nested "
+            "dictionaries."
+        )
+        hints.extend(_nested_none_overwrite_hints(expected, got))
     if isinstance(expected, (int, float)) and isinstance(got, (int, float)):
         hints.append(f"Expected final value {expected!r}, but got {got!r}.")
     return _unique(hints)
@@ -466,7 +487,61 @@ def _extract_expected_got_values(text: str) -> tuple[object | None, object | Non
         re.IGNORECASE,
     )
     if inline is not None:
+        expected_text, got_text = _balanced_inline_expected_got(text, inline.start())
+        if expected_text is not None and got_text is not None:
+            return _literal(expected_text), _literal(got_text)
         return _literal(inline.group("expected")), _literal(inline.group("got"))
+    return None, None
+
+
+def _balanced_inline_expected_got(
+    text: str, start: int = 0
+) -> tuple[str | None, str | None]:
+    expected_marker = re.search(r"expected\s+", text[start:], re.IGNORECASE)
+    if expected_marker is None:
+        return None, None
+    expected_start = start + expected_marker.end()
+    expected_text, expected_end = _balanced_literal_at(text, expected_start)
+    if expected_text is None or expected_end is None:
+        return None, None
+    got_marker = re.search(r",\s+got\s+", text[expected_end:], re.IGNORECASE)
+    if got_marker is None:
+        return None, None
+    got_start = expected_end + got_marker.end()
+    got_text, _ = _balanced_literal_at(text, got_start)
+    return expected_text, got_text
+
+
+def _balanced_literal_at(text: str, start: int) -> tuple[str | None, int | None]:
+    while start < len(text) and text[start].isspace():
+        start += 1
+    if start >= len(text) or text[start] not in "{[":
+        return None, None
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_string = False
+    escaped = False
+    quote = ""
+    for index in range(start, len(text)):
+        current = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == quote:
+                in_string = False
+            continue
+        if current in ("'", '"'):
+            in_string = True
+            quote = current
+        elif current == opener:
+            depth += 1
+        elif current == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1], index + 1
     return None, None
 
 
@@ -584,6 +659,26 @@ def _none_overwrote_non_none(expected: object, got: object) -> bool:
     return False
 
 
+def _nested_none_overwrite_hints(
+    expected: object, got: object, prefix: tuple[str, ...] = ()
+) -> list[str]:
+    if not isinstance(expected, dict) or not isinstance(got, dict):
+        return []
+    hints: list[str] = []
+    for key, expected_value in expected.items():
+        if key not in got:
+            continue
+        path = (*prefix, str(key))
+        got_value = got[key]
+        if expected_value is not None and got_value is None:
+            hints.append(
+                f"Nested key {'.'.join(path)} expected {expected_value!r} "
+                "but got None."
+            )
+        hints.extend(_nested_none_overwrite_hints(expected_value, got_value, path))
+    return hints
+
+
 def _duplicate_suffix_context(contract: str) -> bool:
     return (
         ("duplicate" in contract or "deduplicate" in contract)
@@ -606,6 +701,20 @@ def _none_skip_context(contract: str) -> bool:
         "none values do not override" in contract
         or "none does not override" in contract
         or ("config" in contract and "none" in contract and "override" in contract)
+    )
+
+
+def _shallow_config_update(content: str) -> bool:
+    return bool(
+        re.search(r"\bresult\s*\[\s*key\s*\]\s*\.\s*update\s*\(\s*value\s*\)", content)
+        or re.search(r"\.update\s*\(\s*value\s*\)", content)
+    )
+
+
+def _uses_recursive_merge_helper(content: str) -> bool:
+    return bool(
+        re.search(r"def\s+_?\w*merge\w*\s*\(", content)
+        and re.search(r"_?\w*merge\w*\s*\(\s*result\s*\[\s*key\s*\]\s*,\s*value\s*\)", content)
     )
 
 

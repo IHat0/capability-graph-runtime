@@ -213,6 +213,25 @@ def test_config_none_expected_got_mismatch_produces_none_skip_hint() -> None:
         "When merging config sources, skip None values unless the contract "
         "explicitly allows None overrides."
     ) in hints
+    assert "Nested key db.host expected 'localhost' but got None." in hints
+    assert "A None value overwrote an existing non-None config value." in hints
+    assert (
+        "Skip None values before assignment, including inside nested "
+        "dictionaries."
+    ) in hints
+
+
+def test_config_hidden_safe_summary_produces_nested_none_overwrite_hint() -> None:
+    diagnostic = (
+        "AssertionError: hidden config precedence: expected "
+        "{'db': {'host': 'localhost', 'port': 2, 'user': 'u'}}, "
+        "got {'db': {'host': None, 'port': 2, 'user': 'u'}}"
+    )
+
+    hints = extract_structural_repair_hints(diagnostic)
+
+    assert "Nested key db.host expected 'localhost' but got None." in hints
+    assert "A None value overwrote an existing non-None config value." in hints
 
 
 def test_config_none_overwrite_guard_rejects_unsafe_assignment() -> None:
@@ -243,6 +262,46 @@ def test_config_none_overwrite_guard_rejects_unsafe_assignment() -> None:
         "existing non-None config values."
     )
     assert check_none_overwrite_config_merge(good, checklist) is None
+
+
+def test_config_shallow_update_candidate_is_rejected() -> None:
+    checklist = ["Later sources override earlier sources, nested dictionaries merge, None values do not override"]
+    bad = {
+        "src/config.py": (
+            "def resolve_config(defaults, file_config, env_config, overrides):\n"
+            "    result = dict(defaults)\n"
+            "    for source in (file_config, env_config, overrides):\n"
+            "        for key, value in source.items():\n"
+            "            if isinstance(value, dict) and isinstance(result.get(key), dict):\n"
+            "                result[key].update(value)\n"
+            "            else:\n"
+            "                result[key] = value\n"
+            "    return result\n"
+        )
+    }
+
+    assert check_none_overwrite_config_merge(bad, checklist) == (
+        "Rejected candidate before tests; shallow dict.update cannot satisfy "
+        "recursive None-skipping config merge."
+    )
+
+
+def test_config_assignment_without_none_guard_is_rejected() -> None:
+    checklist = ["None values do not override existing values"]
+    bad = {
+        "src/config.py": (
+            "def _merge(base, incoming):\n"
+            "    result = dict(base)\n"
+            "    for key, value in incoming.items():\n"
+            "        result[key] = value\n"
+            "    return result\n"
+        )
+    }
+
+    assert check_none_overwrite_config_merge(bad, checklist) == (
+        "Rejected candidate before tests; None values must not override "
+        "existing non-None config values."
+    )
 
 
 def test_router_contract_produces_path_param_segment_hints() -> None:
@@ -536,9 +595,20 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     )
 
     assert config_variant == "none-skipping recursive config merge"
-    assert "Skip values that are None" in MultiModelCodingAgentPlugin._variant_instruction(
+    config_prompt = MultiModelCodingAgentPlugin._variant_instruction(
         _coding_task_from_swe(tasks["v0.config_loader_precedence"]), 2, [], [], []
     )[1]
+    assert "Skip value is None before assigning." in config_prompt
+    assert "Do not use result[key].update(value)." in config_prompt
+    assert "def _merge(base, incoming):" in config_prompt
+    deterministic_config_name, deterministic_config_prompt = (
+        MultiModelCodingAgentPlugin._variant_instruction(
+            _coding_task_from_swe(tasks["v0.config_loader_precedence"]), 3, [], [], []
+        )
+    )
+    assert deterministic_config_name == "deterministic none-skipping recursive merge"
+    assert "def _merge(base, incoming):" in deterministic_config_prompt
+    assert "defaults, file_config, env_config, overrides" in deterministic_config_prompt
     assert cart_variant == "discount-amount semantics repair"
     assert bucket_variant == "full-initial token bucket repair"
     assert router_variant_name == "path-parameter router repair"
@@ -808,6 +878,48 @@ def test_repo_single_accepts_segment_router_candidate() -> None:
     assert result.hidden_source_included is False
     assert result.final_exact_repo_verification_passed is True
     assert result.router_param_rejection_hints == []
+
+
+def test_repo_single_accepts_deterministic_config_candidate() -> None:
+    task = next(
+        task for task in create_repo_v0_tasks() if task.id == "v0.config_loader_precedence"
+    )
+    deterministic_config = {
+        "src/config.py": (
+            "def _merge(base, incoming):\n"
+            "    result = dict(base)\n"
+            "    for key, value in incoming.items():\n"
+            "        if value is None:\n"
+            "            continue\n"
+            "        if (\n"
+            "            isinstance(value, dict)\n"
+            "            and isinstance(result.get(key), dict)\n"
+            "        ):\n"
+            "            result[key] = _merge(result[key], value)\n"
+            "        elif isinstance(value, dict):\n"
+            "            result[key] = _merge({}, value)\n"
+            "        else:\n"
+            "            result[key] = value\n"
+            "    return result\n\n"
+            "def resolve_config(defaults, file_config, env_config, overrides):\n"
+            "    result = {}\n"
+            "    for source in (defaults, file_config, env_config, overrides):\n"
+            "        if source:\n"
+            "            result = _merge(result, source)\n"
+            "    return result\n"
+        )
+    }
+    runtime, single, _ = _runtime_with_repo_agents(
+        _RepoRepairClient(deterministic_config, deterministic_config)
+    )
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_single", single.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.hidden_source_included is False
+    assert result.final_exact_repo_verification_passed is True
 
 
 def test_repo_multi_locks_literal_duplicate_suffix_format() -> None:
