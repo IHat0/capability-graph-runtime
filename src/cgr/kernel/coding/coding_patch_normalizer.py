@@ -33,6 +33,8 @@ class CodingPatchNormalizer:
         self,
         text: str,
         allowed_filenames: set[str] | None = None,
+        *,
+        allow_raw_python: bool = True,
     ) -> CodingPatch:
         candidates: list[str] = [text]
         candidates.extend(self._FENCED_JSON.findall(text))
@@ -49,16 +51,54 @@ class CodingPatchNormalizer:
             if patch is not None:
                 return patch
 
-        if allowed_filenames is not None and len(allowed_filenames) == 1:
-            filename = next(iter(allowed_filenames))
-            if self._looks_like_python(text):
-                return self._validate_files({filename: text}, allowed_filenames)
+        if allow_raw_python:
+            raw_patch = self.raw_python_single_file_patch(text, allowed_filenames)
+            if raw_patch is not None:
+                return raw_patch
 
         raise CodingPatchNormalizationError(
             "Model output could not be normalized into non-empty coding patch "
             "JSON with a 'files' mapping.",
             text,
         )
+
+    def raw_python_single_file_patch(
+        self, text: str, allowed_filenames: set[str] | None
+    ) -> CodingPatch | None:
+        """Wrap one safely isolated Python module for a single-file task."""
+        if allowed_filenames is None or len(allowed_filenames) != 1:
+            return None
+        filename = next(iter(allowed_filenames))
+        for candidate in self._raw_python_candidates(text):
+            if self._looks_like_python(candidate):
+                return self._validate_files({filename: candidate}, allowed_filenames)
+        return None
+
+    @staticmethod
+    def _raw_python_candidates(text: str) -> list[str]:
+        candidates = [text]
+        fenced = re.findall(
+            r"```(?:python|py)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE
+        )
+        candidates.extend(fenced)
+        code_starts = [
+            match.end()
+            for match in re.finditer(
+                r'":\s*"(?=(?:def\s+|class\s+|from\s+|import\s+))', text
+            )
+        ]
+        code_starts.extend(
+            match.start()
+            for match in re.finditer(
+                r"(?m)(?=^(?:from\s+|import\s+|def\s+|class\s+|@|[A-Za-z_]\w*\s*=))",
+                text,
+            )
+        )
+        for start in code_starts:
+            candidate = text[start:]
+            candidate = re.sub(r'\n"\s*}\s*}\s*$', "", candidate)
+            candidates.append(candidate)
+        return candidates
 
     def _from_object(
         self,

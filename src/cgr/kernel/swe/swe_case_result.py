@@ -82,4 +82,10 @@ class SWECaseResult(BaseModel):
     placeholder_filename_remapped: bool | None = None
     placeholder_filename_original: str | None = None
     placeholder_filename_target: str | None = None
+    format_retry_used: bool | None = None
+    format_retry_succeeded: bool | None = None
+    format_retry_original_error: str | None = None
+    format_retry_allowed_paths: list[str] | None = None
+    format_retry_raw_output_preview: str | None = None
+    raw_python_single_file_fallback_used: bool | None = None
     router_param_rejection_hints: list[str] | None = None

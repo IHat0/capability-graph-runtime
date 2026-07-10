@@ -55,6 +55,22 @@ def test_normalizer_wraps_raw_python_for_single_allowed_file() -> None:
     assert patch.files == {"app.py": "def answer():\n    return 42\n"}
 
 
+def test_normalizer_can_defer_raw_python_fallback_for_format_retry() -> None:
+    source = "def answer():\n    return 42\n"
+
+    with pytest.raises(CodingPatchNormalizationError):
+        CodingPatchNormalizer().normalize(
+            source, {"app.py"}, allow_raw_python=False
+        )
+
+    patch = CodingPatchNormalizer().raw_python_single_file_patch(
+        source, {"app.py"}
+    )
+
+    assert patch is not None
+    assert patch.files == {"app.py": source}
+
+
 def test_normalizer_remaps_filename_placeholder_for_single_allowed_file() -> None:
     patch = CodingPatchNormalizer().normalize(
         '{"files":{"filename.py":"def answer():\\n    return 42\\n"}}',
@@ -217,7 +233,42 @@ def test_single_agent_retries_invalid_format() -> None:
     )
 
     assert result.output["files"] == {"app.py": 'print("ok")\n'}
-    assert "previous answer was not valid JSON" in client.prompts[1]
+    assert "could not be parsed as a coding patch" in client.prompts[1]
+    assert "Use the exact allowed path: app.py." in client.prompts[1]
+    assert result.output["format_retry_used"] is True
+    assert result.output["format_retry_succeeded"] is True
+
+
+def test_single_agent_recovers_malformed_single_file_json_after_format_retry() -> None:
+    malformed = (
+        '{\n  "files": {\n    "filename.py": "def answer():\n'
+        '    \"\"\"Return the answer.\"\"\"\n'
+        "    return 42\n" + '\n  }\n}'
+    )
+    runtime, client, _ = _model_runtime(
+        [malformed, '{"files":{"src/config.py":"def answer():\\n    return 42\\n"}}']
+    )
+    agent = SingleModelCodingAgentPlugin(runtime)
+    runtime.register_plugin(agent)
+
+    result = runtime.execute(
+        agent.metadata.id,
+        ExecutionRequest(
+            capability=agent.metadata.capabilities[0],
+            context=ExecutionContext(),
+            payload={
+                "issue": "Return 42.",
+                "files": {"src/config.py": "def answer():\n    return 0\n"},
+                "allowed_files_to_edit": ["src/config.py"],
+            },
+        ),
+    )
+
+    assert result.output["files"] == {"src/config.py": "def answer():\n    return 42\n"}
+    assert "Use the exact allowed path: src/config.py." in client.prompts[1]
+    assert result.output["format_retry_used"] is True
+    assert result.output["format_retry_succeeded"] is True
+    assert result.output["raw_python_single_file_fallback_used"] is False
 
 
 def test_multi_agent_retries_invalid_draft_format() -> None:

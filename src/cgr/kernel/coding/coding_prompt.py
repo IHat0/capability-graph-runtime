@@ -204,13 +204,28 @@ def build_repair_plan_prompt(
     )
 
 
-def build_format_retry_prompt(previous_answer: str) -> str:
+def build_format_retry_prompt(
+    previous_answer: str, allowed_paths: set[str] | None = None
+) -> str:
     """Request one strict structural conversion without changing code logic."""
+    exact_path = (
+        next(iter(allowed_paths))
+        if allowed_paths is not None and len(allowed_paths) == 1
+        else "<EXACT_ALLOWED_PATH>"
+    )
     return (
-        "The previous answer was not valid JSON in the required format.\n\n"
-        "Convert it into this exact JSON shape and return only JSON:\n\n"
-        '{\n  "files": {\n    "filename.py": "full file content"\n  }\n}\n\n'
-        "Do not use markdown fences. Do not add explanation. Do not change the "
-        "code logic unless needed to make the JSON valid.\n\nPrevious answer:\n"
+        "Your previous response could not be parsed as a coding patch. Do not "
+        "change the implementation logic. Reformat the same implementation only.\n\n"
+        "Return valid JSON only:\n"
+        "{\n"
+        "  \"files\": {\n"
+        f"    \"{exact_path}\": \"<FULL_FILE_CONTENT_WITH_ALL_QUOTES_ESCAPED>\"\n"
+        "  }\n"
+        "}\n\n"
+        f"Use the exact allowed path: {exact_path}.\n"
+        "Do not use filename.py, main.py, solution.py, or any placeholder.\n"
+        "Do not use Markdown fences.\n"
+        "Avoid Python docstrings if they make JSON escaping difficult.\n"
+        "Do not explain anything.\n\nPrevious answer:\n"
         f"{previous_answer}"
     )

@@ -314,13 +314,44 @@ class SingleModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
         normalizer = CodingPatchNormalizer()
         allowed_filenames = set(task.allowed_files_to_edit or task.files)
         try:
-            return normalizer.normalize(text, allowed_filenames), 0.0
-        except CodingPatchNormalizationError:
-            retry = self._execute_model(build_format_retry_prompt(text))
-            patch = normalizer.normalize(
-                self._model_text(retry.output), allowed_filenames
+            return normalizer.normalize(
+                text, allowed_filenames, allow_raw_python=False
+            ), 0.0
+        except CodingPatchNormalizationError as original_error:
+            retry = self._execute_model(
+                build_format_retry_prompt(text, allowed_filenames)
             )
-            return patch, retry.duration_ms
+            retry_text = self._model_text(retry.output)
+            try:
+                patch = normalizer.normalize(
+                    retry_text, allowed_filenames, allow_raw_python=False
+                )
+            except CodingPatchNormalizationError:
+                raw_patch = normalizer.raw_python_single_file_patch(
+                    retry_text, allowed_filenames
+                )
+                if raw_patch is None:
+                    raw_patch = normalizer.raw_python_single_file_patch(
+                        text, allowed_filenames
+                    )
+                if raw_patch is None:
+                    raise
+                return (
+                    raw_patch.model_copy(
+                        update=_format_retry_fields(
+                            original_error, allowed_filenames, retry_text, False, True
+                        )
+                    ),
+                    retry.duration_ms,
+                )
+            return (
+                patch.model_copy(
+                    update=_format_retry_fields(
+                        original_error, allowed_filenames, retry_text, True, False
+                    )
+                ),
+                retry.duration_ms,
+            )
 
     @staticmethod
     def _trace(
@@ -501,4 +532,29 @@ def _placeholder_trace_fields(patch: CodingPatch) -> dict[str, Any]:
         "placeholder_filename_remapped": patch.placeholder_filename_remapped,
         "placeholder_filename_original": patch.placeholder_filename_original,
         "placeholder_filename_target": patch.placeholder_filename_target,
+        "format_retry_used": patch.format_retry_used,
+        "format_retry_succeeded": patch.format_retry_succeeded,
+        "format_retry_original_error": patch.format_retry_original_error,
+        "format_retry_allowed_paths": patch.format_retry_allowed_paths,
+        "format_retry_raw_output_preview": patch.format_retry_raw_output_preview,
+        "raw_python_single_file_fallback_used": (
+            patch.raw_python_single_file_fallback_used
+        ),
+    }
+
+
+def _format_retry_fields(
+    original_error: CodingPatchNormalizationError,
+    allowed_filenames: set[str],
+    retry_text: str,
+    succeeded: bool,
+    raw_python_fallback: bool,
+) -> dict[str, Any]:
+    return {
+        "format_retry_used": True,
+        "format_retry_succeeded": succeeded,
+        "format_retry_original_error": str(original_error),
+        "format_retry_allowed_paths": sorted(allowed_filenames),
+        "format_retry_raw_output_preview": retry_text[:1000],
+        "raw_python_single_file_fallback_used": raw_python_fallback,
     }

@@ -13,3 +13,9 @@ class CodingPatch(BaseModel):
     placeholder_filename_remapped: bool = False
     placeholder_filename_original: str | None = None
     placeholder_filename_target: str | None = None
+    format_retry_used: bool = False
+    format_retry_succeeded: bool = False
+    format_retry_original_error: str | None = None
+    format_retry_allowed_paths: list[str] = Field(default_factory=list)
+    format_retry_raw_output_preview: str | None = None
+    raw_python_single_file_fallback_used: bool = False

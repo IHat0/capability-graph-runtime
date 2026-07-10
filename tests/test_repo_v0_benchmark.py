@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, Sequence
 
 from cgr.apps.cli import main as cli
 from cgr.kernel.coding import (
@@ -673,8 +673,15 @@ def test_hidden_safe_summary_keeps_expected_got_without_hidden_source() -> None:
 
 
 class _RepoRepairClient:
-    def __init__(self, first_files: dict[str, str], repaired_files: dict[str, str]) -> None:
-        self.responses = [first_files, repaired_files]
+    def __init__(
+        self,
+        first_files: dict[str, str] | str,
+        repaired_files: dict[str, str] | str,
+    ) -> None:
+        self.responses: Sequence[dict[str, str] | str] = [
+            first_files,
+            repaired_files,
+        ]
         self.prompts: list[str] = []
 
     def create_chat_completion(
@@ -684,7 +691,8 @@ class _RepoRepairClient:
     ) -> dict[str, Any]:
         self.prompts.append(messages[-1]["content"])
         files = self.responses[min(len(self.prompts) - 1, len(self.responses) - 1)]
-        return {"choices": [{"message": {"content": json.dumps({"files": files})}}]}
+        content = files if isinstance(files, str) else json.dumps({"files": files})
+        return {"choices": [{"message": {"content": content}}]}
 
 
 class _CriticClient:
@@ -920,6 +928,59 @@ def test_repo_single_accepts_deterministic_config_candidate() -> None:
     assert result.passed is True
     assert result.hidden_source_included is False
     assert result.final_exact_repo_verification_passed is True
+
+
+def test_repo_multi_recovers_malformed_config_patch_with_format_retry() -> None:
+    task = next(
+        task for task in create_repo_v0_tasks() if task.id == "v0.config_loader_precedence"
+    )
+    config_source = task.expected_files["src/config.py"]
+    malformed = (
+        '{\n  "files": {\n    "filename.py": "'
+        + config_source.replace(
+            "    result = dict(a)",
+            '    \"\"\"Merge config dictionaries without mutation.\"\"\"\n'
+            "    result = dict(a)",
+        )
+        + '"\n  }\n}'
+    )
+    valid = json.dumps({"files": {"src/config.py": config_source}})
+    client = _RepoRepairClient(malformed, valid)
+    runtime, _, multi = _runtime_with_repo_agents(client)
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_multi", multi.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.hidden_source_included is False
+    assert result.final_exact_repo_verification_passed is True
+    assert result.format_retry_used is True
+    assert result.format_retry_succeeded is True
+    assert result.format_retry_allowed_paths == ["src/config.py"]
+    assert result.raw_python_single_file_fallback_used is False
+    assert "Use the exact allowed path: src/config.py." in client.prompts[1]
+
+
+def test_repo_multi_uses_compile_gated_raw_fallback_after_failed_format_retry() -> None:
+    task = next(
+        task for task in create_repo_v0_tasks() if task.id == "v0.config_loader_precedence"
+    )
+    config_source = task.expected_files["src/config.py"]
+    malformed = '{"files":{"filename.py":"' + config_source + '"}}'
+    client = _RepoRepairClient(malformed, "still not a coding patch")
+    runtime, _, multi = _runtime_with_repo_agents(client)
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_multi", multi.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.final_exact_repo_verification_passed is True
+    assert result.format_retry_used is True
+    assert result.format_retry_succeeded is False
+    assert result.raw_python_single_file_fallback_used is True
+    assert result.hidden_source_included is False
 
 
 def test_repo_multi_locks_literal_duplicate_suffix_format() -> None:

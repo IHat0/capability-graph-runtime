@@ -127,6 +127,20 @@ class SWEABRunner:
             trace_fields["placeholder_filename_target"] = (
                 patch.placeholder_filename_target
             )
+            trace_fields["format_retry_used"] = patch.format_retry_used
+            trace_fields["format_retry_succeeded"] = patch.format_retry_succeeded
+            trace_fields["format_retry_original_error"] = (
+                patch.format_retry_original_error
+            )
+            trace_fields["format_retry_allowed_paths"] = (
+                patch.format_retry_allowed_paths
+            )
+            trace_fields["format_retry_raw_output_preview"] = (
+                patch.format_retry_raw_output_preview
+            )
+            trace_fields["raw_python_single_file_fallback_used"] = (
+                patch.raw_python_single_file_fallback_used
+            )
             if task.allowed_files_to_edit:
                 trace_fields["allowed_files_to_edit"] = task.allowed_files_to_edit
                 trace_fields["changed_files"] = sorted(patch.files)
