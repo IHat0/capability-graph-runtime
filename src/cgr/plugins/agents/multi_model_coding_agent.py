@@ -338,7 +338,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
                     "deterministic all-sources recursive config merge",
                     "formula/order-of-operations repair",
                     "discount-amount semantics repair",
-                    "deterministic non-mutating discount-subtraction cart total",
+                    "strongly constrained non-mutating discount-subtraction cart repair",
                     "test-example-driven combined repair",
                     "stateful clock simulation repair",
                     "full-initial token bucket repair",
@@ -987,7 +987,7 @@ class MultiModelCodingAgentPlugin(Plugin[Any, dict[str, Any]]):
             )
             if attempt == 1:
                 return (
-                    "deterministic non-mutating discount-subtraction cart total",
+                    "strongly constrained non-mutating discount-subtraction cart repair",
                     combined_warning
                     + "Return the complete replacement file. Preserve this import "
                     "and use this deterministic implementation shape:\n"

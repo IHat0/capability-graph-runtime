@@ -670,6 +670,88 @@ def test_combined_cart_calculation_and_non_mutation_edge_cases() -> None:
     assert passed, messages
 
 
+def test_cart_mutation_provenance_distinguishes_originals_from_copies() -> None:
+    checklist = [
+        "Shopping cart total applies discount before tax, avoids mutating input "
+        "items, and rounds only the final total"
+    ]
+
+    def mutation_detected(body: str, imports: str = "") -> bool:
+        files = {
+            "src/cart.py": (
+                "from src.discounts import discount_amount\n"
+                + imports
+                + "\n"
+                + body
+            )
+        }
+        return cart_total_debug_fields(files, checklist)[
+            "cart_input_mutation_detected"
+        ]
+
+    direct = (
+        "def total(items):\n"
+        "    for item in items:\n"
+        "        item['line_total'] = item['price']\n"
+        "    return 0\n"
+    )
+    aliased = (
+        "def total(items):\n"
+        "    original_items = items\n"
+        "    for item in original_items:\n"
+        "        item['line_total'] = item['price']\n"
+        "    return 0\n"
+    )
+    indexed = (
+        "def total(items):\n"
+        "    item = items[0]\n"
+        "    item['line_total'] = item['price']\n"
+        "    return 0\n"
+    )
+    copied = (
+        "def total(items):\n"
+        "    items_copy = [item.copy() for item in items]\n"
+        "    for item in items_copy:\n"
+        "        item['line_total'] = item['price']\n"
+        "    return 0\n"
+    )
+    dict_copied = copied.replace("item.copy()", "dict(item)")
+    deep_copied = (
+        "def total(items):\n"
+        "    items_copy = deepcopy(items)\n"
+        "    for item in items_copy:\n"
+        "        item['line_total'] = item['price']\n"
+        "    return 0\n"
+    )
+    individual_copy = (
+        "def total(items):\n"
+        "    for item in items:\n"
+        "        copied_item = item.copy()\n"
+        "        copied_item['line_total'] = copied_item['price']\n"
+        "    return 0\n"
+    )
+    collection_method = (
+        "def total(items):\n"
+        "    items.append({'price': 1})\n"
+        "    return 0\n"
+    )
+    collection_delete = (
+        "def total(items):\n"
+        "    del items[0]\n"
+        "    return 0\n"
+    )
+
+    assert mutation_detected(direct) is True
+    assert mutation_detected(aliased) is True
+    assert mutation_detected(indexed) is True
+    assert mutation_detected(copied) is False
+    assert mutation_detected(dict_copied) is False
+    assert mutation_detected(deep_copied, "from copy import deepcopy\n") is False
+    assert mutation_detected(individual_copy) is False
+    assert mutation_detected(collection_method) is True
+    assert mutation_detected(collection_delete) is True
+
+
 def test_token_bucket_first_consume_failure_produces_starts_full_hint() -> None:
     hints = extract_forbidden_patterns_from_failed_code(
         {
@@ -822,7 +904,10 @@ def test_repo_semantic_repair_variants_are_selected_by_context() -> None:
     assert deterministic_config_name == "deterministic all-sources recursive config merge"
     assert "def _merge(base, incoming):" in deterministic_config_prompt
     assert "defaults, file_config, env_config, overrides" in deterministic_config_prompt
-    assert cart_variant == "deterministic non-mutating discount-subtraction cart total"
+    assert (
+        cart_variant
+        == "strongly constrained non-mutating discount-subtraction cart repair"
+    )
     assert "There are two independent requirements" in cart_prompt
     assert "A candidate fixing only one requirement is still invalid." in cart_prompt
     assert "discounted_subtotal = subtotal - discount" in cart_prompt
@@ -1231,6 +1316,42 @@ def test_repo_multi_cart_rejects_partial_repairs_and_selects_combined_repair() -
         "repair_1",
         "repair_2",
     ]
+    assert result.final_exact_repo_verification_passed is True
+    assert result.cart_input_mutation_detected is False
+    assert result.cart_discount_subtraction_detected is True
+    assert result.cart_tax_after_discount_detected is True
+    assert result.cart_final_only_rounding_detected is True
+    assert result.cart_combined_contract_satisfied is True
+    assert result.hidden_source_included is False
+
+
+def test_repo_multi_allows_copied_cart_items_to_reach_exact_verification() -> None:
+    task = next(
+        task for task in create_repo_v0_tasks() if task.id == "v0.shopping_cart_totals"
+    )
+    copied_candidate = _cart_candidate(
+        "def total(items, discount_rate=0, tax_rate=0):\n"
+        "    items_copy = [item.copy() for item in items]\n"
+        "    subtotal = 0\n"
+        "    for item in items_copy:\n"
+        "        item['line_total'] = item['price'] * item.get('qty', 1)\n"
+        "        subtotal += item['line_total']\n"
+        "    discounted_subtotal = subtotal - discount_amount(\n"
+        "        subtotal, discount_rate\n"
+        "    )\n"
+        "    total_with_tax = discounted_subtotal * (1 + tax_rate)\n"
+        "    return round(total_with_tax, 2)\n"
+    )
+    client = _RepoRepairClient(copied_candidate, copied_candidate)
+    runtime, _, multi = _runtime_with_repo_agents(client)
+
+    result = SWEABRunner(runtime)._run_case(
+        task, "cgr_multi", multi.metadata.id, debug_trace=True
+    )
+
+    assert result.passed is True
+    assert result.selected_candidate_id == "candidate_1"
+    assert result.rejected_candidates_before_tests == []
     assert result.final_exact_repo_verification_passed is True
     assert result.cart_input_mutation_detected is False
     assert result.cart_discount_subtraction_detected is True

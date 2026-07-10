@@ -262,22 +262,7 @@ def cart_total_debug_fields(
     )
     if total_function is None:
         return result
-    item_names = {
-        node.target.id
-        for node in ast.walk(total_function)
-        if isinstance(node, (ast.For, ast.comprehension))
-        and isinstance(node.target, ast.Name)
-        and isinstance(node.iter, ast.Name)
-        and node.iter.id == "items"
-    }
-    mutation = any(
-        isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
-        and any(
-            _subscript_root_name(target) in item_names
-            for target in _assignment_targets(node)
-        )
-        for node in ast.walk(total_function)
-    )
+    mutation = _CartMutationAnalyzer(total_function).detected
     discount_names = {
         target.id
         for node in ast.walk(total_function)
@@ -343,19 +328,149 @@ def cart_total_debug_fields(
     return result
 
 
-def _assignment_targets(node: ast.AST) -> list[ast.AST]:
-    if isinstance(node, ast.Assign):
-        return list(node.targets)
-    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-        return [node.target]
-    return []
+class _CartMutationAnalyzer:
+    ORIGINAL_COLLECTION = "original_collection"
+    ORIGINAL_ELEMENT = "original_element"
+    COPIED_COLLECTION = "copied_collection"
+    COPIED_ELEMENT = "copied_element"
+    LOCAL_VALUE = "local_value"
+    UNKNOWN = "unknown"
+    MUTATING_METHODS = {
+        "append",
+        "clear",
+        "extend",
+        "insert",
+        "pop",
+        "remove",
+        "reverse",
+        "sort",
+        "update",
+    }
 
+    def __init__(self, function: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.detected = False
+        self._analyze_block(function.body, {"items": self.ORIGINAL_COLLECTION})
 
-def _subscript_root_name(node: ast.AST) -> str | None:
-    current = node
-    while isinstance(current, ast.Subscript):
-        current = current.value
-    return current.id if isinstance(current, ast.Name) else None
+    def _analyze_block(self, statements: list[ast.stmt], env: dict[str, str]) -> None:
+        for statement in statements:
+            self._detect_calls(statement, env)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if any(self._target_mutates_original(target, env) for target in targets):
+                    self.detected = True
+                value = getattr(statement, "value", None)
+                provenance = self._provenance(value, env)
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        env[target.id] = provenance
+            elif isinstance(statement, (ast.For, ast.AsyncFor)):
+                loop_env = dict(env)
+                if isinstance(statement.target, ast.Name):
+                    collection = self._provenance(statement.iter, env)
+                    loop_env[statement.target.id] = (
+                        self.COPIED_ELEMENT
+                        if collection == self.COPIED_COLLECTION
+                        else self.ORIGINAL_ELEMENT
+                        if collection == self.ORIGINAL_COLLECTION
+                        else self.UNKNOWN
+                    )
+                self._analyze_block(statement.body, loop_env)
+                self._analyze_block(statement.orelse, loop_env)
+            elif isinstance(statement, ast.If):
+                self._analyze_block(statement.body, dict(env))
+                self._analyze_block(statement.orelse, dict(env))
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                self._analyze_block(statement.body, dict(env))
+            elif isinstance(statement, ast.Try):
+                self._analyze_block(statement.body, dict(env))
+                self._analyze_block(statement.orelse, dict(env))
+                self._analyze_block(statement.finalbody, dict(env))
+                for handler in statement.handlers:
+                    self._analyze_block(handler.body, dict(env))
+            elif isinstance(statement, ast.Delete):
+                if any(self._target_mutates_original(target, env) for target in statement.targets):
+                    self.detected = True
+
+    def _provenance(self, node: ast.AST | None, env: dict[str, str]) -> str:
+        if isinstance(node, ast.Name):
+            return env.get(node.id, self.UNKNOWN)
+        if isinstance(node, ast.Subscript):
+            base = self._provenance(node.value, env)
+            if base == self.ORIGINAL_COLLECTION:
+                return self.ORIGINAL_ELEMENT
+            if base == self.COPIED_COLLECTION:
+                return self.COPIED_ELEMENT
+            if base == self.ORIGINAL_ELEMENT:
+                return self.ORIGINAL_ELEMENT
+            return self.LOCAL_VALUE
+        if isinstance(node, ast.ListComp) and len(node.generators) == 1:
+            generator = node.generators[0]
+            if not isinstance(generator.target, ast.Name):
+                return self.UNKNOWN
+            element_env = dict(env)
+            source = self._provenance(generator.iter, env)
+            element_env[generator.target.id] = (
+                self.ORIGINAL_ELEMENT
+                if source == self.ORIGINAL_COLLECTION
+                else self.COPIED_ELEMENT
+                if source == self.COPIED_COLLECTION
+                else self.UNKNOWN
+            )
+            if self._is_element_copy(node.elt, element_env):
+                return self.COPIED_COLLECTION
+            return self.ORIGINAL_COLLECTION if source == self.ORIGINAL_COLLECTION else self.UNKNOWN
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "deepcopy" and node.args:
+                source = self._provenance(node.args[0], env)
+                return (
+                    self.COPIED_COLLECTION
+                    if source == self.ORIGINAL_COLLECTION
+                    else self.COPIED_ELEMENT
+                    if source == self.ORIGINAL_ELEMENT
+                    else self.LOCAL_VALUE
+                )
+            if self._is_element_copy(node, env):
+                return self.COPIED_ELEMENT
+        return self.LOCAL_VALUE
+
+    def _is_element_copy(self, node: ast.AST, env: dict[str, str]) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "copy"
+            and self._provenance(node.func.value, env) == self.ORIGINAL_ELEMENT
+        ):
+            return True
+        return bool(
+            isinstance(node.func, ast.Name)
+            and node.func.id in {"dict", "deepcopy"}
+            and node.args
+            and self._provenance(node.args[0], env) == self.ORIGINAL_ELEMENT
+        )
+
+    def _target_mutates_original(self, node: ast.AST, env: dict[str, str]) -> bool:
+        if not isinstance(node, ast.Subscript):
+            return False
+        return self._provenance(node.value, env) in {
+            self.ORIGINAL_COLLECTION,
+            self.ORIGINAL_ELEMENT,
+        }
+
+    def _detect_calls(self, node: ast.AST, env: dict[str, str]) -> None:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr in self.MUTATING_METHODS
+                and self._provenance(child.func.value, env)
+                in {self.ORIGINAL_COLLECTION, self.ORIGINAL_ELEMENT}
+            ):
+                self.detected = True
 
 
 def _is_discount_amount_call(node: ast.AST) -> bool:
