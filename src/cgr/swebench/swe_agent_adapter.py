@@ -62,7 +62,7 @@ def build_sweagent_command(
         str(workspace),
         "--env.deployment.image",
         "python:3.12",
-        "--problem_statement.data_path",
+        "--problem_statement.path",
         str(problem_file),
         "--agent.model.name",
         f"openai/{model}",

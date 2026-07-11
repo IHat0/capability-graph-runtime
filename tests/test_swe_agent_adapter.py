@@ -39,7 +39,8 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     assert command[:4] == ["sweagent", "run", "--config", str(config.resolve())]
     assert "openai/Qwen/Qwen2.5-Coder-7B-Instruct" in command
     assert "thought_action" in command
-    assert command[command.index("--problem_statement.data_path") + 1] == str(tmp_path / "problem.txt")
+    assert command[command.index("--problem_statement.path") + 1] == str(tmp_path / "problem.txt")
+    assert "--problem_statement.data_path" not in command
     assert "$CGR_DRAFT_API_KEY" not in command
     assert command[command.index("--agent.model.per_instance_call_limit") + 1] == "5"
     assert command[command.index("--agent.model.max_input_tokens") + 1] == "14336"
