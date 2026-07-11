@@ -485,6 +485,7 @@ def run_external_agent(
     mode: str,
     workspace: Path,
     budget: ModeBudget,
+    debug_trace: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Invoke an explicitly configured repository-agent adapter."""
     if not command_template.strip():
@@ -507,6 +508,9 @@ def run_external_agent(
         next((value for marker, value in replacements.items() if item == marker), item)
         for item in arguments
     ]
+    environment = os.environ.copy()
+    if debug_trace:
+        environment["CGR_SWEBENCH_DEBUG_TRACE"] = "1"
     return subprocess.run(
         command,
         cwd=workspace,
@@ -514,6 +518,7 @@ def run_external_agent(
         text=True,
         timeout=budget.timeout_seconds,
         check=False,
+        env=environment,
     )
 
 

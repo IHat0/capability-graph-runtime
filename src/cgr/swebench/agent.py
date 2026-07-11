@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,14 +21,36 @@ from cgr.plugins.providers.openai_compatible.openai_compatible_chat_plugin impor
     OpenAICompatibleChatPlugin,
 )
 
-from .integration import MODES, RepositoryActions
+from .integration import MODES, RepositoryActions, capture_git_patch
 
 
-ModelCall = Callable[[list[dict[str, str]], OpenAICompatibleChatConfig], str]
+@dataclass(frozen=True)
+class ModelResponse:
+    """Text returned by a model call plus safe transport diagnostics."""
+
+    content: str
+    response_format_fallback: bool = False
+
+
+ModelCall = Callable[
+    [list[dict[str, str]], OpenAICompatibleChatConfig], str | ModelResponse
+]
 
 
 class AgentResponseError(RuntimeError):
     """Raised when the model does not produce one valid bounded action."""
+
+    def __init__(self, message: str, debug_trace: list[dict[str, str]] | None = None) -> None:
+        super().__init__(message)
+        self.debug_trace = debug_trace or []
+
+
+class ActionParsingError(AgentResponseError):
+    """Raised when an action response is not a JSON object."""
+
+
+class ActionValidationError(AgentResponseError):
+    """Raised when a JSON object is not in the bounded action schema."""
 
 
 @dataclass(frozen=True)
@@ -35,6 +59,22 @@ class AgentRunResult:
     calls: int
     finished: bool
     stop_reason: str
+    final_patch_size: int
+    debug_trace: list[dict[str, str]]
+
+
+ACTION_SCHEMA: dict[str, tuple[set[str], set[str]]] = {
+    "list_files": (set(), {"limit"}),
+    "search_text": ({"pattern"}, {"limit"}),
+    "read_file": ({"path"}, {"start", "end"}),
+    "inspect_symbols": ({"path"}, set()),
+    "write_file": ({"path", "content"}, set()),
+    "apply_patch": ({"patch"}, set()),
+    "run_tests": ({"command"}, {"timeout"}),
+    "git_diff": (set(), set()),
+    "revert_candidate": (set(), set()),
+    "finish": (set(), set()),
+}
 
 
 class FirstPartyRepositoryAgent:
@@ -69,12 +109,67 @@ class FirstPartyRepositoryAgent:
         messages = self._initial_messages()
         steps = 0
         calls = 0
+        debug_trace: list[dict[str, str]] = []
         while steps < self._max_steps and calls < self._max_calls:
-            response = self._model_call(messages, self._config)
+            try:
+                response = self._request_model(messages, debug_trace)
+            except RuntimeError as exc:
+                debug_trace.append({"event": "model_call_failure", "error": _redact(str(exc), self._config)})
+                raise AgentResponseError("Model call failed.", debug_trace) from exc
             calls += 1
-            action = _parse_action(response)
+            _record_raw_response(debug_trace, response, self._config)
+            try:
+                action = _parse_action(response)
+            except AgentResponseError as exc:
+                _record_failure(debug_trace, exc)
+                if calls >= self._max_calls:
+                    raise AgentResponseError(
+                        "Model response was invalid and the model-call budget is exhausted.",
+                        debug_trace,
+                    ) from exc
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": response},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response was invalid. Return only one "
+                                "valid JSON action object matching the required schema."
+                            ),
+                        },
+                    ]
+                )
+                debug_trace.append({"event": "correction_retry", "outcome": "requested"})
+                try:
+                    retry = self._request_model(messages, debug_trace)
+                except RuntimeError as retry_call_exc:
+                    debug_trace.append(
+                        {
+                            "event": "model_call_failure",
+                            "error": _redact(str(retry_call_exc), self._config),
+                        }
+                    )
+                    debug_trace.append({"event": "correction_retry", "outcome": "failed"})
+                    raise AgentResponseError("Model correction call failed.", debug_trace) from retry_call_exc
+                calls += 1
+                _record_raw_response(debug_trace, retry, self._config)
+                try:
+                    action = _parse_action(retry)
+                except AgentResponseError as retry_exc:
+                    _record_failure(debug_trace, retry_exc)
+                    debug_trace.append({"event": "correction_retry", "outcome": "failed"})
+                    raise AgentResponseError(str(retry_exc), debug_trace) from retry_exc
+                debug_trace.append({"event": "correction_retry", "outcome": "succeeded"})
+                response = retry
             if action["action"] == "finish":
-                return AgentRunResult(steps, calls, True, "finished")
+                try:
+                    patch, _ = capture_git_patch(self._workspace)
+                except ValueError as exc:
+                    raise AgentResponseError(
+                        f"Final workspace does not contain a valid repository diff: {exc}",
+                        debug_trace,
+                    ) from exc
+                return AgentRunResult(steps, calls, True, "finished", len(patch.encode()), debug_trace)
             outcome = self._execute_action(action)
             steps += 1
             messages.extend(
@@ -84,7 +179,19 @@ class FirstPartyRepositoryAgent:
                 ]
             )
         reason = "max_steps" if steps >= self._max_steps else "max_calls"
-        return AgentRunResult(steps, calls, False, reason)
+        raise AgentResponseError(
+            f"Repository agent stopped because {reason} was exhausted.", debug_trace
+        )
+
+    def _request_model(
+        self, messages: list[dict[str, str]], debug_trace: list[dict[str, str]]
+    ) -> str:
+        result = self._model_call(messages, self._config)
+        if isinstance(result, ModelResponse):
+            if result.response_format_fallback:
+                debug_trace.append({"event": "response_format_fallback", "outcome": "used"})
+            return result.content
+        return result
 
     def _initial_messages(self) -> list[dict[str, str]]:
         return [
@@ -94,9 +201,13 @@ class FirstPartyRepositoryAgent:
                     "You are a bounded repository repair agent. Operate only through "
                     "the JSON actions described below. Never request network access, "
                     "Git history, .git files, or paths outside the workspace. Return "
-                    "one JSON object and no Markdown. Actions: list_files, search_text, "
-                    "read_file, inspect_symbols, write_file, apply_patch, run_tests, "
-                    "git_diff, revert_candidate, finish."
+                    "one JSON object and no Markdown. Action schema: list_files accepts "
+                    "optional positive limit; search_text requires pattern and optional "
+                    "positive limit; read_file requires path and optional positive start/end; "
+                    "inspect_symbols requires path; write_file requires path and content; "
+                    "apply_patch requires patch; run_tests requires command as a list of "
+                    "strings and optional positive timeout; git_diff, revert_candidate, "
+                    "and finish take no fields."
                 ),
             },
             {
@@ -181,7 +292,10 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
             _openai_model_call,
         ).run()
     except (AgentResponseError, OSError, RuntimeError, ValueError) as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
+        payload: dict[str, Any] = {"ok": False, "error": str(exc)}
+        if os.getenv("CGR_SWEBENCH_DEBUG_TRACE") == "1":
+            payload["debug_trace"] = getattr(exc, "debug_trace", [])
+        print(json.dumps(payload))
         return 1
     print(
         json.dumps(
@@ -191,6 +305,10 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
                 "calls": result.calls,
                 "finished": result.finished,
                 "stop_reason": result.stop_reason,
+                "final_patch_size": result.final_patch_size,
+                "debug_trace": result.debug_trace
+                if os.getenv("CGR_SWEBENCH_DEBUG_TRACE") == "1"
+                else None,
             }
         )
     )
@@ -199,19 +317,90 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
 
 def _openai_model_call(
     messages: list[dict[str, str]], config: OpenAICompatibleChatConfig
-) -> str:
-    response = UrllibOpenAICompatibleChatClient().create_chat_completion(config, messages)
-    return OpenAICompatibleChatPlugin._extract_text(response)
+) -> ModelResponse:
+    client = UrllibOpenAICompatibleChatClient()
+    try:
+        response = client.create_chat_completion(
+            config, messages, response_format={"type": "json_object"}
+        )
+    except RuntimeError as exc:
+        if not _is_response_format_rejection(exc):
+            raise
+        response = client.create_chat_completion(config, messages)
+        return ModelResponse(
+            OpenAICompatibleChatPlugin._extract_text(response), response_format_fallback=True
+        )
+    return ModelResponse(OpenAICompatibleChatPlugin._extract_text(response))
+
+
+def _is_response_format_rejection(error: RuntimeError) -> bool:
+    detail = str(error).casefold()
+    return "response_format" in detail and any(
+        marker in detail
+        for marker in ("unsupported", "not support", "unknown", "invalid", "400")
+    )
 
 
 def _parse_action(response: str) -> dict[str, Any]:
+    normalized = _extract_json_object(response)
     try:
-        action = json.loads(response)
+        action = json.loads(normalized)
     except json.JSONDecodeError as exc:
-        raise AgentResponseError("Model response was not valid action JSON.") from exc
-    if not isinstance(action, dict) or not isinstance(action.get("action"), str):
-        raise AgentResponseError("Model response did not contain an action string.")
+        raise ActionParsingError("Model response was not valid action JSON.") from exc
+    if not isinstance(action, dict):
+        raise ActionValidationError("Model action must be a JSON object.")
+    name = action.get("action")
+    if not isinstance(name, str) or name not in ACTION_SCHEMA:
+        raise ActionValidationError("Model action is missing or unsupported.")
+    required, optional = ACTION_SCHEMA[name]
+    keys = set(action) - {"action"}
+    if not required.issubset(keys) or not keys.issubset(required | optional):
+        raise ActionValidationError("Model action does not match the action schema.")
+    _validate_action_types(action)
     return action
+
+
+def _extract_json_object(response: str) -> str:
+    stripped = response.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL | re.IGNORECASE)
+    return fenced.group(1).strip() if fenced is not None else stripped
+
+
+def _validate_action_types(action: dict[str, Any]) -> None:
+    name = action["action"]
+    strings = {
+        "search_text": {"pattern"},
+        "read_file": {"path"},
+        "inspect_symbols": {"path"},
+        "write_file": {"path", "content"},
+        "apply_patch": {"patch"},
+    }
+    if name in strings and any(not isinstance(action[key], str) for key in strings[name]):
+        raise ActionValidationError("Model action string fields have invalid types.")
+    if name == "run_tests":
+        command = action["command"]
+        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+            raise ActionValidationError("run_tests command must be a list of strings.")
+    for key in {"limit", "start", "end", "timeout"} & set(action):
+        if not isinstance(action[key], int) or isinstance(action[key], bool) or action[key] <= 0:
+            raise ActionValidationError(f"Model action field {key} must be positive.")
+
+
+def _record_raw_response(
+    debug_trace: list[dict[str, str]], response: str, config: OpenAICompatibleChatConfig
+) -> None:
+    debug_trace.append(
+        {"event": "raw_model_response", "response": _redact(response, config)}
+    )
+
+
+def _record_failure(debug_trace: list[dict[str, str]], error: AgentResponseError) -> None:
+    event = "parsing_failure" if isinstance(error, ActionParsingError) else "validation_failure"
+    debug_trace.append({"event": event, "error": str(error)})
+
+
+def _redact(value: str, config: OpenAICompatibleChatConfig) -> str:
+    return value.replace(config.api_key, "[REDACTED]")
 
 
 def _string(action: dict[str, Any], key: str) -> str:

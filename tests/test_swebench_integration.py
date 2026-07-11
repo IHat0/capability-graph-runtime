@@ -4,12 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from cgr.swebench.cli import _find_official_result, pilot_main
+from cgr.swebench import cli as swebench_cli
+from cgr.swebench.cli import _agent_failure_message, _find_official_result, pilot_main
 from cgr.swebench.integration import (
     DATASET_NAME,
     DEFAULT_BUDGETS,
     FORBIDDEN_MODEL_FIELDS,
     MODES,
+    PilotInstance,
     Prediction,
     RepositoryActions,
     SwebenchManifest,
@@ -368,3 +370,154 @@ def test_windows_style_escape_and_git_metadata_are_rejected(tmp_path: Path) -> N
         actions.read_file(".git/config")
     with pytest.raises(ValueError):
         actions.read_file("..\\outside")
+
+
+def test_agent_subprocess_error_uses_structured_adapter_message() -> None:
+    process = subprocess.CompletedProcess(
+        ["cgr-swebench-agent"],
+        1,
+        stdout='{"ok": false, "error": "Model action rejected"}',
+        stderr="ignored stderr",
+    )
+
+    assert _agent_failure_message(process) == "Model action rejected"
+
+
+def test_generation_failure_does_not_write_blank_predictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _records()[0]
+    pilot_instance = PilotInstance(
+        instance_id=str(record["instance_id"]),
+        repo=str(record["repo"]),
+        base_commit=str(record["base_commit"]),
+    )
+    for name, value in {
+        "CGR_DRAFT_API_KEY": "key",
+        "CGR_DRAFT_BASE_URL": "http://localhost",
+        "CGR_DRAFT_MODEL": "qwen",
+        "CGR_SWEBENCH_AGENT_COMMAND": '["cgr-swebench-agent"]',
+        "CGR_SWEBENCH_SCAFFOLD_ID": "cgr-first-party-agent-v1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(swebench_cli, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(swebench_cli, "doctor_report", lambda: {})
+    monkeypatch.setattr(
+        swebench_cli,
+        "materialize_repository",
+        lambda _instance, destination: destination.mkdir(parents=True),
+    )
+    monkeypatch.setattr(
+        swebench_cli,
+        "run_external_agent",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            ["cgr-swebench-agent"],
+            1,
+            stdout='{"ok": false, "error": "Model response was not valid action JSON."}',
+            stderr="",
+        ),
+    )
+
+    result = swebench_cli._generate_predictions(
+        ["baseline"], [pilot_instance], "manifest", tmp_path / "results", resume=False, debug_trace=True
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    generation = json.loads(
+        (tmp_path / "results" / "baseline" / "generation-results.json").read_text()
+    )
+    assert result == 1
+    assert output["generated"] is False
+    assert output["failed_instances"] == {"baseline": [pilot_instance.instance_id]}
+    assert not (tmp_path / "results" / "baseline" / "predictions.jsonl").exists()
+    assert generation[0]["candidate_count"] == 0
+    assert generation[0]["final_patch_size"] == 0
+    assert generation[0]["generation_error"] == "Model response was not valid action JSON."
+
+
+def test_empty_patch_generation_fails_without_prediction_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _records()[0]
+    instance = PilotInstance(
+        instance_id=str(record["instance_id"]),
+        repo=str(record["repo"]),
+        base_commit=str(record["base_commit"]),
+    )
+    _configure_generation_environment(monkeypatch)
+    monkeypatch.setattr(swebench_cli, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(swebench_cli, "doctor_report", lambda: {})
+    monkeypatch.setattr(
+        swebench_cli,
+        "materialize_repository",
+        lambda _instance, destination: destination.mkdir(parents=True),
+    )
+    monkeypatch.setattr(
+        swebench_cli,
+        "run_external_agent",
+        lambda *args, **kwargs: subprocess.CompletedProcess(["agent"], 0, stdout="{}", stderr=""),
+    )
+    monkeypatch.setattr(
+        swebench_cli,
+        "capture_git_patch",
+        lambda _workspace: (_ for _ in ()).throw(ValueError("Generated SWE-bench patch is empty.")),
+    )
+
+    result = swebench_cli._generate_predictions(
+        ["baseline"], [instance], "manifest", tmp_path / "results", resume=False, debug_trace=False
+    )
+
+    mode_root = tmp_path / "results" / "baseline"
+    generation = json.loads((mode_root / "generation-results.json").read_text())
+    assert result == 1
+    assert not (mode_root / "predictions.jsonl").exists()
+    assert not (mode_root / "predictions.sha256").exists()
+    assert "patch is empty" in generation[0]["generation_error"]
+
+
+def test_successful_generation_writes_jsonl_prediction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _records()[0]
+    instance = PilotInstance(
+        instance_id=str(record["instance_id"]),
+        repo=str(record["repo"]),
+        base_commit=str(record["base_commit"]),
+    )
+    _configure_generation_environment(monkeypatch)
+    monkeypatch.setattr(swebench_cli, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(swebench_cli, "doctor_report", lambda: {})
+    monkeypatch.setattr(
+        swebench_cli,
+        "materialize_repository",
+        lambda _instance, destination: destination.mkdir(parents=True),
+    )
+    monkeypatch.setattr(
+        swebench_cli,
+        "run_external_agent",
+        lambda *args, **kwargs: subprocess.CompletedProcess(["agent"], 0, stdout="{}", stderr=""),
+    )
+    patch = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-a\n+b\n"
+    monkeypatch.setattr(swebench_cli, "capture_git_patch", lambda _workspace: (patch, ["app.py"]))
+    monkeypatch.setattr(swebench_cli, "verify_patch_applies", lambda *args: None)
+
+    result = swebench_cli._generate_predictions(
+        ["baseline"], [instance], "manifest", tmp_path / "results", resume=False, debug_trace=False
+    )
+
+    predictions = (tmp_path / "results" / "baseline" / "predictions.jsonl").read_text().splitlines()
+    assert result == 0
+    assert len(predictions) == 1
+    assert json.loads(predictions[0])["instance_id"] == instance.instance_id
+    validate_prediction_hash(tmp_path / "results" / "baseline" / "predictions.jsonl")
+
+
+def _configure_generation_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {
+        "CGR_DRAFT_API_KEY": "key",
+        "CGR_DRAFT_BASE_URL": "http://localhost",
+        "CGR_DRAFT_MODEL": "qwen",
+        "CGR_SWEBENCH_AGENT_COMMAND": '["cgr-swebench-agent"]',
+        "CGR_SWEBENCH_SCAFFOLD_ID": "cgr-first-party-agent-v1",
+    }.items():
+        monkeypatch.setenv(name, value)

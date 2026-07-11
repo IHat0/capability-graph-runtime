@@ -101,6 +101,35 @@ The bounded repository surface supports file listing/search/reads, visible tests
 edits, patch application, diff inspection, and candidate reversion. `.git`, path
 traversal, network actions, and answer-seeking history commands are denied.
 
+## Generation Failures And Debugging
+
+The first-party agent requests OpenAI-compatible JSON-object mode. If a provider
+explicitly rejects `response_format`, the same request is retried once without that
+option; this transport retry is recorded in the debug trace and does not create an
+extra repository action. The returned action must still be a single JSON object,
+either raw or inside one complete Markdown code fence. Prose, malformed JSON,
+unknown actions, and invalid action fields are rejected. One correction request is
+then allowed within the configured model-call budget:
+
+```text
+Return only one valid JSON action object matching the required schema.
+```
+
+An agent exits nonzero when it exhausts its call or step budget, cannot recover a
+valid action, encounters an unrecoverable action failure, or reaches `finish`
+without a non-empty unified Git diff. A successful adapter exit therefore means a
+valid candidate diff remains in its workspace, not merely that an API request
+completed.
+
+Use `--debug-trace` for a failed generation to retain redacted raw model output,
+parse/schema errors, correction outcomes, and response-format fallback events in
+the generation record. API keys are redacted. The pilot records adapter stdout and
+stderr failures in `generation_error`; any requested instance without a candidate
+patch makes generation return nonzero and `generated: false`. It does not write an
+empty `predictions.jsonl` or a success hash. For a partial run, successful and
+failed instance IDs are reported separately; use `--resume` to retry the incomplete
+set after fixing the underlying issue.
+
 ## Two-Phase Workflow
 
 Do not run the provider until this infrastructure and manifest are committed,

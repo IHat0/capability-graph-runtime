@@ -16,6 +16,7 @@ class OpenAICompatibleChatClient(Protocol):
         self,
         config: OpenAICompatibleChatConfig,
         messages: list[dict[str, str]],
+        response_format: dict[str, str] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -26,15 +27,17 @@ class UrllibOpenAICompatibleChatClient:
         self,
         config: OpenAICompatibleChatConfig,
         messages: list[dict[str, str]],
+        response_format: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        body = json.dumps(
-            {
-                "model": config.model,
-                "messages": messages,
-                "temperature": 0,
-                "top_p": 1,
-            }
-        ).encode("utf-8")
+        payload: dict[str, Any] = {
+            "model": config.model,
+            "messages": messages,
+            "temperature": 0,
+            "top_p": 1,
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        body = json.dumps(payload).encode("utf-8")
         request = Request(
             f"{config.base_url.rstrip('/')}/chat/completions",
             data=body,

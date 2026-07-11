@@ -222,6 +222,8 @@ def _generate_predictions(
     (result_root / "environment.json").write_text(
         json.dumps(environment, indent=2) + "\n", encoding="utf-8"
     )
+    failures_by_mode: dict[str, list[str]] = {}
+    successful_by_mode: dict[str, list[str]] = {}
     for selected_mode in modes:
         mode_root = result_root / selected_mode
         predictions_path = mode_root / "predictions.jsonl"
@@ -234,71 +236,115 @@ def _generate_predictions(
         completed = {prediction.instance_id for prediction in existing}
         predictions = list(existing)
         generation_rows: list[dict[str, Any]] = []
+        failed_instances: list[str] = []
+        successful_instances: list[str] = []
         for pilot_instance in instances:
             if pilot_instance.instance_id in completed:
                 continue
-            record = by_id.get(pilot_instance.instance_id)
-            if record is None:
-                raise RuntimeError(f"Dataset unavailable for {pilot_instance.instance_id}")
-            with tempfile.TemporaryDirectory(prefix="cgr-swebench-workspace-") as temp:
-                workspace = Path(temp) / "repo"
-                safe_instance = filter_model_instance(record, str(workspace))
-                materialize_repository(safe_instance, workspace)
-                started = time.perf_counter()
-                process = run_external_agent(
-                    adapter,
-                    safe_instance,
-                    selected_mode,
-                    workspace,
-                    DEFAULT_BUDGETS[selected_mode],
-                )
-                if process.returncode:
-                    generation_rows.append(
-                        {
-                            **generation_result_template(
-                                selected_mode, model, provider, scaffold
-                            ),
-                            "instance_id": safe_instance.instance_id,
-                            "repo": safe_instance.repo,
-                            "base_commit": safe_instance.base_commit,
-                            "generation_error": process.stderr[-2000:],
-                        }
+            started = time.perf_counter()
+            try:
+                record = by_id.get(pilot_instance.instance_id)
+                if record is None:
+                    raise RuntimeError(
+                        f"Dataset unavailable for {pilot_instance.instance_id}"
                     )
-                    continue
-                patch, changed = capture_git_patch(workspace)
-                verify_patch_applies(workspace, patch, safe_instance.base_commit)
-                predictions.append(
-                    Prediction(
-                        instance_id=safe_instance.instance_id,
-                        model_name_or_path=model,
-                        model_patch=patch,
+                safe_instance = filter_model_instance(record)
+                with tempfile.TemporaryDirectory(prefix="cgr-swebench-workspace-") as temp:
+                    workspace = Path(temp) / "repo"
+                    safe_instance = safe_instance.model_copy(
+                        update={"workspace_path": str(workspace)}
                     )
-                )
-                row = generation_result_template(
-                    selected_mode, model, provider, scaffold
-                )
-                row.update(
+                    materialize_repository(safe_instance, workspace)
+                    process = run_external_agent(
+                        adapter,
+                        safe_instance,
+                        selected_mode,
+                        workspace,
+                        DEFAULT_BUDGETS[selected_mode],
+                        debug_trace=debug_trace,
+                    )
+                    if process.returncode:
+                        raise RuntimeError(_agent_failure_message(process))
+                    patch, changed = capture_git_patch(workspace)
+                    verify_patch_applies(workspace, patch, safe_instance.base_commit)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                failed_instances.append(pilot_instance.instance_id)
+                generation_rows.append(
                     {
-                        "instance_id": safe_instance.instance_id,
-                        "repo": safe_instance.repo,
-                        "base_commit": safe_instance.base_commit,
+                        **generation_result_template(
+                            selected_mode, model, provider, scaffold
+                        ),
+                        "instance_id": pilot_instance.instance_id,
+                        "repo": pilot_instance.repo,
+                        "base_commit": pilot_instance.base_commit,
                         "elapsed_seconds": time.perf_counter() - started,
-                        "candidate_count": DEFAULT_BUDGETS[selected_mode].trajectories,
-                        "final_changed_files": changed,
-                        "final_patch_size": len(patch.encode()),
-                        "local_verification_passed": True,
-                        "local_verification_summary": "Agent completed and patch applies at base_commit.",
-                        "debug_trace": process.stdout[-4000:] if debug_trace else None,
+                        "generation_error": str(exc),
                     }
                 )
-                generation_rows.append(row)
-        write_predictions(predictions_path, sorted(predictions, key=lambda item: item.instance_id))
+                continue
+            predictions.append(
+                Prediction(
+                    instance_id=safe_instance.instance_id,
+                    model_name_or_path=model,
+                    model_patch=patch,
+                )
+            )
+            successful_instances.append(safe_instance.instance_id)
+            row = generation_result_template(selected_mode, model, provider, scaffold)
+            row.update(
+                {
+                    "instance_id": safe_instance.instance_id,
+                    "repo": safe_instance.repo,
+                    "base_commit": safe_instance.base_commit,
+                    "elapsed_seconds": time.perf_counter() - started,
+                    "candidate_count": DEFAULT_BUDGETS[selected_mode].trajectories,
+                    "final_changed_files": changed,
+                    "final_patch_size": len(patch.encode()),
+                    "local_verification_passed": True,
+                    "local_verification_summary": "Agent completed and patch applies at base_commit.",
+                    "debug_trace": process.stdout[-4000:] if debug_trace else None,
+                }
+            )
+            generation_rows.append(row)
         mode_root.mkdir(parents=True, exist_ok=True)
         (mode_root / "generation-results.json").write_text(
             json.dumps(generation_rows, indent=2) + "\n", encoding="utf-8"
         )
-    print(json.dumps({"generated": True, "modes": modes}, indent=2))
-    return 0
+        if not failed_instances:
+            write_predictions(
+                predictions_path, sorted(predictions, key=lambda item: item.instance_id)
+            )
+        else:
+            failures_by_mode[selected_mode] = failed_instances
+        if successful_instances:
+            successful_by_mode[selected_mode] = successful_instances
+    generated = not failures_by_mode
+    print(
+        json.dumps(
+            {
+                "generated": generated,
+                "modes": modes,
+                "successful_instances": successful_by_mode,
+                "failed_instances": failures_by_mode,
+            },
+            indent=2,
+        )
+    )
+    return 0 if generated else 1
+
+
+def _agent_failure_message(process: subprocess.CompletedProcess[str]) -> str:
+    """Preserve an adapter's JSON/stdout error before falling back to stderr."""
+    stdout = process.stdout.strip()
+    if stdout:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+            return payload["error"]
+    message = "\n".join(part for part in (stdout, process.stderr.strip()) if part)
+    return message[-4000:] or f"Repository agent exited with code {process.returncode}."
 
 
 def _evaluate_predictions(modes: list[str], instances: list[Any], result_root: Path) -> int:
