@@ -82,8 +82,6 @@ class AgentRunResult:
     files_modified: list[str]
     successful_verification_commands: list[dict[str, Any]]
     failed_verification_commands: list[dict[str, Any]]
-    repair_phase_entered: bool
-    orchestration_path: str
     debug_trace: list[dict[str, str]]
 
 
@@ -182,8 +180,6 @@ class FirstPartyRepositoryAgent:
         self._model_call = model_call
         self._state = AgentState(set(), set(), [], [])
         self._current_step = 0
-        self._repair_phase_entered = False
-        self._finish_rejections = 0
         self._last_finish_rejection_error: str | None = None
 
     def run(self) -> AgentRunResult:
@@ -256,17 +252,6 @@ class FirstPartyRepositoryAgent:
                         {"role": "tool", "content": json.dumps(finish)},
                     ]
                 )
-                if self._should_enter_repair_phase():
-                    repair_prompt = self._repair_phase_prompt(finish)
-                    messages.append({"role": "user", "content": repair_prompt})
-                    debug_trace.append(
-                        {
-                            "event": "repair_phase_entered",
-                            "mode": self._mode,
-                            "finish_rejections": str(self._finish_rejections),
-                        }
-                    )
-                    self._repair_phase_entered = True
                 continue
             self._current_step = steps + 1
             outcome = self._execute_action(action)
@@ -313,15 +298,12 @@ class FirstPartyRepositoryAgent:
             sorted(self._state.files_modified),
             list(self._state.successful_verification_commands),
             list(self._state.failed_verification_commands),
-            self._repair_phase_entered,
-            self._orchestration_path(),
             debug_trace,
         )
 
     def _finish_rejection(
         self, error: str, debug_trace: list[dict[str, str]]
     ) -> dict[str, Any]:
-        self._finish_rejections += 1
         self._last_finish_rejection_error = error
         required = _required_next_actions(error, self._state)
         outcome: dict[str, Any] = {
@@ -339,27 +321,6 @@ class FirstPartyRepositoryAgent:
             }
         )
         return outcome
-
-    def _should_enter_repair_phase(self) -> bool:
-        return self._mode == "cgr_single" and not self._repair_phase_entered
-
-    def _repair_phase_prompt(self, finish_outcome: dict[str, Any]) -> str:
-        diff = _bounded_tool_text(self._actions.git_diff())
-        return (
-            "CGR single repair phase. The primary candidate was rejected by the "
-            "acceptance gate. Continue with bounded JSON actions only. Rejection: "
-            f"{finish_outcome.get('error')}. Required next actions: "
-            f"{json.dumps(finish_outcome.get('required_next_actions', []))}. "
-            f"Verification state: {json.dumps(self._state_diagnostics())}. "
-            f"Current diff summary:\n{diff}"
-        )
-
-    def _orchestration_path(self) -> str:
-        if self._mode == "baseline":
-            return "baseline"
-        if self._mode == "cgr_single":
-            return "cgr_single_repair" if self._repair_phase_entered else "cgr_single_primary"
-        return "cgr_multi_trajectory"
 
     def _request_model(
         self, messages: list[dict[str, str]], debug_trace: list[dict[str, str]]
@@ -620,8 +581,6 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
                 "successful_verification_commands": result.successful_verification_commands,
                 "failed_verification_commands": result.failed_verification_commands,
                 "local_verification_passed": bool(result.successful_verification_commands),
-                "repair_phase_entered": result.repair_phase_entered,
-                "orchestration_path": result.orchestration_path,
                 "debug_trace": result.debug_trace
                 if os.getenv("CGR_SWEBENCH_DEBUG_TRACE") == "1"
                 else None,

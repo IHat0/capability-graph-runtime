@@ -243,7 +243,6 @@ def _generate_predictions(
                 continue
             started = time.perf_counter()
             process: subprocess.CompletedProcess[str] | None = None
-            candidate_count = 0
             try:
                 record = by_id.get(pilot_instance.instance_id)
                 if record is None:
@@ -252,69 +251,24 @@ def _generate_predictions(
                     )
                 safe_instance = filter_model_instance(record)
                 with tempfile.TemporaryDirectory(prefix="cgr-swebench-workspace-") as temp:
-                    valid_candidates: list[dict[str, Any]] = []
-                    trajectory_errors: list[str] = []
-                    for trajectory in range(DEFAULT_BUDGETS[selected_mode].trajectories):
-                        workspace = Path(temp) / f"repo-{trajectory}"
-                        trajectory_instance = safe_instance.model_copy(
-                            update={"workspace_path": str(workspace)}
-                        )
-                        try:
-                            materialize_repository(trajectory_instance, workspace)
-                            process = run_external_agent(
-                                adapter,
-                                trajectory_instance,
-                                selected_mode,
-                                workspace,
-                                DEFAULT_BUDGETS[selected_mode],
-                                debug_trace=debug_trace,
-                            )
-                            if process.returncode:
-                                raise RuntimeError(_agent_failure_message(process))
-                            payload = _agent_success_payload(process)
-                            candidate_patch, candidate_changed = capture_git_patch(workspace)
-                            verify_patch_applies(
-                                workspace, candidate_patch, trajectory_instance.base_commit
-                            )
-                        except (
-                            OSError,
-                            RuntimeError,
-                            ValueError,
-                            subprocess.SubprocessError,
-                        ) as trajectory_exc:
-                            trajectory_errors.append(str(trajectory_exc))
-                            continue
-                        valid_candidates.append(
-                            {
-                                "patch": candidate_patch,
-                                "changed": candidate_changed,
-                                "agent_payload": payload,
-                                "process": process,
-                                "trajectory": trajectory,
-                            }
-                        )
-                    if not valid_candidates:
-                        if (
-                            DEFAULT_BUDGETS[selected_mode].trajectories == 1
-                            and len(trajectory_errors) == 1
-                        ):
-                            raise RuntimeError(trajectory_errors[0])
-                        raise RuntimeError(
-                            "No valid SWE-bench candidate was generated."
-                            + (
-                                " Trajectory errors: " + " | ".join(trajectory_errors)
-                                if trajectory_errors
-                                else ""
-                            )
-                        )
-                    selected_candidate = min(
-                        valid_candidates, key=lambda item: len(str(item["patch"]).encode())
+                    workspace = Path(temp) / "repo"
+                    safe_instance = safe_instance.model_copy(
+                        update={"workspace_path": str(workspace)}
                     )
-                    candidate_count = len(valid_candidates)
-                    patch = str(selected_candidate["patch"])
-                    changed = list(selected_candidate["changed"])
-                    agent_payload = selected_candidate["agent_payload"]
-                    process = selected_candidate["process"]
+                    materialize_repository(safe_instance, workspace)
+                    process = run_external_agent(
+                        adapter,
+                        safe_instance,
+                        selected_mode,
+                        workspace,
+                        DEFAULT_BUDGETS[selected_mode],
+                        debug_trace=debug_trace,
+                    )
+                    if process.returncode:
+                        raise RuntimeError(_agent_failure_message(process))
+                    agent_payload = _agent_success_payload(process)
+                    patch, changed = capture_git_patch(workspace)
+                    verify_patch_applies(workspace, patch, safe_instance.base_commit)
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                 failed_instances.append(pilot_instance.instance_id)
                 diagnostics = _agent_diagnostics(process)
@@ -328,7 +282,6 @@ def _generate_predictions(
                         "base_commit": pilot_instance.base_commit,
                         "elapsed_seconds": time.perf_counter() - started,
                         "generation_error": str(exc),
-                        "candidate_count": candidate_count,
                         **diagnostics,
                     }
                 )
@@ -350,7 +303,7 @@ def _generate_predictions(
                     "repo": safe_instance.repo,
                     "base_commit": safe_instance.base_commit,
                     "elapsed_seconds": time.perf_counter() - started,
-                    "candidate_count": candidate_count,
+                    "candidate_count": DEFAULT_BUDGETS[selected_mode].trajectories,
                     "final_changed_files": changed,
                     "final_patch_size": len(patch.encode()),
                     "local_tests_invoked": [

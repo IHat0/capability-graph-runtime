@@ -59,17 +59,12 @@ def _workspace(tmp_path: Path) -> Path:
 
 
 def _agent(
-    workspace: Path,
-    model: ScriptedModel,
-    *,
-    mode: str = "baseline",
-    steps: int = 10,
-    calls: int = 10,
+    workspace: Path, model: ScriptedModel, *, steps: int = 10, calls: int = 10
 ) -> FirstPartyRepositoryAgent:
     return FirstPartyRepositoryAgent(
         workspace,
         "Fix the public issue.",
-        mode,
+        "baseline",
         steps,
         calls,
         _config(),
@@ -427,93 +422,31 @@ def test_rejected_finish_after_tests_is_returned_as_tool_result_and_recovers(
     assert finish_rejections[0]["required_next_actions"] == ["inspect_diff"]
 
 
-def test_rejected_finish_before_tests_is_returned_as_tool_result_and_recovers(
-    tmp_path: Path,
-) -> None:
+def test_rejected_finish_exhausts_call_budget_when_model_never_corrects(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     model = ScriptedModel(
         [
             '{"action":"read_file","path":"app.py"}',
             '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
-            '{"action":"finish"}',
             '{"action":"run_tests","command":["python","--version"]}',
-            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+            '{"action":"finish"}',
             '{"action":"finish"}',
         ]
     )
 
-    result = _agent(workspace, model).run()
-    rejection = json.loads(model.messages[3][-1]["content"])
+    with pytest.raises(AgentResponseError, match="max_calls.*Inspect the final diff") as raised:
+        _agent(workspace, model, calls=6).run()
 
-    assert result.finished is True
-    assert result.final_patch_size > 0
-    assert rejection["action"] == "finish"
-    assert rejection["required_next_actions"] == ["inspect_diff", "run_tests"]
-
-
-def test_cgr_single_enters_repair_phase_after_rejected_primary_finish(
-    tmp_path: Path,
-) -> None:
-    workspace = _workspace(tmp_path)
-    model = ScriptedModel(
-        [
-            '{"action":"read_file","path":"app.py"}',
-            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
-            '{"action":"finish"}',
-            '{"action":"run_tests","command":["python","--version"]}',
-            '{"action":"inspect_diff"}',
-            '{"action":"finish"}',
-        ]
-    )
-
-    result = _agent(workspace, model, mode="cgr_single").run()
-
-    assert result.finished is True
-    assert result.repair_phase_entered is True
-    assert result.orchestration_path == "cgr_single_repair"
-    assert any(
-        message["role"] == "user" and "CGR single repair phase" in message["content"]
-        for message in model.messages[3]
-    )
-    assert {"event": "repair_phase_entered", "mode": "cgr_single", "finish_rejections": "1"} in result.debug_trace
-
-
-def test_baseline_and_cgr_single_have_distinct_rejected_finish_paths(
-    tmp_path: Path,
-) -> None:
-    baseline = _agent(
-        _workspace(tmp_path / "baseline"),
-        ScriptedModel(
-            [
-                '{"action":"read_file","path":"app.py"}',
-                '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
-                '{"action":"finish"}',
-                '{"action":"run_tests","command":["python","--version"]}',
-                '{"action":"inspect_diff"}',
-                '{"action":"finish"}',
-            ]
-        ),
-        mode="baseline",
-    ).run()
-    single = _agent(
-        _workspace(tmp_path / "single"),
-        ScriptedModel(
-            [
-                '{"action":"read_file","path":"app.py"}',
-                '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
-                '{"action":"finish"}',
-                '{"action":"run_tests","command":["python","--version"]}',
-                '{"action":"inspect_diff"}',
-                '{"action":"finish"}',
-            ]
-        ),
-        mode="cgr_single",
-    ).run()
-
-    assert baseline.orchestration_path == "baseline"
-    assert baseline.repair_phase_entered is False
-    assert single.orchestration_path == "cgr_single_repair"
-    assert single.repair_phase_entered is True
+    finish_rejections = [
+        json.loads(message[-1]["content"])
+        for message in model.messages
+        if message[-1]["role"] == "tool"
+        and json.loads(message[-1]["content"]).get("action") == "finish"
+    ]
+    assert len(finish_rejections) == 2
+    assert all(item["required_next_actions"] == ["inspect_diff"] for item in finish_rejections)
+    assert sum(item["event"] == "finish_rejected" for item in raised.value.debug_trace) == 3
 
 
 def test_dispatcher_covers_every_non_finish_canonical_action(tmp_path: Path) -> None:
