@@ -15,6 +15,7 @@ export CGR_DRAFT_API_KEY='cgr-aws-key'
 export CGR_DRAFT_MODEL='Qwen/Qwen2.5-Coder-7B-Instruct'
 export CGR_DRAFT_MAX_MODEL_LEN=16384
 export CGR_SWEBENCH_SCAFFOLD_ID='swe-agent-v1.1.0-0f3acaf'
+export CGR_SWE_AGENT_SOURCE="$PWD/.swe-agent-src"
 export CGR_SWE_AGENT_EXECUTABLE="$PWD/.venv-sweagent/bin/sweagent"
 export CGR_SWEBENCH_AGENT_COMMAND='[
   "cgr-swebench-swe-agent-adapter",
@@ -24,6 +25,10 @@ export CGR_SWEBENCH_AGENT_COMMAND='[
   "--max-steps", "{max_steps}",
   "--max-calls", "{max_calls}"
 ]'
+
+"$CGR_SWE_AGENT_EXECUTABLE" --version
+"$CGR_SWE_AGENT_EXECUTABLE" run --help | tee /tmp/cgr-sweagent-run-help.txt
+test -f "$CGR_SWE_AGENT_SOURCE/config/default.yaml"
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT

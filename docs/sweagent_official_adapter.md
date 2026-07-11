@@ -25,6 +25,7 @@ export CGR_DRAFT_API_KEY='cgr-aws-key'
 export CGR_DRAFT_MODEL='Qwen/Qwen2.5-Coder-7B-Instruct'
 export CGR_DRAFT_MAX_MODEL_LEN=16384
 export CGR_SWEBENCH_SCAFFOLD_ID='swe-agent-v1.1.0-0f3acaf'
+export CGR_SWE_AGENT_SOURCE="$HOME/CGR-Ticket-1.1/.swe-agent-src"
 export CGR_SWE_AGENT_EXECUTABLE="$HOME/CGR-Ticket-1.1/.venv-sweagent/bin/sweagent"
 export CGR_SWEBENCH_AGENT_COMMAND='[
   "cgr-swebench-swe-agent-adapter",
