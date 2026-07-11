@@ -9,7 +9,7 @@ if [[ ! -x .venv-sweagent/bin/python ]]; then
 fi
 source .venv-sweagent/bin/activate
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet 'sweagent==1.1.0'
+python -m pip install --quiet 'git+https://github.com/SWE-agent/SWE-agent.git@0f3acafacabc0def8cc76b4e48acb4b6cf302cb9'
 python -m pip install --quiet -e .
 
 export CGR_DRAFT_BASE_URL='http://127.0.0.1:8000/v1'

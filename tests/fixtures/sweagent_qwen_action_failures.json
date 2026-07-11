@@ -1,0 +1,17 @@
+{
+  "provenance": "Exact visible action fragment from the failed EC2 trajectory; remaining responses are synthetic variants because the full trajectory was not provided to this checkout.",
+  "responses": [
+    {
+      "name": "captured_python_action_fragment",
+      "response": "DISCUSSION\nI will add a test.\n```python\n# test_edge_cases.py\nfrom math_utils import add\nassert add(2, 3) == 5\n```"
+    },
+    {
+      "name": "synthetic_multiple_fences_variant",
+      "response": "DISCUSSION\nI will explain first.\n```python\nfrom math_utils import add\nassert add(2, 3) == 5\n```\n```bash\nsed -i 's/a - b/a + b/' math_utils.py\n```"
+    },
+    {
+      "name": "synthetic_raw_python_variant",
+      "response": "DISCUSSION\nI will edit the module.\n```bash\nfrom math_utils import add\nassert add(2, 3) == 5\n```"
+    }
+  ]
+}
