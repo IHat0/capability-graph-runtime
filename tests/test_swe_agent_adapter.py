@@ -141,3 +141,16 @@ def test_official_failure_preserves_bounded_redacted_process_diagnostics(
     assert payload["stdout"] == "provider saw [REDACTED]"
     assert payload["stderr"] == "failed: [REDACTED]"
     assert "hide-this-key" not in json.dumps(payload)
+
+
+def test_ec2_smoke_preflight_is_recorded_without_blocking_adapter() -> None:
+    script = Path("scripts/ec2_sweagent_smoke.sh").read_text(encoding="utf-8")
+
+    assert '"$CGR_SWE_AGENT_EXECUTABLE" run --help >"$preflight_stdout"' in script
+    assert "preflight_status=$?" in script
+    assert "adapter_status=$?" in script
+    assert "final_status=0" in script
+    assert "=== SWE-agent preflight ===" in script
+    assert "=== Adapter ===" in script
+    assert "=== Final workspace ===" in script
+    assert "=== Trajectories/artifacts ===" in script
