@@ -8,6 +8,23 @@ from urllib.request import Request, urlopen
 from .chat_config import OpenAICompatibleChatConfig
 
 
+class OpenAICompatibleHTTPError(RuntimeError):
+    """Provider HTTP failure with safe request-budget diagnostics."""
+
+    def __init__(
+        self, status: int, body: str, prompt_tokens: int, max_tokens: int
+    ) -> None:
+        self.status = status
+        self.body = body
+        self.prompt_tokens = prompt_tokens
+        self.max_tokens = max_tokens
+        super().__init__(
+            "OpenAI-compatible chat request failed: "
+            f"HTTP {status}; provider_body={body}; "
+            f"prompt_token_estimate={prompt_tokens}; max_tokens={max_tokens}."
+        )
+
+
 @runtime_checkable
 class OpenAICompatibleChatClient(Protocol):
     """Client contract used by the provider-neutral chat plugin."""
@@ -17,6 +34,7 @@ class OpenAICompatibleChatClient(Protocol):
         config: OpenAICompatibleChatConfig,
         messages: list[dict[str, str]],
         response_format: dict[str, str] | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -28,6 +46,7 @@ class UrllibOpenAICompatibleChatClient:
         config: OpenAICompatibleChatConfig,
         messages: list[dict[str, str]],
         response_format: dict[str, str] | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": config.model,
@@ -37,6 +56,8 @@ class UrllibOpenAICompatibleChatClient:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         body = json.dumps(payload).encode("utf-8")
         request = Request(
             f"{config.base_url.rstrip('/')}/chat/completions",
@@ -55,9 +76,11 @@ class UrllibOpenAICompatibleChatClient:
                 error_body = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 error_body = ""
-            raise RuntimeError(
-                "OpenAI-compatible chat request failed: "
-                f"{exc.code} {error_body}"
+            raise OpenAICompatibleHTTPError(
+                exc.code,
+                error_body.replace(config.api_key, "[REDACTED]"),
+                _estimate_prompt_tokens(messages),
+                max_tokens or 0,
             ) from exc
         except URLError as exc:
             raise RuntimeError(
@@ -73,3 +96,9 @@ class UrllibOpenAICompatibleChatClient:
         if not isinstance(parsed, dict):
             raise RuntimeError("OpenAI-compatible chat API returned invalid JSON.")
         return parsed
+
+
+def _estimate_prompt_tokens(messages: list[dict[str, str]]) -> int:
+    """Conservative tokenizer-free estimate for provider error diagnostics."""
+    characters = sum(len(message.get("content", "")) for message in messages)
+    return max(1, (characters + 2) // 3) + (4 * len(messages))

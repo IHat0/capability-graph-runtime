@@ -14,10 +14,13 @@ from cgr.swebench.agent import (
     ActionParsingError,
     ActionValidationError,
     AgentResponseError,
+    ContextBudgetError,
     FirstPartyRepositoryAgent,
     ModelResponse,
     _openai_model_call,
     _parse_action,
+    _completion_budget,
+    _estimate_prompt_tokens,
     _system_prompt,
     parse_agent_args,
 )
@@ -142,9 +145,33 @@ def test_action_parser_rejects_missing_action_and_incorrect_fields() -> None:
 def test_system_prompt_and_schema_share_every_canonical_action() -> None:
     prompt = _system_prompt()
 
-    for name, definition in ACTION_DEFINITIONS.items():
+    for name in ACTION_DEFINITIONS:
         assert name in prompt
-        assert json.dumps(definition.example, sort_keys=True) in prompt
+    assert '"action":"read_file"' in prompt
+    assert '"action":"replace_text"' in prompt
+    assert len(prompt) < 2_000
+
+
+def test_prompt_and_completion_budget_fit_within_4096_tokens(tmp_path: Path) -> None:
+    config = _config().model_copy(update={"max_model_len": 4096, "max_completion_tokens": 512})
+    agent = FirstPartyRepositoryAgent(
+        _workspace(tmp_path), "Fix the public issue.", "baseline", 4, 4, config, ScriptedModel([])
+    )
+    messages = agent._initial_messages()
+    completion = _completion_budget(messages, config)
+
+    assert _estimate_prompt_tokens(messages) + completion <= 4096
+    assert completion == 512
+
+
+def test_oversized_problem_fails_before_provider_call(tmp_path: Path) -> None:
+    config = _config().model_copy(update={"max_model_len": 512, "max_completion_tokens": 256})
+    agent = FirstPartyRepositoryAgent(
+        _workspace(tmp_path), "requirement\n" * 5_000, "baseline", 4, 4, config, ScriptedModel([])
+    )
+
+    with pytest.raises(ContextBudgetError, match="Prompt cannot fit"):
+        agent.run()
 
 
 def test_agent_uses_one_correction_retry_and_records_debug_trace(tmp_path: Path) -> None:
@@ -212,8 +239,10 @@ def test_openai_model_call_requests_json_object(
         config: OpenAICompatibleChatConfig,
         messages: list[dict[str, str]],
         response_format: dict[str, str] | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, object]:
         received["response_format"] = response_format
+        received["max_tokens"] = max_tokens
         return {"choices": [{"message": {"content": '{"action":"finish"}'}}]}
 
     monkeypatch.setattr(
@@ -225,6 +254,7 @@ def test_openai_model_call_requests_json_object(
 
     assert response == ModelResponse('{"action":"finish"}')
     assert received["response_format"] == {"type": "json_object"}
+    assert received["max_tokens"] == 512
 
 
 def test_openai_model_call_falls_back_when_provider_rejects_response_format(
@@ -237,6 +267,7 @@ def test_openai_model_call_falls_back_when_provider_rejects_response_format(
         config: OpenAICompatibleChatConfig,
         messages: list[dict[str, str]],
         response_format: dict[str, str] | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, object]:
         formats.append(response_format)
         if response_format is not None:

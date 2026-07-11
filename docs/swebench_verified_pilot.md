@@ -97,6 +97,20 @@ export CGR_SWEBENCH_AGENT_COMMAND='[
 
 The first-party adapter is CGR's bounded action layer, not an external scaffold.
 
+For a vLLM endpoint with a constrained context window, configure the matching
+limit before generation. The agent conservatively estimates prompt tokens, reserves
+completion space, and sends an explicit `max_tokens` value on each chat request.
+
+```bash
+export CGR_DRAFT_MAX_MODEL_LEN=4096
+export CGR_DRAFT_MAX_COMPLETION_TOKENS=512
+```
+
+If the complete issue plus bounded initial repository context cannot fit, the agent
+fails before making a provider request. It removes only nonsemantic whitespace from
+the issue; it never cuts a code block or silently drops requirements. Bounded tool
+outputs explicitly identify truncation so the model can refine its next request.
+
 The bounded repository surface supports file listing/search/reads, visible tests,
 edits, patch application, diff inspection, and candidate reversion. `.git`, path
 traversal, network actions, and answer-seeking history commands are denied.
@@ -131,8 +145,10 @@ completed.
 Use `--debug-trace` for a failed generation to retain redacted raw model output,
 parse/schema errors, correction outcomes, and response-format fallback events in
 the generation record. API keys are redacted. The pilot records adapter stdout and
-stderr failures in `generation_error`; any requested instance without a candidate
-patch makes generation return nonzero and `generated: false`. It does not write an
+stderr, exit code, and parsed agent debug trace alongside the specific
+`generation_error`. HTTP diagnostics retain the provider status/body plus prompt
+and completion-token budget, with API keys redacted. Any requested instance without
+a candidate patch makes generation return nonzero and `generated: false`. It does not write an
 empty `predictions.jsonl` or a success hash. For a partial run, successful and
 failed instance IDs are reported separately; use `--resume` to retry the incomplete
 set after fixing the underlying issue.

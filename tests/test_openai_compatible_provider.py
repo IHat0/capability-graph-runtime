@@ -1,4 +1,6 @@
+from io import BytesIO
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 from pydantic import ValidationError
@@ -8,6 +10,10 @@ from cgr.kernel.model import ModelMessage, ModelRequest, ModelRole
 from cgr.plugins.providers.openai_compatible import (
     OpenAICompatibleChatConfig,
     OpenAICompatibleChatPlugin,
+)
+from cgr.plugins.providers.openai_compatible.chat_client import (
+    OpenAICompatibleHTTPError,
+    UrllibOpenAICompatibleChatClient,
 )
 
 
@@ -59,12 +65,16 @@ def test_chat_config_from_env_reads_prefixed_values(
     monkeypatch.setenv("ALT_BASE_URL", "https://example.test/v1")
     monkeypatch.setenv("ALT_TIMEOUT_SECONDS", "12.5")
     monkeypatch.setenv("ALT_PROVIDER_NAME", "glm")
+    monkeypatch.setenv("ALT_MAX_MODEL_LEN", "4096")
+    monkeypatch.setenv("ALT_MAX_COMPLETION_TOKENS", "384")
 
     config = OpenAICompatibleChatConfig.from_env("ALT")
 
     assert config.model == "glm-4.7"
     assert config.timeout_seconds == 12.5
     assert config.provider_name == "glm"
+    assert config.max_model_len == 4096
+    assert config.max_completion_tokens == 384
     assert "secret" not in repr(config)
 
 
@@ -134,3 +144,35 @@ def test_chat_plugin_rejects_missing_completion_text() -> None:
                 payload={"messages": [{"role": "user", "content": "hello"}]},
             )
         )
+
+
+def test_http_error_preserves_body_budget_and_redacts_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_http_error(*args: object, **kwargs: object) -> None:
+        raise HTTPError(
+            "http://localhost/v1/chat/completions",
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=BytesIO(b'{"error":"maximum context length exceeded: secret-key"}'),
+        )
+
+    monkeypatch.setattr(
+        "cgr.plugins.providers.openai_compatible.chat_client.urlopen", raise_http_error
+    )
+    config = OpenAICompatibleChatConfig(
+        api_key="secret-key", model="qwen", base_url="http://localhost/v1"
+    )
+
+    with pytest.raises(OpenAICompatibleHTTPError) as raised:
+        UrllibOpenAICompatibleChatClient().create_chat_completion(
+            config, [{"role": "user", "content": "hello"}], max_tokens=384
+        )
+
+    error = raised.value
+    assert error.status == 400
+    assert "maximum context length exceeded" in error.body
+    assert "secret-key" not in str(error)
+    assert "prompt_token_estimate=" in str(error)
+    assert "max_tokens=384" in str(error)

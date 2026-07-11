@@ -14,6 +14,8 @@ class OpenAICompatibleChatConfig(BaseModel):
     model: str = Field(min_length=1)
     base_url: str = Field(min_length=1)
     timeout_seconds: float = Field(default=60.0, gt=0)
+    max_model_len: int = Field(default=4096, ge=512)
+    max_completion_tokens: int = Field(default=512, ge=64)
     provider_name: str = Field(default="openai_compatible", min_length=1)
 
     @classmethod
@@ -34,6 +36,13 @@ class OpenAICompatibleChatConfig(BaseModel):
         timeout = os.getenv(f"{prefix}_TIMEOUT_SECONDS")
         if timeout is not None:
             values["timeout_seconds"] = timeout
+        for field_name, suffix in (
+            ("max_model_len", "MAX_MODEL_LEN"),
+            ("max_completion_tokens", "MAX_COMPLETION_TOKENS"),
+        ):
+            value = os.getenv(f"{prefix}_{suffix}")
+            if value is not None:
+                values[field_name] = value
         provider_name = os.getenv(f"{prefix}_PROVIDER_NAME")
         if provider_name is not None:
             values["provider_name"] = provider_name

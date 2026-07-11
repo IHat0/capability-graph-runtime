@@ -242,6 +242,7 @@ def _generate_predictions(
             if pilot_instance.instance_id in completed:
                 continue
             started = time.perf_counter()
+            process: subprocess.CompletedProcess[str] | None = None
             try:
                 record = by_id.get(pilot_instance.instance_id)
                 if record is None:
@@ -269,6 +270,7 @@ def _generate_predictions(
                     verify_patch_applies(workspace, patch, safe_instance.base_commit)
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                 failed_instances.append(pilot_instance.instance_id)
+                diagnostics = _agent_diagnostics(process)
                 generation_rows.append(
                     {
                         **generation_result_template(
@@ -279,6 +281,7 @@ def _generate_predictions(
                         "base_commit": pilot_instance.base_commit,
                         "elapsed_seconds": time.perf_counter() - started,
                         "generation_error": str(exc),
+                        **diagnostics,
                     }
                 )
                 continue
@@ -345,6 +348,38 @@ def _agent_failure_message(process: subprocess.CompletedProcess[str]) -> str:
             return payload["error"]
     message = "\n".join(part for part in (stdout, process.stderr.strip()) if part)
     return message[-4000:] or f"Repository agent exited with code {process.returncode}."
+
+
+def _agent_diagnostics(
+    process: subprocess.CompletedProcess[str] | None,
+) -> dict[str, Any]:
+    if process is None:
+        return {
+            "agent_exit_code": None,
+            "agent_stdout": None,
+            "agent_stderr": None,
+            "agent_debug_trace": None,
+        }
+    stdout = _redact_agent_output(process.stdout[-4000:])
+    stderr = _redact_agent_output(process.stderr[-4000:])
+    trace: Any = None
+    try:
+        payload = json.loads(process.stdout)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("debug_trace"), list):
+        trace = payload["debug_trace"]
+    return {
+        "agent_exit_code": process.returncode,
+        "agent_stdout": stdout,
+        "agent_stderr": stderr,
+        "agent_debug_trace": trace,
+    }
+
+
+def _redact_agent_output(value: str) -> str:
+    api_key = os.getenv("CGR_DRAFT_API_KEY", "")
+    return value.replace(api_key, "[REDACTED]") if api_key else value
 
 
 def _evaluate_predictions(modes: list[str], instances: list[Any], result_root: Path) -> int:

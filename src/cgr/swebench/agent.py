@@ -24,6 +24,11 @@ from cgr.plugins.providers.openai_compatible.openai_compatible_chat_plugin impor
 from .integration import MODES, RepositoryActions, capture_git_patch
 
 
+MIN_COMPLETION_TOKENS = 256
+INITIAL_FILE_LIMIT = 80
+TOOL_TEXT_LIMIT = 4_000
+
+
 @dataclass(frozen=True)
 class ModelResponse:
     """Text returned by a model call plus safe transport diagnostics."""
@@ -51,6 +56,10 @@ class ActionParsingError(AgentResponseError):
 
 class ActionValidationError(AgentResponseError):
     """Raised when a JSON object is not in the bounded action schema."""
+
+
+class ContextBudgetError(AgentResponseError):
+    """Raised before a provider request that cannot fit the configured context."""
 
 
 @dataclass(frozen=True)
@@ -153,7 +162,9 @@ class FirstPartyRepositoryAgent:
                 response = self._request_model(messages, debug_trace)
             except RuntimeError as exc:
                 debug_trace.append({"event": "model_call_failure", "error": _redact(str(exc), self._config)})
-                raise AgentResponseError("Model call failed.", debug_trace) from exc
+                raise AgentResponseError(
+                    f"Model call failed: {_redact(str(exc), self._config)}", debug_trace
+                ) from exc
             calls += 1
             _record_raw_response(debug_trace, response, self._config)
             try:
@@ -185,7 +196,10 @@ class FirstPartyRepositoryAgent:
                         }
                     )
                     debug_trace.append({"event": "correction_retry", "outcome": "failed"})
-                    raise AgentResponseError("Model correction call failed.", debug_trace) from retry_call_exc
+                    raise AgentResponseError(
+                        f"Model correction call failed: {_redact(str(retry_call_exc), self._config)}",
+                        debug_trace,
+                    ) from retry_call_exc
                 calls += 1
                 _record_raw_response(debug_trace, retry, self._config)
                 try:
@@ -229,7 +243,17 @@ class FirstPartyRepositoryAgent:
         return result
 
     def _initial_messages(self) -> list[dict[str, str]]:
-        return [
+        files = self._actions.list_files(limit=INITIAL_FILE_LIMIT + 1)
+        files_truncated = len(files) > INITIAL_FILE_LIMIT
+        if files_truncated:
+            files = files[:INITIAL_FILE_LIMIT]
+        problem = _compact_problem_statement(self._problem_statement)
+        file_notice = (
+            "Initial files (truncated; use list_files to inspect more):"
+            if files_truncated
+            else "Initial files:"
+        )
+        messages = [
             {
                 "role": "system",
                 "content": _system_prompt(),
@@ -237,11 +261,13 @@ class FirstPartyRepositoryAgent:
             {
                 "role": "user",
                 "content": (
-                    f"Mode: {self._mode}\nProblem:\n{self._problem_statement}\n\n"
-                    f"Initial files:\n{json.dumps(self._actions.list_files(limit=500))}"
+                    f"Mode: {self._mode}\nProblem:\n{problem}\n\n"
+                    f"{file_notice}\n{json.dumps(files)}"
                 ),
             },
         ]
+        _completion_budget(messages, self._config)
+        return messages
 
     def _execute_action(self, action: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -251,16 +277,28 @@ class FirstPartyRepositoryAgent:
             if name == "list_files":
                 return {"ok": True, "files": self._actions.list_files(_limit(action))}
             if name == "search_text":
+                limit = _limit(action)
+                matches = self._actions.search_text(_string(action, "pattern"), limit)
                 return {
                     "ok": True,
-                    "matches": self._actions.search_text(_string(action, "pattern"), _limit(action)),
+                    "matches": matches,
+                    "truncated": len(matches) >= limit,
+                    "notice": "Search output may be truncated; narrow the pattern to inspect more."
+                    if len(matches) >= limit
+                    else None,
                 }
             if name == "read_file":
+                start = _positive(action, "start", 1)
+                end = _positive(action, "end", 400)
                 return {
                     "ok": True,
                     "content": self._actions.read_file(
-                        _string(action, "path"), _positive(action, "start", 1), _positive(action, "end", 400)
+                        _string(action, "path"), start, end
                     ),
+                    "truncated": end - start >= 399,
+                    "notice": "Read output is line-bounded; request another range to inspect more."
+                    if end - start >= 399
+                    else None,
                 }
             if name == "inspect_symbols":
                 return {"ok": True, "symbols": self._actions.inspect_symbols(_string(action, "path"))}
@@ -284,11 +322,11 @@ class FirstPartyRepositoryAgent:
                 return {
                     "ok": result.returncode == 0,
                     "exit_code": result.returncode,
-                    "stdout": result.stdout[-4000:],
-                    "stderr": result.stderr[-4000:],
+                    "stdout": _bounded_tool_text(result.stdout),
+                    "stderr": _bounded_tool_text(result.stderr),
                 }
             if name == "inspect_diff":
-                return {"ok": True, "diff": self._actions.git_diff()[-8000:]}
+                return {"ok": True, "diff": _bounded_tool_text(self._actions.git_diff())}
             if name == "revert":
                 self._actions.revert_candidate()
                 return {"ok": True}
@@ -350,14 +388,15 @@ def _openai_model_call(
     messages: list[dict[str, str]], config: OpenAICompatibleChatConfig
 ) -> ModelResponse:
     client = UrllibOpenAICompatibleChatClient()
+    max_tokens = _completion_budget(messages, config)
     try:
         response = client.create_chat_completion(
-            config, messages, response_format={"type": "json_object"}
+            config, messages, response_format={"type": "json_object"}, max_tokens=max_tokens
         )
     except RuntimeError as exc:
         if not _is_response_format_rejection(exc):
             raise
-        response = client.create_chat_completion(config, messages)
+        response = client.create_chat_completion(config, messages, max_tokens=max_tokens)
         return ModelResponse(
             OpenAICompatibleChatPlugin._extract_text(response), response_format_fallback=True
         )
@@ -416,18 +455,65 @@ def _canonical_action_names() -> str:
     return ", ".join(ACTION_DEFINITIONS)
 
 
+def _estimate_prompt_tokens(messages: list[dict[str, str]]) -> int:
+    """Use a conservative tokenizer-free bound before calling a provider."""
+    characters = sum(len(message.get("content", "")) for message in messages)
+    return max(1, (characters + 2) // 3) + (4 * len(messages))
+
+
+def _completion_budget(messages: list[dict[str, str]], config: OpenAICompatibleChatConfig) -> int:
+    prompt_tokens = _estimate_prompt_tokens(messages)
+    available = config.max_model_len - prompt_tokens
+    if available < MIN_COMPLETION_TOKENS:
+        raise ContextBudgetError(
+            "Prompt cannot fit the configured model context: "
+            f"prompt_token_estimate={prompt_tokens}, max_model_len={config.max_model_len}, "
+            f"minimum_completion_tokens={MIN_COMPLETION_TOKENS}."
+        )
+    return min(config.max_completion_tokens, available)
+
+
+def _compact_problem_statement(problem: str) -> str:
+    """Remove only nonsemantic whitespace; never truncate code or requirements."""
+    compacted: list[str] = []
+    in_fence = False
+    blank_count = 0
+    for raw_line in problem.splitlines():
+        line = raw_line.rstrip()
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+        if not in_fence and not line:
+            blank_count += 1
+            if blank_count > 1:
+                continue
+        else:
+            blank_count = 0
+        compacted.append(line)
+    return "\n".join(compacted).strip()
+
+
+def _bounded_tool_text(value: str) -> str:
+    if len(value) <= TOOL_TEXT_LIMIT:
+        return value
+    return (
+        value[:TOOL_TEXT_LIMIT]
+        + f"\n[Output truncated at {TOOL_TEXT_LIMIT} characters; refine the request for more.]"
+    )
+
+
 def _system_prompt() -> str:
-    examples = "\n".join(
-        json.dumps(definition.example, sort_keys=True)
-        for definition in ACTION_DEFINITIONS.values()
+    schema = "; ".join(
+        f"{name}({','.join(sorted(definition.required)) or '-'}"
+        f"; optional={','.join(sorted(definition.optional)) or '-'})"
+        for name, definition in ACTION_DEFINITIONS.items()
     )
     return (
-        "You are a bounded repository repair agent. Operate only through one JSON "
-        "action object. Never request network access, Git history, .git files, or "
-        "paths outside the workspace. Use only these canonical action names: "
-        f"{_canonical_action_names()}. Return JSON only, with no Markdown. "
-        "Valid JSON examples, one for each action:\n"
-        f"{examples}"
+        "Bounded repository repair agent. Return one JSON action only. No network, "
+        "Git history, .git paths, or workspace escapes. Canonical actions: "
+        f"{_canonical_action_names()}. Schemas: {schema}. "
+        'Examples: {"action":"read_file","path":"src/app.py"}; '
+        '{"action":"replace_text","path":"src/app.py","old":"x","new":"y"}. '
+        "Use finish only after leaving a valid non-empty diff."
     )
 
 

@@ -413,8 +413,11 @@ def test_generation_failure_does_not_write_blank_predictions(
         lambda *args, **kwargs: subprocess.CompletedProcess(
             ["cgr-swebench-agent"],
             1,
-            stdout='{"ok": false, "error": "Model response was not valid action JSON."}',
-            stderr="",
+            stdout=(
+                '{"ok": false, "error": "HTTP 400 maximum context length exceeded", '
+                '"debug_trace": [{"event": "model_call_failure"}]}'
+            ),
+            stderr="provider stderr",
         ),
     )
 
@@ -432,7 +435,10 @@ def test_generation_failure_does_not_write_blank_predictions(
     assert not (tmp_path / "results" / "baseline" / "predictions.jsonl").exists()
     assert generation[0]["candidate_count"] == 0
     assert generation[0]["final_patch_size"] == 0
-    assert generation[0]["generation_error"] == "Model response was not valid action JSON."
+    assert generation[0]["generation_error"] == "HTTP 400 maximum context length exceeded"
+    assert generation[0]["agent_exit_code"] == 1
+    assert generation[0]["agent_stderr"] == "provider stderr"
+    assert generation[0]["agent_debug_trace"] == [{"event": "model_call_failure"}]
 
 
 def test_empty_patch_generation_fails_without_prediction_hash(
