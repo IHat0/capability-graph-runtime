@@ -46,7 +46,7 @@ def _config() -> OpenAICompatibleChatConfig:
 
 def _workspace(tmp_path: Path) -> Path:
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True
@@ -59,7 +59,7 @@ def _workspace(tmp_path: Path) -> Path:
 
 
 def _agent(
-    workspace: Path, model: ScriptedModel, *, steps: int = 4, calls: int = 4
+    workspace: Path, model: ScriptedModel, *, steps: int = 10, calls: int = 10
 ) -> FirstPartyRepositoryAgent:
     return FirstPartyRepositoryAgent(
         workspace,
@@ -70,6 +70,14 @@ def _agent(
         _config(),
         model,
     )
+
+
+def _inspect_verify_finish_actions() -> list[str]:
+    return [
+        '{"action":"inspect_diff"}',
+        '{"action":"run_tests","command":["python","--version"]}',
+        '{"action":"finish"}',
+    ]
 
 
 def test_agent_argument_parsing() -> None:
@@ -178,16 +186,17 @@ def test_agent_uses_one_correction_retry_and_records_debug_trace(tmp_path: Path)
     model = ScriptedModel(
         [
             "not json local-secret",
-            '```json\n{"action": "write_file", "path": "app.py", "content": "VALUE = 7\\n"}\n```',
-            '{"action": "finish"}',
+            '```json\n{"action": "read_file", "path": "app.py"}\n```',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 7"}',
+            *_inspect_verify_finish_actions(),
         ]
     )
-    agent = _agent(_workspace(tmp_path), model, calls=3)
+    agent = _agent(_workspace(tmp_path), model, calls=6)
 
     result = agent.run()
 
     assert result.finished is True
-    assert result.calls == 3
+    assert result.calls == 6
     assert any(item["event"] == "parsing_failure" for item in result.debug_trace)
     assert {"event": "correction_retry", "outcome": "succeeded"} in result.debug_trace
     assert "local-secret" not in json.dumps(result.debug_trace)
@@ -199,12 +208,13 @@ def test_agent_corrects_unsupported_action_with_canonical_names(tmp_path: Path) 
     model = ScriptedModel(
         [
             '{"action": "change_file", "path": "app.py"}',
-            '{"action": "replace_text", "path": "app.py", "old": "VALUE = 1", "new": "VALUE = 9"}',
-            '{"action": "finish"}',
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 9"}',
+            *_inspect_verify_finish_actions(),
         ]
     )
 
-    result = _agent(_workspace(tmp_path), model, calls=3).run()
+    result = _agent(_workspace(tmp_path), model, calls=6).run()
 
     assert result.finished is True
     correction = model.messages[1][-1]["content"]
@@ -290,10 +300,13 @@ def test_agent_records_response_format_fallback(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             ModelResponse(
-                '{"action": "write_file", "path": "app.py", "content": "VALUE = 8\\n"}',
+                '{"action":"read_file","path":"app.py"}',
                 response_format_fallback=True,
             ),
-            '{"action": "finish"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 8"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"finish"}',
         ]
     )
 
@@ -323,7 +336,11 @@ def test_agent_applies_unified_patch_inside_workspace(tmp_path: Path) -> None:
         "+VALUE = 2\n"
     )
     model = ScriptedModel(
-        [json.dumps({"action": "apply_patch", "patch": patch}), '{"action":"finish"}']
+        [
+            '{"action":"read_file","path":"app.py"}',
+            json.dumps({"action": "apply_patch", "patch": patch}),
+            *_inspect_verify_finish_actions(),
+        ]
     )
 
     result = _agent(workspace, model).run()
@@ -333,12 +350,12 @@ def test_agent_applies_unified_patch_inside_workspace(tmp_path: Path) -> None:
     assert (workspace / "app.py").read_text() == "VALUE = 2\n"
 
 
-def test_agent_leaves_successful_text_edit_in_workspace(tmp_path: Path) -> None:
+def test_agent_allows_write_file_for_new_file(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     model = ScriptedModel(
         [
-            json.dumps({"action": "write_file", "path": "app.py", "content": "VALUE = 3\n"}),
-            '{"action":"finish"}',
+            json.dumps({"action": "write_file", "path": "new.py", "content": "VALUE = 3\n"}),
+            *_inspect_verify_finish_actions(),
         ]
     )
 
@@ -346,13 +363,14 @@ def test_agent_leaves_successful_text_edit_in_workspace(tmp_path: Path) -> None:
 
     assert result.finished is True
     assert result.final_patch_size > 0
-    assert (workspace / "app.py").read_text() == "VALUE = 3\n"
+    assert (workspace / "new.py").read_text() == "VALUE = 3\n"
 
 
 def test_agent_replace_text_action_edits_inside_workspace(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     model = ScriptedModel(
         [
+            '{"action":"read_file","path":"app.py"}',
             json.dumps(
                 {
                     "action": "replace_text",
@@ -361,7 +379,7 @@ def test_agent_replace_text_action_edits_inside_workspace(tmp_path: Path) -> Non
                     "new": "VALUE = 6",
                 }
             ),
-            '{"action":"finish"}',
+            *_inspect_verify_finish_actions(),
         ]
     )
 
@@ -429,8 +447,9 @@ def test_agent_denies_git_metadata_patch_target(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             json.dumps({"action": "apply_patch", "patch": patch}),
-            json.dumps({"action": "write_file", "path": "app.py", "content": "VALUE = 4\n"}),
-            '{"action":"finish"}',
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 4"}',
+            *_inspect_verify_finish_actions(),
         ]
     )
 
@@ -449,12 +468,13 @@ def test_agent_denies_path_traversal_git_metadata_and_network_actions(tmp_path: 
             json.dumps({"action": "read_file", "path": "../outside.txt"}),
             json.dumps({"action": "read_file", "path": ".git/config"}),
             json.dumps({"action": "run_tests", "command": ["pytest", "https://bad"]}),
-            json.dumps({"action": "write_file", "path": "app.py", "content": "VALUE = 5\n"}),
-            '{"action":"finish"}',
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 5"}',
+            *_inspect_verify_finish_actions(),
         ]
     )
 
-    result = _agent(workspace, model, steps=5, calls=5).run()
+    result = _agent(workspace, model, steps=8, calls=8).run()
     outcomes = [json.loads(messages[-1]["content"]) for messages in model.messages[1:4]]
 
     assert result.finished is True
@@ -467,5 +487,125 @@ def test_agent_denies_path_traversal_git_metadata_and_network_actions(tmp_path: 
 def test_agent_rejects_finish_without_a_candidate_diff(tmp_path: Path) -> None:
     agent = _agent(_workspace(tmp_path), ScriptedModel(['{"action":"finish"}']))
 
-    with pytest.raises(AgentResponseError, match="does not contain a valid repository diff"):
+    with pytest.raises(AgentResponseError, match="Inspect the final diff"):
         agent.run()
+
+
+def _source_workspace(tmp_path: Path, content: str) -> Path:
+    workspace = _workspace(tmp_path)
+    (workspace / "app.py").write_text(content)
+    subprocess.run(["git", "add", "app.py"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-qm", "source"], cwd=workspace, check=True)
+    return workspace
+
+
+def test_catastrophic_existing_file_rewrite_is_rejected(tmp_path: Path) -> None:
+    original = "".join(f"# line {index}\n" for index in range(300))
+    workspace = _source_workspace(tmp_path, original)
+    replacement = "".join(f"# replacement {index}\n" for index in range(15))
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            json.dumps({"action": "replace_text", "path": "app.py", "old": original, "new": replacement}),
+            *_inspect_verify_finish_actions(),
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="Catastrophic rewrite rejected"):
+        _agent(workspace, model).run()
+
+
+def test_removing_unrelated_public_symbol_is_rejected(tmp_path: Path) -> None:
+    original = (
+        "def retained():\n    return 1\n\n"
+        "def unrelated_public():\n    return 2\n\n"
+        + "".join(f"# context {index}\n" for index in range(100))
+    )
+    workspace = _source_workspace(tmp_path, original)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            json.dumps(
+                {
+                    "action": "replace_text",
+                    "path": "app.py",
+                    "old": "def unrelated_public():\n    return 2\n\n",
+                    "new": "",
+                }
+            ),
+            *_inspect_verify_finish_actions(),
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="unrelated_public"):
+        _agent(workspace, model).run()
+
+
+def test_overwriting_existing_file_with_write_file_is_rejected(tmp_path: Path) -> None:
+    agent = _agent(_workspace(tmp_path), ScriptedModel([]))
+
+    outcome = agent._execute_action(
+        {"action": "write_file", "path": "app.py", "content": "VALUE = 9\n"}
+    )
+
+    assert outcome["ok"] is False
+    assert "cannot overwrite" in outcome["error"]
+
+
+def test_finish_requires_diff_inspection_and_successful_verification(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    no_diff_model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"finish"}',
+        ]
+    )
+    with pytest.raises(AgentResponseError, match="Inspect the final diff"):
+        _agent(workspace, no_diff_model).run()
+
+    workspace = _workspace(tmp_path / "second")
+    no_verify_model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+    with pytest.raises(AgentResponseError, match="verification"):
+        _agent(workspace, no_verify_model).run()
+
+
+def test_failed_local_test_prevents_finish(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"run_tests","command":["python","--version","--bad-option"]}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="verification"):
+        _agent(workspace, model).run()
+
+
+def test_failed_local_test_requires_another_edit_before_successful_rerun(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"run_tests","command":["python","--version","--bad-option"]}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="verification"):
+        _agent(workspace, model).run()

@@ -115,6 +115,16 @@ The bounded repository surface supports file listing/search/reads, visible tests
 edits, patch application, diff inspection, and candidate reversion. `.git`, path
 traversal, network actions, and answer-seeking history commands are denied.
 
+The first-party agent also rejects destructive candidates by default. It cannot
+overwrite an existing non-empty file with `write_file`; existing files must be read
+before a focused `replace_text` or `apply_patch` edit. Before `finish`, it requires
+an `inspect_diff` after the last edit and a successful local verification command
+after the last edit. It rejects a changed existing file that loses more than 35% of
+its original lines or more than 100 lines, unless the issue clearly requests that
+file/subsystem's removal. It also rejects removal of public top-level symbols not
+mentioned by the issue. Mode-specific patch byte limits provide an additional
+candidate-size backstop.
+
 The first-party agent's canonical JSON actions are `list_files`, `search_text`,
 `read_file`, `inspect_symbols`, `write_file`, `replace_text`, `apply_patch`,
 `run_tests`, `inspect_diff`, `revert`, and `finish`. It also normalizes the limited

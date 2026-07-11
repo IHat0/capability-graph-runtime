@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,7 @@ from .integration import MODES, RepositoryActions, capture_git_patch
 MIN_COMPLETION_TOKENS = 256
 INITIAL_FILE_LIMIT = 80
 TOOL_TEXT_LIMIT = 4_000
+MAX_PATCH_BYTES = {"baseline": 40_000, "cgr_single": 60_000, "cgr_multi": 80_000}
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,10 @@ class FirstPartyRepositoryAgent:
         self._max_calls = max_calls
         self._config = config
         self._model_call = model_call
+        self._read_existing_files: set[str] = set()
+        self._diff_inspected_since_edit = False
+        self._verification_passed_since_edit = False
+        self._verification_failed_since_edit = False
 
     def run(self) -> AgentRunResult:
         messages = self._initial_messages()
@@ -211,13 +218,15 @@ class FirstPartyRepositoryAgent:
                 debug_trace.append({"event": "correction_retry", "outcome": "succeeded"})
                 response = retry
             if action["action"] == "finish":
+                self._require_finish_preconditions()
                 try:
-                    patch, _ = capture_git_patch(self._workspace)
+                    patch, changed = capture_git_patch(self._workspace)
                 except ValueError as exc:
                     raise AgentResponseError(
                         f"Final workspace does not contain a valid repository diff: {exc}",
                         debug_trace,
                     ) from exc
+                self._validate_candidate_safety(patch, changed)
                 return AgentRunResult(steps, calls, True, "finished", len(patch.encode()), debug_trace)
             outcome = self._execute_action(action)
             steps += 1
@@ -288,12 +297,15 @@ class FirstPartyRepositoryAgent:
                     else None,
                 }
             if name == "read_file":
+                path = _string(action, "path")
                 start = _positive(action, "start", 1)
                 end = _positive(action, "end", 400)
+                if self._is_existing_file(path):
+                    self._read_existing_files.add(path)
                 return {
                     "ok": True,
                     "content": self._actions.read_file(
-                        _string(action, "path"), start, end
+                        path, start, end
                     ),
                     "truncated": end - start >= 399,
                     "notice": "Read output is line-bounded; request another range to inspect more."
@@ -304,14 +316,21 @@ class FirstPartyRepositoryAgent:
                 return {"ok": True, "symbols": self._actions.inspect_symbols(_string(action, "path"))}
             if name == "write_file":
                 self._actions.write_file(_string(action, "path"), _string(action, "content"))
+                self._mark_edit()
                 return {"ok": True}
             if name == "replace_text":
+                self._require_existing_file_was_read(_string(action, "path"))
                 self._actions.replace_text(
                     _string(action, "path"), _string(action, "old"), _string(action, "new")
                 )
+                self._mark_edit()
                 return {"ok": True}
             if name == "apply_patch":
-                self._actions.apply_patch(_string(action, "patch"))
+                patch = _string(action, "patch")
+                for path in _patch_target_paths(patch):
+                    self._require_existing_file_was_read(path)
+                self._actions.apply_patch(patch)
+                self._mark_edit()
                 return {"ok": True}
             if name == "run_tests":
                 command = action.get("command")
@@ -319,6 +338,11 @@ class FirstPartyRepositoryAgent:
                     raise ValueError("command must be a list of strings")
                 _deny_network_command(command)
                 result = self._actions.run_safe(command, timeout=_positive(action, "timeout", 600))
+                if result.returncode == 0 and not self._verification_failed_since_edit:
+                    self._verification_passed_since_edit = True
+                elif result.returncode != 0:
+                    self._verification_passed_since_edit = False
+                    self._verification_failed_since_edit = True
                 return {
                     "ok": result.returncode == 0,
                     "exit_code": result.returncode,
@@ -326,13 +350,70 @@ class FirstPartyRepositoryAgent:
                     "stderr": _bounded_tool_text(result.stderr),
                 }
             if name == "inspect_diff":
+                self._diff_inspected_since_edit = True
                 return {"ok": True, "diff": _bounded_tool_text(self._actions.git_diff())}
             if name == "revert":
                 self._actions.revert_candidate()
+                self._diff_inspected_since_edit = False
+                self._verification_passed_since_edit = False
+                self._verification_failed_since_edit = False
                 return {"ok": True}
             raise ValueError(f"Unsupported action: {name}")
         except (OSError, RuntimeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
+
+    def _mark_edit(self) -> None:
+        self._diff_inspected_since_edit = False
+        self._verification_passed_since_edit = False
+        self._verification_failed_since_edit = False
+
+    def _is_existing_file(self, path: str) -> bool:
+        candidate = (self._workspace / path).resolve()
+        return candidate.is_file() and self._workspace in candidate.parents
+
+    def _require_existing_file_was_read(self, path: str) -> None:
+        if self._is_existing_file(path) and path not in self._read_existing_files:
+            raise ValueError(f"Read existing file before modifying it: {path}")
+
+    def _require_finish_preconditions(self) -> None:
+        if not self._diff_inspected_since_edit:
+            raise AgentResponseError("Inspect the final diff with inspect_diff before finish.")
+        if not self._verification_passed_since_edit:
+            raise AgentResponseError(
+                "Run a relevant local verification command successfully before finish."
+            )
+
+    def _validate_candidate_safety(self, patch: str, changed: list[str]) -> None:
+        if len(patch.encode()) > MAX_PATCH_BYTES[self._mode]:
+            raise AgentResponseError(
+                f"Candidate patch exceeds the {self._mode} size limit of "
+                f"{MAX_PATCH_BYTES[self._mode]} bytes."
+            )
+        for path in changed:
+            original = _head_file_content(self._workspace, path)
+            if original is None:
+                continue
+            current_path = self._workspace / path
+            current = current_path.read_text(encoding="utf-8", errors="replace") if current_path.exists() else ""
+            added, deleted = _numstat_for_path(self._workspace, path)
+            original_lines = len(original.splitlines())
+            resulting_lines = len(current.splitlines())
+            lost_lines = max(0, original_lines - resulting_lines)
+            deleted_percentage = (lost_lines / original_lines * 100) if original_lines else 0.0
+            if not _deletion_is_requested(self._problem_statement, path) and (
+                deleted_percentage > 35 or deleted > 100
+            ):
+                raise AgentResponseError(
+                    f"Catastrophic rewrite rejected for {path}: original_lines={original_lines}, "
+                    f"resulting_lines={resulting_lines}, lines_added={added}, lines_deleted={deleted}, "
+                    f"deleted_percentage={deleted_percentage:.1f}."
+                )
+            disappeared = _unmentioned_public_symbols_removed(original, current, self._problem_statement)
+            if disappeared:
+                raise AgentResponseError(
+                    f"Focused-change check rejected {path}; unrelated public symbols disappeared: "
+                    + ", ".join(disappeared)
+                )
 
 
 def parse_agent_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -501,6 +582,72 @@ def _bounded_tool_text(value: str) -> str:
     )
 
 
+def _patch_target_paths(patch: str) -> set[str]:
+    paths: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            paths.add(line.removeprefix("+++ b/"))
+        elif line.startswith("--- a/"):
+            paths.add(line.removeprefix("--- a/"))
+    return {path for path in paths if path != "/dev/null"}
+
+
+def _head_file_content(workspace: Path, path: str) -> str | None:
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{path}"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def _numstat_for_path(workspace: Path, path: str) -> tuple[int, int]:
+    result = subprocess.run(
+        ["git", "diff", "--numstat", "HEAD", "--", path],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    fields = result.stdout.split("\t", 2)
+    if len(fields) < 2 or not fields[0].isdigit() or not fields[1].isdigit():
+        return 0, 0
+    return int(fields[0]), int(fields[1])
+
+
+def _deletion_is_requested(problem: str, path: str) -> bool:
+    lowered = problem.casefold()
+    if not any(word in lowered for word in ("delete", "remove", "drop", "eliminate")):
+        return False
+    identifiers = {Path(path).name.casefold(), Path(path).stem.casefold()}
+    identifiers.update(part.casefold() for part in Path(path).parts[:-1] if len(part) > 2)
+    return any(identifier in lowered for identifier in identifiers)
+
+
+def _unmentioned_public_symbols_removed(original: str, current: str, problem: str) -> list[str]:
+    try:
+        before = ast.parse(original)
+        after = ast.parse(current)
+    except SyntaxError:
+        return []
+    before_names = {
+        node.name
+        for node in before.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    }
+    after_names = {
+        node.name
+        for node in after.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    }
+    lowered_problem = problem.casefold()
+    return sorted(name for name in before_names - after_names if name.casefold() not in lowered_problem)
+
+
 def _system_prompt() -> str:
     schema = "; ".join(
         f"{name}({','.join(sorted(definition.required)) or '-'}"
@@ -513,7 +660,10 @@ def _system_prompt() -> str:
         f"{_canonical_action_names()}. Schemas: {schema}. "
         'Examples: {"action":"read_file","path":"src/app.py"}; '
         '{"action":"replace_text","path":"src/app.py","old":"x","new":"y"}. '
-        "Use finish only after leaving a valid non-empty diff."
+        "Preserve unrelated code and make the smallest focused change. Never rewrite "
+        "an entire existing file. Read existing files before editing them, inspect the "
+        "final diff, and run relevant local verification. Use finish only after a "
+        "valid non-empty diff remains."
     )
 
 

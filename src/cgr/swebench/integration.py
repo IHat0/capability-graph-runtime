@@ -409,6 +409,11 @@ class RepositoryActions:
 
     def write_file(self, relative_path: str, content: str) -> None:
         path = self._safe_path(relative_path)
+        if path.exists() and path.is_file() and path.stat().st_size > 0:
+            raise ValueError(
+                "write_file cannot overwrite an existing non-empty file; "
+                "use replace_text or apply_patch."
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
