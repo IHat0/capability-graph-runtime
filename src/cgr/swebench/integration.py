@@ -412,6 +412,14 @@ class RepositoryActions:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
+    def replace_text(self, relative_path: str, old: str, new: str) -> None:
+        """Replace one exact text occurrence without leaving the workspace."""
+        path = self._safe_path(relative_path)
+        content = path.read_text(encoding="utf-8", errors="replace")
+        if old not in content:
+            raise ValueError("replace_text old value was not found.")
+        path.write_text(content.replace(old, new, 1), encoding="utf-8")
+
     def apply_patch(self, patch: str) -> None:
         _validate_workspace_patch(patch)
         process = subprocess.run(

@@ -63,17 +63,55 @@ class AgentRunResult:
     debug_trace: list[dict[str, str]]
 
 
-ACTION_SCHEMA: dict[str, tuple[set[str], set[str]]] = {
-    "list_files": (set(), {"limit"}),
-    "search_text": ({"pattern"}, {"limit"}),
-    "read_file": ({"path"}, {"start", "end"}),
-    "inspect_symbols": ({"path"}, set()),
-    "write_file": ({"path", "content"}, set()),
-    "apply_patch": ({"patch"}, set()),
-    "run_tests": ({"command"}, {"timeout"}),
-    "git_diff": (set(), set()),
-    "revert_candidate": (set(), set()),
-    "finish": (set(), set()),
+@dataclass(frozen=True)
+class ActionDefinition:
+    """The one canonical schema, prompt, and dispatch contract for an action."""
+
+    required: frozenset[str]
+    optional: frozenset[str]
+    example: dict[str, Any]
+
+
+ACTION_DEFINITIONS: dict[str, ActionDefinition] = {
+    "list_files": ActionDefinition(frozenset(), frozenset({"limit"}), {"action": "list_files"}),
+    "search_text": ActionDefinition(
+        frozenset({"pattern"}), frozenset({"limit"}), {"action": "search_text", "pattern": "def add"}
+    ),
+    "read_file": ActionDefinition(
+        frozenset({"path"}), frozenset({"start", "end"}), {"action": "read_file", "path": "src/app.py"}
+    ),
+    "inspect_symbols": ActionDefinition(
+        frozenset({"path"}), frozenset(), {"action": "inspect_symbols", "path": "src/app.py"}
+    ),
+    "write_file": ActionDefinition(
+        frozenset({"path", "content"}), frozenset(), {"action": "write_file", "path": "src/app.py", "content": "VALUE = 1\\n"}
+    ),
+    "replace_text": ActionDefinition(
+        frozenset({"path", "old", "new"}), frozenset(), {"action": "replace_text", "path": "src/app.py", "old": "old", "new": "new"}
+    ),
+    "apply_patch": ActionDefinition(
+        frozenset({"patch"}), frozenset(), {"action": "apply_patch", "patch": "diff --git a/a.py b/a.py\\n..."}
+    ),
+    "run_tests": ActionDefinition(
+        frozenset({"command"}), frozenset({"timeout"}), {"action": "run_tests", "command": ["pytest", "-q"]}
+    ),
+    "inspect_diff": ActionDefinition(frozenset(), frozenset(), {"action": "inspect_diff"}),
+    "revert": ActionDefinition(frozenset(), frozenset(), {"action": "revert"}),
+    "finish": ActionDefinition(frozenset(), frozenset(), {"action": "finish"}),
+}
+
+ACTION_ALIASES = {
+    "edit_file": "replace_text",
+    "grep": "search_text",
+    "git_diff": "inspect_diff",
+    "revert_candidate": "revert",
+    "done": "finish",
+}
+
+# Kept as a derived compatibility view; ACTION_DEFINITIONS is the source of truth.
+ACTION_SCHEMA = {
+    name: (set(definition.required), set(definition.optional))
+    for name, definition in ACTION_DEFINITIONS.items()
 }
 
 
@@ -132,10 +170,7 @@ class FirstPartyRepositoryAgent:
                         {"role": "assistant", "content": response},
                         {
                             "role": "user",
-                            "content": (
-                                "Your previous response was invalid. Return only one "
-                                "valid JSON action object matching the required schema."
-                            ),
+                            "content": _correction_prompt(),
                         },
                     ]
                 )
@@ -197,18 +232,7 @@ class FirstPartyRepositoryAgent:
         return [
             {
                 "role": "system",
-                "content": (
-                    "You are a bounded repository repair agent. Operate only through "
-                    "the JSON actions described below. Never request network access, "
-                    "Git history, .git files, or paths outside the workspace. Return "
-                    "one JSON object and no Markdown. Action schema: list_files accepts "
-                    "optional positive limit; search_text requires pattern and optional "
-                    "positive limit; read_file requires path and optional positive start/end; "
-                    "inspect_symbols requires path; write_file requires path and content; "
-                    "apply_patch requires patch; run_tests requires command as a list of "
-                    "strings and optional positive timeout; git_diff, revert_candidate, "
-                    "and finish take no fields."
-                ),
+                "content": _system_prompt(),
             },
             {
                 "role": "user",
@@ -222,6 +246,8 @@ class FirstPartyRepositoryAgent:
     def _execute_action(self, action: dict[str, Any]) -> dict[str, Any]:
         try:
             name = action["action"]
+            if name not in ACTION_DEFINITIONS:
+                raise ValueError(f"Unsupported canonical action: {name}")
             if name == "list_files":
                 return {"ok": True, "files": self._actions.list_files(_limit(action))}
             if name == "search_text":
@@ -241,6 +267,11 @@ class FirstPartyRepositoryAgent:
             if name == "write_file":
                 self._actions.write_file(_string(action, "path"), _string(action, "content"))
                 return {"ok": True}
+            if name == "replace_text":
+                self._actions.replace_text(
+                    _string(action, "path"), _string(action, "old"), _string(action, "new")
+                )
+                return {"ok": True}
             if name == "apply_patch":
                 self._actions.apply_patch(_string(action, "patch"))
                 return {"ok": True}
@@ -256,9 +287,9 @@ class FirstPartyRepositoryAgent:
                     "stdout": result.stdout[-4000:],
                     "stderr": result.stderr[-4000:],
                 }
-            if name == "git_diff":
+            if name == "inspect_diff":
                 return {"ok": True, "diff": self._actions.git_diff()[-8000:]}
-            if name == "revert_candidate":
+            if name == "revert":
                 self._actions.revert_candidate()
                 return {"ok": True}
             raise ValueError(f"Unsupported action: {name}")
@@ -349,21 +380,62 @@ def _parse_action(response: str) -> dict[str, Any]:
         raise ActionParsingError("Model response was not valid action JSON.") from exc
     if not isinstance(action, dict):
         raise ActionValidationError("Model action must be a JSON object.")
+    action = _normalize_action_alias(action)
     name = action.get("action")
-    if not isinstance(name, str) or name not in ACTION_SCHEMA:
-        raise ActionValidationError("Model action is missing or unsupported.")
-    required, optional = ACTION_SCHEMA[name]
+    if not isinstance(name, str):
+        raise ActionValidationError("Model action is missing the required action name.")
+    definition = ACTION_DEFINITIONS.get(name)
+    if definition is None:
+        raise ActionValidationError(
+            f"Model action {name!r} is unsupported. Valid actions: {_canonical_action_names()}."
+        )
     keys = set(action) - {"action"}
-    if not required.issubset(keys) or not keys.issubset(required | optional):
-        raise ActionValidationError("Model action does not match the action schema.")
+    if not definition.required.issubset(keys) or not keys.issubset(
+        definition.required | definition.optional
+    ):
+        raise ActionValidationError(f"Model action {name!r} does not match the action schema.")
     _validate_action_types(action)
     return action
+
+
+def _normalize_action_alias(action: dict[str, Any]) -> dict[str, Any]:
+    name = action.get("action")
+    if not isinstance(name, str):
+        return action
+    canonical = ACTION_ALIASES.get(name, name)
+    return {**action, "action": canonical}
 
 
 def _extract_json_object(response: str) -> str:
     stripped = response.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL | re.IGNORECASE)
     return fenced.group(1).strip() if fenced is not None else stripped
+
+
+def _canonical_action_names() -> str:
+    return ", ".join(ACTION_DEFINITIONS)
+
+
+def _system_prompt() -> str:
+    examples = "\n".join(
+        json.dumps(definition.example, sort_keys=True)
+        for definition in ACTION_DEFINITIONS.values()
+    )
+    return (
+        "You are a bounded repository repair agent. Operate only through one JSON "
+        "action object. Never request network access, Git history, .git files, or "
+        "paths outside the workspace. Use only these canonical action names: "
+        f"{_canonical_action_names()}. Return JSON only, with no Markdown. "
+        "Valid JSON examples, one for each action:\n"
+        f"{examples}"
+    )
+
+
+def _correction_prompt() -> str:
+    return (
+        "Return only one valid JSON action object matching the required schema. "
+        f"Valid canonical action names: {_canonical_action_names()}."
+    )
 
 
 def _validate_action_types(action: dict[str, Any]) -> None:
@@ -373,6 +445,7 @@ def _validate_action_types(action: dict[str, Any]) -> None:
         "read_file": {"path"},
         "inspect_symbols": {"path"},
         "write_file": {"path", "content"},
+        "replace_text": {"path", "old", "new"},
         "apply_patch": {"patch"},
     }
     if name in strings and any(not isinstance(action[key], str) for key in strings[name]):

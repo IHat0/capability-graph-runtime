@@ -9,6 +9,8 @@ from cgr.plugins.providers.openai_compatible.chat_config import (
     OpenAICompatibleChatConfig,
 )
 from cgr.swebench.agent import (
+    ACTION_ALIASES,
+    ACTION_DEFINITIONS,
     ActionParsingError,
     ActionValidationError,
     AgentResponseError,
@@ -16,6 +18,7 @@ from cgr.swebench.agent import (
     ModelResponse,
     _openai_model_call,
     _parse_action,
+    _system_prompt,
     parse_agent_args,
 )
 
@@ -115,6 +118,35 @@ def test_action_parser_rejects_arbitrary_prose_and_unknown_actions() -> None:
         _parse_action('{"action": "delete_repository"}')
 
 
+def test_every_canonical_action_has_an_accepted_exact_schema() -> None:
+    for name, definition in ACTION_DEFINITIONS.items():
+        assert _parse_action(json.dumps(definition.example))["action"] == name
+
+
+def test_every_safe_alias_is_normalized_before_validation() -> None:
+    for alias, canonical in ACTION_ALIASES.items():
+        action = {**ACTION_DEFINITIONS[canonical].example, "action": alias}
+
+        assert _parse_action(json.dumps(action))["action"] == canonical
+
+
+def test_action_parser_rejects_missing_action_and_incorrect_fields() -> None:
+    with pytest.raises(ActionValidationError, match="missing"):
+        _parse_action('{"path": "app.py"}')
+    with pytest.raises(ActionValidationError, match="action schema"):
+        _parse_action('{"action": "finish", "extra": true}')
+    with pytest.raises(ActionValidationError, match="invalid types"):
+        _parse_action('{"action": "replace_text", "path": "app.py", "old": 1, "new": "x"}')
+
+
+def test_system_prompt_and_schema_share_every_canonical_action() -> None:
+    prompt = _system_prompt()
+
+    for name, definition in ACTION_DEFINITIONS.items():
+        assert name in prompt
+        assert json.dumps(definition.example, sort_keys=True) in prompt
+
+
 def test_agent_uses_one_correction_retry_and_records_debug_trace(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
@@ -134,6 +166,24 @@ def test_agent_uses_one_correction_retry_and_records_debug_trace(tmp_path: Path)
     assert "local-secret" not in json.dumps(result.debug_trace)
     assert "[REDACTED]" in json.dumps(result.debug_trace)
     assert "Return only one valid JSON action" in model.messages[1][-1]["content"]
+
+
+def test_agent_corrects_unsupported_action_with_canonical_names(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            '{"action": "change_file", "path": "app.py"}',
+            '{"action": "replace_text", "path": "app.py", "old": "VALUE = 1", "new": "VALUE = 9"}',
+            '{"action": "finish"}',
+        ]
+    )
+
+    result = _agent(_workspace(tmp_path), model, calls=3).run()
+
+    assert result.finished is True
+    correction = model.messages[1][-1]["content"]
+    assert "change_file" in result.debug_trace[1]["error"]
+    assert "replace_text" in correction
+    assert "inspect_diff" in correction
 
 
 def test_invalid_response_does_not_exceed_model_call_budget(tmp_path: Path) -> None:
@@ -266,6 +316,80 @@ def test_agent_leaves_successful_text_edit_in_workspace(tmp_path: Path) -> None:
     assert result.finished is True
     assert result.final_patch_size > 0
     assert (workspace / "app.py").read_text() == "VALUE = 3\n"
+
+
+def test_agent_replace_text_action_edits_inside_workspace(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            json.dumps(
+                {
+                    "action": "replace_text",
+                    "path": "app.py",
+                    "old": "VALUE = 1",
+                    "new": "VALUE = 6",
+                }
+            ),
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+
+    assert result.finished is True
+    assert (workspace / "app.py").read_text() == "VALUE = 6\n"
+
+
+def test_dispatcher_covers_every_non_finish_canonical_action(tmp_path: Path) -> None:
+    class RecordingActions:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def list_files(self, limit: int) -> list[str]:
+            self.calls.append("list_files")
+            return []
+
+        def search_text(self, pattern: str, limit: int) -> list[str]:
+            self.calls.append("search_text")
+            return []
+
+        def read_file(self, path: str, start: int, end: int) -> str:
+            self.calls.append("read_file")
+            return ""
+
+        def inspect_symbols(self, path: str) -> list[dict[str, str]]:
+            self.calls.append("inspect_symbols")
+            return []
+
+        def write_file(self, path: str, content: str) -> None:
+            self.calls.append("write_file")
+
+        def replace_text(self, path: str, old: str, new: str) -> None:
+            self.calls.append("replace_text")
+
+        def apply_patch(self, patch: str) -> None:
+            self.calls.append("apply_patch")
+
+        def run_safe(self, command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+            self.calls.append("run_tests")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        def git_diff(self) -> str:
+            self.calls.append("inspect_diff")
+            return ""
+
+        def revert_candidate(self) -> None:
+            self.calls.append("revert")
+
+    agent = _agent(_workspace(tmp_path), ScriptedModel([]))
+    actions = RecordingActions()
+    agent._actions = actions  # type: ignore[assignment]
+
+    for name, definition in ACTION_DEFINITIONS.items():
+        if name != "finish":
+            assert agent._execute_action(dict(definition.example))["ok"] is True
+
+    assert set(actions.calls) == set(ACTION_DEFINITIONS) - {"finish"}
 
 
 def test_agent_denies_git_metadata_patch_target(tmp_path: Path) -> None:

@@ -101,6 +101,13 @@ The bounded repository surface supports file listing/search/reads, visible tests
 edits, patch application, diff inspection, and candidate reversion. `.git`, path
 traversal, network actions, and answer-seeking history commands are denied.
 
+The first-party agent's canonical JSON actions are `list_files`, `search_text`,
+`read_file`, `inspect_symbols`, `write_file`, `replace_text`, `apply_patch`,
+`run_tests`, `inspect_diff`, `revert`, and `finish`. It also normalizes the limited
+compatibility aliases `edit_file`, `grep`, `git_diff`, `revert_candidate`, and
+`done` before validating their canonical field schemas. `finish` succeeds only
+when a non-empty Git diff remains in the workspace.
+
 ## Generation Failures And Debugging
 
 The first-party agent requests OpenAI-compatible JSON-object mode. If a provider
