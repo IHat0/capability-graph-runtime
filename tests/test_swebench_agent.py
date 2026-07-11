@@ -150,6 +150,49 @@ def test_action_parser_rejects_missing_action_and_incorrect_fields() -> None:
         _parse_action('{"action": "replace_text", "path": "app.py", "old": 1, "new": "x"}')
 
 
+def test_run_tests_command_string_is_normalized() -> None:
+    assert _parse_action('{"action":"run_tests","command":"pytest"}') == {
+        "action": "run_tests",
+        "command": ["pytest"],
+    }
+    assert _parse_action(
+        '{"action":"run_tests","command":"python -m pytest tests/test_x.py"}'
+    ) == {
+        "action": "run_tests",
+        "command": ["python", "-m", "pytest", "tests/test_x.py"],
+    }
+
+
+def test_run_tests_command_list_remains_unchanged_and_quotes_are_handled() -> None:
+    assert _parse_action('{"action":"run_tests","command":["pytest","-q"]}') == {
+        "action": "run_tests",
+        "command": ["pytest", "-q"],
+    }
+    assert _parse_action(
+        '{"action":"run_tests","command":"pytest \\"tests/test one.py\\""}'
+    ) == {
+        "action": "run_tests",
+        "command": ["pytest", "tests/test one.py"],
+    }
+
+
+def test_run_tests_rejects_empty_and_invalid_command_values() -> None:
+    with pytest.raises(ActionValidationError, match="must not be empty"):
+        _parse_action('{"action":"run_tests","command":"   "}')
+    with pytest.raises(ActionValidationError, match="string or a list"):
+        _parse_action('{"action":"run_tests","command":123}')
+    with pytest.raises(ActionValidationError, match="non-empty list"):
+        _parse_action('{"action":"run_tests","command":[]}')
+    with pytest.raises(ActionValidationError, match="non-empty list"):
+        _parse_action('{"action":"run_tests","command":["pytest",3]}')
+
+
+def test_run_tests_string_metacharacters_are_argv_not_shell_syntax() -> None:
+    action = _parse_action('{"action":"run_tests","command":"pytest ; echo unsafe"}')
+
+    assert action["command"] == ["pytest", ";", "echo", "unsafe"]
+
+
 def test_system_prompt_and_schema_share_every_canonical_action() -> None:
     prompt = _system_prompt()
 
@@ -420,6 +463,42 @@ def test_rejected_finish_after_tests_is_returned_as_tool_result_and_recovers(
     assert result.final_patch_size > 0
     assert finish_rejections[0]["ok"] is False
     assert finish_rejections[0]["required_next_actions"] == ["inspect_diff"]
+
+
+def test_run_tests_string_compileall_then_inspect_diff_and_finish_succeeds(
+    tmp_path: Path,
+) -> None:
+    workspace = _source_workspace(tmp_path, "def add(a, b):\n    return a - b\n")
+    (workspace / "math_utils.py").write_text("def add(a, b):\n    return a - b\n")
+    subprocess.run(["git", "add", "math_utils.py"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-qm", "math"], cwd=workspace, check=True)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"math_utils.py"}',
+            json.dumps(
+                {
+                    "action": "replace_text",
+                    "path": "math_utils.py",
+                    "old": "return a - b",
+                    "new": "return a + b",
+                }
+            ),
+            '{"action":"run_tests","command":"python -m compileall math_utils.py"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+
+    assert result.finished is True
+    assert result.final_patch_size > 0
+    assert result.successful_verification_commands[-1]["command"] == [
+        "python",
+        "-m",
+        "compileall",
+        "math_utils.py",
+    ]
 
 
 def test_rejected_finish_exhausts_call_budget_when_model_never_corrects(tmp_path: Path) -> None:

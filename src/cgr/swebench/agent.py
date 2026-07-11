@@ -7,6 +7,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -418,9 +419,7 @@ class FirstPartyRepositoryAgent:
                     self._mark_edit(path)
                 return {"ok": True}
             if name == "run_tests":
-                command = action.get("command")
-                if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-                    raise ValueError("command must be a list of strings")
+                command = _normalize_run_tests_command(action.get("command"))
                 _deny_network_command(command)
                 result = self._actions.run_safe(command, timeout=_positive(action, "timeout", 600))
                 record = {
@@ -831,9 +830,10 @@ def _validate_action_types(action: dict[str, Any]) -> None:
     if name in strings and any(not isinstance(action[key], str) for key in strings[name]):
         raise ActionValidationError("Model action string fields have invalid types.")
     if name == "run_tests":
-        command = action["command"]
-        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-            raise ActionValidationError("run_tests command must be a list of strings.")
+        try:
+            action["command"] = _normalize_run_tests_command(action["command"])
+        except ValueError as exc:
+            raise ActionValidationError(str(exc)) from exc
     for key in {"limit", "start", "end", "timeout"} & set(action):
         if not isinstance(action[key], int) or isinstance(action[key], bool) or action[key] <= 0:
             raise ActionValidationError(f"Model action field {key} must be positive.")
@@ -872,6 +872,21 @@ def _positive(action: dict[str, Any], key: str, default: int) -> int:
 
 def _limit(action: dict[str, Any]) -> int:
     return min(_positive(action, "limit", 200), 2000)
+
+
+def _normalize_run_tests_command(value: Any) -> list[str]:
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError("run_tests command string must not be empty.")
+        command = shlex.split(value, posix=True)
+        if not command:
+            raise ValueError("run_tests command string did not contain an executable.")
+        return command
+    if isinstance(value, list):
+        if not value or not all(isinstance(item, str) for item in value):
+            raise ValueError("run_tests command must be a string or a non-empty list of strings.")
+        return list(value)
+    raise ValueError("run_tests command must be a string or a list of strings.")
 
 
 def _positive_int(value: str) -> int:
