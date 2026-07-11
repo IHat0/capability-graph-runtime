@@ -130,7 +130,7 @@ ACTION_DEFINITIONS: dict[str, ActionDefinition] = {
         frozenset({"patch"}), frozenset(), {"action": "apply_patch", "patch": "diff --git a/a.py b/a.py\\n..."}
     ),
     "run_tests": ActionDefinition(
-        frozenset({"command"}), frozenset({"timeout"}), {"action": "run_tests", "command": ["pytest", "-q"]}
+        frozenset(), frozenset({"command", "timeout"}), {"action": "run_tests", "command": ["pytest", "-q"]}
     ),
     "inspect_diff": ActionDefinition(frozenset(), frozenset(), {"action": "inspect_diff"}),
     "revert": ActionDefinition(frozenset(), frozenset(), {"action": "revert"}),
@@ -419,7 +419,17 @@ class FirstPartyRepositoryAgent:
                     self._mark_edit(path)
                 return {"ok": True}
             if name == "run_tests":
-                command = _normalize_run_tests_command(action.get("command"))
+                command = self._run_tests_command(action)
+                if command is None:
+                    return {
+                        "ok": False,
+                        "action": "run_tests",
+                        "error": "No default verification is available.",
+                        "required_schema": {
+                            "action": "run_tests",
+                            "command": ["<executable>", "<argument>"],
+                        },
+                    }
                 _deny_network_command(command)
                 result = self._actions.run_safe(command, timeout=_positive(action, "timeout", 600))
                 record = {
@@ -457,6 +467,14 @@ class FirstPartyRepositoryAgent:
             raise ValueError(f"Unsupported action: {name}")
         except (OSError, RuntimeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
+
+    def _run_tests_command(self, action: dict[str, Any]) -> list[str] | None:
+        if "command" in action:
+            return _normalize_run_tests_command(action["command"])
+        changed_python = _changed_python_files(self._workspace)
+        if not changed_python:
+            return None
+        return ["python", "-m", "compileall", *changed_python]
 
     def _mark_edit(self, path: str) -> None:
         self._state.files_modified.add(path)
@@ -741,6 +759,21 @@ def _numstat_for_path(workspace: Path, path: str) -> tuple[int, int]:
     return int(fields[0]), int(fields[1])
 
 
+def _changed_python_files(workspace: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD", "--", "*.py"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip().endswith(".py")
+    ]
+
+
 def _deletion_is_requested(problem: str, path: str) -> bool:
     lowered = problem.casefold()
     if not any(word in lowered for word in ("delete", "remove", "drop", "eliminate")):
@@ -803,7 +836,8 @@ def _system_prompt() -> str:
         f"{_canonical_action_names()}. Schemas: {schema}. "
         'Examples: {"action":"read_file","path":"src/app.py"}; '
         '{"action":"replace_text","path":"src/app.py","old":"x","new":"y"}. '
-        "Preserve unrelated code and make the smallest focused change. Never rewrite "
+        "run_tests may omit command to run safe default verification, or provide "
+        "command as a string/list. Preserve unrelated code and make the smallest focused change. Never rewrite "
         "an entire existing file. Read existing files before editing them, inspect the "
         "final diff, and run relevant local verification. Use finish only after a "
         "valid non-empty diff remains."
@@ -830,10 +864,11 @@ def _validate_action_types(action: dict[str, Any]) -> None:
     if name in strings and any(not isinstance(action[key], str) for key in strings[name]):
         raise ActionValidationError("Model action string fields have invalid types.")
     if name == "run_tests":
-        try:
-            action["command"] = _normalize_run_tests_command(action["command"])
-        except ValueError as exc:
-            raise ActionValidationError(str(exc)) from exc
+        if "command" in action:
+            try:
+                action["command"] = _normalize_run_tests_command(action["command"])
+            except ValueError as exc:
+                raise ActionValidationError(str(exc)) from exc
     for key in {"limit", "start", "end", "timeout"} & set(action):
         if not isinstance(action[key], int) or isinstance(action[key], bool) or action[key] <= 0:
             raise ActionValidationError(f"Model action field {key} must be positive.")

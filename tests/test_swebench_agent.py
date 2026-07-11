@@ -501,6 +501,131 @@ def test_run_tests_string_compileall_then_inspect_diff_and_finish_succeeds(
     ]
 
 
+def test_bare_run_tests_with_one_changed_python_file_runs_compileall(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"run_tests"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+
+    assert result.finished is True
+    assert result.successful_verification_commands[-1]["command"] == [
+        "python",
+        "-m",
+        "compileall",
+        "app.py",
+    ]
+
+
+def test_bare_run_tests_with_multiple_changed_python_files(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace / "other.py").write_text("VALUE = 1\n")
+    subprocess.run(["git", "add", "other.py"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-qm", "other"], cwd=workspace, check=True)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"read_file","path":"other.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"replace_text","path":"other.py","old":"VALUE = 1","new":"VALUE = 3"}',
+            '{"action":"run_tests"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+
+    assert result.finished is True
+    assert result.successful_verification_commands[-1]["command"] == [
+        "python",
+        "-m",
+        "compileall",
+        "app.py",
+        "other.py",
+    ]
+
+
+def test_bare_run_tests_without_changed_python_file_returns_recoverable_error(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            json.dumps({"action": "write_file", "path": "notes.txt", "content": "changed\n"}),
+            '{"action":"run_tests"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+    error = json.loads(model.messages[2][-1]["content"])
+
+    assert result.finished is True
+    assert error == {
+        "ok": False,
+        "action": "run_tests",
+        "error": "No default verification is available.",
+        "required_schema": {
+            "action": "run_tests",
+            "command": ["<executable>", "<argument>"],
+        },
+    }
+
+
+def test_failed_automatic_compileall_does_not_verify(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"def broken(:\\n"}',
+            '{"action":"run_tests"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    try:
+        with pytest.raises(AgentResponseError, match="verification"):
+            _agent(workspace, model, calls=5).run()
+    finally:
+        (workspace / "app.py").write_text("VALUE = 1\n")
+
+
+def test_live_bare_run_tests_sequence_recovers_and_finishes(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"finish"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"run_tests"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+
+    assert result.finished is True
+    assert result.final_patch_size > 0
+    assert result.successful_verification_commands[-1]["command"] == [
+        "python",
+        "-m",
+        "compileall",
+        "app.py",
+    ]
+
+
 def test_rejected_finish_exhausts_call_budget_when_model_never_corrects(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     model = ScriptedModel(
