@@ -52,7 +52,15 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     assert command[command.index("--agent.model.max_input_tokens") + 1] == "14336"
     assert override.is_absolute()
     assert override.is_file()
-    assert override.read_text(encoding="utf-8") == "agent:\n  history_processors: []\n"
+    overlay = override.read_text(encoding="utf-8")
+    assert "history_processors: []" in overlay
+    assert "Every response MUST contain exactly this structure" in overlay
+    assert "Never emit more than one fenced block." in overlay
+    assert "executed by Bash" in overlay
+    assert "type: thought_action" in overlay
+    assert "edit_anthropic" not in overlay
+    assert "function_calling" not in overlay
+    assert "cache_control" not in overlay
 
 
 def test_adapter_applies_official_patch_and_reports_metadata(

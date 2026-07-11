@@ -27,6 +27,53 @@ SWE_AGENT_COMMIT = "0f3acaf"
 SWE_AGENT_PYTHON_REQUIRES = ">=3.11"
 _PATCH_KEYS = ("patch", "model_patch", "submission")
 _SECRET_VALUES = ("CGR_DRAFT_API_KEY",)
+LOCAL_QWEN_OVERLAY = """agent:
+  history_processors: []
+  templates:
+    system_template: |-
+      You are an autonomous software engineer operating a Linux shell in a repository.
+      Every response MUST contain exactly this structure and nothing else:
+
+      DISCUSSION
+      <brief reasoning with no code fences>
+
+      ```bash
+      <one executable Bash command or Bash script>
+      ```
+
+      The single fenced block is extracted and executed by Bash. Never emit more than one fenced block. Never emit a Python fenced block, Markdown examples, tutorial-style answers, or commands merely described in prose. Never place raw Python source directly in the action block. If Python source is necessary, create it through a valid Bash command such as a quoted heredoc inside the one Bash block.
+      Inspect files with shell commands, edit with a valid Bash command, verify the change with a shell command, and submit only after a successful diff exists. Make the smallest focused change; do not create reproduction files unless the issue requires one.
+
+      Available shell commands:
+      {{command_docs}}
+    instance_template: |-
+      Task:
+      {{problem_statement}}
+
+      Start by inspecting the relevant repository file. For a simple arithmetic fix, inspect the source, make the focused edit, verify it with a shell command, inspect the diff, then submit.
+    next_step_template: |-
+      OBSERVATION:
+      {{observation}}
+
+      Repeat the exact DISCUSSION plus one ```bash fenced-action contract. The fenced action is executed by Bash.
+    next_step_no_output_template: |-
+      Your Bash command completed without output. Continue with exactly one Bash fenced action after brief DISCUSSION.
+    shell_check_error_template: |-
+      Your proposed action was not valid Bash and was not executed. The extracted fenced block is executed by Bash. Return brief DISCUSSION followed by exactly one ```bash fenced block containing executable Bash only. Do not emit Python source, multiple fences, Markdown examples, or tutorial text.
+
+      bash stdout:
+      {{bash_stdout}}
+      bash stderr:
+      {{bash_stderr}}
+  tools:
+    bundles:
+      - path: tools/review_on_submit_m
+    enable_bash_tool: true
+    parse_function:
+      type: thought_action
+      error_message: |-
+        Your response violated the required action format. The extracted fenced block is executed by Bash. Return exactly brief DISCUSSION followed by exactly one ```bash fenced block with one executable Bash command or script. Do not use multiple fenced blocks, Python fences, raw Python source, Markdown examples, tutorial-style prose, or native tool-call syntax.
+"""
 
 
 def build_sweagent_command(
@@ -256,10 +303,10 @@ def _verify_applied_patch(workspace: Path) -> dict[str, Any]:
 
 
 def write_local_model_override(output_dir: Path) -> Path:
-    """Write the minimal v1.1.0 overlay disabling cache-control history handling."""
+    """Write the Qwen thought-action overlay for SWE-agent's Bash execution path."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = (output_dir / "cgr-local-qwen.yaml").resolve()
-    path.write_text("agent:\n  history_processors: []\n", encoding="utf-8")
+    path.write_text(LOCAL_QWEN_OVERLAY, encoding="utf-8")
     return path
 
 
