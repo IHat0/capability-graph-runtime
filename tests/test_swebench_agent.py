@@ -196,6 +196,9 @@ def test_agent_uses_one_correction_retry_and_records_debug_trace(tmp_path: Path)
     result = agent.run()
 
     assert result.finished is True
+    assert result.successful_verification_commands[-1]["command"] == ["python", "--version"]
+    assert result.files_read == ["app.py"]
+    assert result.files_modified == ["app.py"]
     assert result.calls == 6
     assert any(item["event"] == "parsing_failure" for item in result.debug_trace)
     assert {"event": "correction_retry", "outcome": "succeeded"} in result.debug_trace
@@ -363,6 +366,7 @@ def test_agent_allows_write_file_for_new_file(tmp_path: Path) -> None:
 
     assert result.finished is True
     assert result.final_patch_size > 0
+    assert result.successful_verification_commands[-1]["command"] == ["python", "--version"]
     assert (workspace / "new.py").read_text() == "VALUE = 3\n"
 
 
@@ -515,6 +519,28 @@ def test_catastrophic_existing_file_rewrite_is_rejected(tmp_path: Path) -> None:
         _agent(workspace, model).run()
 
 
+def test_exact_destructive_write_invalid_tests_finish_sequence_is_rejected(
+    tmp_path: Path,
+) -> None:
+    original = "".join(f"# keep {index}\n" for index in range(385))
+    workspace = _source_workspace(tmp_path, original)
+    replacement = "".join(f"# replacement {index}\n" for index in range(16))
+    model = ScriptedModel(
+        [
+            json.dumps({"action": "write_file", "path": "app.py", "content": replacement}),
+            '{"action":"run_tests","command":"pytest"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="Inspect the final diff") as raised:
+        _agent(workspace, model, calls=3).run()
+
+    assert (workspace / "app.py").read_text() == original
+    assert raised.value.diagnostics["local_tests_invoked"] == []
+    assert raised.value.diagnostics["local_verification_passed"] is False
+
+
 def test_removing_unrelated_public_symbol_is_rejected(tmp_path: Path) -> None:
     original = (
         "def retained():\n    return 1\n\n"
@@ -609,3 +635,87 @@ def test_failed_local_test_requires_another_edit_before_successful_rerun(tmp_pat
 
     with pytest.raises(AgentResponseError, match="verification"):
         _agent(workspace, model).run()
+
+
+def test_edit_after_successful_test_requires_testing_again(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 2","new":"VALUE = 3"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="verification"):
+        _agent(workspace, model).run()
+
+
+def test_edit_after_inspect_diff_requires_inspection_again(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 2","new":"VALUE = 3"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="Inspect the final diff"):
+        _agent(workspace, model).run()
+
+
+def test_379_line_deletion_is_rejected(tmp_path: Path) -> None:
+    original = "".join(f"# original {index}\n" for index in range(385))
+    workspace = _source_workspace(tmp_path, original)
+    replacement = "".join(f"# tiny {index}\n" for index in range(16))
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            json.dumps({"action": "replace_text", "path": "app.py", "old": original, "new": replacement}),
+            *_inspect_verify_finish_actions(),
+        ]
+    )
+
+    with pytest.raises(AgentResponseError, match="lines_deleted"):
+        _agent(workspace, model).run()
+
+
+def test_focused_small_edit_with_passing_verification_and_diff_is_accepted(
+    tmp_path: Path,
+) -> None:
+    workspace = _source_workspace(
+        tmp_path, "def add(a, b):\n    return a - b\n\ndef helper():\n    return 1\n"
+    )
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            json.dumps(
+                {
+                    "action": "replace_text",
+                    "path": "app.py",
+                    "old": "return a - b",
+                    "new": "return a + b",
+                }
+            ),
+            '{"action":"run_tests","command":["python","-m","compileall","app.py"]}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+
+    assert result.finished is True
+    assert result.successful_verification_commands[-1]["command"] == [
+        "python",
+        "-m",
+        "compileall",
+        "app.py",
+    ]

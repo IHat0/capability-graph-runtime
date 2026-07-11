@@ -266,6 +266,7 @@ def _generate_predictions(
                     )
                     if process.returncode:
                         raise RuntimeError(_agent_failure_message(process))
+                    agent_payload = _agent_success_payload(process)
                     patch, changed = capture_git_patch(workspace)
                     verify_patch_applies(workspace, patch, safe_instance.base_commit)
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
@@ -294,6 +295,8 @@ def _generate_predictions(
             )
             successful_instances.append(safe_instance.instance_id)
             row = generation_result_template(selected_mode, model, provider, scaffold)
+            successful_commands = agent_payload["successful_verification_commands"]
+            failed_commands = agent_payload["failed_verification_commands"]
             row.update(
                 {
                     "instance_id": safe_instance.instance_id,
@@ -303,8 +306,16 @@ def _generate_predictions(
                     "candidate_count": DEFAULT_BUDGETS[selected_mode].trajectories,
                     "final_changed_files": changed,
                     "final_patch_size": len(patch.encode()),
-                    "local_verification_passed": True,
-                    "local_verification_summary": "Agent completed and patch applies at base_commit.",
+                    "local_tests_invoked": [
+                        item["command"] for item in [*successful_commands, *failed_commands]
+                    ],
+                    "local_verification_passed": bool(successful_commands),
+                    "local_verification_summary": (
+                        "Agent reported successful local verification: "
+                        + _format_command(successful_commands[-1]["command"])
+                    ),
+                    "successful_verification_commands": successful_commands,
+                    "failed_verification_commands": failed_commands,
                     "debug_trace": process.stdout[-4000:] if debug_trace else None,
                 }
             )
@@ -334,6 +345,35 @@ def _generate_predictions(
         )
     )
     return 0 if generated else 1
+
+
+def _agent_success_payload(process: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    try:
+        payload = json.loads(process.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Repository agent did not return a valid JSON success payload.") from exc
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError("Repository agent did not report ok: true.")
+    if payload.get("finished") is not True:
+        raise RuntimeError("Repository agent did not report a finished candidate.")
+    if int(payload.get("final_patch_size") or 0) <= 0:
+        raise RuntimeError("Repository agent reported an empty candidate patch.")
+    successful = payload.get("successful_verification_commands")
+    failed = payload.get("failed_verification_commands")
+    if not isinstance(successful, list) or not successful:
+        raise RuntimeError("Repository agent reported no successful local verification command.")
+    if not isinstance(failed, list):
+        raise RuntimeError("Repository agent reported malformed verification diagnostics.")
+    return {
+        "successful_verification_commands": successful,
+        "failed_verification_commands": failed,
+    }
+
+
+def _format_command(command: Any) -> str:
+    if isinstance(command, list) and all(isinstance(item, str) for item in command):
+        return " ".join(command)
+    return str(command)
 
 
 def _agent_failure_message(process: subprocess.CompletedProcess[str]) -> str:
@@ -369,12 +409,34 @@ def _agent_diagnostics(
         payload = None
     if isinstance(payload, dict) and isinstance(payload.get("debug_trace"), list):
         trace = payload["debug_trace"]
-    return {
+    diagnostics = {
         "agent_exit_code": process.returncode,
         "agent_stdout": stdout,
         "agent_stderr": stderr,
         "agent_debug_trace": trace,
     }
+    if isinstance(payload, dict):
+        successful = payload.get("successful_verification_commands")
+        failed = payload.get("failed_verification_commands")
+        if isinstance(successful, list) and isinstance(failed, list):
+            diagnostics.update(
+                {
+                    "successful_verification_commands": successful,
+                    "failed_verification_commands": failed,
+                    "local_tests_invoked": [
+                        item["command"]
+                        for item in [*successful, *failed]
+                        if isinstance(item, dict) and "command" in item
+                    ],
+                    "local_verification_passed": bool(
+                        payload.get("local_verification_passed")
+                    ),
+                    "local_verification_summary": "Agent failed before accepted local verification."
+                    if not payload.get("local_verification_passed")
+                    else "Agent reported local verification before failure.",
+                }
+            )
+    return diagnostics
 
 
 def _redact_agent_output(value: str) -> str:

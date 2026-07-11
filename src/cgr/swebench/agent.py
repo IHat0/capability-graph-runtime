@@ -48,9 +48,15 @@ ModelCall = Callable[
 class AgentResponseError(RuntimeError):
     """Raised when the model does not produce one valid bounded action."""
 
-    def __init__(self, message: str, debug_trace: list[dict[str, str]] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        debug_trace: list[dict[str, str]] | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.debug_trace = debug_trace or []
+        self.diagnostics = diagnostics or {}
 
 
 class ActionParsingError(AgentResponseError):
@@ -72,6 +78,10 @@ class AgentRunResult:
     finished: bool
     stop_reason: str
     final_patch_size: int
+    files_read: list[str]
+    files_modified: list[str]
+    successful_verification_commands: list[dict[str, Any]]
+    failed_verification_commands: list[dict[str, Any]]
     debug_trace: list[dict[str, str]]
 
 
@@ -82,6 +92,20 @@ class ActionDefinition:
     required: frozenset[str]
     optional: frozenset[str]
     example: dict[str, Any]
+
+
+@dataclass
+class AgentState:
+    """State that must be true before a candidate can be accepted."""
+
+    files_read: set[str]
+    files_modified: set[str]
+    successful_verification_commands: list[dict[str, Any]]
+    failed_verification_commands: list[dict[str, Any]]
+    diff_inspected_after_last_edit: bool = False
+    verification_after_last_edit: bool = False
+    failed_verification_after_last_edit: bool = False
+    last_edit_step: int | None = None
 
 
 ACTION_DEFINITIONS: dict[str, ActionDefinition] = {
@@ -154,10 +178,8 @@ class FirstPartyRepositoryAgent:
         self._max_calls = max_calls
         self._config = config
         self._model_call = model_call
-        self._read_existing_files: set[str] = set()
-        self._diff_inspected_since_edit = False
-        self._verification_passed_since_edit = False
-        self._verification_failed_since_edit = False
+        self._state = AgentState(set(), set(), [], [])
+        self._current_step = 0
 
     def run(self) -> AgentRunResult:
         messages = self._initial_messages()
@@ -218,16 +240,35 @@ class FirstPartyRepositoryAgent:
                 debug_trace.append({"event": "correction_retry", "outcome": "succeeded"})
                 response = retry
             if action["action"] == "finish":
-                self._require_finish_preconditions()
                 try:
+                    self._require_finish_preconditions()
                     patch, changed = capture_git_patch(self._workspace)
+                    self._validate_candidate_safety(patch, changed)
+                except AgentResponseError as exc:
+                    if not exc.debug_trace:
+                        exc.debug_trace = debug_trace
+                    if not exc.diagnostics:
+                        exc.diagnostics = self._state_diagnostics()
+                    raise
                 except ValueError as exc:
                     raise AgentResponseError(
                         f"Final workspace does not contain a valid repository diff: {exc}",
                         debug_trace,
+                        self._state_diagnostics(),
                     ) from exc
-                self._validate_candidate_safety(patch, changed)
-                return AgentRunResult(steps, calls, True, "finished", len(patch.encode()), debug_trace)
+                return AgentRunResult(
+                    steps,
+                    calls,
+                    True,
+                    "finished",
+                    len(patch.encode()),
+                    sorted(self._state.files_read),
+                    sorted(self._state.files_modified),
+                    list(self._state.successful_verification_commands),
+                    list(self._state.failed_verification_commands),
+                    debug_trace,
+                )
+            self._current_step = steps + 1
             outcome = self._execute_action(action)
             steps += 1
             messages.extend(
@@ -238,7 +279,9 @@ class FirstPartyRepositoryAgent:
             )
         reason = "max_steps" if steps >= self._max_steps else "max_calls"
         raise AgentResponseError(
-            f"Repository agent stopped because {reason} was exhausted.", debug_trace
+            f"Repository agent stopped because {reason} was exhausted.",
+            debug_trace,
+            self._state_diagnostics(),
         )
 
     def _request_model(
@@ -301,7 +344,7 @@ class FirstPartyRepositoryAgent:
                 start = _positive(action, "start", 1)
                 end = _positive(action, "end", 400)
                 if self._is_existing_file(path):
-                    self._read_existing_files.add(path)
+                    self._state.files_read.add(path)
                 return {
                     "ok": True,
                     "content": self._actions.read_file(
@@ -315,22 +358,26 @@ class FirstPartyRepositoryAgent:
             if name == "inspect_symbols":
                 return {"ok": True, "symbols": self._actions.inspect_symbols(_string(action, "path"))}
             if name == "write_file":
-                self._actions.write_file(_string(action, "path"), _string(action, "content"))
-                self._mark_edit()
+                path = _string(action, "path")
+                self._actions.write_file(path, _string(action, "content"))
+                self._mark_edit(path)
                 return {"ok": True}
             if name == "replace_text":
-                self._require_existing_file_was_read(_string(action, "path"))
+                path = _string(action, "path")
+                self._require_existing_file_was_read(path)
                 self._actions.replace_text(
-                    _string(action, "path"), _string(action, "old"), _string(action, "new")
+                    path, _string(action, "old"), _string(action, "new")
                 )
-                self._mark_edit()
+                self._mark_edit(path)
                 return {"ok": True}
             if name == "apply_patch":
                 patch = _string(action, "patch")
-                for path in _patch_target_paths(patch):
+                targets = _patch_target_paths(patch)
+                for path in targets:
                     self._require_existing_file_was_read(path)
                 self._actions.apply_patch(patch)
-                self._mark_edit()
+                for path in targets:
+                    self._mark_edit(path)
                 return {"ok": True}
             if name == "run_tests":
                 command = action.get("command")
@@ -338,11 +385,19 @@ class FirstPartyRepositoryAgent:
                     raise ValueError("command must be a list of strings")
                 _deny_network_command(command)
                 result = self._actions.run_safe(command, timeout=_positive(action, "timeout", 600))
-                if result.returncode == 0 and not self._verification_failed_since_edit:
-                    self._verification_passed_since_edit = True
+                record = {
+                    "command": list(command),
+                    "exit_code": result.returncode,
+                    "stdout": _bounded_tool_text(result.stdout),
+                    "stderr": _bounded_tool_text(result.stderr),
+                }
+                if result.returncode == 0 and not self._state.failed_verification_after_last_edit:
+                    self._state.verification_after_last_edit = True
+                    self._state.successful_verification_commands.append(record)
                 elif result.returncode != 0:
-                    self._verification_passed_since_edit = False
-                    self._verification_failed_since_edit = True
+                    self._state.verification_after_last_edit = False
+                    self._state.failed_verification_after_last_edit = True
+                    self._state.failed_verification_commands.append(record)
                 return {
                     "ok": result.returncode == 0,
                     "exit_code": result.returncode,
@@ -350,35 +405,41 @@ class FirstPartyRepositoryAgent:
                     "stderr": _bounded_tool_text(result.stderr),
                 }
             if name == "inspect_diff":
-                self._diff_inspected_since_edit = True
+                if self._state.last_edit_step is None:
+                    return {"ok": False, "error": "inspect_diff must occur after an edit."}
+                self._state.diff_inspected_after_last_edit = True
                 return {"ok": True, "diff": _bounded_tool_text(self._actions.git_diff())}
             if name == "revert":
                 self._actions.revert_candidate()
-                self._diff_inspected_since_edit = False
-                self._verification_passed_since_edit = False
-                self._verification_failed_since_edit = False
+                self._state.files_modified.clear()
+                self._state.diff_inspected_after_last_edit = False
+                self._state.verification_after_last_edit = False
+                self._state.failed_verification_after_last_edit = False
+                self._state.last_edit_step = None
                 return {"ok": True}
             raise ValueError(f"Unsupported action: {name}")
         except (OSError, RuntimeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    def _mark_edit(self) -> None:
-        self._diff_inspected_since_edit = False
-        self._verification_passed_since_edit = False
-        self._verification_failed_since_edit = False
+    def _mark_edit(self, path: str) -> None:
+        self._state.files_modified.add(path)
+        self._state.diff_inspected_after_last_edit = False
+        self._state.verification_after_last_edit = False
+        self._state.failed_verification_after_last_edit = False
+        self._state.last_edit_step = self._current_step
 
     def _is_existing_file(self, path: str) -> bool:
         candidate = (self._workspace / path).resolve()
         return candidate.is_file() and self._workspace in candidate.parents
 
     def _require_existing_file_was_read(self, path: str) -> None:
-        if self._is_existing_file(path) and path not in self._read_existing_files:
+        if self._is_existing_file(path) and path not in self._state.files_read:
             raise ValueError(f"Read existing file before modifying it: {path}")
 
     def _require_finish_preconditions(self) -> None:
-        if not self._diff_inspected_since_edit:
+        if not self._state.diff_inspected_after_last_edit:
             raise AgentResponseError("Inspect the final diff with inspect_diff before finish.")
-        if not self._verification_passed_since_edit:
+        if not self._state.verification_after_last_edit:
             raise AgentResponseError(
                 "Run a relevant local verification command successfully before finish."
             )
@@ -400,13 +461,15 @@ class FirstPartyRepositoryAgent:
             resulting_lines = len(current.splitlines())
             lost_lines = max(0, original_lines - resulting_lines)
             deleted_percentage = (lost_lines / original_lines * 100) if original_lines else 0.0
+            resulting_percentage = (resulting_lines / original_lines * 100) if original_lines else 100.0
             if not _deletion_is_requested(self._problem_statement, path) and (
-                deleted_percentage > 35 or deleted > 100
+                deleted_percentage > 35 or deleted > 100 or resulting_percentage < 50
             ):
                 raise AgentResponseError(
                     f"Catastrophic rewrite rejected for {path}: original_lines={original_lines}, "
                     f"resulting_lines={resulting_lines}, lines_added={added}, lines_deleted={deleted}, "
-                    f"deleted_percentage={deleted_percentage:.1f}."
+                    f"deleted_percentage={deleted_percentage:.1f}, "
+                    f"resulting_percentage={resulting_percentage:.1f}."
                 )
             disappeared = _unmentioned_public_symbols_removed(original, current, self._problem_statement)
             if disappeared:
@@ -414,6 +477,24 @@ class FirstPartyRepositoryAgent:
                     f"Focused-change check rejected {path}; unrelated public symbols disappeared: "
                     + ", ".join(disappeared)
                 )
+
+    def _state_diagnostics(self) -> dict[str, Any]:
+        return {
+            "files_read": sorted(self._state.files_read),
+            "files_modified": sorted(self._state.files_modified),
+            "successful_verification_commands": list(self._state.successful_verification_commands),
+            "failed_verification_commands": list(self._state.failed_verification_commands),
+            "local_tests_invoked": [
+                item["command"]
+                for item in [
+                    *self._state.successful_verification_commands,
+                    *self._state.failed_verification_commands,
+                ]
+            ],
+            "local_verification_passed": self._state.verification_after_last_edit,
+            "diff_inspected_after_last_edit": self._state.diff_inspected_after_last_edit,
+            "last_edit_step": self._state.last_edit_step,
+        }
 
 
 def parse_agent_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -443,6 +524,7 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
         ).run()
     except (AgentResponseError, OSError, RuntimeError, ValueError) as exc:
         payload: dict[str, Any] = {"ok": False, "error": str(exc)}
+        payload.update(getattr(exc, "diagnostics", {}))
         if os.getenv("CGR_SWEBENCH_DEBUG_TRACE") == "1":
             payload["debug_trace"] = getattr(exc, "debug_trace", [])
         print(json.dumps(payload))
@@ -456,6 +538,11 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
                 "finished": result.finished,
                 "stop_reason": result.stop_reason,
                 "final_patch_size": result.final_patch_size,
+                "files_read": result.files_read,
+                "files_modified": result.files_modified,
+                "successful_verification_commands": result.successful_verification_commands,
+                "failed_verification_commands": result.failed_verification_commands,
+                "local_verification_passed": bool(result.successful_verification_commands),
                 "debug_trace": result.debug_trace
                 if os.getenv("CGR_SWEBENCH_DEBUG_TRACE") == "1"
                 else None,

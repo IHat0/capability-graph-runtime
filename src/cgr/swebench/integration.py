@@ -255,7 +255,19 @@ def validate_prediction_hash(path: Path) -> None:
 
 def capture_git_patch(repository: Path) -> tuple[str, list[str]]:
     _run(["git", "add", "--intent-to-add", "--", "."], repository)
-    result = _run(["git", "diff", "--no-ext-diff", "--full-index"], repository)
+    result = _run(
+        [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--full-index",
+            "--",
+            ".",
+            ":(exclude)**/__pycache__/**",
+            ":(exclude)**/*.pyc",
+        ],
+        repository,
+    )
     patch = result.stdout
     if not patch.strip():
         raise ValueError("Generated SWE-bench patch is empty.")

@@ -461,7 +461,9 @@ def test_empty_patch_generation_fails_without_prediction_hash(
     monkeypatch.setattr(
         swebench_cli,
         "run_external_agent",
-        lambda *args, **kwargs: subprocess.CompletedProcess(["agent"], 0, stdout="{}", stderr=""),
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            ["agent"], 0, stdout=_agent_success_stdout(), stderr=""
+        ),
     )
     monkeypatch.setattr(
         swebench_cli,
@@ -501,7 +503,9 @@ def test_successful_generation_writes_jsonl_prediction(
     monkeypatch.setattr(
         swebench_cli,
         "run_external_agent",
-        lambda *args, **kwargs: subprocess.CompletedProcess(["agent"], 0, stdout="{}", stderr=""),
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            ["agent"], 0, stdout=_agent_success_stdout(), stderr=""
+        ),
     )
     patch = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-a\n+b\n"
     monkeypatch.setattr(swebench_cli, "capture_git_patch", lambda _workspace: (patch, ["app.py"]))
@@ -516,6 +520,116 @@ def test_successful_generation_writes_jsonl_prediction(
     assert len(predictions) == 1
     assert json.loads(predictions[0])["instance_id"] == instance.instance_id
     validate_prediction_hash(tmp_path / "results" / "baseline" / "predictions.jsonl")
+    generation = json.loads(
+        (tmp_path / "results" / "baseline" / "generation-results.json").read_text()
+    )
+    assert generation[0]["local_verification_passed"] is True
+    assert generation[0]["local_tests_invoked"] == [["python", "-m", "compileall", "app.py"]]
+
+
+def test_agent_without_successful_verification_is_generation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _records()[0]
+    instance = PilotInstance(
+        instance_id=str(record["instance_id"]),
+        repo=str(record["repo"]),
+        base_commit=str(record["base_commit"]),
+    )
+    _configure_generation_environment(monkeypatch)
+    monkeypatch.setattr(swebench_cli, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(swebench_cli, "doctor_report", lambda: {})
+    monkeypatch.setattr(
+        swebench_cli,
+        "materialize_repository",
+        lambda _instance, destination: destination.mkdir(parents=True),
+    )
+    monkeypatch.setattr(
+        swebench_cli,
+        "run_external_agent",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            ["agent"],
+            0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "finished": True,
+                    "final_patch_size": 42,
+                    "successful_verification_commands": [],
+                    "failed_verification_commands": [],
+                }
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        swebench_cli,
+        "capture_git_patch",
+        lambda _workspace: ("diff --git a/app.py b/app.py\n", ["app.py"]),
+    )
+
+    result = swebench_cli._generate_predictions(
+        ["baseline"], [instance], "manifest", tmp_path / "results", resume=False, debug_trace=False
+    )
+
+    mode_root = tmp_path / "results" / "baseline"
+    generation = json.loads((mode_root / "generation-results.json").read_text())
+    assert result == 1
+    assert "no successful local verification" in generation[0]["generation_error"]
+    assert generation[0]["local_verification_passed"] is False
+    assert generation[0]["candidate_count"] == 0
+    assert not (mode_root / "predictions.jsonl").exists()
+
+
+def test_rejected_agent_failure_preserves_actual_test_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _records()[0]
+    instance = PilotInstance(
+        instance_id=str(record["instance_id"]),
+        repo=str(record["repo"]),
+        base_commit=str(record["base_commit"]),
+    )
+    _configure_generation_environment(monkeypatch)
+    monkeypatch.setattr(swebench_cli, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(swebench_cli, "doctor_report", lambda: {})
+    monkeypatch.setattr(
+        swebench_cli,
+        "materialize_repository",
+        lambda _instance, destination: destination.mkdir(parents=True),
+    )
+    monkeypatch.setattr(
+        swebench_cli,
+        "run_external_agent",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            ["agent"],
+            1,
+            stdout=json.dumps(
+                {
+                    "ok": False,
+                    "error": "Run a relevant local verification command successfully before finish.",
+                    "successful_verification_commands": [],
+                    "failed_verification_commands": [
+                        {"command": ["pytest"], "exit_code": 2, "stdout": "", "stderr": "bad"}
+                    ],
+                    "local_verification_passed": False,
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    result = swebench_cli._generate_predictions(
+        ["baseline"], [instance], "manifest", tmp_path / "results", resume=False, debug_trace=False
+    )
+
+    mode_root = tmp_path / "results" / "baseline"
+    generation = json.loads((mode_root / "generation-results.json").read_text())
+    assert result == 1
+    assert generation[0]["local_tests_invoked"] == [["pytest"]]
+    assert generation[0]["local_verification_passed"] is False
+    assert generation[0]["candidate_count"] == 0
+    assert not (mode_root / "predictions.jsonl").exists()
 
 
 def _configure_generation_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -527,3 +641,22 @@ def _configure_generation_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "CGR_SWEBENCH_SCAFFOLD_ID": "cgr-first-party-agent-v1",
     }.items():
         monkeypatch.setenv(name, value)
+
+
+def _agent_success_stdout() -> str:
+    return json.dumps(
+        {
+            "ok": True,
+            "finished": True,
+            "final_patch_size": 80,
+            "successful_verification_commands": [
+                {
+                    "command": ["python", "-m", "compileall", "app.py"],
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }
+            ],
+            "failed_verification_commands": [],
+        }
+    )
