@@ -9,7 +9,21 @@ if [[ ! -x .venv-sweagent/bin/python ]]; then
 fi
 source .venv-sweagent/bin/activate
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet 'git+https://github.com/SWE-agent/SWE-agent.git@0f3acafacabc0def8cc76b4e48acb4b6cf302cb9'
+source_root="$PWD/.swe-agent-src"
+commit='0f3acafacabc0def8cc76b4e48acb4b6cf302cb9'
+if [[ ! -d "$source_root/.git" ]]; then
+  git clone --quiet https://github.com/SWE-agent/SWE-agent.git "$source_root"
+fi
+git -C "$source_root" fetch --quiet origin "$commit"
+git -C "$source_root" checkout --quiet --detach "$commit"
+[[ "$(git -C "$source_root" rev-parse HEAD)" == "$commit" ]] || {
+  echo "Pinned SWE-agent commit verification failed." >&2
+  exit 2
+}
+[[ -f "$source_root/sweagent/__init__.py" ]] || { echo "Missing SWE-agent module source." >&2; exit 2; }
+[[ -f "$source_root/config/default.yaml" ]] || { echo "Missing SWE-agent default config." >&2; exit 2; }
+[[ -d "$source_root/tools" ]] || { echo "Missing SWE-agent tools directory." >&2; exit 2; }
+python -m pip install --quiet -e "$source_root"
 python -m pip install --quiet -e .
 
 export CGR_DRAFT_BASE_URL='http://127.0.0.1:8000/v1'
@@ -17,7 +31,7 @@ export CGR_DRAFT_API_KEY='cgr-aws-key'
 export CGR_DRAFT_MODEL='Qwen/Qwen2.5-Coder-7B-Instruct'
 export CGR_DRAFT_MAX_MODEL_LEN=16384
 export CGR_SWEBENCH_SCAFFOLD_ID='swe-agent-v1.1.0-0f3acaf'
-export CGR_SWE_AGENT_SOURCE="$PWD/.swe-agent-src"
+export CGR_SWE_AGENT_SOURCE="$source_root"
 export CGR_SWE_AGENT_EXECUTABLE="$PWD/.venv-sweagent/bin/sweagent"
 export CGR_SWEBENCH_AGENT_COMMAND='[
   "cgr-swebench-swe-agent-adapter",
@@ -29,6 +43,7 @@ export CGR_SWEBENCH_AGENT_COMMAND='[
 ]'
 
 test -f "$CGR_SWE_AGENT_SOURCE/config/default.yaml"
+python -c 'import os, pathlib, sweagent; source = pathlib.Path(os.environ["CGR_SWE_AGENT_SOURCE"]).resolve(); module = pathlib.Path(sweagent.__file__).resolve(); assert source in module.parents, f"SWE-agent imported from site-packages: {module}"'
 
 tmpdir="${CGR_SWE_AGENT_SMOKE_ROOT:-$(mktemp -d)}"
 mkdir -p "$tmpdir"

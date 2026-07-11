@@ -14,7 +14,11 @@ cd ~/CGR-Ticket-1.1
 python3.12 -m venv .venv-sweagent
 . .venv-sweagent/bin/activate
 python -m pip install --upgrade pip
-python -m pip install 'git+https://github.com/SWE-agent/SWE-agent.git@0f3acafacabc0def8cc76b4e48acb4b6cf302cb9'
+git clone https://github.com/SWE-agent/SWE-agent.git .swe-agent-src
+git -C .swe-agent-src fetch origin 0f3acafacabc0def8cc76b4e48acb4b6cf302cb9
+git -C .swe-agent-src checkout --detach 0f3acafacabc0def8cc76b4e48acb4b6cf302cb9
+test "$(git -C .swe-agent-src rev-parse HEAD)" = 0f3acafacabc0def8cc76b4e48acb4b6cf302cb9
+python -m pip install -e "$PWD/.swe-agent-src"
 ```
 
 Configure the local OpenAI-compatible vLLM endpoint and the official adapter:

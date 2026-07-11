@@ -75,6 +75,9 @@ def test_adapter_applies_official_patch_and_reports_metadata(
     source = tmp_path / "source"
     (source / "config").mkdir(parents=True)
     (source / "config" / "default.yaml").write_text("agent: {}\n")
+    (source / "sweagent").mkdir()
+    (source / "sweagent" / "__init__.py").write_text("")
+    (source / "tools").mkdir()
     monkeypatch.setenv("CGR_SWE_AGENT_SOURCE", str(source))
     monkeypatch.setattr(adapter.shutil, "which", lambda _value: "/fake/sweagent")
 
@@ -119,6 +122,9 @@ def test_adapter_failure_redacts_api_key(
     source = tmp_path / "source"
     (source / "config").mkdir(parents=True)
     (source / "config" / "default.yaml").write_text("agent: {}\n")
+    (source / "sweagent").mkdir()
+    (source / "sweagent" / "__init__.py").write_text("")
+    (source / "tools").mkdir()
     monkeypatch.setenv("CGR_SWE_AGENT_SOURCE", str(source))
     monkeypatch.setattr(adapter.shutil, "which", lambda _value: None)
 
@@ -138,6 +144,9 @@ def test_official_failure_preserves_bounded_redacted_process_diagnostics(
     source = tmp_path / "source"
     (source / "config").mkdir(parents=True)
     (source / "config" / "default.yaml").write_text("agent: {}\n")
+    (source / "sweagent").mkdir()
+    (source / "sweagent" / "__init__.py").write_text("")
+    (source / "tools").mkdir()
     monkeypatch.setenv("CGR_SWE_AGENT_SOURCE", str(source))
     monkeypatch.setenv("CGR_DRAFT_BASE_URL", "http://127.0.0.1:8000/v1")
     monkeypatch.setenv("CGR_DRAFT_API_KEY", "hide-this-key")
@@ -173,3 +182,17 @@ def test_ec2_smoke_preflight_is_recorded_without_blocking_adapter() -> None:
     assert "=== Adapter ===" in script
     assert "=== Final workspace ===" in script
     assert "=== Trajectories/artifacts ===" in script
+
+
+def test_pinned_source_validation_rejects_site_packages_only_install(tmp_path: Path) -> None:
+    source = tmp_path / ".swe-agent-src"
+    source.mkdir()
+    assert adapter._is_valid_sweagent_source(source) is False
+
+    (source / "sweagent").mkdir()
+    (source / "sweagent" / "__init__.py").write_text("", encoding="utf-8")
+    (source / "config").mkdir()
+    (source / "config" / "default.yaml").write_text("agent: {}\n", encoding="utf-8")
+    (source / "tools").mkdir()
+
+    assert adapter._is_valid_sweagent_source(source) is True

@@ -31,8 +31,10 @@ def test_official_sweagent_install_is_pinned_to_the_upstream_commit() -> None:
     smoke_script = Path("scripts/ec2_sweagent_smoke.sh").read_text(encoding="utf-8")
     commit = "0f3acafacabc0def8cc76b4e48acb4b6cf302cb9"
 
-    assert f"SWE-agent.git@{commit}" in pyproject
-    assert f"SWE-agent.git@{commit}" in smoke_script
+    assert "SWE-agent.git@" not in pyproject
+    assert 'fetch --quiet origin "$commit"' in smoke_script
+    assert 'python -m pip install --quiet -e "$source_root"' in smoke_script
+    assert commit in smoke_script
 
 
 @pytest.mark.parametrize(

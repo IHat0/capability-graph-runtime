@@ -393,12 +393,20 @@ def resolve_sweagent_source(executable: str) -> Path:
     if executable_path.is_absolute():
         candidates.append(executable_path.parent.parent / ".swe-agent-src")
     for root in candidates:
-        config = root.expanduser().resolve() / "config" / "default.yaml"
-        if config.is_file():
-            return config.parent.parent
+        resolved = root.expanduser().resolve()
+        if _is_valid_sweagent_source(resolved):
+            return resolved
     raise ValueError(
         "Pinned official SWE-agent source/config is unavailable; set CGR_SWE_AGENT_SOURCE "
         "to the v1.1.0 checkout containing config/default.yaml."
+    )
+
+
+def _is_valid_sweagent_source(root: Path) -> bool:
+    return (
+        (root / "sweagent" / "__init__.py").is_file()
+        and (root / "config" / "default.yaml").is_file()
+        and (root / "tools").is_dir()
     )
 
 

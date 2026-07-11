@@ -32,4 +32,3 @@ cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]
 swebench=["datasets>=3.0","swebench>=3.0"]
-sweagent=["sweagent @ git+https://github.com/SWE-agent/SWE-agent.git@0f3acafacabc0def8cc76b4e48acb4b6cf302cb9"]
