@@ -78,11 +78,24 @@ All modes use the same Qwen identity and repository-action adapter.
 - `cgr_single`: one primary plus bounded repair, at most 10 calls, 24 steps, and 2100 seconds.
 - `cgr_multi`: three trajectories, at most 18 calls, 36 steps, and 3600 seconds.
 
-The adapter is configured through `CGR_SWEBENCH_AGENT_COMMAND`, a JSON argument array
-using `{workspace}`, `{problem_file}`, `{mode}`, `{max_steps}`, and `{max_calls}`.
-This supports a pinned mini-SWE-agent or SWE-agent adapter while CGR retains budgets,
-candidate policy, verification, comparison, logging, and selection. The adapter must
-record its scaffold name and version; the scaffold is not CGR.
+The first-party adapter is configured through `CGR_SWEBENCH_AGENT_COMMAND`, a JSON
+argument array using `{workspace}`, `{problem_file}`, `{mode}`, `{max_steps}`, and
+`{max_calls}`. It uses `CGR_DRAFT_API_KEY`, `CGR_DRAFT_BASE_URL`, and
+`CGR_DRAFT_MODEL` for the OpenAI-compatible Qwen endpoint.
+
+```bash
+export CGR_SWEBENCH_SCAFFOLD_ID="cgr-first-party-agent-v1"
+export CGR_SWEBENCH_AGENT_COMMAND='[
+  "cgr-swebench-agent",
+  "--workspace", "{workspace}",
+  "--problem-file", "{problem_file}",
+  "--mode", "{mode}",
+  "--max-steps", "{max_steps}",
+  "--max-calls", "{max_calls}"
+]'
+```
+
+The first-party adapter is CGR's bounded action layer, not an external scaffold.
 
 The bounded repository surface supports file listing/search/reads, visible tests,
 edits, patch application, diff inspection, and candidate reversion. `.git`, path

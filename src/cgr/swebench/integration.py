@@ -413,6 +413,7 @@ class RepositoryActions:
         path.write_text(content, encoding="utf-8")
 
     def apply_patch(self, patch: str) -> None:
+        _validate_workspace_patch(patch)
         process = subprocess.run(
             ["git", "apply", "-"], cwd=self.root, input=patch, text=True, check=False
         )
@@ -595,3 +596,20 @@ def _run(
             f"{result.stderr[-1000:]}"
         )
     return result
+
+
+def _validate_workspace_patch(patch: str) -> None:
+    """Reject patch targets that could escape the isolated worktree."""
+    paths: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            fields = line.split()
+            paths.extend(fields[2:4])
+        elif line.startswith(("--- ", "+++ ")):
+            paths.append(line[4:].split("\t", 1)[0])
+    for raw_path in paths:
+        if raw_path == "/dev/null":
+            continue
+        path = raw_path.removeprefix("a/").removeprefix("b/")
+        if path == ".git" or path.startswith(".git/") or ".." in Path(path).parts:
+            raise ValueError("Patch targets .git or escapes the repository workspace.")
