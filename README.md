@@ -240,6 +240,11 @@ improvement. Real GLM and OpenAI-compatible provider runs are the next step.
 
 ## Next Possible Steps
 
+The frozen external-evaluation protocol is documented in
+[`docs/swebench_verified_pilot.md`](docs/swebench_verified_pilot.md). Repo-v0 is a
+development benchmark; SWE-bench Verified is evaluated separately with the official
+Docker harness as the final judge.
+
 - Add additional real model provider plugins.
 - Add persistence for `LearningMemory`.
 - Add async and parallel execution.
