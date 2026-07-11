@@ -82,6 +82,8 @@ class AgentRunResult:
     files_modified: list[str]
     successful_verification_commands: list[dict[str, Any]]
     failed_verification_commands: list[dict[str, Any]]
+    repair_phase_entered: bool
+    orchestration_path: str
     debug_trace: list[dict[str, str]]
 
 
@@ -180,6 +182,9 @@ class FirstPartyRepositoryAgent:
         self._model_call = model_call
         self._state = AgentState(set(), set(), [], [])
         self._current_step = 0
+        self._repair_phase_entered = False
+        self._finish_rejections = 0
+        self._last_finish_rejection_error: str | None = None
 
     def run(self) -> AgentRunResult:
         messages = self._initial_messages()
@@ -240,34 +245,29 @@ class FirstPartyRepositoryAgent:
                 debug_trace.append({"event": "correction_retry", "outcome": "succeeded"})
                 response = retry
             if action["action"] == "finish":
-                try:
-                    self._require_finish_preconditions()
-                    patch, changed = capture_git_patch(self._workspace)
-                    self._validate_candidate_safety(patch, changed)
-                except AgentResponseError as exc:
-                    if not exc.debug_trace:
-                        exc.debug_trace = debug_trace
-                    if not exc.diagnostics:
-                        exc.diagnostics = self._state_diagnostics()
-                    raise
-                except ValueError as exc:
-                    raise AgentResponseError(
-                        f"Final workspace does not contain a valid repository diff: {exc}",
-                        debug_trace,
-                        self._state_diagnostics(),
-                    ) from exc
-                return AgentRunResult(
-                    steps,
-                    calls,
-                    True,
-                    "finished",
-                    len(patch.encode()),
-                    sorted(self._state.files_read),
-                    sorted(self._state.files_modified),
-                    list(self._state.successful_verification_commands),
-                    list(self._state.failed_verification_commands),
-                    debug_trace,
+                self._current_step = steps + 1
+                finish = self._try_finish(debug_trace)
+                steps += 1
+                if isinstance(finish, AgentRunResult):
+                    return finish
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": response},
+                        {"role": "tool", "content": json.dumps(finish)},
+                    ]
                 )
+                if self._should_enter_repair_phase():
+                    repair_prompt = self._repair_phase_prompt(finish)
+                    messages.append({"role": "user", "content": repair_prompt})
+                    debug_trace.append(
+                        {
+                            "event": "repair_phase_entered",
+                            "mode": self._mode,
+                            "finish_rejections": str(self._finish_rejections),
+                        }
+                    )
+                    self._repair_phase_entered = True
+                continue
             self._current_step = steps + 1
             outcome = self._execute_action(action)
             steps += 1
@@ -278,11 +278,88 @@ class FirstPartyRepositoryAgent:
                 ]
             )
         reason = "max_steps" if steps >= self._max_steps else "max_calls"
+        detail = (
+            f" Last finish rejection: {self._last_finish_rejection_error}."
+            if self._last_finish_rejection_error
+            else ""
+        )
         raise AgentResponseError(
-            f"Repository agent stopped because {reason} was exhausted.",
+            f"Repository agent stopped because {reason} was exhausted.{detail}",
             debug_trace,
             self._state_diagnostics(),
         )
+
+    def _try_finish(
+        self, debug_trace: list[dict[str, str]]
+    ) -> AgentRunResult | dict[str, Any]:
+        try:
+            self._require_finish_preconditions()
+            patch, changed = capture_git_patch(self._workspace)
+            self._validate_candidate_safety(patch, changed)
+        except AgentResponseError as exc:
+            return self._finish_rejection(str(exc), debug_trace)
+        except ValueError as exc:
+            return self._finish_rejection(
+                f"Final workspace does not contain a valid repository diff: {exc}",
+                debug_trace,
+            )
+        return AgentRunResult(
+            self._current_step,
+            len([item for item in debug_trace if item.get("event") == "raw_model_response"]),
+            True,
+            "finished",
+            len(patch.encode()),
+            sorted(self._state.files_read),
+            sorted(self._state.files_modified),
+            list(self._state.successful_verification_commands),
+            list(self._state.failed_verification_commands),
+            self._repair_phase_entered,
+            self._orchestration_path(),
+            debug_trace,
+        )
+
+    def _finish_rejection(
+        self, error: str, debug_trace: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        self._finish_rejections += 1
+        self._last_finish_rejection_error = error
+        required = _required_next_actions(error, self._state)
+        outcome: dict[str, Any] = {
+            "ok": False,
+            "action": "finish",
+            "error": error,
+            "required_next_actions": required,
+            **self._state_diagnostics(),
+        }
+        debug_trace.append(
+            {
+                "event": "finish_rejected",
+                "error": error,
+                "required_next_actions": json.dumps(required),
+            }
+        )
+        return outcome
+
+    def _should_enter_repair_phase(self) -> bool:
+        return self._mode == "cgr_single" and not self._repair_phase_entered
+
+    def _repair_phase_prompt(self, finish_outcome: dict[str, Any]) -> str:
+        diff = _bounded_tool_text(self._actions.git_diff())
+        return (
+            "CGR single repair phase. The primary candidate was rejected by the "
+            "acceptance gate. Continue with bounded JSON actions only. Rejection: "
+            f"{finish_outcome.get('error')}. Required next actions: "
+            f"{json.dumps(finish_outcome.get('required_next_actions', []))}. "
+            f"Verification state: {json.dumps(self._state_diagnostics())}. "
+            f"Current diff summary:\n{diff}"
+        )
+
+    def _orchestration_path(self) -> str:
+        if self._mode == "baseline":
+            return "baseline"
+        if self._mode == "cgr_single":
+            return "cgr_single_repair" if self._repair_phase_entered else "cgr_single_primary"
+        return "cgr_multi_trajectory"
 
     def _request_model(
         self, messages: list[dict[str, str]], debug_trace: list[dict[str, str]]
@@ -543,6 +620,8 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
                 "successful_verification_commands": result.successful_verification_commands,
                 "failed_verification_commands": result.failed_verification_commands,
                 "local_verification_passed": bool(result.successful_verification_commands),
+                "repair_phase_entered": result.repair_phase_entered,
+                "orchestration_path": result.orchestration_path,
                 "debug_trace": result.debug_trace
                 if os.getenv("CGR_SWEBENCH_DEBUG_TRACE") == "1"
                 else None,
@@ -733,6 +812,25 @@ def _unmentioned_public_symbols_removed(original: str, current: str, problem: st
     }
     lowered_problem = problem.casefold()
     return sorted(name for name in before_names - after_names if name.casefold() not in lowered_problem)
+
+
+def _required_next_actions(error: str, state: AgentState) -> list[str]:
+    lowered = error.casefold()
+    actions: list[str] = []
+    if "inspect_diff" in lowered or not state.diff_inspected_after_last_edit:
+        actions.append("inspect_diff")
+    if (
+        "verification" in lowered
+        or "run a relevant local" in lowered
+        or state.failed_verification_after_last_edit
+        or not state.verification_after_last_edit
+    ):
+        actions.append("run_tests")
+    if any(marker in lowered for marker in ("catastrophic", "public symbols", "empty")):
+        actions.extend(["replace_text", "apply_patch"])
+    if "empty" in lowered and "inspect_diff" not in actions:
+        actions.append("inspect_diff")
+    return list(dict.fromkeys(actions or ["inspect_diff", "run_tests"]))
 
 
 def _system_prompt() -> str:

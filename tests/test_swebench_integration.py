@@ -527,6 +527,56 @@ def test_successful_generation_writes_jsonl_prediction(
     assert generation[0]["local_tests_invoked"] == [["python", "-m", "compileall", "app.py"]]
 
 
+def test_cgr_multi_runs_independent_trajectories_and_selects_valid_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _records()[0]
+    instance = PilotInstance(
+        instance_id=str(record["instance_id"]),
+        repo=str(record["repo"]),
+        base_commit=str(record["base_commit"]),
+    )
+    workspaces: list[Path] = []
+    calls = 0
+    _configure_generation_environment(monkeypatch)
+    monkeypatch.setattr(swebench_cli, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(swebench_cli, "doctor_report", lambda: {})
+
+    def fake_materialize(_instance: object, destination: Path) -> None:
+        workspaces.append(destination)
+        destination.mkdir(parents=True)
+
+    def fake_agent(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(["agent"], 1, stdout='{"ok": false, "error": "bad"}', stderr="")
+        return subprocess.CompletedProcess(["agent"], 0, stdout=_agent_success_stdout(), stderr="")
+
+    def fake_patch(workspace: Path) -> tuple[str, list[str]]:
+        suffix = workspace.name.rsplit("-", 1)[-1]
+        body = "small" if suffix == "1" else "large" * 20
+        return (f"diff --git a/app.py b/app.py\n+{body}\n", ["app.py"])
+
+    monkeypatch.setattr(swebench_cli, "materialize_repository", fake_materialize)
+    monkeypatch.setattr(swebench_cli, "run_external_agent", fake_agent)
+    monkeypatch.setattr(swebench_cli, "capture_git_patch", fake_patch)
+    monkeypatch.setattr(swebench_cli, "verify_patch_applies", lambda *args: None)
+
+    result = swebench_cli._generate_predictions(
+        ["cgr_multi"], [instance], "manifest", tmp_path / "results", resume=False, debug_trace=False
+    )
+
+    mode_root = tmp_path / "results" / "cgr_multi"
+    generation = json.loads((mode_root / "generation-results.json").read_text())
+    prediction = json.loads((mode_root / "predictions.jsonl").read_text().splitlines()[0])
+    assert result == 0
+    assert calls == 3
+    assert len({path.name for path in workspaces}) == 3
+    assert generation[0]["candidate_count"] == 2
+    assert "+small" in prediction["model_patch"]
+
+
 def test_agent_without_successful_verification_is_generation_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

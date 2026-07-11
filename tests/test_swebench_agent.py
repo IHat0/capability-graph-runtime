@@ -59,12 +59,17 @@ def _workspace(tmp_path: Path) -> Path:
 
 
 def _agent(
-    workspace: Path, model: ScriptedModel, *, steps: int = 10, calls: int = 10
+    workspace: Path,
+    model: ScriptedModel,
+    *,
+    mode: str = "baseline",
+    steps: int = 10,
+    calls: int = 10,
 ) -> FirstPartyRepositoryAgent:
     return FirstPartyRepositoryAgent(
         workspace,
         "Fix the public issue.",
-        "baseline",
+        mode,
         steps,
         calls,
         _config(),
@@ -393,6 +398,124 @@ def test_agent_replace_text_action_edits_inside_workspace(tmp_path: Path) -> Non
     assert (workspace / "app.py").read_text() == "VALUE = 6\n"
 
 
+def test_rejected_finish_after_tests_is_returned_as_tool_result_and_recovers(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"finish"}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+    finish_rejections = [
+        json.loads(message[-1]["content"])
+        for message in model.messages
+        if message[-1]["role"] == "tool"
+        and json.loads(message[-1]["content"]).get("action") == "finish"
+    ]
+
+    assert result.finished is True
+    assert result.final_patch_size > 0
+    assert finish_rejections[0]["ok"] is False
+    assert finish_rejections[0]["required_next_actions"] == ["inspect_diff"]
+
+
+def test_rejected_finish_before_tests_is_returned_as_tool_result_and_recovers(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"finish"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model).run()
+    rejection = json.loads(model.messages[3][-1]["content"])
+
+    assert result.finished is True
+    assert result.final_patch_size > 0
+    assert rejection["action"] == "finish"
+    assert rejection["required_next_actions"] == ["inspect_diff", "run_tests"]
+
+
+def test_cgr_single_enters_repair_phase_after_rejected_primary_finish(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    model = ScriptedModel(
+        [
+            '{"action":"read_file","path":"app.py"}',
+            '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+            '{"action":"finish"}',
+            '{"action":"run_tests","command":["python","--version"]}',
+            '{"action":"inspect_diff"}',
+            '{"action":"finish"}',
+        ]
+    )
+
+    result = _agent(workspace, model, mode="cgr_single").run()
+
+    assert result.finished is True
+    assert result.repair_phase_entered is True
+    assert result.orchestration_path == "cgr_single_repair"
+    assert any(
+        message["role"] == "user" and "CGR single repair phase" in message["content"]
+        for message in model.messages[3]
+    )
+    assert {"event": "repair_phase_entered", "mode": "cgr_single", "finish_rejections": "1"} in result.debug_trace
+
+
+def test_baseline_and_cgr_single_have_distinct_rejected_finish_paths(
+    tmp_path: Path,
+) -> None:
+    baseline = _agent(
+        _workspace(tmp_path / "baseline"),
+        ScriptedModel(
+            [
+                '{"action":"read_file","path":"app.py"}',
+                '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+                '{"action":"finish"}',
+                '{"action":"run_tests","command":["python","--version"]}',
+                '{"action":"inspect_diff"}',
+                '{"action":"finish"}',
+            ]
+        ),
+        mode="baseline",
+    ).run()
+    single = _agent(
+        _workspace(tmp_path / "single"),
+        ScriptedModel(
+            [
+                '{"action":"read_file","path":"app.py"}',
+                '{"action":"replace_text","path":"app.py","old":"VALUE = 1","new":"VALUE = 2"}',
+                '{"action":"finish"}',
+                '{"action":"run_tests","command":["python","--version"]}',
+                '{"action":"inspect_diff"}',
+                '{"action":"finish"}',
+            ]
+        ),
+        mode="cgr_single",
+    ).run()
+
+    assert baseline.orchestration_path == "baseline"
+    assert baseline.repair_phase_entered is False
+    assert single.orchestration_path == "cgr_single_repair"
+    assert single.repair_phase_entered is True
+
+
 def test_dispatcher_covers_every_non_finish_canonical_action(tmp_path: Path) -> None:
     class RecordingActions:
         def __init__(self) -> None:
@@ -489,7 +612,7 @@ def test_agent_denies_path_traversal_git_metadata_and_network_actions(tmp_path: 
 
 
 def test_agent_rejects_finish_without_a_candidate_diff(tmp_path: Path) -> None:
-    agent = _agent(_workspace(tmp_path), ScriptedModel(['{"action":"finish"}']))
+    agent = _agent(_workspace(tmp_path), ScriptedModel(['{"action":"finish"}']), calls=1)
 
     with pytest.raises(AgentResponseError, match="Inspect the final diff"):
         agent.run()
@@ -516,7 +639,7 @@ def test_catastrophic_existing_file_rewrite_is_rejected(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AgentResponseError, match="Catastrophic rewrite rejected"):
-        _agent(workspace, model).run()
+        _agent(workspace, model, calls=5).run()
 
 
 def test_exact_destructive_write_invalid_tests_finish_sequence_is_rejected(
@@ -564,7 +687,7 @@ def test_removing_unrelated_public_symbol_is_rejected(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AgentResponseError, match="unrelated_public"):
-        _agent(workspace, model).run()
+        _agent(workspace, model, calls=5).run()
 
 
 def test_overwriting_existing_file_with_write_file_is_rejected(tmp_path: Path) -> None:
@@ -589,7 +712,7 @@ def test_finish_requires_diff_inspection_and_successful_verification(tmp_path: P
         ]
     )
     with pytest.raises(AgentResponseError, match="Inspect the final diff"):
-        _agent(workspace, no_diff_model).run()
+        _agent(workspace, no_diff_model, calls=4).run()
 
     workspace = _workspace(tmp_path / "second")
     no_verify_model = ScriptedModel(
@@ -601,7 +724,7 @@ def test_finish_requires_diff_inspection_and_successful_verification(tmp_path: P
         ]
     )
     with pytest.raises(AgentResponseError, match="verification"):
-        _agent(workspace, no_verify_model).run()
+        _agent(workspace, no_verify_model, calls=4).run()
 
 
 def test_failed_local_test_prevents_finish(tmp_path: Path) -> None:
@@ -617,7 +740,7 @@ def test_failed_local_test_prevents_finish(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AgentResponseError, match="verification"):
-        _agent(workspace, model).run()
+        _agent(workspace, model, calls=5).run()
 
 
 def test_failed_local_test_requires_another_edit_before_successful_rerun(tmp_path: Path) -> None:
@@ -634,7 +757,7 @@ def test_failed_local_test_requires_another_edit_before_successful_rerun(tmp_pat
     )
 
     with pytest.raises(AgentResponseError, match="verification"):
-        _agent(workspace, model).run()
+        _agent(workspace, model, calls=6).run()
 
 
 def test_edit_after_successful_test_requires_testing_again(tmp_path: Path) -> None:
@@ -651,7 +774,7 @@ def test_edit_after_successful_test_requires_testing_again(tmp_path: Path) -> No
     )
 
     with pytest.raises(AgentResponseError, match="verification"):
-        _agent(workspace, model).run()
+        _agent(workspace, model, calls=6).run()
 
 
 def test_edit_after_inspect_diff_requires_inspection_again(tmp_path: Path) -> None:
@@ -668,7 +791,7 @@ def test_edit_after_inspect_diff_requires_inspection_again(tmp_path: Path) -> No
     )
 
     with pytest.raises(AgentResponseError, match="Inspect the final diff"):
-        _agent(workspace, model).run()
+        _agent(workspace, model, calls=6).run()
 
 
 def test_379_line_deletion_is_rejected(tmp_path: Path) -> None:
@@ -684,7 +807,7 @@ def test_379_line_deletion_is_rejected(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AgentResponseError, match="lines_deleted"):
-        _agent(workspace, model).run()
+        _agent(workspace, model, calls=5).run()
 
 
 def test_focused_small_edit_with_passing_verification_and_diff_is_accepted(
