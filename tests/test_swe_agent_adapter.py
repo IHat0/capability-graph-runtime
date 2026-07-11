@@ -20,12 +20,14 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     config = tmp_path / "source" / "config" / "default.yaml"
     config.parent.mkdir(parents=True)
     config.write_text("agent: {}\n")
+    override = adapter.write_local_model_override(tmp_path / "output")
     command = adapter.build_sweagent_command(
         executable="sweagent",
         workspace=tmp_path / "repo",
         problem_file=tmp_path / "problem.txt",
         output_dir=tmp_path / "output",
         config_path=config,
+        local_override_path=override,
         max_calls=5,
         max_steps=8,
         environment={
@@ -36,14 +38,21 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
         },
     )
 
-    assert command[:4] == ["sweagent", "run", "--config", str(config.resolve())]
+    assert command[:6] == [
+        "sweagent", "run", "--config", str(config.resolve()), "--config", str(override.resolve())
+    ]
     assert "openai/Qwen/Qwen2.5-Coder-7B-Instruct" in command
     assert "thought_action" in command
     assert command[command.index("--problem_statement.path") + 1] == str(tmp_path / "problem.txt")
     assert "--problem_statement.data_path" not in command
+    assert "--agent.history_processors" not in command
+    assert "[]" not in command
     assert "$CGR_DRAFT_API_KEY" not in command
     assert command[command.index("--agent.model.per_instance_call_limit") + 1] == "5"
     assert command[command.index("--agent.model.max_input_tokens") + 1] == "14336"
+    assert override.is_absolute()
+    assert override.is_file()
+    assert override.read_text(encoding="utf-8") == "agent:\n  history_processors: []\n"
 
 
 def test_adapter_applies_official_patch_and_reports_metadata(
@@ -82,6 +91,7 @@ def test_adapter_applies_official_patch_and_reports_metadata(
     assert payload["official_sweagent"]["tag"] == "v1.1.0"
     assert (workspace / "math_utils.py").read_text().endswith("return a + b\n")
     assert subprocess.run(["git", "diff", "--quiet"], cwd=workspace).returncode == 1
+    assert (tmp_path / ".cgr-sweagent-trajectories" / "cgr-local-qwen.yaml").is_file()
 
 
 def test_adapter_rejects_empty_or_forbidden_official_patch(tmp_path: Path) -> None:

@@ -36,6 +36,7 @@ def build_sweagent_command(
     problem_file: Path,
     output_dir: Path,
     config_path: Path,
+    local_override_path: Path,
     max_calls: int,
     max_steps: int,
     environment: dict[str, str] | None = None,
@@ -56,6 +57,8 @@ def build_sweagent_command(
         "run",
         "--config",
         str(config_path.resolve(strict=True)),
+        "--config",
+        str(local_override_path.resolve(strict=True)),
         "--output_dir",
         str(output_dir),
         "--env.repo.path",
@@ -84,8 +87,6 @@ def build_sweagent_command(
         str(max_output),
         "--agent.tools.parse_function.type",
         "thought_action",
-        "--agent.history_processors",
-        "[]",
     ]
 
 
@@ -167,12 +168,14 @@ def adapter_main(argv: list[str] | None = None) -> int:
         config_path = source_root / "config" / "default.yaml"
         output_dir = workspace.parent / ".cgr-sweagent-trajectories"
         output_dir.mkdir(parents=True, exist_ok=True)
+        local_override_path = write_local_model_override(output_dir)
         command = build_sweagent_command(
             executable=executable,
             workspace=workspace,
             problem_file=problem_file,
             output_dir=output_dir,
             config_path=config_path,
+            local_override_path=local_override_path,
             max_calls=args.max_calls,
             max_steps=args.max_steps,
         )
@@ -250,6 +253,14 @@ def _verify_applied_patch(workspace: Path) -> dict[str, Any]:
     if result.returncode:
         raise ValueError("Applied official SWE-agent patch fails git diff --check.")
     return {"command": command, "exit_code": 0, "stdout": result.stdout[-2000:], "stderr": result.stderr[-2000:]}
+
+
+def write_local_model_override(output_dir: Path) -> Path:
+    """Write the minimal v1.1.0 overlay disabling cache-control history handling."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = (output_dir / "cgr-local-qwen.yaml").resolve()
+    path.write_text("agent:\n  history_processors: []\n", encoding="utf-8")
+    return path
 
 
 def _find_patch(value: Any) -> str | None:

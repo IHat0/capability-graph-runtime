@@ -41,7 +41,9 @@ The adapter invokes `sweagent run` using the maintained `config/default.yaml`
 and minimal local-model overrides: LiteLLM `openai/<model>` naming, the vLLM
 base URL, `thought_action` parsing, zero monetary cost limits, the CGR model-call
 budget, deterministic temperature, and an input/output split derived from
-`CGR_DRAFT_MAX_MODEL_LEN`. The adapter validates and applies only the unified
+`CGR_DRAFT_MAX_MODEL_LEN`. It writes a second absolute YAML config containing only
+`agent.history_processors: []`, so cache-control-specific history handling is not
+enabled for local Qwen. The adapter validates and applies only the unified
 patch exported by SWE-agent to CGR's temporary workspace. CGR then retains patch
 validation, destructive-change rejection, prediction hashing, and official
 evaluation ownership.
