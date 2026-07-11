@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from cgr.swebench.cli import pilot_main
+from cgr.swebench.cli import _find_official_result, pilot_main
 from cgr.swebench.integration import (
     DATASET_NAME,
     DEFAULT_BUDGETS,
@@ -207,6 +207,48 @@ def test_official_harness_subprocess_shape() -> None:
     assert command[command.index("--dataset_name") + 1] == DATASET_NAME
     assert command[command.index("--predictions_path") + 1] == "gold"
     assert command[command.index("--max_workers") + 1] == "1"
+
+
+def test_gold_smoke_finds_stdout_report_and_explicit_resolved_instance(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "gold.cgr-gold-smoke.json"
+    report.write_text(json.dumps({"sympy__sympy-20590": {"resolved": True}}))
+
+    resolved, location = _find_official_result(
+        "cgr-gold-smoke",
+        "sympy__sympy-20590",
+        "Report written to gold.cgr-gold-smoke.json\nInstances resolved: 1\n",
+        tmp_path,
+    )
+
+    assert resolved is True
+    assert location == str(report.resolve())
+
+
+def test_gold_smoke_uses_conventional_path_and_explicit_unresolved_list(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "gold.cgr-gold-smoke.json"
+    report.write_text(json.dumps({"unresolved_ids": ["sympy__sympy-20590"]}))
+
+    resolved, location = _find_official_result(
+        "cgr-gold-smoke", "sympy__sympy-20590", search_root=tmp_path
+    )
+
+    assert resolved is False
+    assert location == str(report.resolve())
+
+
+def test_gold_smoke_does_not_infer_instance_status_from_aggregate_summary(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "gold.cgr-gold-smoke.json"
+    report.write_text(json.dumps({"resolved": 1, "unresolved": 0}))
+
+    assert _find_official_result(
+        "cgr-gold-smoke", "sympy__sympy-20590", search_root=tmp_path
+    ) == (None, None)
 
 
 def test_integrity_accepts_same_instances_and_model_for_all_modes(tmp_path: Path) -> None:

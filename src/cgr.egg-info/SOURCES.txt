@@ -138,6 +138,9 @@ src/cgr/shared/events/event.py
 src/cgr/shared/events/event_bus.py
 src/cgr/shared/events/event_handler.py
 src/cgr/shared/events/event_type.py
+src/cgr/swebench/__init__.py
+src/cgr/swebench/cli.py
+src/cgr/swebench/integration.py
 tests/test_benchmark.py
 tests/test_benchmark_report.py
 tests/test_booster.py
@@ -169,4 +172,5 @@ tests/test_repo_v0_benchmark.py
 tests/test_router_components.py
 tests/test_runtime_errors.py
 tests/test_runtime_health.py
+tests/test_swebench_integration.py
 tests/test_verification.py

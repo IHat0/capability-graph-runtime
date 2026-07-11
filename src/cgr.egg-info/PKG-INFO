@@ -13,3 +13,6 @@ Requires-Dist: pytest-asyncio; extra == "dev"
 Requires-Dist: ruff; extra == "dev"
 Requires-Dist: black; extra == "dev"
 Requires-Dist: mypy; extra == "dev"
+Provides-Extra: swebench
+Requires-Dist: datasets>=3.0; extra == "swebench"
+Requires-Dist: swebench>=3.0; extra == "swebench"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -108,7 +109,9 @@ def gold_smoke_main(argv: list[str] | None = None) -> int:
     process = subprocess.run(command, capture_output=True, text=True, check=False)
     output_root = args.result_root / "official-evaluation" / "gold-smoke"
     output_root.mkdir(parents=True, exist_ok=True)
-    resolved, result_path = _find_official_result(args.run_id, args.instance_id)
+    resolved, result_path = _find_official_result(
+        args.run_id, args.instance_id, process.stdout
+    )
     result = {
         "command": command,
         "exit_code": process.returncode,
@@ -406,22 +409,99 @@ def _write_final_summary(modes: list[str], instances: list[Any], result_root: Pa
     )
 
 
-def _find_official_result(run_id: str, instance_id: str) -> tuple[bool | None, str | None]:
-    roots = [Path("logs/run_evaluation") / run_id, Path(".")]
-    for root in roots:
-        if not root.exists():
+def _find_official_result(
+    run_id: str,
+    instance_id: str,
+    stdout: str = "",
+    search_root: Path | None = None,
+) -> tuple[bool | None, str | None]:
+    """Read an official report; never infer resolution from process status."""
+    root = (search_root or Path.cwd()).resolve()
+    for report in _official_report_candidates(run_id, stdout, root):
+        try:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
             continue
-        for report in root.rglob("report.json"):
-            if instance_id not in report.as_posix():
-                continue
-            try:
-                data = json.loads(report.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            resolved = data.get("resolved")
-            if isinstance(resolved, bool):
-                return resolved, str(report)
+        resolved = _official_instance_resolution(data, instance_id)
+        if resolved is not None:
+            return resolved, str(report.resolve())
     return None, None
+
+
+def _official_report_candidates(run_id: str, stdout: str, root: Path) -> list[Path]:
+    """Find paths reported by the harness and its conventional gold summary path."""
+    candidates: list[Path] = []
+    for match in re.finditer(r"(?im)^\s*Report written to\s+(.+?)\s*$", stdout):
+        raw_path = match.group(1).strip().strip("'\"")
+        path = Path(raw_path)
+        candidates.append(path if path.is_absolute() else root / path)
+    candidates.extend(
+        [
+            root / f"gold.{run_id}.json",
+            root / "logs" / "run_evaluation" / run_id / f"gold.{run_id}.json",
+        ]
+    )
+    log_root = root / "logs" / "run_evaluation" / run_id
+    if log_root.exists():
+        candidates.extend(log_root.rglob("report.json"))
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen and resolved.is_file():
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
+def _official_instance_resolution(data: Any, instance_id: str) -> bool | None:
+    """Return a status only when the official report explicitly names the instance."""
+    if not isinstance(data, dict):
+        return None
+    for container_key in ("instances", "results", "reports"):
+        container = data.get(container_key)
+        if isinstance(container, dict) and instance_id in container:
+            status = _resolved_flag(container[instance_id])
+            if status is not None:
+                return status
+        if isinstance(container, list):
+            for entry in container:
+                if isinstance(entry, dict) and entry.get("instance_id") == instance_id:
+                    status = _resolved_flag(entry)
+                    if status is not None:
+                        return status
+    if instance_id in data:
+        status = _resolved_flag(data[instance_id])
+        if status is not None:
+            return status
+    for key, value in data.items():
+        if key in {"resolved", "resolved_ids", "resolved_instances"} and _contains_id(
+            value, instance_id
+        ):
+            return True
+        if key in {"unresolved", "unresolved_ids", "unresolved_instances"} and _contains_id(
+            value, instance_id
+        ):
+            return False
+    return None
+
+
+def _resolved_flag(value: Any) -> bool | None:
+    if isinstance(value, dict) and isinstance(value.get("resolved"), bool):
+        return value["resolved"]
+    return None
+
+
+def _contains_id(value: Any, instance_id: str) -> bool:
+    if isinstance(value, list):
+        return any(
+            item == instance_id
+            or (isinstance(item, dict) and item.get("instance_id") == instance_id)
+            for item in value
+        )
+    if isinstance(value, dict):
+        return instance_id in value
+    return False
 
 
 if __name__ == "__main__":

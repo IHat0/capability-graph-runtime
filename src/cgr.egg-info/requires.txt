@@ -10,3 +10,7 @@ pytest-asyncio
 ruff
 black
 mypy
+
+[swebench]
+datasets>=3.0
+swebench>=3.0
