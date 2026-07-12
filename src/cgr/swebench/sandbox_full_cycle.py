@@ -257,7 +257,10 @@ agent:
 
 
 def _model_server(
-    log_path: Path, submission_path: str, actions: Sequence[str] | None = None
+    log_path: Path,
+    submission_path: str,
+    actions: Sequence[str] | None = None,
+    discussions: Sequence[str] | None = None,
 ) -> ThreadingHTTPServer:
     scripted_actions = list(actions) if actions is not None else [
         "pwd && git status --short && sed -n '1,80p' math_utils.py",
@@ -283,7 +286,12 @@ def _model_server(
             call = state["calls"]
             state["calls"] += 1
             action = scripted_actions[min(call, len(scripted_actions) - 1)]
-            response_text = f"DISCUSSION\nProceed with the next deterministic repository action.\n\n```bash\n{action}\n```"
+            discussion = (
+                discussions[min(call, len(discussions) - 1)]
+                if discussions
+                else "Proceed with the next deterministic repository action."
+            )
+            response_text = f"DISCUSSION\n{discussion}\n\n```bash\n{action}\n```"
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(

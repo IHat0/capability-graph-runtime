@@ -9,7 +9,12 @@ from cgr.quixbugs_diagnosis import (
     diagnose_attempt,
     normalize_action,
 )
-from cgr.quixbugs_pilot import DEFAULT_MANIFEST, _load_task, _select_attempt
+from cgr.quixbugs_pilot import (
+    DEFAULT_MANIFEST,
+    _load_task,
+    _select_attempt,
+    _trajectory_step_count,
+)
 
 
 FAILED_ACTION = (
@@ -73,6 +78,7 @@ def test_diagnosis_extracts_repetition_errors_paths_and_activity(tmp_path: Path)
         "missing_path_reference",
         "no_repository_change",
         "no_tests_run",
+        "unnecessary_git_commit",
         "budget_exhausted",
     ]
     assert diagnosis["repeated_actions"][0]["count"] == 2
@@ -177,6 +183,67 @@ def test_repository_activity_uses_actions_and_real_git_diff(tmp_path: Path) -> N
     assert diagnosis["patch_submitted"] is True
 
 
+def test_second_failure_diagnosis_is_grounded_in_inspection_and_pushes(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "./.git/cgr-origin.bundle"],
+        cwd=workspace,
+        check=True,
+    )
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    source_observation = """def gcd(a, b):
+    if b == 0:
+        return a
+    else:
+        return gcd(a % b, b)
+"""
+    push_error = "error: failed to push some refs to './.git/cgr-origin.bundle'"
+    steps = [
+        {
+            "action": "sed -n '1,100p' python_programs/gcd.py",
+            "observation": source_observation,
+            "response": "Inspect the source.",
+        },
+        {
+            "action": 'git commit -m "Fix gcd function"\ngit push origin main',
+            "observation": push_error,
+            "response": "The provided gcd function appears to be implementing the algorithm correctly.",
+        },
+        {"action": "git push origin main", "observation": push_error},
+        {"action": "git push origin main", "observation": push_error},
+    ]
+    trajectory = tmp_path / "second-failure.traj"
+    trajectory.write_text(json.dumps({"trajectory": steps}), encoding="utf-8")
+    result = {
+        "classification": "budget_exhausted",
+        "termination_reason": "exit_cost",
+        "patch_status": "no_patch",
+        "patch_size": 0,
+        "pre_agent_verifier_exit_code": 1,
+    }
+
+    diagnosis = diagnose_attempt(trajectory, workspace, result, task)
+    correction = build_corrective_message(diagnosis, task)
+
+    assert diagnosis["required_actions"] == {
+        "inspect_target": True,
+        "edit_target": False,
+        "run_focused_test": False,
+        "inspect_diff": False,
+        "submit_patch": False,
+    }
+    assert diagnosis["possible_incorrect_source_assessment"] is True
+    assert diagnosis["configured_origin"]["type"] == "portable_bundle"
+    assert diagnosis["push_actions"][1]["count"] == 2
+    assert diagnosis["push_actions"][1]["repeated_error"]["count"] == 2
+    assert {item["category"] for item in diagnosis["repeated_errors"]} == {
+        "git_push_failure"
+    }
+    assert "`return gcd(a % b, b)`" in correction
+    assert "Do not commit, push, or modify Git remotes" in correction
+    assert "return gcd(b, a % b)" not in correction
+
+
 def test_selector_prefers_verified_then_nonempty_patch() -> None:
     unresolved = {"classification": "budget_exhausted", "patch_size": 0}
     patched = {"classification": "tests_failed", "patch_size": 12, "verifier_exit_code": 1}
@@ -184,6 +251,31 @@ def test_selector_prefers_verified_then_nonempty_patch() -> None:
 
     assert _select_attempt([unresolved, patched]) == 1
     assert _select_attempt([resolved, patched]) == 0
+
+
+def test_selector_uses_inspection_then_later_attempt_for_equal_failures() -> None:
+    failures = [
+        {"classification": "budget_exhausted", "patch_size": 0},
+        {"classification": "budget_exhausted", "patch_size": 0},
+        {"classification": "budget_exhausted", "patch_size": 0},
+    ]
+    diagnoses = [
+        {"inspected_source_paths": []},
+        {"inspected_source_paths": ["python_programs/gcd.py"]},
+        {"inspected_source_paths": ["python_programs/gcd.py"]},
+    ]
+
+    assert _select_attempt(failures, diagnoses) == 2
+
+
+def test_model_request_count_can_be_derived_from_trajectory(tmp_path: Path) -> None:
+    trajectory = tmp_path / "count.traj"
+    trajectory.write_text(
+        json.dumps({"trajectory": [{"action": "one"}, {"action": "two"}]}),
+        encoding="utf-8",
+    )
+
+    assert _trajectory_step_count(trajectory) == 2
 
 
 def _write_trajectory(tmp_path: Path) -> Path:

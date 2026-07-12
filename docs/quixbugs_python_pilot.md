@@ -60,11 +60,15 @@ cgr-quixbugs-pilot \
   --deployment-type docker
 ```
 
-Baseline accepts exactly one attempt; CGR accepts one or two in this version.
-CGR results use `run-NNN/` with `run-result.json`, `diagnosis.json`,
-`corrective-message.md`, child `attempt-NNN/` directories, and `selected.patch`
-when available. Selection prefers a passing verifier, then a nonempty patch,
-then the most informative controlled failure. No LLM judges trajectory prose.
+Baseline accepts exactly one attempt; CGR accepts one to three in this version.
+The default remains two attempts, while `--max-attempts 3` enables two bounded
+diagnosis-and-repair transitions. CGR results use `run-NNN/` with
+`run-result.json`, numbered `diagnosis-NNN.json` and
+`corrective-message-NNN.md` transitions, child `attempt-NNN/` directories, and
+`selected.patch` when available. Each fresh attempt receives only the latest
+correction. Selection prefers a passing verifier, nonempty patch, tests,
+tracked changes, target inspection, then the later attempt. No LLM judges
+trajectory prose.
 
 ## External Model Run
 

@@ -47,7 +47,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--correction-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--deterministic-profile",
-        choices=("success", "failed", "recovery"),
+        choices=("success", "failed", "misassessment", "recovery"),
         default="success",
         help=argparse.SUPPRESS,
     )
@@ -60,8 +60,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         parser.error("--max-attempts must be at least 1")
     if args.mode == "baseline" and max_attempts != 1:
         parser.error("baseline mode supports exactly one attempt")
-    if args.mode == "cgr" and max_attempts > 2:
-        parser.error("cgr mode supports at most two attempts in this version")
+    if args.mode == "cgr" and max_attempts > 3:
+        parser.error("cgr mode supports at most three attempts in this version")
     if args.mode == "cgr":
         return _run_cgr(args, max_attempts)
 
@@ -134,6 +134,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 interaction_path,
                 cycle._git_bash_path(runtime_root / "model.patch"),
                 actions=actions,
+                discussions=_deterministic_discussions(args.deterministic_profile),
             )
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
@@ -241,7 +242,10 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 "model_identifier": model,
                 "model_requests": cycle._jsonl_count(interaction_path)
                 if interaction_path
-                else None,
+                else _trajectory_step_count(trajectory),
+                "model_requests_source": "model_interactions_jsonl"
+                if interaction_path
+                else "trajectory_steps",
                 "repository_root": str(workspace),
                 "initial_repository_clean": initial_status == "",
                 "pre_agent_verifier_exit_code": pre_verifier.returncode,
@@ -297,58 +301,92 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
         "infrastructure_status": "failed",
         "recovery_occurred": False,
         "top_level_exit_code": 1,
+        "diagnoses_generated": [],
+        "corrective_messages_generated": [],
+        "attempt_lineage": [],
     }
     try:
         task, _manifest = _load_task(args.manifest.absolute(), args.task_id)
         child_results: list[dict[str, Any]] = []
-        first = _launch_child_attempt(args, run, profile="failed")
-        child_results.append(first)
-        result["attempts_started"] = 1
-        result["attempts_completed"] = 1
-        result["child_artifact_paths"].append(first["artifact_directory"])
-        result["first_attempt_classification"] = first.get("classification")
-        if first.get("infrastructure_status") != "completed":
-            raise RuntimeError("First QuixBugs child attempt had an infrastructure failure.")
-
-        trajectory = _result_path(first.get("trajectory_path"))
-        workspace = Path(str(first["repository_root"]))
-        diagnosis = diagnose_attempt(trajectory, workspace, first)
-        diagnosis_path = run / "diagnosis.json"
-        diagnosis_path.write_text(json.dumps(diagnosis, indent=2), encoding="utf-8")
-        correction_path = run / "corrective-message.md"
-        correction_path.write_text(build_corrective_message(diagnosis, task), encoding="utf-8")
-        result["diagnosis_path"] = str(diagnosis_path)
-        result["corrective_message_path"] = str(correction_path)
-
-        if first.get("classification") != "resolved" and max_attempts >= 2:
-            second = _launch_child_attempt(
+        diagnoses: list[dict[str, Any] | None] = []
+        latest_correction: Path | None = None
+        profiles = ("failed", "misassessment", "recovery")
+        for attempt_index in range(1, max_attempts + 1):
+            child = _launch_child_attempt(
                 args,
                 run,
-                correction=correction_path,
-                profile="recovery",
+                correction=latest_correction,
+                profile=profiles[attempt_index - 1],
             )
-            child_results.append(second)
-            result["attempts_started"] = 2
-            result["attempts_completed"] = 2
-            result["child_artifact_paths"].append(second["artifact_directory"])
-            result["second_attempt_classification"] = second.get("classification")
-            result["recovery_occurred"] = True
-            if second.get("infrastructure_status") != "completed":
-                raise RuntimeError("Second QuixBugs child attempt had an infrastructure failure.")
+            child_results.append(child)
+            result["attempts_started"] = attempt_index
+            result["attempts_completed"] = attempt_index
+            result["child_artifact_paths"].append(child["artifact_directory"])
+            if child.get("infrastructure_status") != "completed":
+                raise RuntimeError(
+                    f"QuixBugs child attempt {attempt_index} had an infrastructure failure."
+                )
+            lineage = {
+                "attempt": f"attempt-{attempt_index:03d}",
+                "artifact_path": child["artifact_directory"],
+                "correction_used": str(latest_correction) if latest_correction else None,
+                "classification": child.get("classification"),
+                "model_requests": child.get("model_requests"),
+                "model_requests_source": child.get("model_requests_source"),
+            }
+            result["attempt_lineage"].append(lineage)
+            if child.get("classification") == "resolved":
+                diagnoses.append(None)
+                break
 
-        selected_index = _select_attempt(child_results)
+            diagnosis = diagnose_attempt(
+                _result_path(child.get("trajectory_path")),
+                Path(str(child["repository_root"])),
+                child,
+                task,
+            )
+            diagnoses.append(diagnosis)
+            diagnosis_path = run / f"diagnosis-{attempt_index:03d}.json"
+            diagnosis_path.write_text(json.dumps(diagnosis, indent=2), encoding="utf-8")
+            result["diagnoses_generated"].append(
+                {
+                    "attempt": f"attempt-{attempt_index:03d}",
+                    "path": str(diagnosis_path),
+                    "failure_types": diagnosis["failure_types"],
+                }
+            )
+            lineage["diagnosis_path"] = str(diagnosis_path)
+            if attempt_index < max_attempts:
+                correction_path = run / f"corrective-message-{attempt_index:03d}.md"
+                correction_path.write_text(
+                    build_corrective_message(diagnosis, task), encoding="utf-8"
+                )
+                result["corrective_messages_generated"].append(
+                    {
+                        "after_attempt": f"attempt-{attempt_index:03d}",
+                        "path": str(correction_path),
+                    }
+                )
+                latest_correction = correction_path
+
+        result["recovery_occurred"] = len(child_results) > 1
+        selected_index = _select_attempt(child_results, diagnoses)
         selected = child_results[selected_index]
         selected_name = f"attempt-{selected_index + 1:03d}"
+        rationale = _selection_rationale(selected, diagnoses[selected_index])
         result.update(
             {
                 "selected_attempt": selected_name,
                 "selected_attempt_path": selected["artifact_directory"],
+                "selection_rationale": rationale,
                 "final_classification": selected.get("classification"),
-                "final_patch_path": selected.get("submitted_patch_path"),
+                "final_patch_path": None,
                 "final_verifier_exit_code": selected.get("verifier_exit_code"),
                 "infrastructure_status": "completed",
                 "top_level_exit_code": 0,
                 "attempt_results": child_results,
+                "total_model_attempts": len(child_results),
+                "recovery_stage": selected_index + 1,
             }
         )
         patch_path = _result_path(selected.get("submitted_patch_path"))
@@ -445,23 +483,43 @@ def _allocate_run(root: Path) -> Path:
     raise RuntimeError("No available QuixBugs CGR run directory.")
 
 
-def _select_attempt(results: list[dict[str, Any]]) -> int:
-    def score(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int]:
+def _select_attempt(
+    results: list[dict[str, Any]], diagnoses: list[dict[str, Any] | None] | None = None
+) -> int:
+    evidence = diagnoses or [None] * len(results)
+
+    def score(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int, int, int, int]:
         index, result = item
+        diagnosis = evidence[index] or {}
         verified = int(
             result.get("classification") == "resolved"
             and result.get("verifier_exit_code") == 0
         )
         patch = int(bool(result.get("patch_size")))
-        informative = {
-            "tests_failed": 4,
-            "verifier_error": 3,
-            "budget_exhausted": 2,
-            "no_patch": 1,
-        }.get(str(result.get("classification")), 0)
-        return verified, patch, informative - index
+        tests = int(bool(diagnosis.get("tests_run") or result.get("verifier_status") == "executed"))
+        changed = int(bool(diagnosis.get("tracked_change_observed") or result.get("patch_size")))
+        inspected = int(bool(diagnosis.get("inspected_source_paths")))
+        return verified, patch, tests, changed, inspected, index
 
     return max(enumerate(results), key=score)[0]
+
+
+def _selection_rationale(
+    result: dict[str, Any], diagnosis: dict[str, Any] | None
+) -> list[str]:
+    evidence = diagnosis or {}
+    rationale = []
+    if result.get("classification") == "resolved" and result.get("verifier_exit_code") == 0:
+        rationale.append("verifier_passed")
+    if result.get("patch_size"):
+        rationale.append("nonempty_patch")
+    if evidence.get("tests_run") or result.get("verifier_status") == "executed":
+        rationale.append("tests_executed")
+    if evidence.get("tracked_change_observed") or result.get("patch_size"):
+        rationale.append("tracked_change_observed")
+    if evidence.get("inspected_source_paths"):
+        rationale.append("target_inspection_observed")
+    return rationale or ["later_attempt_tiebreak"]
 
 
 def _result_path(value: Any) -> Path | None:
@@ -587,6 +645,16 @@ def _deterministic_actions(
             'git commit -m "Fix gcd function to return the greatest common divisor" 2>&1'
         )
         return [failed]
+    if profile == "misassessment":
+        return [
+            f"sed -n '1,100p' {shlex_quote(source)}",
+            (
+                f"git add {shlex_quote(source)} 2>&1\n"
+                'git commit -m "Fix gcd function" 2>&1\n'
+                "git push origin main 2>&1"
+            ),
+            "git push origin main 2>&1",
+        ]
     return [
         f"sed -n '1,100p' {shlex_quote(source)} && sed -n '1,120p' {shlex_quote(test)}",
         f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
@@ -594,6 +662,24 @@ def _deterministic_actions(
         f"git diff -- {shlex_quote(source)}",
         f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\\n'",
     ]
+
+
+def _deterministic_discussions(profile: str) -> list[str] | None:
+    if profile != "misassessment":
+        return None
+    return [
+        "Inspect the requested source before deciding what to change.",
+        "The provided gcd function appears to be implementing the Euclidean algorithm correctly.",
+        "Retry the publication command.",
+    ]
+
+
+def _trajectory_step_count(path: Path | None) -> int | None:
+    if path is None or not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    steps = payload.get("trajectory") if isinstance(payload, dict) else None
+    return len(steps) if isinstance(steps, list) else None
 
 
 def shlex_quote(value: str) -> str:
