@@ -22,8 +22,12 @@ def test_overlay_has_complete_qwen_bash_contract() -> None:
     assert "verify" in LOCAL_QWEN_OVERLAY
     assert "submit only after a successful diff" in LOCAL_QWEN_OVERLAY
     assert "history_processors: []" in LOCAL_QWEN_OVERLAY
+    assert "type: strict_thought_action" in LOCAL_QWEN_OVERLAY
     assert "edit_anthropic" not in LOCAL_QWEN_OVERLAY
     assert "function_calling" not in LOCAL_QWEN_OVERLAY
+    assert LOCAL_QWEN_OVERLAY.index("path: tools/registry") < LOCAL_QWEN_OVERLAY.index(
+        "path: tools/review_on_submit_m"
+    )
 
 
 def test_official_sweagent_install_is_pinned_to_the_upstream_commit() -> None:
@@ -35,6 +39,21 @@ def test_official_sweagent_install_is_pinned_to_the_upstream_commit() -> None:
     assert 'fetch --quiet origin "$commit"' in smoke_script
     assert 'python -m pip install --quiet -e "$source_root"' in smoke_script
     assert commit in smoke_script
+    assert 'apply --check "$patch_path"' in smoke_script
+    assert "sweagent_patch_sha256" in smoke_script
+    assert "5914d306f77feaf5e1252de96b14357822127f898b574f93e2468cab3c3f4a28" in smoke_script
+
+
+def test_maintained_strict_parser_patch_registers_the_configured_type() -> None:
+    patch = Path("patches/sweagent-v1.1.0-strict-thought-action.patch").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'class StrictThoughtActionParser(ThoughtActionParser, BaseModel):' in patch
+    assert 'Literal["strict_thought_action"]' in patch
+    assert "| StrictThoughtActionParser" in patch
+    assert "if len(blocks) != 1:" in patch
+    assert 'block.group("language") != "bash"' in patch
 
 
 @pytest.mark.parametrize(
@@ -62,6 +81,15 @@ def test_strict_contract_rejects_captured_and_synthetic_qwen_failures() -> None:
     assert extract_v1_1_thought_action(responses[0]["response"]).startswith("# test_edge_cases.py")
     assert extract_v1_1_thought_action(responses[1]["response"]).startswith("sed -i")
     assert extract_v1_1_thought_action(responses[2]["response"]).startswith("from math_utils")
+
+
+def test_real_step_zero_response_selects_submit_upstream_but_fails_strict_contract() -> None:
+    fixture = Path("tests/fixtures/sweagent_step0_raw_response.json")
+    response = json.loads(fixture.read_text(encoding="utf-8"))["response"]
+
+    assert extract_v1_1_thought_action(response) == "submit"
+    with pytest.raises(ValueError, match="exactly one Bash fenced block"):
+        validate_qwen_action_contract(response)
 
 
 def test_simulated_bash_trajectory_produces_focused_patch(tmp_path: Path) -> None:

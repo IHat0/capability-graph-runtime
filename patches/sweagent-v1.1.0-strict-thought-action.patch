@@ -1,0 +1,51 @@
+diff --git a/sweagent/tools/parsing.py b/sweagent/tools/parsing.py
+index 6a657055..347ab95e 100644
+--- a/sweagent/tools/parsing.py
++++ b/sweagent/tools/parsing.py
+@@ -165,4 +165,38 @@ class ThoughtActionParser(AbstractParseFunction, BaseModel):
+         raise FormatError(msg)
+ 
+ 
++class StrictThoughtActionParser(ThoughtActionParser, BaseModel):
++    """Accept exactly one explicitly labelled Bash action block."""
++
++    error_message: str = dedent("""\
++    Your output was not formatted correctly. Return one brief discussion followed by
++    exactly one ```bash fenced block containing executable Bash. The fenced block is
++    executed by Bash; do not use multiple blocks, another fence language, or raw
++    Python source as the action.
++    """)
++
++    type: Literal["strict_thought_action"] = "strict_thought_action"
++    """Type for (de)serialization. Do not change."""
++
++    def __call__(self, model_response: dict, commands: list[Command], strict=False):
++        message = model_response["message"]
++        pattern = re.compile(
++            r"^```(?P<language>\S*)\s*\n(?P<action>.*?)^```\s*$",
++            re.MULTILINE | re.DOTALL,
++        )
++        blocks = list(pattern.finditer(message))
++        if len(blocks) != 1:
++            raise FormatError("Expected exactly one fenced Bash action block.")
++        block = blocks[0]
++        if block.group("language") != "bash":
++            raise FormatError("The single action block must be explicitly labelled bash.")
++        action = block.group("action").strip()
++        if not action:
++            raise FormatError("The Bash action block is empty.")
++        if re.search(r"^\s*(?:from\s+\S+\s+import\s+|import\s+|def\s+|class\s+|assert\s+)", action, re.MULTILINE):
++            raise FormatError("Raw Python source is not a Bash action.")
++        thought = message[: block.start()] + message[block.end() :]
++        return thought, action
++
++
+ class XMLThoughtActionParser(AbstractParseFunction, BaseModel):
+@@ -530,6 +564,7 @@ class JsonParser(AbstractParseFunction, BaseModel):
+ ParseFunction = (
+     ActionParser
+     | ThoughtActionParser
++    | StrictThoughtActionParser
+     | ActionOnlyParser
+     | XMLThoughtActionParser
+     | XMLFunctionCallingParser

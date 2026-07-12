@@ -67,10 +67,11 @@ LOCAL_QWEN_OVERLAY = """agent:
       {{bash_stderr}}
   tools:
     bundles:
+      - path: tools/registry
       - path: tools/review_on_submit_m
     enable_bash_tool: true
     parse_function:
-      type: thought_action
+      type: strict_thought_action
       error_message: |-
         Your response violated the required action format. The extracted fenced block is executed by Bash. Return exactly brief DISCUSSION followed by exactly one ```bash fenced block with one executable Bash command or script. Do not use multiple fenced blocks, Python fences, raw Python source, Markdown examples, tutorial-style prose, or native tool-call syntax.
 """
@@ -132,8 +133,6 @@ def build_sweagent_command(
         str(max_input),
         "--agent.model.max_output_tokens",
         str(max_output),
-        "--agent.tools.parse_function.type",
-        "thought_action",
     ]
 
 
@@ -247,6 +246,8 @@ def adapter_main(argv: list[str] | None = None) -> int:
                 "upstream": SWE_AGENT_UPSTREAM,
                 "tag": SWE_AGENT_TAG,
                 "commit": SWE_AGENT_COMMIT,
+                "source_patch_sha256": os.getenv("CGR_SWE_AGENT_PATCH_SHA256", ""),
+                "source_patch_applied": os.getenv("CGR_SWE_AGENT_PATCH_APPLIED") == "1",
                 "trajectory_artifact": str(artifact),
             },
             "final_patch_size": len(patch.encode()),

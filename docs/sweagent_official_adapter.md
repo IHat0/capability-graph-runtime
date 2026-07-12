@@ -18,6 +18,8 @@ git clone https://github.com/SWE-agent/SWE-agent.git .swe-agent-src
 git -C .swe-agent-src fetch origin 0f3acafacabc0def8cc76b4e48acb4b6cf302cb9
 git -C .swe-agent-src checkout --detach 0f3acafacabc0def8cc76b4e48acb4b6cf302cb9
 test "$(git -C .swe-agent-src rev-parse HEAD)" = 0f3acafacabc0def8cc76b4e48acb4b6cf302cb9
+git -C .swe-agent-src apply --check "$PWD/patches/sweagent-v1.1.0-strict-thought-action.patch"
+git -C .swe-agent-src apply "$PWD/patches/sweagent-v1.1.0-strict-thought-action.patch"
 python -m pip install -e "$PWD/.swe-agent-src"
 ```
 
@@ -48,7 +50,10 @@ budget, deterministic temperature, and an input/output split derived from
 `CGR_DRAFT_MAX_MODEL_LEN`. It writes a second absolute YAML config with
 `agent.history_processors: []` and a strict one-Bash-fence contract for local Qwen,
 so cache-control-specific history handling and Anthropic-native editor instructions
-are not enabled. The adapter validates and applies only the unified
+are not enabled. The pinned checkout receives the maintained
+`patches/sweagent-v1.1.0-strict-thought-action.patch`, which registers
+`strict_thought_action` and rejects invalid responses through SWE-agent's normal
+format-error/requery path. The adapter validates and applies only the unified
 patch exported by SWE-agent to CGR's temporary workspace. CGR then retains patch
 validation, destructive-change rejection, prediction hashing, and official
 evaluation ownership.

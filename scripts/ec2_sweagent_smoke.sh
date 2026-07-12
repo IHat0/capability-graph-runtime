@@ -23,6 +23,28 @@ git -C "$source_root" checkout --quiet --detach "$commit"
 [[ -f "$source_root/sweagent/__init__.py" ]] || { echo "Missing SWE-agent module source." >&2; exit 2; }
 [[ -f "$source_root/config/default.yaml" ]] || { echo "Missing SWE-agent default config." >&2; exit 2; }
 [[ -d "$source_root/tools" ]] || { echo "Missing SWE-agent tools directory." >&2; exit 2; }
+patch_path="$PWD/patches/sweagent-v1.1.0-strict-thought-action.patch"
+[[ -f "$patch_path" ]] || { echo "Missing maintained strict parser patch." >&2; exit 2; }
+patch_sha256="$(sha256sum "$patch_path" | awk '{print $1}')"
+expected_patch_sha256='5914d306f77feaf5e1252de96b14357822127f898b574f93e2468cab3c3f4a28'
+[[ "$patch_sha256" == "$expected_patch_sha256" ]] || {
+  echo "Strict parser patch SHA-256 does not match the pinned expectation." >&2
+  exit 2
+}
+git -C "$source_root" diff --quiet || { echo "Pinned SWE-agent source is not clean." >&2; exit 2; }
+git -C "$source_root" apply --check "$patch_path"
+git -C "$source_root" apply "$patch_path"
+grep -q 'class StrictThoughtActionParser' "$source_root/sweagent/tools/parsing.py" || {
+  echo "Strict parser patch did not modify the expected source." >&2
+  exit 2
+}
+grep -q 'strict_thought_action' "$source_root/sweagent/tools/parsing.py" || {
+  echo "Strict parser registration is missing." >&2
+  exit 2
+}
+printf 'sweagent_upstream_commit=%s\nsweagent_patch_sha256=%s\n' "$commit" "$patch_sha256"
+export CGR_SWE_AGENT_PATCH_SHA256="$patch_sha256"
+export CGR_SWE_AGENT_PATCH_APPLIED=1
 python -m pip install --quiet -e "$source_root"
 python -m pip install --quiet -e .
 

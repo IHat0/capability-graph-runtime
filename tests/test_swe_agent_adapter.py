@@ -42,7 +42,7 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
         "sweagent", "run", "--config", str(config.resolve()), "--config", str(override.resolve())
     ]
     assert "openai/Qwen/Qwen2.5-Coder-7B-Instruct" in command
-    assert "thought_action" in command
+    assert "--agent.tools.parse_function.type" not in command
     assert command[command.index("--problem_statement.path") + 1] == str(tmp_path / "problem.txt")
     assert "--problem_statement.data_path" not in command
     assert "--agent.history_processors" not in command
@@ -57,7 +57,7 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     assert "Every response MUST contain exactly this structure" in overlay
     assert "Never emit more than one fenced block." in overlay
     assert "executed by Bash" in overlay
-    assert "type: thought_action" in overlay
+    assert "type: strict_thought_action" in overlay
     assert "edit_anthropic" not in overlay
     assert "function_calling" not in overlay
     assert "cache_control" not in overlay
