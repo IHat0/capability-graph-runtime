@@ -65,6 +65,7 @@ class ModelEndpoint:
 @dataclass(frozen=True)
 class EvaluatorRuntime:
     python: str
+    reported_python: str
     version: str
     package_path: str
     harness_path: str
@@ -208,6 +209,8 @@ def generate_attempt(
         "upstream_commit": source_identity["upstream_commit"],
         "parser_patch_sha256": source_identity["parser_patch_sha256"],
         "imported_sweagent_path": source_identity["imported_sweagent_path"],
+        "configured_sweagent_python": source_identity["configured_sweagent_python"],
+        "reported_sweagent_python": source_identity["reported_sweagent_python"],
         "infrastructure_status": "failed",
         "prediction_status": None,
         "prediction_path": None,
@@ -346,6 +349,7 @@ def evaluate_attempt(
         "base_commit": instance.base_commit,
         "manifest_hash": manifest_hash,
         "evaluator_python": evaluator.python,
+        "evaluator_reported_python": evaluator.reported_python,
         "evaluator_version": evaluator.version,
         "evaluator_package_path": evaluator.package_path,
         "evaluator_harness_path": evaluator.harness_path,
@@ -445,13 +449,25 @@ def verify_pinned_sweagent(source: Path, executable: str) -> dict[str, str]:
     if "class StrictThoughtActionParser" not in parsing or '"strict_thought_action"' not in parsing:
         raise ValueError("strict_thought_action is absent from pinned SWE-agent source.")
     python = _sweagent_python(executable)
-    imported = _run_checked(
+    identity_output = _run_checked(
         [
             python,
             "-c",
-            "import pathlib,sweagent; print(pathlib.Path(sweagent.__file__).resolve())",
+            (
+                "import json,pathlib,sys,sweagent;"
+                "print(json.dumps({'reported_python':sys.executable,"
+                "'package_path':str(pathlib.Path(sweagent.__file__).resolve())}))"
+            ),
         ]
     ).stdout.strip()
+    try:
+        python_identity = json.loads(identity_output)
+        reported_python = python_identity["reported_python"]
+        imported = python_identity["package_path"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError("SWE-agent Python returned malformed identity output.") from exc
+    if not isinstance(reported_python, str) or not isinstance(imported, str):
+        raise ValueError("SWE-agent Python returned incomplete identity output.")
     imported_path = Path(imported).resolve(strict=True)
     if source not in imported_path.parents:
         raise ValueError("Imported sweagent package resolves outside .swe-agent-src.")
@@ -459,6 +475,8 @@ def verify_pinned_sweagent(source: Path, executable: str) -> dict[str, str]:
         "upstream_commit": commit,
         "parser_patch_sha256": patch_sha,
         "imported_sweagent_path": str(imported_path),
+        "configured_sweagent_python": python,
+        "reported_sweagent_python": reported_python,
     }
 
 
@@ -469,18 +487,19 @@ def verify_evaluator_runtime() -> EvaluatorRuntime:
             "CGR_SWEBENCH_EVALUATOR_PYTHON is required for official evaluation. "
             "Run scripts/setup_swebench_evaluator.sh first."
         )
-    python = Path(configured).expanduser()
-    if not python.is_file() or not os.access(python, os.X_OK):
+    python = _absolute_interpreter_path(configured)
+    if not Path(python).is_file() or not os.access(python, os.X_OK):
         raise ValueError(
             "CGR_SWEBENCH_EVALUATOR_PYTHON is not an executable file: " + str(python)
         )
     probe = subprocess.run(
         [
-            str(python.resolve()),
+            python,
             "-c",
             (
-                "import importlib.metadata,json,pathlib,swebench,swebench.harness;"
+                "import importlib.metadata,json,pathlib,sys,swebench,swebench.harness;"
                 "print(json.dumps({"
+                "'reported_python':sys.executable,"
                 "'version':importlib.metadata.version('swebench'),"
                 "'package_path':str(pathlib.Path(swebench.__file__).resolve()),"
                 "'harness_path':str(pathlib.Path(swebench.harness.__file__).resolve())}))"
@@ -508,10 +527,16 @@ def verify_evaluator_runtime() -> EvaluatorRuntime:
         )
     package_path = identity.get("package_path")
     harness_path = identity.get("harness_path")
-    if not isinstance(package_path, str) or not isinstance(harness_path, str):
+    reported_python = identity.get("reported_python")
+    if (
+        not isinstance(package_path, str)
+        or not isinstance(harness_path, str)
+        or not isinstance(reported_python, str)
+    ):
         raise ValueError("Evaluator Python returned incomplete package identity output.")
     return EvaluatorRuntime(
-        python=str(python.resolve()),
+        python=python,
+        reported_python=reported_python,
         version=SWEBENCH_EVALUATOR_VERSION,
         package_path=package_path,
         harness_path=harness_path,
@@ -714,13 +739,18 @@ def _sweagent_executable(configured: str | None) -> str:
 def _sweagent_python(executable: str) -> str:
     configured = os.getenv("CGR_SWE_AGENT_PYTHON")
     if configured:
-        return configured
+        return _absolute_interpreter_path(configured)
     path = Path(executable)
     if path.is_absolute():
         candidate = path.parent / ("python.exe" if os.name == "nt" else "python")
         if candidate.is_file():
-            return str(candidate)
+            return _absolute_interpreter_path(str(candidate))
     return sys.executable
+
+
+def _absolute_interpreter_path(configured: str) -> str:
+    """Make an interpreter path absolute without dereferencing virtualenv symlinks."""
+    return os.path.abspath(os.path.expanduser(configured))
 
 
 def _configured_secrets() -> list[str]:

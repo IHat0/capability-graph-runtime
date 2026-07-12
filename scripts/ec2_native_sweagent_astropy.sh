@@ -36,9 +36,9 @@ git -C "$CGR_SWE_AGENT_SOURCE" apply --reverse --check \
 
 sweagent_python="${CGR_SWE_AGENT_PYTHON:-$(dirname "$CGR_SWE_AGENT_EXECUTABLE")/python}"
 export CGR_SWE_AGENT_PYTHON="$sweagent_python"
-sweagent_identity="$("$sweagent_python" -c 'import os, pathlib, sweagent; source = pathlib.Path(os.environ["CGR_SWE_AGENT_SOURCE"]).resolve(); imported = pathlib.Path(sweagent.__file__).resolve(); assert source in imported.parents, imported; print(imported)')"
+sweagent_identity="$("$sweagent_python" -c 'import os, pathlib, sys, sweagent; source = pathlib.Path(os.environ["CGR_SWE_AGENT_SOURCE"]).resolve(); imported = pathlib.Path(sweagent.__file__).resolve(); assert source in imported.parents, imported; print(f"{sys.executable}|{imported}")')"
 "$sweagent_python" -c 'from sweagent.tools.parsing import StrictThoughtActionParser; assert StrictThoughtActionParser().type == "strict_thought_action"'
-evaluator_identity="$("$CGR_SWEBENCH_EVALUATOR_PYTHON" -c 'import importlib.metadata,pathlib,swebench,swebench.harness; version=importlib.metadata.version("swebench"); assert version == "3.0.17", version; print(f"{pathlib.Path(swebench.__file__).resolve()}|{pathlib.Path(swebench.harness.__file__).resolve()}|{version}")')"
+evaluator_identity="$("$CGR_SWEBENCH_EVALUATOR_PYTHON" -c 'import importlib.metadata,pathlib,sys,swebench,swebench.harness; version=importlib.metadata.version("swebench"); assert version == "3.0.17", version; print(f"{sys.executable}|{pathlib.Path(swebench.__file__).resolve()}|{pathlib.Path(swebench.harness.__file__).resolve()}|{version}")')"
 
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $CGR_DRAFT_API_KEY" \
@@ -68,11 +68,12 @@ command=(
 printf 'branch=%s\ncommit=%s\n' "$expected_branch" "$CGR_NATIVE_EXPECTED_CGR_COMMIT"
 printf 'sweagent_upstream_commit=%s\nparser_patch_sha256=%s\n' \
   "$upstream_commit" "$patch_sha256"
-printf 'sweagent_python=%s\nsweagent_package=%s\n' \
-  "$sweagent_python" "$sweagent_identity"
-IFS='|' read -r evaluator_package evaluator_harness evaluator_version <<<"$evaluator_identity"
-printf 'evaluator_python=%s\nswebench_package=%s\nswebench_harness=%s\nswebench_version=%s\n' \
-  "$CGR_SWEBENCH_EVALUATOR_PYTHON" "$evaluator_package" "$evaluator_harness" "$evaluator_version"
+IFS='|' read -r reported_sweagent_python sweagent_package <<<"$sweagent_identity"
+printf 'configured_sweagent_python=%s\nreported_sweagent_python=%s\nsweagent_package=%s\n' \
+  "$sweagent_python" "$reported_sweagent_python" "$sweagent_package"
+IFS='|' read -r reported_evaluator_python evaluator_package evaluator_harness evaluator_version <<<"$evaluator_identity"
+printf 'configured_evaluator_python=%s\nreported_evaluator_python=%s\nswebench_package=%s\nswebench_harness=%s\nswebench_version=%s\n' \
+  "$CGR_SWEBENCH_EVALUATOR_PYTHON" "$reported_evaluator_python" "$evaluator_package" "$evaluator_harness" "$evaluator_version"
 printf 'model_endpoint=%s\nmodel_identifier=%s\n' \
   "$CGR_DRAFT_BASE_URL" "$CGR_DRAFT_MODEL"
 printf 'command='
@@ -83,7 +84,6 @@ run_log="$result_root/baseline-${instance_id}-runner.log"
 set +e
 "${command[@]}" 2>&1 | tee "$run_log"
 benchmark_status=${PIPESTATUS[0]}
-set -e
 
 attempt_root="$result_root/baseline/$instance_id"
 attempt="$(find "$attempt_root" -mindepth 1 -maxdepth 1 -type d -name 'attempt-*' -print 2>/dev/null | sort | tail -n 1 || true)"

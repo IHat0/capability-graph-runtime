@@ -1,6 +1,9 @@
 import hashlib
 import json
+import os
 import subprocess
+import sys
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +47,8 @@ def _identity(source: Path) -> dict[str, str]:
         "upstream_commit": native.SWE_AGENT_COMMIT,
         "parser_patch_sha256": native.SWE_AGENT_PATCH_SHA256,
         "imported_sweagent_path": str(source / "sweagent" / "__init__.py"),
+        "configured_sweagent_python": sys.executable,
+        "reported_sweagent_python": sys.executable,
     }
 
 
@@ -51,7 +56,8 @@ def _evaluator(tmp_path: Path) -> native.EvaluatorRuntime:
     python = tmp_path / "evaluator-python"
     python.write_text("", encoding="utf-8")
     return native.EvaluatorRuntime(
-        python=str(python.resolve()),
+        python=os.path.abspath(python),
+        reported_python=os.path.abspath(python),
         version=native.SWEBENCH_EVALUATOR_VERSION,
         package_path=str(tmp_path / "site-packages" / "swebench" / "__init__.py"),
         harness_path=str(tmp_path / "site-packages" / "swebench" / "harness" / "__init__.py"),
@@ -179,9 +185,21 @@ def test_pinned_sweagent_verification_checks_commit_patch_and_import_path(
     executable.write_text("", encoding="utf-8")
     python = executable.parent / "python"
     python.write_text("", encoding="utf-8")
+    monkeypatch.setenv("CGR_SWE_AGENT_PYTHON", str(python))
     monkeypatch.setattr(native, "SWE_AGENT_PATCH", patch)
     monkeypatch.setattr(native, "SWE_AGENT_PATCH_SHA256", patch_hash)
-    outputs = iter([native.SWE_AGENT_COMMIT + "\n", str(source / "sweagent" / "__init__.py") + "\n"])
+    outputs = iter(
+        [
+            native.SWE_AGENT_COMMIT + "\n",
+            json.dumps(
+                {
+                    "reported_python": str(python),
+                    "package_path": str(source / "sweagent" / "__init__.py"),
+                }
+            )
+            + "\n",
+        ]
+    )
     monkeypatch.setattr(
         native,
         "_run_checked",
@@ -198,6 +216,8 @@ def test_pinned_sweagent_verification_checks_commit_patch_and_import_path(
     assert identity["upstream_commit"] == native.SWE_AGENT_COMMIT
     assert identity["parser_patch_sha256"] == patch_hash
     assert Path(identity["imported_sweagent_path"]).is_relative_to(source)
+    assert identity["configured_sweagent_python"] == os.path.abspath(python)
+    assert identity["reported_sweagent_python"] == str(python)
 
 
 def test_pinned_sweagent_verification_rejects_wrong_commit(
@@ -226,7 +246,18 @@ def test_pinned_sweagent_verification_rejects_import_outside_source(
     patch.write_text("patch", encoding="utf-8")
     monkeypatch.setattr(native, "SWE_AGENT_PATCH", patch)
     monkeypatch.setattr(native, "SWE_AGENT_PATCH_SHA256", hashlib.sha256(b"patch").hexdigest())
-    outputs = iter([native.SWE_AGENT_COMMIT + "\n", str(tmp_path / "site-packages/sweagent.py")])
+    outside = tmp_path / "site-packages" / "sweagent.py"
+    outputs = iter(
+        [
+            native.SWE_AGENT_COMMIT + "\n",
+            json.dumps(
+                {
+                    "reported_python": sys.executable,
+                    "package_path": str(outside),
+                }
+            ),
+        ]
+    )
     monkeypatch.setattr(
         native,
         "_run_checked",
@@ -237,7 +268,6 @@ def test_pinned_sweagent_verification_rejects_import_outside_source(
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
     )
-    outside = tmp_path / "site-packages" / "sweagent.py"
     outside.parent.mkdir()
     outside.write_text("", encoding="utf-8")
 
@@ -522,6 +552,7 @@ def test_evaluator_version_must_match_frozen_configuration(
             json.dumps(
                 {
                     "version": "4.1.0",
+                    "reported_python": "/venv/bin/python",
                     "package_path": "/venv/swebench/__init__.py",
                     "harness_path": "/venv/swebench/harness/__init__.py",
                 }
@@ -532,6 +563,70 @@ def test_evaluator_version_must_match_frozen_configuration(
 
     with pytest.raises(ValueError, match="expected 3.0.17, found 4.1.0"):
         native.verify_evaluator_runtime()
+
+
+def test_interpreter_normalization_is_absolute_without_symlink_dereference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "system-python"
+    target.write_text("", encoding="utf-8")
+    link = tmp_path / "venv-python"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("Symbolic links are unavailable on this platform.")
+
+    monkeypatch.chdir(tmp_path)
+    normalized = native._absolute_interpreter_path("venv-python")
+
+    assert normalized == os.path.abspath("venv-python")
+    assert normalized != str(link.resolve())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux virtualenv symlink regression")
+def test_evaluator_runtime_preserves_real_virtualenv_interpreter_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = tmp_path / "evaluator-venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    configured_python = environment / "bin" / "python"
+    assert configured_python.is_symlink()
+
+    site_packages_result = subprocess.run(
+        [str(configured_python), "-c", "import site; print(site.getsitepackages()[0])"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    site_packages = Path(site_packages_result.stdout.strip())
+    (site_packages / "venv_only_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (site_packages / "swebench" / "harness").mkdir(parents=True)
+    (site_packages / "swebench" / "__init__.py").write_text("", encoding="utf-8")
+    (site_packages / "swebench" / "harness" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    metadata = site_packages / "swebench-3.0.17.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: swebench\nVersion: 3.0.17\n", encoding="utf-8"
+    )
+
+    configured_import = subprocess.run(
+        [str(configured_python), "-c", "import venv_only_probe"], check=False
+    )
+    dereferenced_import = subprocess.run(
+        [str(configured_python.resolve()), "-c", "import venv_only_probe"], check=False
+    )
+    assert configured_import.returncode == 0
+    assert dereferenced_import.returncode != 0
+
+    monkeypatch.setenv("CGR_SWEBENCH_EVALUATOR_PYTHON", str(configured_python))
+    runtime = native.verify_evaluator_runtime()
+
+    assert runtime.python == os.path.abspath(configured_python)
+    assert runtime.python != str(configured_python.resolve())
+    assert runtime.reported_python
+    assert runtime.version == "3.0.17"
 
 
 def _mock_native_main_generation(
