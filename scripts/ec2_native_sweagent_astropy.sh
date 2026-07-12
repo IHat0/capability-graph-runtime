@@ -20,6 +20,11 @@ result_root="$PWD/benchmark-results/swebench-native-pilot-v1"
 [[ "$CGR_DRAFT_MAX_MODEL_LEN" == "16384" ]]
 
 source .venv-sweagent/bin/activate
+export CGR_SWEBENCH_EVALUATOR_PYTHON="$PWD/.venv-swebench-eval/bin/python"
+[[ -x "$CGR_SWEBENCH_EVALUATOR_PYTHON" ]] || {
+  echo "Missing dedicated evaluator runtime. Run scripts/setup_swebench_evaluator.sh." >&2
+  exit 2
+}
 
 [[ "$(git branch --show-current)" == "$expected_branch" ]]
 [[ "$(git rev-parse HEAD)" == "$CGR_NATIVE_EXPECTED_CGR_COMMIT" ]]
@@ -30,15 +35,17 @@ git -C "$CGR_SWE_AGENT_SOURCE" apply --reverse --check \
   "$PWD/patches/sweagent-v1.1.0-strict-thought-action.patch"
 
 sweagent_python="${CGR_SWE_AGENT_PYTHON:-$(dirname "$CGR_SWE_AGENT_EXECUTABLE")/python}"
-"$sweagent_python" -c 'import os, pathlib, sweagent; source = pathlib.Path(os.environ["CGR_SWE_AGENT_SOURCE"]).resolve(); imported = pathlib.Path(sweagent.__file__).resolve(); assert source in imported.parents, imported'
+export CGR_SWE_AGENT_PYTHON="$sweagent_python"
+sweagent_identity="$("$sweagent_python" -c 'import os, pathlib, sweagent; source = pathlib.Path(os.environ["CGR_SWE_AGENT_SOURCE"]).resolve(); imported = pathlib.Path(sweagent.__file__).resolve(); assert source in imported.parents, imported; print(imported)')"
 "$sweagent_python" -c 'from sweagent.tools.parsing import StrictThoughtActionParser; assert StrictThoughtActionParser().type == "strict_thought_action"'
+evaluator_identity="$("$CGR_SWEBENCH_EVALUATOR_PYTHON" -c 'import importlib.metadata,pathlib,swebench,swebench.harness; version=importlib.metadata.version("swebench"); assert version == "3.0.17", version; print(f"{pathlib.Path(swebench.__file__).resolve()}|{pathlib.Path(swebench.harness.__file__).resolve()}|{version}")')"
 
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $CGR_DRAFT_API_KEY" \
   "$CGR_DRAFT_BASE_URL/models" >/dev/null
 cgr-swebench-integrity-check --manifest "$manifest" \
   --result-root benchmark-results/swebench-verified-pilot-v1 >/dev/null
-python -c 'import datasets, swebench'
+"$CGR_SWEBENCH_EVALUATOR_PYTHON" -c 'import swebench, swebench.harness'
 docker info >/dev/null
 
 available_kb="$(df -Pk "$PWD" | awk 'NR==2 {print $4}')"
@@ -61,6 +68,11 @@ command=(
 printf 'branch=%s\ncommit=%s\n' "$expected_branch" "$CGR_NATIVE_EXPECTED_CGR_COMMIT"
 printf 'sweagent_upstream_commit=%s\nparser_patch_sha256=%s\n' \
   "$upstream_commit" "$patch_sha256"
+printf 'sweagent_python=%s\nsweagent_package=%s\n' \
+  "$sweagent_python" "$sweagent_identity"
+IFS='|' read -r evaluator_package evaluator_harness evaluator_version <<<"$evaluator_identity"
+printf 'evaluator_python=%s\nswebench_package=%s\nswebench_harness=%s\nswebench_version=%s\n' \
+  "$CGR_SWEBENCH_EVALUATOR_PYTHON" "$evaluator_package" "$evaluator_harness" "$evaluator_version"
 printf 'model_endpoint=%s\nmodel_identifier=%s\n' \
   "$CGR_DRAFT_BASE_URL" "$CGR_DRAFT_MODEL"
 printf 'command='

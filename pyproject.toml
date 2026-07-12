@@ -32,4 +32,4 @@ cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]
-swebench=["datasets>=3.0","swebench>=3.0"]
+swebench=["datasets>=3.0","swebench==3.0.17"]

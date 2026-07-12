@@ -41,6 +41,7 @@ NATIVE_MODES = ("baseline", "cgr")
 NATIVE_CALL_BUDGET = DEFAULT_BUDGETS["baseline"].maximum_model_calls
 NATIVE_STEP_BUDGET = DEFAULT_BUDGETS["baseline"].maximum_steps
 NATIVE_TIMEOUT_SECONDS = DEFAULT_BUDGETS["baseline"].timeout_seconds
+SWEBENCH_EVALUATOR_VERSION = "3.0.17"
 _METADATA_FILES = {
     "generation-result.json",
     "evaluation-result.json",
@@ -59,6 +60,14 @@ class ModelEndpoint:
     @property
     def sweagent_model(self) -> str:
         return self.model if self.model.startswith("openai/") else f"openai/{self.model}"
+
+
+@dataclass(frozen=True)
+class EvaluatorRuntime:
+    python: str
+    version: str
+    package_path: str
+    harness_path: str
 
 
 def native_pilot_main(argv: list[str] | None = None) -> int:
@@ -84,6 +93,7 @@ def native_pilot_main(argv: list[str] | None = None) -> int:
         instance = _selected_instance(manifest.instances, args.instance_id)
         modes = list(NATIVE_MODES) if args.compare else [str(args.mode)]
         if args.evaluate_only:
+            evaluation_runtime = verify_evaluator_runtime()
             evaluation_summaries = []
             overall = 0
             for selected_mode in modes:
@@ -94,12 +104,16 @@ def native_pilot_main(argv: list[str] | None = None) -> int:
                     attempt,
                     instance=instance,
                     manifest_hash=manifest.selected_ids_sha256,
+                    evaluator=evaluation_runtime,
                 )
                 evaluation_summaries.append(evaluation)
                 overall = overall or int(evaluation["exit_code"] != 0)
             print(json.dumps({"ok": overall == 0, "runs": evaluation_summaries}, indent=2))
             return overall
 
+        generation_evaluator = (
+            verify_evaluator_runtime() if args.generate_and_evaluate else None
+        )
         records, fingerprint = load_verified_records()
         record = _verified_record(records, instance)
         if manifest.dataset_fingerprint and fingerprint != manifest.dataset_fingerprint:
@@ -139,6 +153,7 @@ def native_pilot_main(argv: list[str] | None = None) -> int:
                     Path(generation["artifact_directory"]),
                     instance=instance,
                     manifest_hash=manifest.selected_ids_sha256,
+                    evaluator=generation_evaluator,
                 )
                 summary["evaluation"] = evaluation
                 overall = overall or int(evaluation["exit_code"] != 0)
@@ -283,7 +298,9 @@ def evaluate_attempt(
     *,
     instance: PilotInstance,
     manifest_hash: str,
+    evaluator: EvaluatorRuntime | None = None,
 ) -> dict[str, Any]:
+    evaluator = evaluator or verify_evaluator_runtime()
     generation_path = attempt / "generation-result.json"
     if not generation_path.is_file():
         raise FileNotFoundError("Native generation metadata is missing.")
@@ -301,6 +318,7 @@ def evaluate_attempt(
     evaluator_prediction = _official_evaluator_prediction(prediction_path, evaluation_dir)
     run_id = f"cgr-native-{generation['mode']}-{instance.instance_id}"
     command = official_harness_command(str(evaluator_prediction), [instance.instance_id], run_id)
+    command[0] = evaluator.python
     _write_json(evaluation_dir / "evaluator-command.json", command)
     started = time.perf_counter()
     process = subprocess.run(
@@ -327,6 +345,10 @@ def evaluate_attempt(
         "instance_id": instance.instance_id,
         "base_commit": instance.base_commit,
         "manifest_hash": manifest_hash,
+        "evaluator_python": evaluator.python,
+        "evaluator_version": evaluator.version,
+        "evaluator_package_path": evaluator.package_path,
+        "evaluator_harness_path": evaluator.harness_path,
         "prediction_path": str(prediction_path),
         "evaluator_prediction_path": str(evaluator_prediction),
         "prediction_sha256": actual_hash,
@@ -438,6 +460,62 @@ def verify_pinned_sweagent(source: Path, executable: str) -> dict[str, str]:
         "parser_patch_sha256": patch_sha,
         "imported_sweagent_path": str(imported_path),
     }
+
+
+def verify_evaluator_runtime() -> EvaluatorRuntime:
+    configured = os.getenv("CGR_SWEBENCH_EVALUATOR_PYTHON", "").strip()
+    if not configured:
+        raise ValueError(
+            "CGR_SWEBENCH_EVALUATOR_PYTHON is required for official evaluation. "
+            "Run scripts/setup_swebench_evaluator.sh first."
+        )
+    python = Path(configured).expanduser()
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise ValueError(
+            "CGR_SWEBENCH_EVALUATOR_PYTHON is not an executable file: " + str(python)
+        )
+    probe = subprocess.run(
+        [
+            str(python.resolve()),
+            "-c",
+            (
+                "import importlib.metadata,json,pathlib,swebench,swebench.harness;"
+                "print(json.dumps({"
+                "'version':importlib.metadata.version('swebench'),"
+                "'package_path':str(pathlib.Path(swebench.__file__).resolve()),"
+                "'harness_path':str(pathlib.Path(swebench.harness.__file__).resolve())}))"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode:
+        detail = (probe.stderr or probe.stdout).strip()[-1000:]
+        raise ValueError(
+            "CGR_SWEBENCH_EVALUATOR_PYTHON cannot import swebench and "
+            f"swebench.harness: {detail}"
+        )
+    try:
+        identity = json.loads(probe.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Evaluator Python returned malformed package identity output.") from exc
+    if not isinstance(identity, dict) or identity.get("version") != SWEBENCH_EVALUATOR_VERSION:
+        found = identity.get("version") if isinstance(identity, dict) else None
+        raise ValueError(
+            "Evaluator version differs from the frozen configuration: "
+            f"expected {SWEBENCH_EVALUATOR_VERSION}, found {found}."
+        )
+    package_path = identity.get("package_path")
+    harness_path = identity.get("harness_path")
+    if not isinstance(package_path, str) or not isinstance(harness_path, str):
+        raise ValueError("Evaluator Python returned incomplete package identity output.")
+    return EvaluatorRuntime(
+        python=str(python.resolve()),
+        version=SWEBENCH_EVALUATOR_VERSION,
+        package_path=package_path,
+        harness_path=harness_path,
+    )
 
 
 def _model_endpoint(mode: str) -> ModelEndpoint:

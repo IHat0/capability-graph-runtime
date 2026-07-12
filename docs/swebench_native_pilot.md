@@ -47,6 +47,21 @@ infrastructure failure stops the comparison before CGR mode. Normal official
 `.pred` output with `model_patch: null` is retained as a completed unresolved
 prediction; process crashes and missing predictions are infrastructure failures.
 
+Generation and evaluation use separate Python runtimes. `CGR_SWE_AGENT_PYTHON`
+belongs only to the pinned official SWE-agent installation. Official evaluation
+requires `CGR_SWEBENCH_EVALUATOR_PYTHON`, pinned to `swebench==3.0.17` by the
+repository setup script:
+
+```bash
+bash scripts/setup_swebench_evaluator.sh
+export CGR_SWEBENCH_EVALUATOR_PYTHON="$PWD/.venv-swebench-eval/bin/python"
+```
+
+`--generate-only` does not inspect or import the evaluator package. The two
+evaluation phases fail before generation unless the configured evaluator Python
+is executable, imports `swebench` and `swebench.harness`, and reports the pinned
+version.
+
 Each attempt is retained under
 `benchmark-results/swebench-native-pilot-v1/<mode>/<instance>/attempt-NNN`.
 Evaluation validates the frozen identity and generation-time prediction SHA-256,

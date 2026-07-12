@@ -47,6 +47,17 @@ def _identity(source: Path) -> dict[str, str]:
     }
 
 
+def _evaluator(tmp_path: Path) -> native.EvaluatorRuntime:
+    python = tmp_path / "evaluator-python"
+    python.write_text("", encoding="utf-8")
+    return native.EvaluatorRuntime(
+        python=str(python.resolve()),
+        version=native.SWEBENCH_EVALUATOR_VERSION,
+        package_path=str(tmp_path / "site-packages" / "swebench" / "__init__.py"),
+        harness_path=str(tmp_path / "site-packages" / "swebench" / "harness" / "__init__.py"),
+    )
+
+
 def _fake_sweagent(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -396,12 +407,16 @@ def test_evaluator_receives_exact_official_prediction_artifact(
 
     monkeypatch.setattr(native.subprocess, "run", run)
     result = native.evaluate_attempt(
-        attempt, instance=INSTANCE, manifest_hash="manifest-hash"
+        attempt,
+        instance=INSTANCE,
+        manifest_hash="manifest-hash",
+        evaluator=_evaluator(tmp_path),
     )
 
     evaluator_input = Path(calls[0][calls[0].index("--predictions_path") + 1])
     assert evaluator_input.suffix == ".json"
     assert evaluator_input.samefile(prediction)
+    assert calls[0][0] == _evaluator(tmp_path).python
     assert result["resolved"] is True
     assert result["infrastructure_status"] == "completed"
     assert Path(str(result["official_report_path"])).is_file()
@@ -419,7 +434,12 @@ def test_evaluate_refuses_modified_prediction_without_invoking_evaluator(
     )
 
     with pytest.raises(ValueError, match="changed after generation"):
-        native.evaluate_attempt(attempt, instance=INSTANCE, manifest_hash="manifest-hash")
+        native.evaluate_attempt(
+            attempt,
+            instance=INSTANCE,
+            manifest_hash="manifest-hash",
+            evaluator=_evaluator(tmp_path),
+        )
 
 
 def test_evaluate_only_never_invokes_generation(
@@ -429,6 +449,7 @@ def test_evaluate_only_never_invokes_generation(
         instances=[INSTANCE], selected_ids_sha256="manifest-hash", dataset_fingerprint="fingerprint"
     )
     monkeypatch.setattr(native, "load_manifest", lambda _path: manifest)
+    monkeypatch.setattr(native, "verify_evaluator_runtime", lambda: _evaluator(tmp_path))
     monkeypatch.setattr(native, "_latest_completed_attempt", lambda *args: tmp_path / "attempt")
     monkeypatch.setattr(
         native,
@@ -459,6 +480,177 @@ def test_evaluate_only_never_invokes_generation(
     assert json.loads(capsys.readouterr().out)["runs"][0]["resolved"] is False
 
 
+def test_missing_evaluator_python_fails_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CGR_SWEBENCH_EVALUATOR_PYTHON", raising=False)
+
+    with pytest.raises(ValueError, match="CGR_SWEBENCH_EVALUATOR_PYTHON is required"):
+        native.verify_evaluator_runtime()
+
+
+def test_evaluator_python_that_cannot_import_swebench_fails_clearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setenv("CGR_SWEBENCH_EVALUATOR_PYTHON", str(python))
+    monkeypatch.setattr(native.os, "access", lambda *_args: True)
+    monkeypatch.setattr(
+        native.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, "", "ModuleNotFoundError: No module named 'swebench'"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="cannot import swebench"):
+        native.verify_evaluator_runtime()
+
+
+def test_evaluator_version_must_match_frozen_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setenv("CGR_SWEBENCH_EVALUATOR_PYTHON", str(python))
+    monkeypatch.setattr(native.os, "access", lambda *_args: True)
+    monkeypatch.setattr(
+        native.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(
+                {
+                    "version": "4.1.0",
+                    "package_path": "/venv/swebench/__init__.py",
+                    "harness_path": "/venv/swebench/harness/__init__.py",
+                }
+            ),
+            "",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="expected 3.0.17, found 4.1.0"):
+        native.verify_evaluator_runtime()
+
+
+def _mock_native_main_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = SimpleNamespace(
+        instances=[INSTANCE], selected_ids_sha256="manifest-hash", dataset_fingerprint="fingerprint"
+    )
+    source = _source(tmp_path)
+    record = {
+        "instance_id": INSTANCE.instance_id,
+        "repo": INSTANCE.repo,
+        "base_commit": INSTANCE.base_commit,
+        "problem_statement": "Issue",
+    }
+    monkeypatch.setattr(native, "load_manifest", lambda _path: manifest)
+    monkeypatch.setattr(native, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(native, "_sweagent_source", lambda _configured: source)
+    monkeypatch.setattr(native, "_sweagent_executable", lambda _configured: "official-sweagent")
+    monkeypatch.setattr(native, "verify_pinned_sweagent", lambda *_args: _identity(source))
+    monkeypatch.setenv("CGR_DRAFT_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("CGR_DRAFT_API_KEY", "key")
+    monkeypatch.setenv("CGR_DRAFT_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
+    monkeypatch.setenv("CGR_DRAFT_MAX_MODEL_LEN", "16384")
+
+
+def test_generate_only_never_requires_or_imports_swebench_evaluator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mock_native_main_generation(tmp_path, monkeypatch)
+    monkeypatch.delenv("CGR_SWEBENCH_EVALUATOR_PYTHON", raising=False)
+    monkeypatch.setattr(
+        native,
+        "verify_evaluator_runtime",
+        lambda: pytest.fail("generate-only must not inspect evaluator runtime"),
+    )
+    monkeypatch.setattr(
+        native,
+        "generate_attempt",
+        lambda **kwargs: {
+            "infrastructure_status": "completed",
+            "artifact_directory": str(tmp_path / "attempt-001"),
+        },
+    )
+
+    result = native.native_pilot_main(
+        ["--mode", "baseline", "--instance-id", INSTANCE.instance_id, "--generate-only"]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_combined_run_rejects_missing_evaluator_before_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mock_native_main_generation(tmp_path, monkeypatch)
+    monkeypatch.delenv("CGR_SWEBENCH_EVALUATOR_PYTHON", raising=False)
+    monkeypatch.setattr(
+        native,
+        "generate_attempt",
+        lambda **kwargs: pytest.fail("generation must not run before evaluator preflight"),
+    )
+
+    result = native.native_pilot_main(
+        [
+            "--mode",
+            "baseline",
+            "--instance-id",
+            INSTANCE.instance_id,
+            "--generate-and-evaluate",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert "CGR_SWEBENCH_EVALUATOR_PYTHON is required" in output["error"]
+
+
+def test_generate_and_evaluate_uses_separate_python_runtimes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mock_native_main_generation(tmp_path, monkeypatch)
+    evaluator = _evaluator(tmp_path)
+    agent_python = str(tmp_path / "sweagent-python")
+    monkeypatch.setenv("CGR_SWE_AGENT_PYTHON", agent_python)
+    monkeypatch.setattr(native, "verify_evaluator_runtime", lambda: evaluator)
+    attempt = tmp_path / "attempt-001"
+    attempt.mkdir()
+    observed: dict[str, object] = {}
+
+    def generate(**kwargs: object) -> dict[str, object]:
+        observed["sweagent_executable"] = kwargs["executable"]
+        return {"infrastructure_status": "completed", "artifact_directory": str(attempt)}
+
+    def evaluate(*args: object, **kwargs: object) -> dict[str, object]:
+        observed["evaluator"] = kwargs["evaluator"]
+        return {"exit_code": 0, "resolved": False}
+
+    monkeypatch.setattr(native, "generate_attempt", generate)
+    monkeypatch.setattr(native, "evaluate_attempt", evaluate)
+
+    result = native.native_pilot_main(
+        [
+            "--mode",
+            "baseline",
+            "--instance-id",
+            INSTANCE.instance_id,
+            "--generate-and-evaluate",
+        ]
+    )
+
+    assert result == 0
+    assert observed["sweagent_executable"] == "official-sweagent"
+    assert observed["evaluator"] == evaluator
+    assert evaluator.python != agent_python
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
 def test_native_cli_and_ec2_runner_are_separate_from_legacy_adapter() -> None:
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     script = Path("scripts/ec2_native_sweagent_astropy.sh").read_text(encoding="utf-8")
@@ -468,3 +660,7 @@ def test_native_cli_and_ec2_runner_are_separate_from_legacy_adapter() -> None:
     assert "--generate-and-evaluate" in script
     assert "set +e" in script and "PIPESTATUS[0]" in script
     assert "/tmp" not in script
+    assert 'CGR_SWEBENCH_EVALUATOR_PYTHON="$PWD/.venv-swebench-eval/bin/python"' in script
+    setup = Path("scripts/setup_swebench_evaluator.sh").read_text(encoding="utf-8")
+    assert "evaluator_version='3.0.17'" in setup
+    assert '"swebench==$evaluator_version"' in setup

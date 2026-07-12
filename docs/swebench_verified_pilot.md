@@ -52,7 +52,8 @@ cgr-swebench-integrity-check
 Install the optional integration and inspect prerequisites:
 
 ```bash
-pip install -e ".[swebench]"
+bash scripts/setup_swebench_evaluator.sh
+export CGR_SWEBENCH_EVALUATOR_PYTHON="$PWD/.venv-swebench-eval/bin/python"
 cgr-swebench-doctor
 ```
 
