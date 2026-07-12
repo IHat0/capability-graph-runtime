@@ -70,6 +70,7 @@ def _fake_sweagent(
     model_patch: str | None = "diff --git a/x b/x\n",
     instance_id: str = INSTANCE.instance_id,
     returncode: int = 0,
+    raw_prediction: str | None = None,
 ) -> list[list[str]]:
     calls: list[list[str]] = []
 
@@ -81,7 +82,8 @@ def _fake_sweagent(
             instance_root = output / INSTANCE.instance_id
             instance_root.mkdir()
             (instance_root / f"{INSTANCE.instance_id}.pred").write_text(
-                json.dumps(
+                raw_prediction
+                or json.dumps(
                     {
                         "model_name_or_path": "official-sweagent",
                         "instance_id": instance_id,
@@ -110,6 +112,7 @@ def _generate(
     model_patch: str | None = "diff --git a/x b/x\n",
     instance_id: str = INSTANCE.instance_id,
     returncode: int = 0,
+    raw_prediction: str | None = None,
 ) -> tuple[dict[str, object], list[list[str]]]:
     source = _source(tmp_path)
     calls = _fake_sweagent(
@@ -117,6 +120,7 @@ def _generate(
         model_patch=model_patch,
         instance_id=instance_id,
         returncode=returncode,
+        raw_prediction=raw_prediction,
     )
     result = native.generate_attempt(
         result_root=tmp_path / "results",
@@ -295,14 +299,23 @@ def test_successful_official_prediction_is_retained_and_hashed(
     assert native._hash_artifacts(attempt) == hashes
 
 
-def test_null_model_patch_is_completed_unresolved_prediction(
+def test_null_model_patch_is_completed_no_patch_prediction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result, _ = _generate(tmp_path, monkeypatch, model_patch=None)
 
     assert result["infrastructure_status"] == "completed"
-    assert result["prediction_status"] == "unresolved"
+    assert result["prediction_status"] == "no_patch"
     assert result["generation_exit_code"] == 0
+
+
+def test_empty_model_patch_is_completed_no_patch_prediction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _generate(tmp_path, monkeypatch, model_patch="")
+
+    assert result["infrastructure_status"] == "completed"
+    assert result["prediction_status"] == "no_patch"
 
 
 def test_process_crash_without_prediction_is_infrastructure_failure(
@@ -341,6 +354,16 @@ def test_normal_process_exit_without_prediction_is_infrastructure_failure(
 
     assert result["infrastructure_status"] == "failed"
     assert "no .pred artifact" in str(result["generation_error"])
+
+
+def test_malformed_native_prediction_is_recorded_as_parse_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _generate(tmp_path, monkeypatch, raw_prediction="{not-json")
+
+    assert result["infrastructure_status"] == "failed"
+    assert result["prediction_status"] == "parse_failed"
+    assert "not valid JSON" in str(result["generation_error"])
 
 
 def test_mismatched_official_prediction_instance_is_rejected(
@@ -392,7 +415,7 @@ def test_failure_traceback_and_result_redact_api_key(
     assert "secret-key" not in (attempt / "failure-traceback.txt").read_text(encoding="utf-8")
 
 
-def _completed_attempt(tmp_path: Path) -> tuple[Path, Path]:
+def _completed_attempt(tmp_path: Path, *, model_patch: str | None = "diff --git a/x b/x\n") -> tuple[Path, Path]:
     attempt = tmp_path / "attempt-001"
     prediction = attempt / INSTANCE.instance_id / f"{INSTANCE.instance_id}.pred"
     prediction.parent.mkdir(parents=True)
@@ -401,7 +424,7 @@ def _completed_attempt(tmp_path: Path) -> tuple[Path, Path]:
             {
                 "model_name_or_path": "official",
                 "instance_id": INSTANCE.instance_id,
-                "model_patch": None,
+                "model_patch": model_patch,
             }
         ),
         encoding="utf-8",
@@ -426,7 +449,7 @@ def _completed_attempt(tmp_path: Path) -> tuple[Path, Path]:
     return attempt, prediction
 
 
-def test_evaluator_receives_exact_official_prediction_artifact(
+def test_evaluator_receives_jsonl_serialization_of_official_prediction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     attempt, prediction = _completed_attempt(tmp_path)
@@ -449,12 +472,59 @@ def test_evaluator_receives_exact_official_prediction_artifact(
     )
 
     evaluator_input = Path(calls[0][calls[0].index("--predictions_path") + 1])
-    assert evaluator_input.suffix == ".json"
-    assert evaluator_input.samefile(prediction)
+    assert evaluator_input.suffix == ".jsonl"
+    assert not evaluator_input.samefile(prediction)
+    rows = [json.loads(line) for line in evaluator_input.read_text(encoding="utf-8").splitlines()]
+    assert rows == [
+        {
+            "instance_id": INSTANCE.instance_id,
+            "model_name_or_path": "official",
+            "model_patch": "diff --git a/x b/x\n",
+        }
+    ]
     assert calls[0][0] == _evaluator(tmp_path).python
     assert result["resolved"] is True
     assert result["infrastructure_status"] == "completed"
     assert Path(str(result["official_report_path"])).is_file()
+
+
+def test_no_patch_skips_official_evaluator_without_writing_invalid_prediction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, _ = _completed_attempt(tmp_path, model_patch=None)
+    monkeypatch.setattr(
+        native.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("official evaluator must not run for no-patch output"),
+    )
+
+    result = native.evaluate_attempt(
+        attempt,
+        instance=INSTANCE,
+        manifest_hash="manifest-hash",
+        evaluator=_evaluator(tmp_path),
+    )
+
+    assert result["evaluation_status"] == "skipped_no_patch"
+    assert result["infrastructure_status"] == "not_run"
+    assert result["resolved"] is False
+    assert result["evaluator_prediction_path"] is None
+    assert result["evaluator_command"] is None
+    assert not list((attempt / "official-evaluation").glob("*.jsonl"))
+
+
+def test_official_prediction_rejects_malformed_or_missing_patch_fields(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt"
+    prediction = attempt / INSTANCE.instance_id / f"{INSTANCE.instance_id}.pred"
+    prediction.parent.mkdir(parents=True)
+    prediction.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        native._official_prediction(attempt, INSTANCE.instance_id)
+
+    prediction.write_text(json.dumps({"instance_id": INSTANCE.instance_id}), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing model_patch"):
+        native._official_prediction(attempt, INSTANCE.instance_id)
 
 
 def test_evaluate_refuses_modified_prediction_without_invoking_evaluator(

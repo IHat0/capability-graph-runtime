@@ -21,9 +21,11 @@ from .integration import (
     DEFAULT_BUDGETS,
     DEFAULT_MANIFEST,
     PilotInstance,
+    Prediction,
     load_manifest,
     load_verified_records,
     official_harness_command,
+    write_predictions,
 )
 from .swe_agent_adapter import LOCAL_QWEN_OVERLAY
 
@@ -263,6 +265,7 @@ def generate_attempt(
         _redact_artifact_tree(attempt, secrets)
         if process.returncode:
             raise RuntimeError(f"Official SWE-agent exited with code {process.returncode}.")
+        result["prediction_status"] = "parse_failed"
         prediction_path, prediction = _official_prediction(attempt, instance.instance_id)
         prediction_sha256 = _sha256_file(prediction_path)
         (attempt / "prediction.sha256").write_text(prediction_sha256 + "\n", encoding="ascii")
@@ -270,7 +273,7 @@ def generate_attempt(
             {
                 "infrastructure_status": "completed",
                 "prediction_status": (
-                    "unresolved" if prediction["model_patch"] is None else "patch_submitted"
+                    "patch_submitted" if _has_model_patch(prediction) else "no_patch"
                 ),
                 "prediction_path": str(prediction_path.resolve()),
                 "prediction_sha256": prediction_sha256,
@@ -314,11 +317,23 @@ def evaluate_attempt(
     actual_hash = _sha256_file(prediction_path)
     if actual_hash != expected_hash:
         raise ValueError("Official prediction changed after generation.")
-    _official_prediction(attempt, instance.instance_id, expected_path=prediction_path)
+    _, prediction = _official_prediction(
+        attempt, instance.instance_id, expected_path=prediction_path
+    )
 
     evaluation_dir = attempt / "official-evaluation"
     evaluation_dir.mkdir(exist_ok=False)
-    evaluator_prediction = _official_evaluator_prediction(prediction_path, evaluation_dir)
+    if not _has_model_patch(prediction):
+        return _record_skipped_no_patch_evaluation(
+            evaluation_dir,
+            generation=generation,
+            instance=instance,
+            manifest_hash=manifest_hash,
+            evaluator=evaluator,
+            prediction_path=prediction_path,
+            prediction_sha256=actual_hash,
+        )
+    evaluator_prediction = _official_evaluator_prediction(prediction, evaluation_dir)
     run_id = f"cgr-native-{generation['mode']}-{instance.instance_id}"
     command = official_harness_command(str(evaluator_prediction), [instance.instance_id], run_id)
     command[0] = evaluator.python
@@ -356,6 +371,7 @@ def evaluate_attempt(
         "prediction_path": str(prediction_path),
         "evaluator_prediction_path": str(evaluator_prediction),
         "prediction_sha256": actual_hash,
+        "evaluation_status": "completed",
         "evaluator_command": command,
         "evaluation_exit_code": process.returncode,
         "elapsed_seconds": time.perf_counter() - started,
@@ -614,7 +630,14 @@ def _official_prediction(
         raise ValueError("Official SWE-agent .pred is missing model_patch.")
     if prediction["model_patch"] is not None and not isinstance(prediction["model_patch"], str):
         raise ValueError("Official SWE-agent .pred model_patch has an invalid type.")
+    if not isinstance(prediction.get("model_name_or_path"), str):
+        raise ValueError("Official SWE-agent .pred is missing model_name_or_path.")
     return path, prediction
+
+
+def _has_model_patch(prediction: dict[str, Any]) -> bool:
+    model_patch = prediction.get("model_patch")
+    return isinstance(model_patch, str) and bool(model_patch.strip())
 
 
 def _verify_generation_identity(
@@ -634,13 +657,63 @@ def _verify_generation_identity(
         raise ValueError("Generation manifest hash differs from the frozen manifest.")
 
 
-def _official_evaluator_prediction(prediction: Path, evaluation_dir: Path) -> Path:
-    """Expose the official .pred bytes under the extension required by SWE-bench."""
-    evaluator_path = evaluation_dir / "official-sweagent-prediction.json"
-    os.link(prediction, evaluator_path)
-    if not evaluator_path.samefile(prediction):
-        raise ValueError("Evaluator prediction is not the official SWE-agent .pred artifact.")
+def _official_evaluator_prediction(prediction: dict[str, Any], evaluation_dir: Path) -> Path:
+    """Serialize one parsed SWE-agent prediction in SWE-bench's JSONL collection format."""
+    model_patch = prediction["model_patch"]
+    if not isinstance(model_patch, str) or not model_patch.strip():
+        raise ValueError("A non-empty model_patch is required for official evaluation.")
+    evaluator_path = evaluation_dir / "official-sweagent-predictions.jsonl"
+    write_predictions(
+        evaluator_path,
+        [
+            Prediction(
+                instance_id=str(prediction["instance_id"]),
+                model_name_or_path=str(prediction["model_name_or_path"]),
+                model_patch=model_patch,
+            )
+        ],
+    )
     return evaluator_path
+
+
+def _record_skipped_no_patch_evaluation(
+    evaluation_dir: Path,
+    *,
+    generation: dict[str, Any],
+    instance: PilotInstance,
+    manifest_hash: str,
+    evaluator: EvaluatorRuntime,
+    prediction_path: Path,
+    prediction_sha256: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "mode": generation["mode"],
+        "instance_id": instance.instance_id,
+        "base_commit": instance.base_commit,
+        "manifest_hash": manifest_hash,
+        "evaluator_python": evaluator.python,
+        "evaluator_reported_python": evaluator.reported_python,
+        "evaluator_version": evaluator.version,
+        "evaluator_package_path": evaluator.package_path,
+        "evaluator_harness_path": evaluator.harness_path,
+        "prediction_path": str(prediction_path),
+        "evaluator_prediction_path": None,
+        "prediction_sha256": prediction_sha256,
+        "evaluator_command": None,
+        "evaluation_exit_code": None,
+        "elapsed_seconds": 0.0,
+        "resolved": False,
+        "official_report_path": None,
+        "evaluation_status": "skipped_no_patch",
+        "evaluation_skip_reason": "SWE-agent submitted no patch; official evaluation was not invoked.",
+        "infrastructure_status": "not_run",
+        "exit_code": 0,
+    }
+    result["artifact_hashes"] = _hash_artifacts(evaluation_dir)
+    _write_json(evaluation_dir / "evaluation-artifact-sha256.json", result["artifact_hashes"])
+    _write_json(evaluation_dir / "evaluation-result.json", result)
+    _assert_no_secrets(evaluation_dir, _configured_secrets())
+    return result
 
 
 def _allocate_attempt(result_root: Path, mode: str, instance_id: str) -> Path:

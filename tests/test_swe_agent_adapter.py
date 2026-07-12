@@ -96,8 +96,8 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     overlay = override.read_text(encoding="utf-8")
     assert "history_processors: []" in overlay
     assert "post_startup_commands:" in overlay
-    for command in adapter.POST_STARTUP_COMMANDS:
-        assert json.dumps(command) in overlay
+    for startup_command in adapter.POST_STARTUP_COMMANDS:
+        assert json.dumps(startup_command) in overlay
     assert "Every response MUST contain exactly this structure" in overlay
     assert "Never emit more than one fenced block." in overlay
     assert "executed by Bash" in overlay
