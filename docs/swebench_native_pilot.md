@@ -11,6 +11,16 @@ model endpoint, artifact retention, prediction integrity checks, and official
 SWE-bench evaluation. It never creates a host repository checkout and never
 extracts or reapplies the submitted patch.
 
+For native CGR runs, the wrapper also enables a deterministic action-validation
+boundary. Before SWE-agent executes a model-proposed action, the maintained
+`sweagent-v1.1.0-cgr-action-validator.patch` obtains the live deployed Git
+worktree root and invokes CGR's path validator. A clearly external repository
+path is not executed; CGR returns the real root and an unambiguous relative
+suggestion when available through SWE-agent's normal format-retry path. The
+validator does not rewrite actions, change the model prompt, or alter accepted
+SWE-agent execution. Its JSONL event log and aggregate rejection/recovery
+metrics are retained in each attempt directory.
+
 Baseline uses:
 
 ```bash

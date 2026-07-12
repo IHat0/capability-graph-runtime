@@ -30,6 +30,10 @@ def _source(tmp_path: Path) -> Path:
         'class StrictThoughtActionParser:\n    pass\n\ntype = "strict_thought_action"\n',
         encoding="utf-8",
     )
+    (source / "sweagent" / "agent").mkdir()
+    (source / "sweagent" / "agent" / "agents.py").write_text(
+        "def _validate_cgr_action():\n    pass\n", encoding="utf-8"
+    )
     return source
 
 
@@ -46,6 +50,7 @@ def _identity(source: Path) -> dict[str, str]:
     return {
         "upstream_commit": native.SWE_AGENT_COMMIT,
         "parser_patch_sha256": native.SWE_AGENT_PATCH_SHA256,
+        "cgr_action_validator_patch_sha256": native.CGR_ACTION_VALIDATOR_PATCH_SHA256,
         "imported_sweagent_path": str(source / "sweagent" / "__init__.py"),
         "configured_sweagent_python": sys.executable,
         "reported_sweagent_python": sys.executable,
@@ -148,6 +153,59 @@ def test_native_generation_invokes_official_sweagent_directly_without_adapter_or
     assert "cgr-swebench-swe-agent-adapter" not in flattened
     assert "git apply" not in Path(native.__file__).read_text(encoding="utf-8")
     assert "TemporaryDirectory" not in Path(native.__file__).read_text(encoding="utf-8")
+
+
+def test_native_generation_enables_cgr_action_validation_outside_sweagent_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _generate(tmp_path, monkeypatch)
+    attempt = Path(str(result["artifact_directory"]))
+    environment = json.loads((attempt / "environment.json").read_text(encoding="utf-8"))
+    effective_config = (attempt / "effective-config.yaml").read_text(encoding="utf-8")
+
+    assert environment["CGR_ACTION_VALIDATOR_COMMAND"] == "[CGR configured validator command]"
+    assert environment["CGR_ACTION_VALIDATION_LOG"].endswith("cgr-action-validation.jsonl")
+    assert "CGR_ACTION_VALIDATOR_COMMAND" not in effective_config
+
+
+def test_native_diagnostics_record_cgr_rejection_and_recovery(tmp_path: Path) -> None:
+    (tmp_path / "cgr-action-validation.jsonl").write_text(
+        "\n".join(
+            (
+                json.dumps(
+                    {"metrics": {
+                        "cgr_action_rejections": 1,
+                        "invalid_repository_paths": ["~/dev/repo/src/a.py"],
+                        "repeated_invalid_path_rejections": 0,
+                        "corrective_root_feedback_sent": 1,
+                        "suggested_repository_relative_paths": ["src/a.py"],
+                        "recovery_after_cgr_rejection": False,
+                        "first_valid_action_after_rejection": False,
+                    }}
+                ),
+                json.dumps(
+                    {"metrics": {
+                        "cgr_action_rejections": 0,
+                        "invalid_repository_paths": [],
+                        "repeated_invalid_path_rejections": 0,
+                        "corrective_root_feedback_sent": 0,
+                        "suggested_repository_relative_paths": [],
+                        "recovery_after_cgr_rejection": True,
+                        "first_valid_action_after_rejection": True,
+                    }}
+                ),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = native._native_attempt_diagnostics(tmp_path, ())
+
+    assert diagnostics["cgr_action_rejections"] == 1
+    assert diagnostics["invalid_repository_paths"] == ["~/dev/repo/src/a.py"]
+    assert diagnostics["suggested_repository_relative_paths"] == ["src/a.py"]
+    assert diagnostics["recovery_after_cgr_rejection"] is True
+    assert diagnostics["first_valid_action_after_rejection"] is True
 
 
 def test_native_modes_differ_only_by_model_endpoint_and_identifier(tmp_path: Path) -> None:

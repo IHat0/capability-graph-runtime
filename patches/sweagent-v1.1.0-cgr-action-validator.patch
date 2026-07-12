@@ -1,0 +1,60 @@
+diff --git a/sweagent/agent/agents.py b/sweagent/agent/agents.py
+index 4d5befa9..3665cb07 100644
+--- a/sweagent/agent/agents.py
++++ b/sweagent/agent/agents.py
+@@ -6,0 +7,3 @@ import logging
++import os
++import shlex
++import subprocess
+@@ -468,0 +472 @@ class DefaultAgent(AbstractAgent):
++        self._cgr_invalid_paths: set[str] = set()
+@@ -894,0 +899,47 @@ class DefaultAgent(AbstractAgent):
++    def _validate_cgr_action(self, action: str) -> None:
++        """Ask CGR to supervise an action before the environment executes it.
++
++        This is intentionally dormant unless CGR_ACTION_VALIDATOR_COMMAND is
++        configured by a CGR runner. The validator receives the live worktree
++        metadata and returns a normal format error for the upstream retry loop.
++        """
++        validator_command = os.getenv("CGR_ACTION_VALIDATOR_COMMAND")
++        if not validator_command:
++            return
++        assert self._env is not None
++        repository_root = self._env.communicate("git rev-parse --show-toplevel", check="raise").strip()
++        repository_files = self._env.communicate("git ls-files", check="raise").splitlines()
++        request = {
++            "action": action,
++            "repository_root": repository_root,
++            "repository_files": repository_files,
++            "prior_invalid_paths": sorted(self._cgr_invalid_paths),
++        }
++        result = subprocess.run(
++            shlex.split(validator_command),
++            input=json.dumps(request),
++            text=True,
++            capture_output=True,
++            check=False,
++            timeout=10,
++        )
++        if result.returncode:
++            raise RuntimeError(f"CGR action validator failed: {result.stderr.strip()}")
++        try:
++            response = json.loads(result.stdout)
++        except json.JSONDecodeError as exc:
++            raise RuntimeError("CGR action validator returned malformed JSON.") from exc
++        if not isinstance(response, dict) or not isinstance(response.get("allowed"), bool):
++            raise RuntimeError("CGR action validator returned an invalid response.")
++        validation_log = os.getenv("CGR_ACTION_VALIDATION_LOG")
++        if validation_log:
++            with Path(validation_log).open("a", encoding="utf-8") as handle:
++                handle.write(json.dumps(response, sort_keys=True) + "\\n")
++        invalid_paths = response.get("invalid_paths", [])
++        if isinstance(invalid_paths, list):
++            self._cgr_invalid_paths.update(path for path in invalid_paths if isinstance(path, str))
++        if not response["allowed"]:
++            feedback = response.get("feedback")
++            if not isinstance(feedback, str) or not feedback:
++                raise RuntimeError("CGR rejected an action without corrective feedback.")
++            raise FormatError(feedback)
+@@ -917,0 +970 @@ class DefaultAgent(AbstractAgent):
++        self._validate_cgr_action(step.action)

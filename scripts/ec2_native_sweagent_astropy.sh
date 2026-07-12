@@ -6,6 +6,7 @@ cd "$HOME/CGR-Ticket-1.1"
 expected_branch='feat/swebench-verified-pilot'
 upstream_commit='0f3acafacabc0def8cc76b4e48acb4b6cf302cb9'
 expected_patch_sha256='5914d306f77feaf5e1252de96b14357822127f898b574f93e2468cab3c3f4a28'
+expected_validator_patch_sha256='cd31bd21c37e5d4645ae9d3236abb1818fdbdffad4ea081513011abe205537fd'
 instance_id='astropy__astropy-7671'
 manifest='benchmark-manifests/swebench-verified-pilot-v1.json'
 result_root="$PWD/benchmark-results/swebench-native-pilot-v1"
@@ -31,8 +32,12 @@ export CGR_SWEBENCH_EVALUATOR_PYTHON="$PWD/.venv-swebench-eval/bin/python"
 [[ "$(git -C "$CGR_SWE_AGENT_SOURCE" rev-parse HEAD)" == "$upstream_commit" ]]
 patch_sha256="$(sha256sum patches/sweagent-v1.1.0-strict-thought-action.patch | awk '{print $1}')"
 [[ "$patch_sha256" == "$expected_patch_sha256" ]]
+validator_patch_sha256="$(sha256sum patches/sweagent-v1.1.0-cgr-action-validator.patch | awk '{print $1}')"
+[[ "$validator_patch_sha256" == "$expected_validator_patch_sha256" ]]
 git -C "$CGR_SWE_AGENT_SOURCE" apply --reverse --check \
   "$PWD/patches/sweagent-v1.1.0-strict-thought-action.patch"
+git -C "$CGR_SWE_AGENT_SOURCE" apply --reverse --check \
+  "$PWD/patches/sweagent-v1.1.0-cgr-action-validator.patch"
 
 sweagent_python="${CGR_SWE_AGENT_PYTHON:-$(dirname "$CGR_SWE_AGENT_EXECUTABLE")/python}"
 export CGR_SWE_AGENT_PYTHON="$sweagent_python"
@@ -48,6 +53,7 @@ done <<<"$sweagent_identity_output"
   exit 2
 }
 "$sweagent_python" -c 'from sweagent.tools.parsing import StrictThoughtActionParser; assert StrictThoughtActionParser().type == "strict_thought_action"'
+grep -q 'def _validate_cgr_action' "$CGR_SWE_AGENT_SOURCE/sweagent/agent/agents.py"
 evaluator_identity="$("$CGR_SWEBENCH_EVALUATOR_PYTHON" -c 'import importlib.metadata,pathlib,sys,swebench,swebench.harness; version=importlib.metadata.version("swebench"); assert version == "3.0.17", version; print(f"{sys.executable}|{pathlib.Path(swebench.__file__).resolve()}|{pathlib.Path(swebench.harness.__file__).resolve()}|{version}")')"
 
 curl --fail --silent --show-error \
@@ -78,6 +84,7 @@ command=(
 printf 'branch=%s\ncommit=%s\n' "$expected_branch" "$CGR_NATIVE_EXPECTED_CGR_COMMIT"
 printf 'sweagent_upstream_commit=%s\nparser_patch_sha256=%s\n' \
   "$upstream_commit" "$patch_sha256"
+printf 'cgr_action_validator_patch_sha256=%s\n' "$validator_patch_sha256"
 IFS='|' read -r reported_sweagent_python sweagent_package <<<"$sweagent_identity"
 printf 'configured_sweagent_python=%s\nreported_sweagent_python=%s\nsweagent_package=%s\n' \
   "$sweagent_python" "$reported_sweagent_python" "$sweagent_package"
@@ -137,6 +144,13 @@ print(f"change_survived_until_submission={generation.get('change_survived_until_
 print(f"submission_attempted={generation.get('submission_attempted')}")
 print(f"parser_rejections_count={generation.get('parser_rejections_count')}")
 print(f"call_budget_exceeded_by={generation.get('call_budget_exceeded_by')}")
+print(f"cgr_action_rejections={generation.get('cgr_action_rejections')}")
+print(f"invalid_repository_paths={generation.get('invalid_repository_paths')}")
+print(f"repeated_invalid_path_rejections={generation.get('repeated_invalid_path_rejections')}")
+print(f"corrective_root_feedback_sent={generation.get('corrective_root_feedback_sent')}")
+print(f"suggested_repository_relative_paths={generation.get('suggested_repository_relative_paths')}")
+print(f"recovery_after_cgr_rejection={generation.get('recovery_after_cgr_rejection')}")
+print(f"first_valid_action_after_rejection={generation.get('first_valid_action_after_rejection')}")
 print(f"last_model_output_preview={generation.get('last_model_output_preview')}")
 print(f"last_agent_message_preview={generation.get('last_agent_message_preview')}")
 PY

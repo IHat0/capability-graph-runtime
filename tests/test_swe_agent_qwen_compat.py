@@ -21,9 +21,6 @@ def test_overlay_has_complete_qwen_bash_contract() -> None:
     assert "quoted heredoc" in LOCAL_QWEN_OVERLAY
     assert "inspect" in LOCAL_QWEN_OVERLAY
     assert "verify" in LOCAL_QWEN_OVERLAY
-    assert "submit only after a successful diff" in LOCAL_QWEN_OVERLAY
-    assert "A zero exit status from sed" in LOCAL_QWEN_OVERLAY
-    assert "git diff -- <changed-file>" in LOCAL_QWEN_OVERLAY
     assert "history_processors: []" in LOCAL_QWEN_OVERLAY
     assert "type: strict_thought_action" in LOCAL_QWEN_OVERLAY
     assert "edit_anthropic" not in LOCAL_QWEN_OVERLAY

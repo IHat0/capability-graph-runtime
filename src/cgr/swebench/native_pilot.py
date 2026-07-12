@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -39,6 +40,12 @@ SWE_AGENT_PATCH = (
     / "sweagent-v1.1.0-strict-thought-action.patch"
 )
 SWE_AGENT_PATCH_SHA256 = "5914d306f77feaf5e1252de96b14357822127f898b574f93e2468cab3c3f4a28"
+CGR_ACTION_VALIDATOR_PATCH = (
+    Path(__file__).resolve().parents[3]
+    / "patches"
+    / "sweagent-v1.1.0-cgr-action-validator.patch"
+)
+CGR_ACTION_VALIDATOR_PATCH_SHA256 = "cd31bd21c37e5d4645ae9d3236abb1818fdbdffad4ea081513011abe205537fd"
 NATIVE_MODES = ("baseline", "cgr")
 NATIVE_CALL_BUDGET = DEFAULT_BUDGETS["baseline"].maximum_model_calls
 NATIVE_STEP_BUDGET = DEFAULT_BUDGETS["baseline"].maximum_steps
@@ -211,6 +218,7 @@ def generate_attempt(
         "step_budget": NATIVE_STEP_BUDGET,
         "upstream_commit": source_identity["upstream_commit"],
         "parser_patch_sha256": source_identity["parser_patch_sha256"],
+        "cgr_action_validator_patch_sha256": source_identity["cgr_action_validator_patch_sha256"],
         "imported_sweagent_path": source_identity["imported_sweagent_path"],
         "configured_sweagent_python": source_identity["configured_sweagent_python"],
         "reported_sweagent_python": source_identity["reported_sweagent_python"],
@@ -239,6 +247,8 @@ def generate_attempt(
             attempt / "environment.json",
             {
                 "CGR_NATIVE_API_KEY": "[REDACTED]",
+                "CGR_ACTION_VALIDATOR_COMMAND": "[CGR configured validator command]",
+                "CGR_ACTION_VALIDATION_LOG": str(attempt / "cgr-action-validation.jsonl"),
                 "SWE_AGENT_CONFIG_ROOT": str(source),
                 "model_endpoint": endpoint.base_url,
                 "model_identifier": endpoint.model,
@@ -247,6 +257,10 @@ def generate_attempt(
         environment = os.environ.copy()
         environment["CGR_NATIVE_API_KEY"] = endpoint.api_key
         environment["SWE_AGENT_CONFIG_ROOT"] = str(source)
+        environment["CGR_ACTION_VALIDATOR_COMMAND"] = shlex.join(
+            [sys.executable, "-m", "cgr.swebench.action_validation"]
+        )
+        environment["CGR_ACTION_VALIDATION_LOG"] = str(attempt / "cgr-action-validation.jsonl")
         process = subprocess.run(
             command,
             cwd=source,
@@ -446,8 +460,12 @@ def verify_pinned_sweagent(source: Path, executable: str) -> dict[str, str]:
     source = source.resolve(strict=True)
     patch = SWE_AGENT_PATCH.resolve(strict=True)
     patch_sha = _sha256_file(patch)
+    validator_patch = CGR_ACTION_VALIDATOR_PATCH.resolve(strict=True)
+    validator_patch_sha = _sha256_file(validator_patch)
     if patch_sha != SWE_AGENT_PATCH_SHA256:
         raise ValueError("Maintained SWE-agent parser patch SHA-256 differs from the pin.")
+    if validator_patch_sha != CGR_ACTION_VALIDATOR_PATCH_SHA256:
+        raise ValueError("Maintained SWE-agent action-validator patch SHA-256 differs from the pin.")
     commit = _run_checked(["git", "-C", str(source), "rev-parse", "HEAD"]).stdout.strip()
     if commit != SWE_AGENT_COMMIT:
         raise ValueError("Pinned SWE-agent source commit differs from the required commit.")
@@ -459,9 +477,20 @@ def verify_pinned_sweagent(source: Path, executable: str) -> dict[str, str]:
     )
     if reverse_check.returncode:
         raise ValueError("Maintained strict parser patch is not applied to SWE-agent source.")
+    validator_reverse_check = subprocess.run(
+        ["git", "-C", str(source), "apply", "--reverse", "--check", str(validator_patch)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if validator_reverse_check.returncode:
+        raise ValueError("Maintained CGR action-validator patch is not applied to SWE-agent source.")
     parsing = (source / "sweagent" / "tools" / "parsing.py").read_text(encoding="utf-8")
     if "class StrictThoughtActionParser" not in parsing or '"strict_thought_action"' not in parsing:
         raise ValueError("strict_thought_action is absent from pinned SWE-agent source.")
+    agents = (source / "sweagent" / "agent" / "agents.py").read_text(encoding="utf-8")
+    if "def _validate_cgr_action" not in agents:
+        raise ValueError("CGR action-validator hook is absent from pinned SWE-agent source.")
     python = _sweagent_python(executable)
     identity_output = _run_checked(
         [
@@ -489,6 +518,7 @@ def verify_pinned_sweagent(source: Path, executable: str) -> dict[str, str]:
     return {
         "upstream_commit": commit,
         "parser_patch_sha256": patch_sha,
+        "cgr_action_validator_patch_sha256": validator_patch_sha,
         "imported_sweagent_path": str(imported_path),
         "configured_sweagent_python": python,
         "reported_sweagent_python": reported_python,
@@ -664,7 +694,15 @@ def _native_attempt_diagnostics(attempt: Path, secrets: Sequence[str]) -> dict[s
         "call_budget_exceeded_by": 0,
         "last_model_output_preview": None,
         "last_agent_message_preview": None,
+        "cgr_action_rejections": 0,
+        "invalid_repository_paths": [],
+        "repeated_invalid_path_rejections": 0,
+        "corrective_root_feedback_sent": 0,
+        "suggested_repository_relative_paths": [],
+        "recovery_after_cgr_rejection": False,
+        "first_valid_action_after_rejection": False,
     }
+    _merge_cgr_action_validation_metrics(diagnostics, attempt)
     trajectory_paths = sorted(attempt.rglob("*.traj"))
     if not trajectory_paths:
         return diagnostics
@@ -764,6 +802,46 @@ def _native_attempt_diagnostics(attempt: Path, secrets: Sequence[str]) -> dict[s
     if diagnostics["termination_reason"] is None and diagnostics["commands_executed"]:
         diagnostics["termination_reason"] = "trajectory_ended_without_exit_status"
     return diagnostics
+
+
+def _merge_cgr_action_validation_metrics(diagnostics: dict[str, Any], attempt: Path) -> None:
+    log_path = attempt / "cgr-action-validation.jsonl"
+    if not log_path.is_file():
+        return
+    invalid_paths: list[str] = []
+    suggestions: list[str] = []
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        metrics = event.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        diagnostics["cgr_action_rejections"] += int(metrics.get("cgr_action_rejections", 0))
+        diagnostics["repeated_invalid_path_rejections"] += int(
+            metrics.get("repeated_invalid_path_rejections", 0)
+        )
+        diagnostics["corrective_root_feedback_sent"] += int(
+            metrics.get("corrective_root_feedback_sent", 0)
+        )
+        diagnostics["recovery_after_cgr_rejection"] = bool(
+            diagnostics["recovery_after_cgr_rejection"] or metrics.get("recovery_after_cgr_rejection")
+        )
+        diagnostics["first_valid_action_after_rejection"] = bool(
+            diagnostics["first_valid_action_after_rejection"]
+            or metrics.get("first_valid_action_after_rejection")
+        )
+        invalid = metrics.get("invalid_repository_paths", [])
+        suggested = metrics.get("suggested_repository_relative_paths", [])
+        if isinstance(invalid, list):
+            invalid_paths.extend(path for path in invalid if isinstance(path, str))
+        if isinstance(suggested, list):
+            suggestions.extend(path for path in suggested if isinstance(path, str))
+    diagnostics["invalid_repository_paths"] = list(dict.fromkeys(invalid_paths))
+    diagnostics["suggested_repository_relative_paths"] = list(dict.fromkeys(suggestions))
 
 
 def _is_edit_command(action: str) -> bool:

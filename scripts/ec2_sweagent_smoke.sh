@@ -25,6 +25,7 @@ git -C "$source_root" reset --quiet --hard "$commit"
 [[ -f "$source_root/config/default.yaml" ]] || { echo "Missing SWE-agent default config." >&2; exit 2; }
 [[ -d "$source_root/tools" ]] || { echo "Missing SWE-agent tools directory." >&2; exit 2; }
 patch_path="$PWD/patches/sweagent-v1.1.0-strict-thought-action.patch"
+validator_patch_path="$PWD/patches/sweagent-v1.1.0-cgr-action-validator.patch"
 [[ -f "$patch_path" ]] || { echo "Missing maintained strict parser patch." >&2; exit 2; }
 patch_sha256="$(sha256sum "$patch_path" | awk '{print $1}')"
 expected_patch_sha256='5914d306f77feaf5e1252de96b14357822127f898b574f93e2468cab3c3f4a28'
@@ -35,12 +36,19 @@ expected_patch_sha256='5914d306f77feaf5e1252de96b14357822127f898b574f93e2468cab3
 git -C "$source_root" diff --quiet || { echo "Pinned SWE-agent source is not clean." >&2; exit 2; }
 git -C "$source_root" apply --check "$patch_path"
 git -C "$source_root" apply "$patch_path"
+[[ -f "$validator_patch_path" ]] || { echo "Missing maintained CGR action-validator patch." >&2; exit 2; }
+git -C "$source_root" apply --check "$validator_patch_path"
+git -C "$source_root" apply "$validator_patch_path"
 grep -q 'class StrictThoughtActionParser' "$source_root/sweagent/tools/parsing.py" || {
   echo "Strict parser patch did not modify the expected source." >&2
   exit 2
 }
 grep -q 'strict_thought_action' "$source_root/sweagent/tools/parsing.py" || {
   echo "Strict parser registration is missing." >&2
+  exit 2
+}
+grep -q 'def _validate_cgr_action' "$source_root/sweagent/agent/agents.py" || {
+  echo "CGR action-validator patch did not modify the expected source." >&2
   exit 2
 }
 printf 'sweagent_upstream_commit=%s\nsweagent_patch_sha256=%s\n' "$commit" "$patch_sha256"
