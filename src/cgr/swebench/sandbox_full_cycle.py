@@ -256,8 +256,10 @@ agent:
 """
 
 
-def _model_server(log_path: Path, submission_path: str) -> ThreadingHTTPServer:
-    actions = [
+def _model_server(
+    log_path: Path, submission_path: str, actions: Sequence[str] | None = None
+) -> ThreadingHTTPServer:
+    scripted_actions = list(actions) if actions is not None else [
         "pwd && git status --short && sed -n '1,80p' math_utils.py",
         "sed -i 's/return a - b/return a + b/' math_utils.py",
         "git diff -- math_utils.py && grep -q 'return a + b' math_utils.py",
@@ -280,7 +282,7 @@ def _model_server(log_path: Path, submission_path: str) -> ThreadingHTTPServer:
             payload = json.loads(self.rfile.read(length))
             call = state["calls"]
             state["calls"] += 1
-            action = actions[min(call, len(actions) - 1)]
+            action = scripted_actions[min(call, len(scripted_actions) - 1)]
             response_text = f"DISCUSSION\nProceed with the next deterministic repository action.\n\n```bash\n{action}\n```"
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(

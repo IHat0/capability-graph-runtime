@@ -238,6 +238,15 @@ This command exercises the complete comparison path with deterministic local
 model fixtures. It proves the measurement and trace shape, not real model
 improvement. Real GLM and OpenAI-compatible provider runs are the next step.
 
+## One-Task QuixBugs Pilot
+
+`cgr-quixbugs-pilot` runs the pinned `quixbugs.gcd` Python task through the
+same real CGR, SWE-agent, model API, Git, verifier, and artifact path used by
+the full-cycle sandbox. See
+[`docs/quixbugs_python_pilot.md`](docs/quixbugs_python_pilot.md) for checkout
+preparation, the deterministic local integration command, and external model
+configuration.
+
 ## Next Possible Steps
 
 The frozen external-evaluation protocol is documented in

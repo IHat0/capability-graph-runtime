@@ -8,5 +8,7 @@ __pycache__/
 .venv-swebench-eval/
 .sandbox-sweagent-src/
 .sandbox-sweagent-venv/
+.quixbugs-src/
+benchmark-results/
 dist/
 build/

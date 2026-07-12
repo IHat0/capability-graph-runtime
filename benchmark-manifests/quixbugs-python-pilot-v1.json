@@ -1,0 +1,31 @@
+{
+  "benchmark": "QuixBugs",
+  "version": "python-pilot-v1",
+  "source_repository": "https://github.com/jkoppel/QuixBugs",
+  "pinned_commit": "4257f44b0ff1181dedaedee6a447e133219fcebf",
+  "dependencies": [
+    "pytest==8.3.5"
+  ],
+  "tasks": [
+    {
+      "task_id": "quixbugs.gcd",
+      "benchmark": "QuixBugs",
+      "language": "python",
+      "source_repository": "https://github.com/jkoppel/QuixBugs",
+      "pinned_commit": "4257f44b0ff1181dedaedee6a447e133219fcebf",
+      "source_file": "python_programs/gcd.py",
+      "test_file": "python_testcases/test_gcd.py",
+      "verifier_command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "python_testcases/test_gcd.py"
+      ],
+      "problem_statement": "Fix the bug in python_programs/gcd.py so gcd returns the greatest common divisor for the provided nonnegative integer inputs. Preserve the public function and make the focused matching test pass.",
+      "permitted_repository_root": ".",
+      "timeout_seconds": 300,
+      "expected_initial_state": "failing"
+    }
+  ]
+}

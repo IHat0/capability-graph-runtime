@@ -29,6 +29,7 @@ cgr-swebench-native-pilot = "cgr.swebench.native_pilot:native_pilot_main"
 cgr-swebench-agent = "cgr.swebench.agent:agent_main"
 cgr-swebench-swe-agent-adapter = "cgr.swebench.swe_agent_adapter:adapter_main"
 cgr-sandbox-full-cycle = "cgr.swebench.sandbox_full_cycle:sandbox_full_cycle_main"
+cgr-quixbugs-pilot = "cgr.quixbugs_pilot:quixbugs_pilot_main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]
