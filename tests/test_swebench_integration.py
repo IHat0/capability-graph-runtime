@@ -441,6 +441,73 @@ def test_generation_failure_does_not_write_blank_predictions(
     assert generation[0]["agent_debug_trace"] == [{"event": "model_call_failure"}]
 
 
+def test_failed_generation_retains_workspace_and_trajectory_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _records()[0]
+    instance = PilotInstance(
+        instance_id=str(record["instance_id"]),
+        repo=str(record["repo"]),
+        base_commit=str(record["base_commit"]),
+    )
+    _configure_generation_environment(monkeypatch)
+    monkeypatch.setenv("CGR_DRAFT_API_KEY", "retention-secret")
+    monkeypatch.setattr(swebench_cli, "load_verified_records", lambda: ([record], "fingerprint"))
+    monkeypatch.setattr(swebench_cli, "doctor_report", lambda: {})
+
+    def materialize(_instance: object, destination: Path) -> None:
+        destination.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=destination, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=destination, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=destination, check=True)
+        (destination / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "module.py"], cwd=destination, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=destination, check=True)
+
+    def failing_agent(*args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        workspace = args[3]
+        assert isinstance(workspace, Path)
+        (workspace / "module.py").write_text("VALUE = 2\n", encoding="utf-8")
+        (workspace / "rendered.png").write_bytes(b"\x89PNG\r\n\x1a\nartifact")
+        trajectories = workspace.parent / ".cgr-sweagent-trajectories"
+        trajectories.mkdir()
+        (trajectories / "failed.traj").write_text("trajectory", encoding="utf-8")
+        (trajectories / "debug.log").write_text("debug", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            ["agent", "--api-key", "retention-secret"],
+            1,
+            stdout="adapter stdout",
+            stderr="adapter stderr",
+        )
+
+    monkeypatch.setattr(swebench_cli, "materialize_repository", materialize)
+    monkeypatch.setattr(swebench_cli, "run_external_agent", failing_agent)
+
+    result = swebench_cli._generate_predictions(
+        ["baseline"], [instance], "manifest", tmp_path / "results", resume=False, debug_trace=False
+    )
+
+    generation = json.loads(
+        (tmp_path / "results" / "baseline" / "generation-results.json").read_text()
+    )
+    row = generation[0]
+    artifact_directory = Path(row["artifact_directory"])
+    assert result == 1
+    assert artifact_directory.is_dir()
+    assert (artifact_directory / "sweagent-trajectories" / "failed.traj").read_text() == "trajectory"
+    assert (artifact_directory / "workspace-git-diff.binary.patch").read_text().startswith("diff --git")
+    assert (artifact_directory / "agent-stdout.txt").read_text() == "adapter stdout"
+    assert (artifact_directory / "agent-stderr.txt").read_text() == "adapter stderr"
+    assert "RuntimeError" in (artifact_directory / "failure-traceback.txt").read_text()
+    diagnostics = json.loads((artifact_directory / "workspace-changed-files.json").read_text())
+    binary = next(item for item in diagnostics if item["path"] == "rendered.png")
+    assert binary["size_bytes"] == len(b"\x89PNG\r\n\x1a\nartifact")
+    assert binary["utf8_decodable"] is False
+    assert binary["non_utf8_first_16_bytes_hex"] == b"\x89PNG\r\n\x1a\nartifact"[:16].hex()
+    assert "retention-secret" not in Path(row["artifact_adapter_command"]).read_text()
+    assert not Path(row["temporary_workspace_path"]).exists()
+
+
 def test_empty_patch_generation_fails_without_prediction_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

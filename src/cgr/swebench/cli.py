@@ -6,10 +6,12 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -243,6 +245,10 @@ def _generate_predictions(
                 continue
             started = time.perf_counter()
             process: subprocess.CompletedProcess[str] | None = None
+            workspace: Path | None = None
+            artifact_details = _create_generation_artifact_directory(
+                mode_root, pilot_instance.instance_id
+            )
             try:
                 record = by_id.get(pilot_instance.instance_id)
                 if record is None:
@@ -252,23 +258,42 @@ def _generate_predictions(
                 safe_instance = filter_model_instance(record)
                 with tempfile.TemporaryDirectory(prefix="cgr-swebench-workspace-") as temp:
                     workspace = Path(temp) / "repo"
-                    safe_instance = safe_instance.model_copy(
-                        update={"workspace_path": str(workspace)}
-                    )
-                    materialize_repository(safe_instance, workspace)
-                    process = run_external_agent(
-                        adapter,
-                        safe_instance,
-                        selected_mode,
-                        workspace,
-                        DEFAULT_BUDGETS[selected_mode],
-                        debug_trace=debug_trace,
-                    )
-                    if process.returncode:
-                        raise RuntimeError(_agent_failure_message(process))
-                    agent_payload = _agent_success_payload(process)
-                    patch, changed = capture_git_patch(workspace)
-                    verify_patch_applies(workspace, patch, safe_instance.base_commit)
+                    failure_traceback: str | None = None
+                    try:
+                        safe_instance = safe_instance.model_copy(
+                            update={"workspace_path": str(workspace)}
+                        )
+                        materialize_repository(safe_instance, workspace)
+                        process = run_external_agent(
+                            adapter,
+                            safe_instance,
+                            selected_mode,
+                            workspace,
+                            DEFAULT_BUDGETS[selected_mode],
+                            debug_trace=debug_trace,
+                        )
+                        if process.returncode:
+                            raise RuntimeError(_agent_failure_message(process))
+                        agent_payload = _agent_success_payload(process)
+                        patch, changed = capture_git_patch(workspace)
+                        verify_patch_applies(workspace, patch, safe_instance.base_commit)
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        subprocess.SubprocessError,
+                    ):
+                        failure_traceback = traceback.format_exc()
+                        raise
+                    finally:
+                        artifact_details.update(
+                            _retain_generation_artifacts(
+                                Path(artifact_details["artifact_directory"]),
+                                workspace=workspace,
+                                process=process,
+                                failure_traceback=failure_traceback,
+                            )
+                        )
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                 failed_instances.append(pilot_instance.instance_id)
                 diagnostics = _agent_diagnostics(process)
@@ -283,6 +308,7 @@ def _generate_predictions(
                         "elapsed_seconds": time.perf_counter() - started,
                         "generation_error": str(exc),
                         **diagnostics,
+                        **artifact_details,
                     }
                 )
                 continue
@@ -317,6 +343,7 @@ def _generate_predictions(
                     "successful_verification_commands": successful_commands,
                     "failed_verification_commands": failed_commands,
                     "debug_trace": process.stdout[-4000:] if debug_trace else None,
+                    **artifact_details,
                 }
             )
             generation_rows.append(row)
@@ -442,6 +469,154 @@ def _agent_diagnostics(
 def _redact_agent_output(value: str) -> str:
     api_key = os.getenv("CGR_DRAFT_API_KEY", "")
     return value.replace(api_key, "[REDACTED]") if api_key else value
+
+
+def _create_generation_artifact_directory(mode_root: Path, instance_id: str) -> dict[str, Any]:
+    """Allocate durable evidence storage before starting an agent invocation."""
+    safe_instance_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", instance_id)
+    instance_root = mode_root / "generation-artifacts" / safe_instance_id
+    instance_root.mkdir(parents=True, exist_ok=True)
+    attempt = 1
+    while (instance_root / f"attempt-{attempt:03d}").exists():
+        attempt += 1
+    artifact_directory = instance_root / f"attempt-{attempt:03d}"
+    artifact_directory.mkdir()
+    return {
+        "artifact_directory": str(artifact_directory),
+        "artifact_retention_errors": [],
+    }
+
+
+def _retain_generation_artifacts(
+    artifact_directory: Path,
+    *,
+    workspace: Path | None,
+    process: subprocess.CompletedProcess[str] | None,
+    failure_traceback: str | None,
+) -> dict[str, Any]:
+    """Retain agent evidence before the ephemeral repository is deleted."""
+    errors: list[str] = []
+    retained: dict[str, Any] = {
+        "temporary_workspace_path": str(workspace) if workspace is not None else None,
+    }
+
+    def save_text(name: str, value: str) -> Path | None:
+        try:
+            path = artifact_directory / name
+            path.write_text(_redact_agent_output(value), encoding="utf-8")
+            return path
+        except OSError as exc:
+            errors.append(f"Could not retain {name}: {exc}")
+            return None
+
+    if process is not None:
+        command = process.args
+        if isinstance(command, (list, tuple)):
+            command = [_redact_agent_output(str(item)) for item in command]
+        else:
+            command = _redact_agent_output(str(command))
+        try:
+            command_path = artifact_directory / "adapter-command.json"
+            command_path.write_text(json.dumps(command, indent=2) + "\n", encoding="utf-8")
+            retained["artifact_adapter_command"] = str(command_path)
+        except OSError as exc:
+            errors.append(f"Could not retain adapter command: {exc}")
+        stdout_path = save_text("agent-stdout.txt", process.stdout)
+        stderr_path = save_text("agent-stderr.txt", process.stderr)
+        if stdout_path is not None:
+            retained["artifact_agent_stdout"] = str(stdout_path)
+        if stderr_path is not None:
+            retained["artifact_agent_stderr"] = str(stderr_path)
+    if failure_traceback:
+        traceback_path = save_text("failure-traceback.txt", failure_traceback)
+        if traceback_path is not None:
+            retained["artifact_failure_traceback"] = str(traceback_path)
+
+    if workspace is not None:
+        trajectories = workspace.parent / ".cgr-sweagent-trajectories"
+        if trajectories.is_dir():
+            try:
+                destination = artifact_directory / "sweagent-trajectories"
+                shutil.copytree(trajectories, destination)
+                retained["artifact_trajectories"] = str(destination)
+            except (OSError, shutil.Error) as exc:
+                errors.append(f"Could not retain SWE-agent trajectories: {exc}")
+        if (workspace / ".git").exists():
+            status = _git_artifact_output(workspace, ["status", "--short"], errors)
+            binary_diff = _git_artifact_output(workspace, ["diff", "HEAD", "--binary"], errors)
+            numstat = _git_artifact_output(workspace, ["diff", "HEAD", "--numstat"], errors)
+            status_path = save_text("workspace-git-status.txt", status)
+            binary_path = save_text("workspace-git-diff.binary.patch", binary_diff)
+            numstat_path = save_text("workspace-git-diff.numstat", numstat)
+            if status_path is not None:
+                retained["artifact_workspace_git_status"] = str(status_path)
+            if binary_path is not None:
+                retained["artifact_workspace_binary_diff"] = str(binary_path)
+            if numstat_path is not None:
+                retained["artifact_workspace_numstat"] = str(numstat_path)
+            changed_files_path = artifact_directory / "workspace-changed-files.json"
+            try:
+                changed_files_path.write_text(
+                    json.dumps(_changed_file_diagnostics(workspace, errors), indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                retained["artifact_changed_files"] = str(changed_files_path)
+            except OSError as exc:
+                errors.append(f"Could not retain changed-file diagnostics: {exc}")
+
+    retained["artifact_retention_errors"] = errors
+    return retained
+
+
+def _git_artifact_output(workspace: Path, arguments: list[str], errors: list[str]) -> str:
+    try:
+        process = subprocess.run(
+            ["git", *arguments],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        errors.append(f"Could not run git {' '.join(arguments)}: {exc}")
+        return ""
+    if process.returncode:
+        errors.append(
+            f"git {' '.join(arguments)} exited {process.returncode}: {process.stderr.strip()}"
+        )
+    return process.stdout
+
+
+def _changed_file_diagnostics(workspace: Path, errors: list[str]) -> list[dict[str, Any]]:
+    changed = _git_artifact_output(workspace, ["diff", "--name-only", "HEAD"], errors)
+    untracked = _git_artifact_output(
+        workspace, ["ls-files", "--others", "--exclude-standard"], errors
+    )
+    paths = sorted({line for line in (changed + "\n" + untracked).splitlines() if line})
+    diagnostics: list[dict[str, Any]] = []
+    root = workspace.resolve()
+    for relative_name in paths:
+        path = workspace / relative_name
+        entry: dict[str, Any] = {"path": relative_name}
+        try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root) or path.is_symlink():
+                entry["diagnostic_error"] = "Changed path is outside the workspace or a symlink."
+            elif not path.is_file():
+                entry["diagnostic_error"] = "Changed path is not a regular file."
+            else:
+                payload = path.read_bytes()
+                entry["size_bytes"] = len(payload)
+                try:
+                    payload.decode("utf-8")
+                    entry["utf8_decodable"] = True
+                except UnicodeDecodeError:
+                    entry["utf8_decodable"] = False
+                    entry["non_utf8_first_16_bytes_hex"] = payload[:16].hex()
+        except OSError as exc:
+            entry["diagnostic_error"] = str(exc)
+        diagnostics.append(entry)
+    return diagnostics
 
 
 def _evaluate_predictions(modes: list[str], instances: list[Any], result_root: Path) -> int:
