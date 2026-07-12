@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -14,6 +16,44 @@ def _repo(tmp_path: Path) -> Path:
     for command in (["git", "init", "-q"], ["git", "add", "."], ["git", "commit", "-qm", "base"]):
         subprocess.run(command, cwd=workspace, check=True)
     return workspace
+
+
+def _git(workspace: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(workspace), *arguments],
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def _run_post_startup_commands(workspace: Path) -> int | None:
+    for index, command in enumerate(adapter.POST_STARTUP_COMMANDS):
+        arguments = command.split()
+        assert arguments[:3] == ["git", "-C", "/repo"]
+        arguments[2] = str(workspace)
+        if subprocess.run(arguments, check=False).returncode:
+            return index
+    return None
+
+
+def _mode_contaminated_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    image = workspace / "asset.png"
+    source = workspace / "module.py"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    for path in (image, source):
+        os.chmod(path, path.stat().st_mode | stat.S_IXUSR)
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@example.com")
+    _git(workspace, "config", "user.name", "Test")
+    _git(workspace, "add", "asset.png", "module.py")
+    _git(workspace, "commit", "-qm", "base")
+    for path in (image, source):
+        os.chmod(path, path.stat().st_mode & ~stat.S_IXUSR)
+    return workspace, image, source
 
 
 def test_official_command_uses_local_openai_compatible_configuration(tmp_path: Path) -> None:
@@ -54,6 +94,9 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     assert override.is_file()
     overlay = override.read_text(encoding="utf-8")
     assert "history_processors: []" in overlay
+    assert "post_startup_commands:" in overlay
+    for command in adapter.POST_STARTUP_COMMANDS:
+        assert command in overlay
     assert "Every response MUST contain exactly this structure" in overlay
     assert "Never emit more than one fenced block." in overlay
     assert "executed by Bash" in overlay
@@ -61,6 +104,49 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     assert "edit_anthropic" not in overlay
     assert "function_calling" not in overlay
     assert "cache_control" not in overlay
+
+
+def test_post_startup_file_mode_normalization_preserves_real_content_changes(
+    tmp_path: Path,
+) -> None:
+    workspace, image, source = _mode_contaminated_repo(tmp_path)
+    executable_entries = _git(workspace, "ls-tree", "-r", "HEAD").stdout
+    expected_entries = ("100755 blob", "asset.png", "module.py")
+    if not all(entry in executable_entries for entry in expected_entries):
+        pytest.skip("The current filesystem does not expose executable-bit changes to Git.")
+
+    _git(workspace, "config", "core.fileMode", "true")
+    if _git(workspace, "diff", "--quiet", check=False).returncode == 0:
+        pytest.skip("The current Git platform does not report transferred file-mode changes.")
+    before = _git(workspace, "diff", "--summary")
+    assert "mode change 100755 => 100644 asset.png" in before.stdout
+    assert "mode change 100755 => 100644 module.py" in before.stdout
+
+    assert _run_post_startup_commands(workspace) is None
+    assert _git(workspace, "diff", "--quiet", "--ignore-submodules", "--", check=False).returncode == 0
+    assert _git(workspace, "diff", "--cached", "--quiet", "--ignore-submodules", "--", check=False).returncode == 0
+
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    assert _git(workspace, "diff", "--quiet", "--ignore-submodules", "--", check=False).returncode == 1
+    assert _run_post_startup_commands(workspace) == 1
+    _git(workspace, "restore", "module.py")
+
+    source.write_text("VALUE = 3\n", encoding="utf-8")
+    _git(workspace, "add", "module.py")
+    assert _git(workspace, "diff", "--cached", "--quiet", "--ignore-submodules", "--", check=False).returncode == 1
+    assert _run_post_startup_commands(workspace) == 2
+    assert image.read_bytes().startswith(b"\x89PNG")
+
+
+def test_post_startup_clean_gate_blocks_first_model_response(tmp_path: Path) -> None:
+    workspace = _repo(tmp_path)
+    (workspace / "math_utils.py").write_text("def add(a, b):\n    return a + b\n")
+
+    model_responses: list[str] = []
+    if _run_post_startup_commands(workspace) is None:
+        model_responses.append("first model response")
+
+    assert model_responses == []
 
 
 def test_adapter_applies_official_patch_and_reports_metadata(

@@ -58,6 +58,12 @@ patch exported by SWE-agent to CGR's temporary workspace. CGR then retains patch
 validation, destructive-change rejection, prediction hashing, and official
 evaluation ownership.
 
+Before the first model request, the overlay's supported SWE-agent
+`env.post_startup_commands` sets `core.fileMode=false` in the transferred
+`/repo` and fails startup if either the tracked unstaged or staged diff is
+non-empty. This removes transfer-induced permission-only changes without hiding
+real content edits or changing the PatchFormatter.
+
 For a manual adapter smoke on EC2, make a disposable Git repository and invoke
 the command above. A successful run has a non-empty `git diff`, a SWE-agent
 trajectory under the workspace's parent `.cgr-sweagent-trajectories` directory,

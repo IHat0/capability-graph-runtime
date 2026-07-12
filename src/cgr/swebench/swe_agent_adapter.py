@@ -27,7 +27,18 @@ SWE_AGENT_COMMIT = "0f3acaf"
 SWE_AGENT_PYTHON_REQUIRES = ">=3.11"
 _PATCH_KEYS = ("patch", "model_patch", "submission")
 _SECRET_VALUES = ("CGR_DRAFT_API_KEY",)
-LOCAL_QWEN_OVERLAY = """agent:
+POST_STARTUP_COMMANDS = (
+    "git -C /repo config core.fileMode false",
+    "git -C /repo diff --quiet --ignore-submodules --",
+    "git -C /repo diff --cached --quiet --ignore-submodules --",
+)
+_POST_STARTUP_COMMANDS_YAML = "\n".join(
+    f'    - "{command}"' for command in POST_STARTUP_COMMANDS
+)
+LOCAL_QWEN_OVERLAY = f"""env:
+  post_startup_commands:
+{_POST_STARTUP_COMMANDS_YAML}
+agent:
   history_processors: []
   templates:
     system_template: |-
