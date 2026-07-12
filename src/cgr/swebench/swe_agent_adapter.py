@@ -27,13 +27,17 @@ SWE_AGENT_COMMIT = "0f3acaf"
 SWE_AGENT_PYTHON_REQUIRES = ">=3.11"
 _PATCH_KEYS = ("patch", "model_patch", "submission")
 _SECRET_VALUES = ("CGR_DRAFT_API_KEY",)
+_DEPLOYED_REPO_ROOT = (
+    'repo_root="$(git rev-parse --show-toplevel)" '
+    '|| { echo "Unable to identify the deployed Git repository." >&2; exit 1; }; '
+)
 POST_STARTUP_COMMANDS = (
-    "git -C /repo config core.fileMode false",
-    "git -C /repo diff --quiet --ignore-submodules --",
-    "git -C /repo diff --cached --quiet --ignore-submodules --",
+    _DEPLOYED_REPO_ROOT + 'git -C "$repo_root" config core.fileMode false',
+    _DEPLOYED_REPO_ROOT + 'git -C "$repo_root" diff --quiet --ignore-submodules --',
+    _DEPLOYED_REPO_ROOT + 'git -C "$repo_root" diff --cached --quiet --ignore-submodules --',
 )
 _POST_STARTUP_COMMANDS_YAML = "\n".join(
-    f'    - "{command}"' for command in POST_STARTUP_COMMANDS
+    f"    - {json.dumps(command)}" for command in POST_STARTUP_COMMANDS
 )
 LOCAL_QWEN_OVERLAY = f"""env:
   post_startup_commands:

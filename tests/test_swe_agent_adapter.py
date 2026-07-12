@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -28,11 +29,11 @@ def _git(workspace: Path, *arguments: str, check: bool = True) -> subprocess.Com
 
 
 def _run_post_startup_commands(workspace: Path) -> int | None:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("Bash is required to exercise SWE-agent startup commands.")
     for index, command in enumerate(adapter.POST_STARTUP_COMMANDS):
-        arguments = command.split()
-        assert arguments[:3] == ["git", "-C", "/repo"]
-        arguments[2] = str(workspace)
-        if subprocess.run(arguments, check=False).returncode:
+        if subprocess.run([bash, "-c", command], cwd=workspace, check=False).returncode:
             return index
     return None
 
@@ -96,7 +97,7 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     assert "history_processors: []" in overlay
     assert "post_startup_commands:" in overlay
     for command in adapter.POST_STARTUP_COMMANDS:
-        assert command in overlay
+        assert json.dumps(command) in overlay
     assert "Every response MUST contain exactly this structure" in overlay
     assert "Never emit more than one fenced block." in overlay
     assert "executed by Bash" in overlay
@@ -104,6 +105,8 @@ def test_official_command_uses_local_openai_compatible_configuration(tmp_path: P
     assert "edit_anthropic" not in overlay
     assert "function_calling" not in overlay
     assert "cache_control" not in overlay
+    assert "/repo" not in overlay
+    assert "/astropy" not in overlay
 
 
 def test_post_startup_file_mode_normalization_preserves_real_content_changes(
@@ -147,6 +150,40 @@ def test_post_startup_clean_gate_blocks_first_model_response(tmp_path: Path) -> 
         model_responses.append("first model response")
 
     assert model_responses == []
+
+
+def test_post_startup_hook_derives_arbitrary_deployed_repository_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "randomized" / "workspace" / "project-4f19"
+    workspace.mkdir(parents=True)
+    (workspace / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@example.com")
+    _git(workspace, "config", "user.name", "Test")
+    _git(workspace, "add", "module.py")
+    _git(workspace, "commit", "-qm", "base")
+
+    assert _run_post_startup_commands(workspace) is None
+    commands = "\n".join(adapter.POST_STARTUP_COMMANDS)
+    assert "/repo" not in commands
+    assert "/workspace/project" not in commands
+    assert "/astropy" not in commands
+
+
+def test_post_startup_hook_fails_clearly_outside_deployed_repository(tmp_path: Path) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("Bash is required to exercise SWE-agent startup commands.")
+
+    result = subprocess.run(
+        [bash, "-c", adapter.POST_STARTUP_COMMANDS[0]],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Unable to identify the deployed Git repository." in result.stderr
 
 
 def test_adapter_applies_official_patch_and_reports_metadata(

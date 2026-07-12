@@ -162,7 +162,9 @@ def test_native_modes_differ_only_by_model_endpoint_and_identifier(tmp_path: Pat
     assert "type: strict_thought_action" in baseline
     assert "tools/registry" in baseline
     assert baseline.index("tools/registry") < baseline.index("tools/review_on_submit_m")
-    assert "git -C /repo config core.fileMode false" in baseline
+    assert "git rev-parse --show-toplevel" in baseline
+    assert "git -C /repo" not in baseline
+    assert "/astropy" not in baseline
     assert "$CGR_NATIVE_API_KEY" in baseline
     assert "secret-key" not in baseline
 

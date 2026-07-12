@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -379,10 +378,6 @@ def render_native_overlay(
     endpoint: ModelEndpoint,
     problem_path: Path,
 ) -> str:
-    repo_name = instance.repo.rsplit("/", 1)[-1]
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", repo_name):
-        raise ValueError("Repository name is not safe for SWE-agent deployment commands.")
-    base = LOCAL_QWEN_OVERLAY.replace("git -C /repo", f"git -C /{repo_name}")
     env_fields = (
         "env:\n"
         "  deployment:\n"
@@ -393,7 +388,7 @@ def render_native_overlay(
         f"    github_url: {json.dumps('https://github.com/' + instance.repo)}\n"
         f"    base_commit: {json.dumps(instance.base_commit)}\n"
     )
-    base = base.replace("env:\n", env_fields, 1)
+    base = LOCAL_QWEN_OVERLAY.replace("env:\n", env_fields, 1)
     model_fields = (
         "problem_statement:\n"
         "  type: text_file\n"
