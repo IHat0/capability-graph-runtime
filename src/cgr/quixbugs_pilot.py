@@ -295,6 +295,14 @@ def _clone_attempt(source: Path, workspace: Path, commit: str) -> None:
     )
     cycle._git(workspace, "checkout", "--quiet", "--detach", commit)
     cycle._git(workspace, "reset", "--hard", commit)
+    cycle._git(workspace, "bundle", "create", ".git/cgr-origin.bundle", "HEAD")
+    cycle._git(
+        workspace,
+        "remote",
+        "set-url",
+        "origin",
+        "./.git/cgr-origin.bundle",
+    )
     cycle._git(workspace, "clean", "-fd")
 
 

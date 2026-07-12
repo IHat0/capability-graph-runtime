@@ -22,7 +22,10 @@ scripts/prepare_quixbugs_pilot.sh .quixbugs-src
 The preparation command pins and cleans only known generated test state, checks
 the selected files and commit, and requires the buggy task's verifier to fail.
 Each pilot attempt uses a fresh disposable clone; the canonical checkout is not
-modified by SWE-agent.
+modified by SWE-agent. The disposable clone replaces its inherited host-local
+origin with `./.git/cgr-origin.bundle`. That bundle contains the pinned commit,
+travels with the uploaded Git repository, and lets SWE-agent's normal `git
+fetch` initialization run without network or access to the canonical checkout.
 
 ## Local Integration Proof
 

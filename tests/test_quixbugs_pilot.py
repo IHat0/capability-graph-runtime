@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -72,6 +73,43 @@ def test_attempt_clone_is_disposable_and_pinned(tmp_path: Path) -> None:
     assert _git(workspace, "rev-parse", "HEAD") == commit
     assert _git(source, "status", "--porcelain=v1") == ""
     assert tracked.read_text(encoding="utf-8") == "buggy = True\n"
+
+
+def test_real_quixbugs_workspace_origin_survives_relocation(tmp_path: Path) -> None:
+    official = Path(".quixbugs-src").absolute()
+    if not official.is_dir():
+        pytest.skip("The pinned QuixBugs integration checkout is not available.")
+    task, _ = pilot._load_task(pilot.DEFAULT_MANIFEST, "quixbugs.gcd")
+    if _git(official, "rev-parse", "HEAD") != task["pinned_commit"]:
+        pytest.skip("The local QuixBugs checkout is not at the pilot commit.")
+
+    canonical = tmp_path / "canonical-source"
+    shutil.copytree(official, canonical)
+    workspace = tmp_path / "first-location" / "workspace"
+    workspace.parent.mkdir()
+    pilot._clone_attempt(canonical, workspace, str(task["pinned_commit"]))
+
+    origin = _git(workspace, "remote", "get-url", "origin")
+    assert origin == "./.git/cgr-origin.bundle"
+    assert str(canonical) not in origin
+    assert (workspace / ".git" / "cgr-origin.bundle").is_file()
+
+    relocated = tmp_path / "unrelated-location" / "uploaded-workspace"
+    relocated.parent.mkdir()
+    shutil.copytree(workspace, relocated)
+    canonical.rename(tmp_path / "canonical-source-unavailable")
+
+    for command in (
+        ("status",),
+        ("fetch",),
+        ("checkout", "HEAD"),
+        ("clean", "-fdq"),
+    ):
+        _git(relocated, *command)
+
+    assert _git(relocated, "rev-parse", "HEAD") == task["pinned_commit"]
+    assert _git(relocated, "status", "--porcelain=v1") == ""
+    assert _git(relocated, "diff", "--binary", "HEAD", "--") == ""
 
 
 @pytest.mark.parametrize(
