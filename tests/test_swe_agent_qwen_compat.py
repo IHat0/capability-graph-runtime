@@ -37,6 +37,7 @@ def test_official_sweagent_install_is_pinned_to_the_upstream_commit() -> None:
 
     assert "SWE-agent.git@" not in pyproject
     assert 'fetch --quiet origin "$commit"' in smoke_script
+    assert 'reset --quiet --hard "$commit"' in smoke_script
     assert 'python -m pip install --quiet -e "$source_root"' in smoke_script
     assert commit in smoke_script
     assert 'apply --check "$patch_path"' in smoke_script

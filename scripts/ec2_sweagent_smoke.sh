@@ -16,6 +16,7 @@ if [[ ! -d "$source_root/.git" ]]; then
 fi
 git -C "$source_root" fetch --quiet origin "$commit"
 git -C "$source_root" checkout --quiet --detach "$commit"
+git -C "$source_root" reset --quiet --hard "$commit"
 [[ "$(git -C "$source_root" rev-parse HEAD)" == "$commit" ]] || {
   echo "Pinned SWE-agent commit verification failed." >&2
   exit 2
