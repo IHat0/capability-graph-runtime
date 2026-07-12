@@ -106,6 +106,8 @@ def build_sweagent_command(
     max_calls: int,
     max_steps: int,
     environment: dict[str, str] | None = None,
+    deployment_type: str = "docker",
+    deployed_repo_name: str | None = None,
 ) -> list[str]:
     """Create the documented official CLI invocation for a local vLLM model."""
     env = os.environ if environment is None else environment
@@ -118,7 +120,7 @@ def build_sweagent_command(
     if max_input <= 0:
         raise ValueError("CGR_DRAFT_MAX_MODEL_LEN is too small for SWE-agent output.")
     # `openai/` is LiteLLM's supported provider prefix for OpenAI-compatible proxies.
-    return [
+    command = [
         executable,
         "run",
         "--config",
@@ -127,10 +129,6 @@ def build_sweagent_command(
         str(local_override_path.resolve(strict=True)),
         "--output_dir",
         str(output_dir),
-        "--env.repo.path",
-        str(workspace),
-        "--env.deployment.image",
-        "python:3.12",
         "--problem_statement.path",
         str(problem_file),
         "--agent.model.name",
@@ -152,6 +150,28 @@ def build_sweagent_command(
         "--agent.model.max_output_tokens",
         str(max_output),
     ]
+    if deployment_type == "docker":
+        command.extend(
+            ["--env.repo.path", str(workspace), "--env.deployment.image", "python:3.12"]
+        )
+    elif deployment_type == "local":
+        if not deployed_repo_name:
+            raise ValueError("Local deployment requires a preexisting deployed repository name.")
+        command.extend(
+            [
+                "--env.deployment.type",
+                "local",
+                "--env.repo.type",
+                "preexisting",
+                "--env.repo.repo_name",
+                deployed_repo_name,
+                "--env.repo.base_commit",
+                "HEAD",
+            ]
+        )
+    else:
+        raise ValueError(f"Unsupported SWE-agent deployment type: {deployment_type}")
+    return command
 
 
 def run_official_sweagent(
@@ -211,6 +231,10 @@ def adapter_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--max-calls", type=int, required=True)
+    parser.add_argument("--deployment-type", choices=("docker", "local"), default="docker")
+    parser.add_argument("--deployed-repo-name")
+    parser.add_argument("--config-overlay", type=Path)
+    parser.add_argument("--repository-shared-with-agent", action="store_true")
     args = parser.parse_args(argv)
     started = time.perf_counter()
     output_dir: Path | None = None
@@ -232,7 +256,12 @@ def adapter_main(argv: list[str] | None = None) -> int:
         config_path = source_root / "config" / "default.yaml"
         output_dir = workspace.parent / ".cgr-sweagent-trajectories"
         output_dir.mkdir(parents=True, exist_ok=True)
-        local_override_path = write_local_model_override(output_dir)
+        if args.config_overlay is None:
+            local_override_path = write_local_model_override(output_dir)
+        else:
+            local_override_path = args.config_overlay.resolve(strict=True)
+            if local_override_path.parent != workspace.parent:
+                raise ValueError("--config-overlay must be inside the workspace parent directory.")
         command = build_sweagent_command(
             executable=executable,
             workspace=workspace,
@@ -242,6 +271,8 @@ def adapter_main(argv: list[str] | None = None) -> int:
             local_override_path=local_override_path,
             max_calls=args.max_calls,
             max_steps=args.max_steps,
+            deployment_type=args.deployment_type,
+            deployed_repo_name=args.deployed_repo_name,
         )
         child_environment = os.environ.copy()
         child_environment["SWE_AGENT_CONFIG_ROOT"] = str(source_root)
@@ -254,7 +285,10 @@ def adapter_main(argv: list[str] | None = None) -> int:
         if process.returncode:
             raise OfficialSWEAgentFailure(process, command, output_dir)
         patch, artifact = collect_official_patch(output_dir)
-        apply_official_patch(workspace, patch)
+        if args.repository_shared_with_agent:
+            _verify_shared_workspace_patch(workspace, patch)
+        else:
+            apply_official_patch(workspace, patch)
         verification = _verify_applied_patch(workspace)
         payload = {
             "ok": True,
@@ -319,6 +353,26 @@ def _verify_applied_patch(workspace: Path) -> dict[str, Any]:
     if result.returncode:
         raise ValueError("Applied official SWE-agent patch fails git diff --check.")
     return {"command": command, "exit_code": 0, "stdout": result.stdout[-2000:], "stderr": result.stderr[-2000:]}
+
+
+def _verify_shared_workspace_patch(workspace: Path, patch: str) -> None:
+    """Verify that a local SWE-agent submission is the worktree's real diff."""
+    _validate_patch_paths(patch)
+    result = subprocess.run(
+        ["git", "diff", "--binary", "HEAD", "--"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise ValueError("Could not inspect the shared SWE-agent worktree diff.")
+    actual = result.stdout.replace("\r\n", "\n").strip()
+    submitted = patch.replace("\r\n", "\n").strip()
+    if not actual:
+        raise ValueError("Official SWE-agent submitted a patch but the shared worktree is clean.")
+    if actual != submitted:
+        raise ValueError("Official SWE-agent submission differs from the shared worktree diff.")
 
 
 def write_local_model_override(output_dir: Path) -> Path:

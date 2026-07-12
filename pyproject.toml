@@ -28,8 +28,12 @@ cgr-swebench-pilot = "cgr.swebench.cli:pilot_main"
 cgr-swebench-native-pilot = "cgr.swebench.native_pilot:native_pilot_main"
 cgr-swebench-agent = "cgr.swebench.agent:agent_main"
 cgr-swebench-swe-agent-adapter = "cgr.swebench.swe_agent_adapter:adapter_main"
+cgr-sandbox-full-cycle = "cgr.swebench.sandbox_full_cycle:sandbox_full_cycle_main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]
 swebench=["datasets>=3.0","swebench==3.0.17"]
+
+[tool.pytest.ini_options]
+testpaths=["tests"]

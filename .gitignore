@@ -6,5 +6,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 .venv-swebench-eval/
+.sandbox-sweagent-src/
+.sandbox-sweagent-venv/
 dist/
 build/
