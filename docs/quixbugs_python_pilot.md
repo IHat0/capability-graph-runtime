@@ -31,6 +31,8 @@ fetch` initialization run without network or access to the canonical checkout.
 
 ```bash
 cgr-quixbugs-pilot \
+  --mode baseline \
+  --max-attempts 1 \
   --task-id quixbugs.gcd \
   --quixbugs-root .quixbugs-src \
   --deterministic-model \
@@ -40,6 +42,29 @@ cgr-quixbugs-pilot \
 The deterministic option starts a local OpenAI-compatible endpoint. Responses
 still pass through the normal provider API and drive the real SWE-agent loop,
 shell, submission, Git diff, verifier, and artifact pipeline.
+
+## Attempt-Level CGR Repair
+
+Baseline mode preserves the original single-attempt directory and result
+schema. CGR mode runs that same complete baseline attempt as a child process.
+If it is unresolved, CGR diagnoses the real trajectory and repository state,
+stores concise corrective evidence, and launches one fresh child attempt at
+the pinned commit:
+
+```bash
+cgr-quixbugs-pilot \
+  --mode cgr \
+  --max-attempts 2 \
+  --task-id quixbugs.gcd \
+  --quixbugs-root .quixbugs-src \
+  --deployment-type docker
+```
+
+Baseline accepts exactly one attempt; CGR accepts one or two in this version.
+CGR results use `run-NNN/` with `run-result.json`, `diagnosis.json`,
+`corrective-message.md`, child `attempt-NNN/` directories, and `selected.patch`
+when available. Selection prefers a passing verifier, then a nonempty patch,
+then the most informative controlled failure. No LLM judges trajectory prose.
 
 ## External Model Run
 
@@ -55,12 +80,14 @@ export CGR_SWE_AGENT_PYTHON="$PWD/.sandbox-sweagent-venv/bin/python"
 export CGR_SWE_AGENT_EXECUTABLE="$PWD/.sandbox-sweagent-venv/bin/sweagent"
 
 cgr-quixbugs-pilot \
+  --mode baseline \
+  --max-attempts 1 \
   --task-id quixbugs.gcd \
   --quixbugs-root .quixbugs-src \
   --deployment-type docker
 ```
 
-Results are retained under
-`benchmark-results/quixbugs-python-pilot-v1/quixbugs.gcd/attempt-NNN`. A model
-failure, no patch, failing verifier, or exhausted budget is serialized as a
-task outcome; infrastructure failures remain distinct.
+Baseline results remain under `quixbugs.gcd/attempt-NNN`; CGR parent results
+use `quixbugs.gcd/run-NNN`. A model failure, no patch, failing verifier, or
+exhausted budget is serialized as a task outcome; infrastructure failures
+remain distinct.

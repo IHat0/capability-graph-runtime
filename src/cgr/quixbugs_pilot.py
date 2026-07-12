@@ -6,7 +6,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -14,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from cgr.swebench import sandbox_full_cycle as cycle
+from cgr.quixbugs_diagnosis import build_corrective_message, diagnose_attempt
 
 
 DEFAULT_MANIFEST = Path("benchmark-manifests/quixbugs-python-pilot-v1.json")
@@ -26,6 +29,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quixbugs-root", type=Path, required=True)
     parser.add_argument("--result-root", type=Path, default=DEFAULT_RESULT_ROOT)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--mode", choices=("baseline", "cgr"), default="baseline")
+    parser.add_argument("--max-attempts", type=int)
     parser.add_argument("--deterministic-model", action="store_true")
     parser.add_argument("--deployment-type", choices=("docker", "local"))
     parser.add_argument(
@@ -38,9 +43,34 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path(os.getenv("CGR_SWE_AGENT_PYTHON", ".sandbox-sweagent-venv/Scripts/python.exe")),
     )
+    parser.add_argument("--attempt-parent", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--correction-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--deterministic-profile",
+        choices=("success", "failed", "recovery"),
+        default="success",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
 
-    attempt = cycle._allocate_attempt(args.result_root.absolute() / args.task_id)
+    max_attempts = args.max_attempts
+    if max_attempts is None:
+        max_attempts = 1 if args.mode == "baseline" else 2
+    if max_attempts < 1:
+        parser.error("--max-attempts must be at least 1")
+    if args.mode == "baseline" and max_attempts != 1:
+        parser.error("baseline mode supports exactly one attempt")
+    if args.mode == "cgr" and max_attempts > 2:
+        parser.error("cgr mode supports at most two attempts in this version")
+    if args.mode == "cgr":
+        return _run_cgr(args, max_attempts)
+
+    attempt_root = (
+        args.attempt_parent.absolute()
+        if args.attempt_parent is not None
+        else args.result_root.absolute() / args.task_id
+    )
+    attempt = cycle._allocate_attempt(attempt_root)
     final_path = attempt / "final-result.json"
     server = None
     server_thread: threading.Thread | None = None
@@ -70,7 +100,10 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             str(task["pinned_commit"]) + "\n", encoding="utf-8"
         )
         problem_path = attempt / "problem-statement.md"
-        problem_path.write_text(str(task["problem_statement"]) + "\n", encoding="utf-8")
+        problem = str(task["problem_statement"]) + "\n"
+        if args.correction_file is not None:
+            problem += "\n" + args.correction_file.read_text(encoding="utf-8")
+        problem_path.write_text(problem, encoding="utf-8")
 
         verifier_command = _verifier_command(task, sweagent_python)
         pre_verifier = _run_verifier(verifier_command, source_root, int(task["timeout_seconds"]))
@@ -91,7 +124,12 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         interaction_path: Path | None = None
         if args.deterministic_model:
             interaction_path = attempt / "model-interactions.jsonl"
-            actions = _deterministic_actions(task, sweagent_python, runtime_root)
+            actions = _deterministic_actions(
+                task,
+                sweagent_python,
+                runtime_root,
+                profile=args.deterministic_profile,
+            )
             server = cycle._model_server(
                 interaction_path,
                 cycle._git_bash_path(runtime_root / "model.patch"),
@@ -242,6 +280,194 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     return int(result["top_level_exit_code"])
 
 
+def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
+    started = time.perf_counter()
+    run = _allocate_run(args.result_root.absolute() / args.task_id)
+    result_path = run / "run-result.json"
+    result: dict[str, Any] = {
+        "run_id": run.name,
+        "task_id": args.task_id,
+        "mode": "cgr",
+        "maximum_attempts": max_attempts,
+        "attempts_started": 0,
+        "attempts_completed": 0,
+        "child_artifact_paths": [],
+        "selected_attempt": None,
+        "final_classification": "infrastructure_error",
+        "infrastructure_status": "failed",
+        "recovery_occurred": False,
+        "top_level_exit_code": 1,
+    }
+    try:
+        task, _manifest = _load_task(args.manifest.absolute(), args.task_id)
+        child_results: list[dict[str, Any]] = []
+        first = _launch_child_attempt(args, run, profile="failed")
+        child_results.append(first)
+        result["attempts_started"] = 1
+        result["attempts_completed"] = 1
+        result["child_artifact_paths"].append(first["artifact_directory"])
+        result["first_attempt_classification"] = first.get("classification")
+        if first.get("infrastructure_status") != "completed":
+            raise RuntimeError("First QuixBugs child attempt had an infrastructure failure.")
+
+        trajectory = _result_path(first.get("trajectory_path"))
+        workspace = Path(str(first["repository_root"]))
+        diagnosis = diagnose_attempt(trajectory, workspace, first)
+        diagnosis_path = run / "diagnosis.json"
+        diagnosis_path.write_text(json.dumps(diagnosis, indent=2), encoding="utf-8")
+        correction_path = run / "corrective-message.md"
+        correction_path.write_text(build_corrective_message(diagnosis, task), encoding="utf-8")
+        result["diagnosis_path"] = str(diagnosis_path)
+        result["corrective_message_path"] = str(correction_path)
+
+        if first.get("classification") != "resolved" and max_attempts >= 2:
+            second = _launch_child_attempt(
+                args,
+                run,
+                correction=correction_path,
+                profile="recovery",
+            )
+            child_results.append(second)
+            result["attempts_started"] = 2
+            result["attempts_completed"] = 2
+            result["child_artifact_paths"].append(second["artifact_directory"])
+            result["second_attempt_classification"] = second.get("classification")
+            result["recovery_occurred"] = True
+            if second.get("infrastructure_status") != "completed":
+                raise RuntimeError("Second QuixBugs child attempt had an infrastructure failure.")
+
+        selected_index = _select_attempt(child_results)
+        selected = child_results[selected_index]
+        selected_name = f"attempt-{selected_index + 1:03d}"
+        result.update(
+            {
+                "selected_attempt": selected_name,
+                "selected_attempt_path": selected["artifact_directory"],
+                "final_classification": selected.get("classification"),
+                "final_patch_path": selected.get("submitted_patch_path"),
+                "final_verifier_exit_code": selected.get("verifier_exit_code"),
+                "infrastructure_status": "completed",
+                "top_level_exit_code": 0,
+                "attempt_results": child_results,
+            }
+        )
+        patch_path = _result_path(selected.get("submitted_patch_path"))
+        if patch_path is not None and patch_path.is_file() and patch_path.stat().st_size:
+            parent_patch = run / "selected.patch"
+            shutil.copyfile(patch_path, parent_patch)
+            result["final_patch_path"] = str(parent_patch)
+    except Exception as exc:
+        (run / "failure-traceback.log").write_text(traceback.format_exc(), encoding="utf-8")
+        result["error"] = str(exc)
+    finally:
+        result["total_elapsed_seconds"] = time.perf_counter() - started
+        result["artifact_hash_manifest"] = str(run / "artifact-sha256.json")
+        result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        cycle._write_hash_manifest(run)
+    print(json.dumps(result, indent=2))
+    return int(result["top_level_exit_code"])
+
+
+def _launch_child_attempt(
+    args: argparse.Namespace,
+    run: Path,
+    *,
+    correction: Path | None = None,
+    profile: str,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        "-m",
+        "cgr.quixbugs_pilot",
+        "--mode",
+        "baseline",
+        "--max-attempts",
+        "1",
+        "--task-id",
+        args.task_id,
+        "--quixbugs-root",
+        str(args.quixbugs_root.absolute()),
+        "--result-root",
+        str(args.result_root.absolute()),
+        "--manifest",
+        str(args.manifest.absolute()),
+        "--sweagent-source",
+        str(args.sweagent_source.absolute()),
+        "--sweagent-python",
+        str(args.sweagent_python.absolute()),
+        "--attempt-parent",
+        str(run),
+        "--deterministic-profile",
+        profile,
+    ]
+    if args.deployment_type:
+        command.extend(["--deployment-type", args.deployment_type])
+    if args.deterministic_model:
+        command.append("--deterministic-model")
+    if correction is not None:
+        command.extend(["--correction-file", str(correction)])
+    index = len(list(run.glob("attempt-*/final-result.json"))) + 1
+    process = subprocess.run(
+        command,
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    (run / f"attempt-{index:03d}.launcher.stdout.log").write_text(
+        process.stdout, encoding="utf-8"
+    )
+    (run / f"attempt-{index:03d}.launcher.stderr.log").write_text(
+        process.stderr, encoding="utf-8"
+    )
+    attempt_path = run / f"attempt-{index:03d}" / "final-result.json"
+    if not attempt_path.is_file():
+        raise RuntimeError(
+            f"Child attempt {index} produced no final result (exit {process.returncode})."
+        )
+    child = json.loads(attempt_path.read_text(encoding="utf-8"))
+    if process.returncode != int(child.get("top_level_exit_code", 1)):
+        raise RuntimeError(f"Child attempt {index} exit code disagrees with its result.")
+    return child
+
+
+def _allocate_run(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    for index in range(1, 10000):
+        candidate = root / f"run-{index:03d}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError("No available QuixBugs CGR run directory.")
+
+
+def _select_attempt(results: list[dict[str, Any]]) -> int:
+    def score(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int]:
+        index, result = item
+        verified = int(
+            result.get("classification") == "resolved"
+            and result.get("verifier_exit_code") == 0
+        )
+        patch = int(bool(result.get("patch_size")))
+        informative = {
+            "tests_failed": 4,
+            "verifier_error": 3,
+            "budget_exhausted": 2,
+            "no_patch": 1,
+        }.get(str(result.get("classification")), 0)
+        return verified, patch, informative - index
+
+    return max(enumerate(results), key=score)[0]
+
+
+def _result_path(value: Any) -> Path | None:
+    return Path(value) if isinstance(value, str) and value else None
+
+
 def _load_task(path: Path, task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     tasks = manifest.get("tasks") if isinstance(manifest, dict) else None
@@ -349,12 +575,18 @@ def _configured_model() -> tuple[str, str, str]:
 
 
 def _deterministic_actions(
-    task: dict[str, Any], python: Path, runtime_root: Path
+    task: dict[str, Any], python: Path, runtime_root: Path, *, profile: str = "success"
 ) -> list[str]:
     source = str(task["source_file"])
     test = str(task["test_file"])
     python_posix = cycle._git_bash_path(python)
     submission = cycle._git_bash_path(runtime_root / "model.patch")
+    if profile == "failed":
+        failed = (
+            f"git add {shlex_quote(source)} test_gcd.py 2>&1\n"
+            'git commit -m "Fix gcd function to return the greatest common divisor" 2>&1'
+        )
+        return [failed]
     return [
         f"sed -n '1,100p' {shlex_quote(source)} && sed -n '1,120p' {shlex_quote(test)}",
         f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
