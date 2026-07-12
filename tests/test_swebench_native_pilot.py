@@ -191,7 +191,9 @@ def test_pinned_sweagent_verification_checks_commit_patch_and_import_path(
     outputs = iter(
         [
             native.SWE_AGENT_COMMIT + "\n",
-            json.dumps(
+            "INFO This is SWE-agent version 1.1.0\n"
+            + native._SWEAGENT_IDENTITY_PREFIX
+            + json.dumps(
                 {
                     "reported_python": str(python),
                     "package_path": str(source / "sweagent" / "__init__.py"),
@@ -250,7 +252,8 @@ def test_pinned_sweagent_verification_rejects_import_outside_source(
     outputs = iter(
         [
             native.SWE_AGENT_COMMIT + "\n",
-            json.dumps(
+            native._SWEAGENT_IDENTITY_PREFIX
+            + json.dumps(
                 {
                     "reported_python": sys.executable,
                     "package_path": str(outside),
@@ -753,6 +756,8 @@ def test_native_cli_and_ec2_runner_are_separate_from_legacy_adapter() -> None:
     assert 'cgr-swebench-native-pilot = "cgr.swebench.native_pilot:native_pilot_main"' in pyproject
     assert "cgr-swebench-swe-agent-adapter" not in script
     assert "--generate-and-evaluate" in script
+    assert "CGR_SWEAGENT_IDENTITY=" in script
+    assert 'exit "$benchmark_status"' in script
     assert "set +e" in script and "PIPESTATUS[0]" in script
     assert "/tmp" not in script
     assert 'CGR_SWEBENCH_EVALUATOR_PYTHON="$PWD/.venv-swebench-eval/bin/python"' in script

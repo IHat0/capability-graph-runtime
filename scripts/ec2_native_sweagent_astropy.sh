@@ -36,7 +36,17 @@ git -C "$CGR_SWE_AGENT_SOURCE" apply --reverse --check \
 
 sweagent_python="${CGR_SWE_AGENT_PYTHON:-$(dirname "$CGR_SWE_AGENT_EXECUTABLE")/python}"
 export CGR_SWE_AGENT_PYTHON="$sweagent_python"
-sweagent_identity="$("$sweagent_python" -c 'import os, pathlib, sys, sweagent; source = pathlib.Path(os.environ["CGR_SWE_AGENT_SOURCE"]).resolve(); imported = pathlib.Path(sweagent.__file__).resolve(); assert source in imported.parents, imported; print(f"{sys.executable}|{imported}")')"
+sweagent_identity_output="$("$sweagent_python" -c 'import os, pathlib, sys, sweagent; source = pathlib.Path(os.environ["CGR_SWE_AGENT_SOURCE"]).resolve(); imported = pathlib.Path(sweagent.__file__).resolve(); assert source in imported.parents, imported; print(f"CGR_SWEAGENT_IDENTITY={sys.executable}|{imported}")')"
+sweagent_identity=''
+while IFS= read -r identity_line; do
+  if [[ "$identity_line" == CGR_SWEAGENT_IDENTITY=* ]]; then
+    sweagent_identity="${identity_line#CGR_SWEAGENT_IDENTITY=}"
+  fi
+done <<<"$sweagent_identity_output"
+[[ -n "$sweagent_identity" ]] || {
+  echo "SWE-agent Python produced no machine-readable identity record." >&2
+  exit 2
+}
 "$sweagent_python" -c 'from sweagent.tools.parsing import StrictThoughtActionParser; assert StrictThoughtActionParser().type == "strict_thought_action"'
 evaluator_identity="$("$CGR_SWEBENCH_EVALUATOR_PYTHON" -c 'import importlib.metadata,pathlib,sys,swebench,swebench.harness; version=importlib.metadata.version("swebench"); assert version == "3.0.17", version; print(f"{sys.executable}|{pathlib.Path(swebench.__file__).resolve()}|{pathlib.Path(swebench.harness.__file__).resolve()}|{version}")')"
 
@@ -117,3 +127,4 @@ PY
 fi
 
 printf 'The benchmark command status was captured; this shell remains available.\n'
+exit "$benchmark_status"

@@ -42,6 +42,7 @@ NATIVE_CALL_BUDGET = DEFAULT_BUDGETS["baseline"].maximum_model_calls
 NATIVE_STEP_BUDGET = DEFAULT_BUDGETS["baseline"].maximum_steps
 NATIVE_TIMEOUT_SECONDS = DEFAULT_BUDGETS["baseline"].timeout_seconds
 SWEBENCH_EVALUATOR_VERSION = "3.0.17"
+_SWEAGENT_IDENTITY_PREFIX = "CGR_SWEAGENT_IDENTITY="
 _METADATA_FILES = {
     "generation-result.json",
     "evaluation-result.json",
@@ -455,16 +456,17 @@ def verify_pinned_sweagent(source: Path, executable: str) -> dict[str, str]:
             "-c",
             (
                 "import json,pathlib,sys,sweagent;"
-                "print(json.dumps({'reported_python':sys.executable,"
+                f"print('{_SWEAGENT_IDENTITY_PREFIX}'+json.dumps("
+                "{'reported_python':sys.executable,"
                 "'package_path':str(pathlib.Path(sweagent.__file__).resolve())}))"
             ),
         ]
-    ).stdout.strip()
+    ).stdout
     try:
-        python_identity = json.loads(identity_output)
+        python_identity = _parse_sweagent_identity(identity_output)
         reported_python = python_identity["reported_python"]
         imported = python_identity["package_path"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (KeyError, TypeError) as exc:
         raise ValueError("SWE-agent Python returned malformed identity output.") from exc
     if not isinstance(reported_python, str) or not isinstance(imported, str):
         raise ValueError("SWE-agent Python returned incomplete identity output.")
@@ -751,6 +753,23 @@ def _sweagent_python(executable: str) -> str:
 def _absolute_interpreter_path(configured: str) -> str:
     """Make an interpreter path absolute without dereferencing virtualenv symlinks."""
     return os.path.abspath(os.path.expanduser(configured))
+
+
+def _parse_sweagent_identity(output: str) -> dict[str, Any]:
+    records = [
+        line.removeprefix(_SWEAGENT_IDENTITY_PREFIX)
+        for line in output.splitlines()
+        if line.startswith(_SWEAGENT_IDENTITY_PREFIX)
+    ]
+    if len(records) != 1:
+        raise ValueError("SWE-agent Python returned no unique identity record.")
+    try:
+        identity = json.loads(records[0])
+    except json.JSONDecodeError as exc:
+        raise ValueError("SWE-agent Python returned malformed identity JSON.") from exc
+    if not isinstance(identity, dict):
+        raise ValueError("SWE-agent Python returned a non-object identity record.")
+    return identity
 
 
 def _configured_secrets() -> list[str]:
