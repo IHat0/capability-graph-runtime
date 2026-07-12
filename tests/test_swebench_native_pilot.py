@@ -169,6 +169,8 @@ def test_native_modes_differ_only_by_model_endpoint_and_identifier(tmp_path: Pat
     assert "git rev-parse --show-toplevel" in baseline
     assert "git -C /repo" not in baseline
     assert "/astropy" not in baseline
+    assert "{{problem_statement}}" in baseline
+    assert "{{command_docs}}" in baseline
     assert "$CGR_NATIVE_API_KEY" in baseline
     assert "secret-key" not in baseline
 
@@ -364,6 +366,35 @@ def test_malformed_native_prediction_is_recorded_as_parse_failure(
     assert result["infrastructure_status"] == "failed"
     assert result["prediction_status"] == "parse_failed"
     assert "not valid JSON" in str(result["generation_error"])
+
+
+def test_native_attempt_diagnostics_capture_real_no_patch_failure_path(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt-003"
+    trajectory = attempt / INSTANCE.instance_id / f"{INSTANCE.instance_id}.traj"
+    trajectory.parent.mkdir(parents=True)
+    fixture = Path("tests/fixtures/sweagent_native_attempt_003.traj.json")
+    trajectory.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    (trajectory.parent / f"{INSTANCE.instance_id}.info.log").write_text(
+        "Executing submission command git add -A && git diff --cached > /root/model.patch\n"
+        "Found submission: \n",
+        encoding="utf-8",
+    )
+
+    diagnostics = native._native_attempt_diagnostics(attempt, ["secret"])
+
+    assert diagnostics["termination_reason"] == "exit_cost"
+    assert diagnostics["model_calls_used"] == 9
+    assert diagnostics["steps_used"] == 2
+    assert diagnostics["commands_attempted"] == 1
+    assert diagnostics["commands_executed"] == 1
+    assert diagnostics["edit_commands_attempted"] == 1
+    assert diagnostics["edit_commands_succeeded"] == 0
+    assert diagnostics["tests_run"] == []
+    assert diagnostics["repository_dirty_at_end"] is False
+    assert diagnostics["submission_attempted"] is True
+    assert diagnostics["parser_rejections_count"] == 0
+    assert diagnostics["last_model_output_preview"].startswith("DISCUSSION")
+    assert diagnostics["last_agent_message_preview"] == "Exit due to cost limit"
 
 
 def test_mismatched_official_prediction_instance_is_rejected(

@@ -39,9 +39,11 @@ POST_STARTUP_COMMANDS = (
 _POST_STARTUP_COMMANDS_YAML = "\n".join(
     f"    - {json.dumps(command)}" for command in POST_STARTUP_COMMANDS
 )
-LOCAL_QWEN_OVERLAY = f"""env:
-  post_startup_commands:
-{_POST_STARTUP_COMMANDS_YAML}
+LOCAL_QWEN_OVERLAY = (
+    "env:\n"
+    "  post_startup_commands:\n"
+    + _POST_STARTUP_COMMANDS_YAML
+    + """
 agent:
   history_processors: []
   templates:
@@ -90,6 +92,7 @@ agent:
       error_message: |-
         Your response violated the required action format. The extracted fenced block is executed by Bash. Return exactly brief DISCUSSION followed by exactly one ```bash fenced block with one executable Bash command or script. Do not use multiple fenced blocks, Python fences, raw Python source, Markdown examples, tutorial-style prose, or native tool-call syntax.
 """
+)
 
 
 def build_sweagent_command(

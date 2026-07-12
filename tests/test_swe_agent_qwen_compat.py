@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from cgr.swebench.qwen_action_contract import (
     extract_v1_1_thought_action,
@@ -28,6 +29,18 @@ def test_overlay_has_complete_qwen_bash_contract() -> None:
     assert LOCAL_QWEN_OVERLAY.index("path: tools/registry") < LOCAL_QWEN_OVERLAY.index(
         "path: tools/review_on_submit_m"
     )
+    for placeholder in (
+        "{{command_docs}}",
+        "{{problem_statement}}",
+        "{{observation}}",
+        "{{bash_stdout}}",
+        "{{bash_stderr}}",
+    ):
+        assert placeholder in LOCAL_QWEN_OVERLAY
+    parsed = yaml.safe_load(LOCAL_QWEN_OVERLAY)
+    parse_function = parsed["agent"]["tools"]["parse_function"]
+    assert parse_function["type"] == "strict_thought_action"
+    assert isinstance(parse_function["error_message"], str)
 
 
 def test_official_sweagent_install_is_pinned_to_the_upstream_commit() -> None:

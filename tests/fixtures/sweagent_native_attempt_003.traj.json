@@ -1,0 +1,39 @@
+{
+  "provenance": "Reduced fixture from the retained native Astropy attempt 003 trajectory.",
+  "trajectory": [
+    {
+      "action": "cat path/to/repository/file.sh\nsed -i 's/old/new/' path/to/repository/file.sh",
+      "observation": "cat: path/to/repository/file.sh: No such file or directory\nsed: can't read path/to/repository/file.sh: No such file or directory\n",
+      "response": "DISCUSSION\nI will inspect the relevant repository file.\n\n```bash\ncat path/to/repository/file.sh\n```",
+      "thought": "I will inspect the relevant repository file.",
+      "execution_time": 0.117
+    },
+    {
+      "action": "",
+      "observation": "",
+      "response": "Exit due to cost limit",
+      "thought": "Exit due to cost limit",
+      "execution_time": 0.0
+    }
+  ],
+  "history": [
+    {
+      "role": "user",
+      "content": "Task:\n{problem_statement}",
+      "message_type": "observation"
+    },
+    {
+      "role": "assistant",
+      "content": "Exit due to cost limit",
+      "message_type": "action"
+    }
+  ],
+  "info": {
+    "submission": null,
+    "exit_status": "exit_cost",
+    "edited_files30": "Empty. No edited files found.",
+    "model_stats": {
+      "api_calls": 9
+    }
+  }
+}

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -291,6 +292,7 @@ def generate_attempt(
             (attempt / "sweagent.stderr.log").write_text(
                 _redact(process.stderr, secrets), encoding="utf-8"
             )
+    result.update(_native_attempt_diagnostics(attempt, secrets))
     result["elapsed_seconds"] = time.perf_counter() - started
     result["artifact_hashes"] = _hash_artifacts(attempt)
     _write_json(attempt / "artifact-sha256.json", result["artifact_hashes"])
@@ -638,6 +640,124 @@ def _official_prediction(
 def _has_model_patch(prediction: dict[str, Any]) -> bool:
     model_patch = prediction.get("model_patch")
     return isinstance(model_patch, str) and bool(model_patch.strip())
+
+
+def _native_attempt_diagnostics(attempt: Path, secrets: Sequence[str]) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "termination_reason": None,
+        "model_calls_used": None,
+        "steps_used": 0,
+        "commands_attempted": 0,
+        "commands_executed": 0,
+        "edit_commands_attempted": 0,
+        "edit_commands_succeeded": 0,
+        "tests_run": [],
+        "repository_dirty_at_end": None,
+        "submission_attempted": False,
+        "parser_rejections_count": 0,
+        "last_model_output_preview": None,
+        "last_agent_message_preview": None,
+    }
+    trajectory_paths = sorted(attempt.rglob("*.traj"))
+    if not trajectory_paths:
+        return diagnostics
+    try:
+        payload = json.loads(trajectory_paths[-1].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        diagnostics["termination_reason"] = "trajectory_unreadable"
+        return diagnostics
+    if not isinstance(payload, dict):
+        diagnostics["termination_reason"] = "trajectory_invalid"
+        return diagnostics
+
+    trajectory = payload.get("trajectory")
+    history = payload.get("history")
+    info = payload.get("info")
+    entries = [item for item in trajectory if isinstance(item, dict)] if isinstance(trajectory, list) else []
+    messages = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+    info_map = info if isinstance(info, dict) else {}
+    model_stats = info_map.get("model_stats")
+    if isinstance(model_stats, dict) and isinstance(model_stats.get("api_calls"), int):
+        diagnostics["model_calls_used"] = model_stats["api_calls"]
+    diagnostics["termination_reason"] = info_map.get("exit_status") if isinstance(
+        info_map.get("exit_status"), str
+    ) else None
+    diagnostics["steps_used"] = len(entries)
+    diagnostics["repository_dirty_at_end"] = (
+        bool(info_map["submission"]) if "submission" in info_map else None
+    )
+
+    executed_actions: list[dict[str, Any]] = []
+    test_commands: list[str] = []
+    for entry in entries:
+        action = entry.get("action")
+        if not isinstance(action, str) or not action.strip():
+            continue
+        diagnostics["commands_attempted"] += 1
+        execution_time = entry.get("execution_time")
+        if isinstance(execution_time, (int, float)) and execution_time > 0:
+            diagnostics["commands_executed"] += 1
+            executed_actions.append(entry)
+        if _is_edit_command(action):
+            diagnostics["edit_commands_attempted"] += 1
+            observation = entry.get("observation")
+            if isinstance(observation, str) and not _command_output_failed(observation):
+                diagnostics["edit_commands_succeeded"] += 1
+        if _is_test_command(action):
+            test_commands.append(_redact(_preview(action), secrets))
+    diagnostics["tests_run"] = test_commands
+
+    info_log = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in sorted(attempt.rglob("*.info.log"))
+    )
+    diagnostics["submission_attempted"] = (
+        "Executing submission command" in info_log or bool(info_map.get("submission"))
+    )
+    diagnostics["parser_rejections_count"] = sum(
+        1
+        for message in messages
+        if isinstance(message.get("content"), str)
+        and "Your response violated the required action format" in message["content"]
+    )
+
+    model_responses = [
+        entry["response"]
+        for entry in entries
+        if isinstance(entry.get("response"), str)
+        and entry["response"]
+        and entry.get("action")
+    ]
+    if model_responses:
+        diagnostics["last_model_output_preview"] = _redact(_preview(model_responses[-1]), secrets)
+    agent_messages = [
+        message["content"]
+        for message in messages
+        if message.get("role") == "assistant" and isinstance(message.get("content"), str)
+    ]
+    if agent_messages:
+        diagnostics["last_agent_message_preview"] = _redact(_preview(agent_messages[-1]), secrets)
+    if diagnostics["termination_reason"] is None and executed_actions:
+        diagnostics["termination_reason"] = "trajectory_ended_without_exit_status"
+    return diagnostics
+
+
+def _is_edit_command(action: str) -> bool:
+    return bool(
+        re.search(r"(?m)^\s*(?:sed|perl|tee|apply_patch|patch|git\s+apply|cp|mv|rm)\b", action)
+    )
+
+
+def _is_test_command(action: str) -> bool:
+    return bool(re.search(r"\b(?:pytest|tox|nox|make\s+test|npm\s+test)\b", action))
+
+
+def _command_output_failed(observation: str) -> bool:
+    return bool(re.search(r"(?im)(?:no such file|not found|can'?t read|fatal:|traceback|error:)", observation))
+
+
+def _preview(value: str, limit: int = 1000) -> str:
+    return value[:limit]
 
 
 def _verify_generation_identity(
