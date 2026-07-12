@@ -650,11 +650,18 @@ def _native_attempt_diagnostics(attempt: Path, secrets: Sequence[str]) -> dict[s
         "commands_attempted": 0,
         "commands_executed": 0,
         "edit_commands_attempted": 0,
-        "edit_commands_succeeded": 0,
+        "edit_commands_executed": 0,
+        "edit_commands_without_observed_error": 0,
+        "edit_commands_exit_zero": None,
         "tests_run": [],
+        "verification_commands_attempted": [],
+        "git_diff_observed": False,
+        "tracked_file_change_observed": False,
         "repository_dirty_at_end": None,
+        "change_survived_until_submission": None,
         "submission_attempted": False,
         "parser_rejections_count": 0,
+        "call_budget_exceeded_by": 0,
         "last_model_output_preview": None,
         "last_agent_message_preview": None,
     }
@@ -686,9 +693,14 @@ def _native_attempt_diagnostics(attempt: Path, secrets: Sequence[str]) -> dict[s
     diagnostics["repository_dirty_at_end"] = (
         bool(info_map["submission"]) if "submission" in info_map else None
     )
+    diagnostics["change_survived_until_submission"] = diagnostics["repository_dirty_at_end"]
+    if isinstance(diagnostics["model_calls_used"], int):
+        diagnostics["call_budget_exceeded_by"] = max(
+            0, diagnostics["model_calls_used"] - NATIVE_CALL_BUDGET
+        )
 
-    executed_actions: list[dict[str, Any]] = []
     test_commands: list[str] = []
+    verification_commands: list[str] = []
     for entry in entries:
         action = entry.get("action")
         if not isinstance(action, str) or not action.strip():
@@ -697,15 +709,27 @@ def _native_attempt_diagnostics(attempt: Path, secrets: Sequence[str]) -> dict[s
         execution_time = entry.get("execution_time")
         if isinstance(execution_time, (int, float)) and execution_time > 0:
             diagnostics["commands_executed"] += 1
-            executed_actions.append(entry)
         if _is_edit_command(action):
             diagnostics["edit_commands_attempted"] += 1
+            if isinstance(execution_time, (int, float)) and execution_time > 0:
+                diagnostics["edit_commands_executed"] += 1
             observation = entry.get("observation")
             if isinstance(observation, str) and not _command_output_failed(observation):
-                diagnostics["edit_commands_succeeded"] += 1
+                diagnostics["edit_commands_without_observed_error"] += 1
         if _is_test_command(action):
             test_commands.append(_redact(_preview(action), secrets))
+        if _is_verification_command(action):
+            verification_commands.append(_redact(_preview(action), secrets))
+        observation = entry.get("observation")
+        if (
+            "git diff" in action
+            and isinstance(observation, str)
+            and "diff --git " in observation
+        ):
+            diagnostics["git_diff_observed"] = True
+            diagnostics["tracked_file_change_observed"] = True
     diagnostics["tests_run"] = test_commands
+    diagnostics["verification_commands_attempted"] = verification_commands
 
     info_log = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
@@ -737,7 +761,7 @@ def _native_attempt_diagnostics(attempt: Path, secrets: Sequence[str]) -> dict[s
     ]
     if agent_messages:
         diagnostics["last_agent_message_preview"] = _redact(_preview(agent_messages[-1]), secrets)
-    if diagnostics["termination_reason"] is None and executed_actions:
+    if diagnostics["termination_reason"] is None and diagnostics["commands_executed"]:
         diagnostics["termination_reason"] = "trajectory_ended_without_exit_status"
     return diagnostics
 
@@ -750,6 +774,12 @@ def _is_edit_command(action: str) -> bool:
 
 def _is_test_command(action: str) -> bool:
     return bool(re.search(r"\b(?:pytest|tox|nox|make\s+test|npm\s+test)\b", action))
+
+
+def _is_verification_command(action: str) -> bool:
+    return _is_test_command(action) or bool(
+        re.search(r"\bpython(?:\d+(?:\.\d+)*)?\s+(?:-m\s+\S+|-c)\b", action)
+    )
 
 
 def _command_output_failed(observation: str) -> bool:

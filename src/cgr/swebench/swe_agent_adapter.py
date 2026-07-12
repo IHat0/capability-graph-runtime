@@ -59,7 +59,7 @@ agent:
       ```
 
       The single fenced block is extracted and executed by Bash. Never emit more than one fenced block. Never emit a Python fenced block, Markdown examples, tutorial-style answers, or commands merely described in prose. Never place raw Python source directly in the action block. If Python source is necessary, create it through a valid Bash command such as a quoted heredoc inside the one Bash block.
-      Inspect files with shell commands, edit with a valid Bash command, verify the change with a shell command, and submit only after a successful diff exists. Make the smallest focused change; do not create reproduction files unless the issue requires one.
+      First inspect the exact relevant source before editing. Do not invent code, use placeholder paths, or modify a line that was not shown by an earlier observation. Execute one focused action at a time. A zero exit status from sed, perl, or another editor does not prove a change: after every edit, run `git diff -- <changed-file>` before making any further diagnosis. If that diff is empty, inspect the real source and correct the edit instead of continuing as though it succeeded. Use command observations to choose the next action; do not repeat a failed plan. Run a focused relevant test or check after a non-empty diff, then submit only after a successful diff exists. Make the smallest focused change; do not create reproduction files unless the issue requires one.
 
       Available shell commands:
       {{command_docs}}

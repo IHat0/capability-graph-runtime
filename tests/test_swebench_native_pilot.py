@@ -388,13 +388,46 @@ def test_native_attempt_diagnostics_capture_real_no_patch_failure_path(tmp_path:
     assert diagnostics["commands_attempted"] == 1
     assert diagnostics["commands_executed"] == 1
     assert diagnostics["edit_commands_attempted"] == 1
-    assert diagnostics["edit_commands_succeeded"] == 0
+    assert diagnostics["edit_commands_executed"] == 1
+    assert diagnostics["edit_commands_without_observed_error"] == 0
+    assert diagnostics["edit_commands_exit_zero"] is None
     assert diagnostics["tests_run"] == []
     assert diagnostics["repository_dirty_at_end"] is False
     assert diagnostics["submission_attempted"] is True
     assert diagnostics["parser_rejections_count"] == 0
     assert diagnostics["last_model_output_preview"].startswith("DISCUSSION")
     assert diagnostics["last_agent_message_preview"] == "Exit due to cost limit"
+
+
+def test_native_attempt_diagnostics_do_not_treat_noop_edits_as_file_changes(
+    tmp_path: Path,
+) -> None:
+    attempt = tmp_path / "attempt-004"
+    trajectory = attempt / INSTANCE.instance_id / f"{INSTANCE.instance_id}.traj"
+    trajectory.parent.mkdir(parents=True)
+    fixture = Path("tests/fixtures/sweagent_native_attempt_004.traj.json")
+    trajectory.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    (trajectory.parent / f"{INSTANCE.instance_id}.info.log").write_text(
+        "Executing submission command git add -A && git diff --cached > /root/model.patch\n"
+        "Found submission: \n",
+        encoding="utf-8",
+    )
+
+    diagnostics = native._native_attempt_diagnostics(attempt, [])
+
+    assert diagnostics["termination_reason"] == "exit_cost"
+    assert diagnostics["model_calls_used"] == 9
+    assert diagnostics["call_budget_exceeded_by"] == 1
+    assert diagnostics["edit_commands_attempted"] == 2
+    assert diagnostics["edit_commands_executed"] == 2
+    assert diagnostics["edit_commands_without_observed_error"] == 2
+    assert diagnostics["edit_commands_exit_zero"] is None
+    assert diagnostics["verification_commands_attempted"]
+    assert diagnostics["tests_run"] == []
+    assert diagnostics["git_diff_observed"] is False
+    assert diagnostics["tracked_file_change_observed"] is False
+    assert diagnostics["repository_dirty_at_end"] is False
+    assert diagnostics["change_survived_until_submission"] is False
 
 
 def test_mismatched_official_prediction_instance_is_rejected(
