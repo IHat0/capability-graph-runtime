@@ -174,3 +174,21 @@ def test_agent_pytest_runtime_is_portable_and_preflighted(tmp_path: Path) -> Non
     assert "command -v python" in overlay
     assert "command -v sed" in overlay
     assert ".sandbox-sweagent-venv" not in overlay
+
+
+def test_actionable_recovery_requires_grounded_noop_edit() -> None:
+    assert pilot._qualifies_for_actionable_recovery(
+        {
+            "required_next_phase": "edit",
+            "no_op_edits": [{"target": "python_programs/gcd.py"}],
+            "phase_exit_condition": {"requires_nonempty_diff": True},
+        }
+    )
+    assert not pilot._qualifies_for_actionable_recovery(
+        {
+            "required_next_phase": "edit",
+            "no_op_edits": [],
+            "phase_exit_condition": {"requires_nonempty_diff": True},
+            "budget_exhausted": True,
+        }
+    )

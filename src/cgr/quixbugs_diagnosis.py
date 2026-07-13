@@ -177,6 +177,32 @@ def diagnose_attempt(
         )
     )
     edit_action_observed = any(_is_edit_action(action) for action in normalized_actions)
+    edit_commands = _edit_command_telemetry(actions, steps, target, traceback_evidence)
+    if target_changed:
+        target_edits = [item for item in edit_commands if item["target_named"]]
+        if target_edits:
+            target_edits[-1]["edit_effect_observed"] = True
+    edit_command_attempted = any(item["command_attempted"] for item in edit_commands)
+    edit_command_succeeded = any(item["command_succeeded"] for item in edit_commands)
+    edit_effect_observed = target_changed
+    no_op_edits = [
+        {
+            "command": item["command"],
+            "target": item["target"],
+            "mechanism": item["mechanism"],
+            "command_completed": item["command_succeeded"],
+            "target_changed": False,
+            "reason": "replacement_pattern_not_found_or_no_content_change",
+        }
+        for item in edit_commands
+        if item["command_succeeded"] and item["target_named"] and not target_changed
+    ]
+    stale_or_reversed = [
+        item for item in edit_commands if item.get("possible_stale_or_reversed_edit")
+    ]
+    verification_after_ineffective = _verification_after_ineffective_edit(
+        edit_commands, test_telemetry["attempts"], target_changed
+    )
     reasoning_action_mismatch = bool(
         edit_proposed
         and test_telemetry["test_command_attempted"]
@@ -198,6 +224,15 @@ def diagnose_attempt(
         "target_source_displayed": target_displayed,
         "source_evidence": traceback_evidence,
         "target_file_changed": target_changed,
+        "edit_command_observed": edit_action_observed,
+        "edit_command_attempted": edit_command_attempted,
+        "edit_command_succeeded": edit_command_succeeded,
+        "edit_effect_observed": edit_effect_observed,
+        "edit_commands": edit_commands,
+        "no_op_edits": no_op_edits,
+        "possible_stale_or_reversed_edit": bool(stale_or_reversed),
+        "stale_or_reversed_edit_evidence": stale_or_reversed,
+        "verification_after_ineffective_edit": verification_after_ineffective,
         "source_assessment_claimed_correct": claimed_correct,
         "tracked_change_observed": tracked_change,
         "git_diff_observed": git_diff_observed,
@@ -218,8 +253,10 @@ def diagnose_attempt(
         "possible_reasoning_action_mismatch": reasoning_action_mismatch,
         "reasoning_action_evidence": {
             "edit_proposed": edit_proposed,
-            "edit_action_observed": edit_action_observed,
+            "edit_command_observed": edit_action_observed,
+            "edit_effect_observed": edit_effect_observed,
             "response_excerpt": _reasoning_excerpt(prose) if edit_proposed else None,
+            "action_excerpt": edit_commands[0]["command"][:500] if edit_commands else None,
         },
         "commit_attempted": commit_attempted,
         "push_attempted": bool(push_occurrences),
@@ -243,7 +280,12 @@ def diagnose_attempt(
                 and attempt_result.get("patch_size")
             ),
         },
-        "required_next_phase": "edit" if repeated_tests else None,
+        "required_next_phase": "edit" if repeated_tests or no_op_edits else None,
+        "phase_exit_condition": (
+            {"target": target, "requires_nonempty_diff": True}
+            if repeated_tests or no_op_edits
+            else None
+        ),
     }
     possible_incorrect_assessment = bool(
         target_displayed
@@ -278,6 +320,12 @@ def diagnose_attempt(
         failure_types.append("possible_incorrect_source_assessment")
     if repeated_tests:
         failure_types.extend(("repeated_test_without_change", "known_failure_reverified"))
+    if no_op_edits:
+        failure_types.append("no_op_edit")
+    if stale_or_reversed:
+        failure_types.append("possible_stale_or_reversed_edit")
+    if verification_after_ineffective:
+        failure_types.append("verification_after_ineffective_edit")
     if reasoning_action_mismatch:
         failure_types.append("possible_reasoning_action_mismatch")
     if budget_exhausted:
@@ -314,6 +362,41 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
     ).replace("{agent_python}", "python")
     repeated_tests = diagnosis.get("repeated_test_without_change") or []
     traceback_evidence = diagnosis.get("source_evidence") or []
+    no_op_edits = diagnosis.get("no_op_edits") or []
+    if no_op_edits and traceback_evidence:
+        source_item = traceback_evidence[0]
+        return "\n".join(
+            [
+                "## CGR corrective evidence",
+                "",
+                "Previous attempt outcome:",
+                f"- You attempted to edit {source}, but the target file did not change.",
+                "- The sed command searched for text that was not the current source line.",
+                "- You then reran the same failing test without a nonempty diff.",
+                "- The verifier again failed with RecursionError.",
+                "- Do not commit, push, modify remotes, or configure Git identity.",
+                "",
+                "Current grounded source:",
+                f"- `{source_item['content']}`",
+                "",
+                "Immediate required phase: edit and confirm",
+                "",
+                f"1. Modify the existing line in {source} using a noninteractive mechanism.",
+                "2. Display the relevant target file region after editing.",
+                f"3. Run `git diff -- {source}`.",
+                "4. Do not run pytest unless this diff is nonempty and the old grounded line is absent.",
+                "5. If the diff is empty, the edit did not take effect; correct the edit command first.",
+                "6. After a confirmed edit, run the focused test once.",
+                "7. Inspect the final diff and submit the worktree patch without committing.",
+                "- Your next executed action must perform the required edit phase.",
+                "",
+                "Required edit condition:",
+                "- The edit must modify the existing grounded line.",
+                "- Confirm the old line is no longer present.",
+                f"- Confirm `git diff -- {source}` is nonempty before testing.",
+                "",
+            ]
+        )
     if repeated_tests and traceback_evidence:
         repeated = repeated_tests[0]
         source_item = traceback_evidence[0]
@@ -602,6 +685,94 @@ def _traceback_source_evidence(
             item["occurrences"] += 1
             item["last_step"] = step
     return list(grouped.values())
+
+
+def _edit_command_telemetry(
+    actions: list[tuple[int, str, str]],
+    steps: list[dict[str, Any]],
+    target: str,
+    source_evidence: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grounded_lines = {
+        str(item["content"]).strip()
+        for item in source_evidence
+        if item.get("content")
+    }
+    telemetry = []
+    for step, _raw, command in actions:
+        if not _is_edit_action(command):
+            continue
+        observation = _observation_for_step(steps, step)
+        mechanism = "sed" if re.search(r"(?:^|\s)sed\s+-i", command) else "other"
+        target_named = bool(target and target in command)
+        failed = bool(
+            re.search(
+                r"command not found|no such file|permission denied|syntax error|traceback \(most recent call last\)|error:",
+                observation,
+                re.I,
+            )
+        )
+        item: dict[str, Any] = {
+            "step": step,
+            "command": command,
+            "target": target if target_named else None,
+            "mechanism": mechanism,
+            "target_named": target_named,
+            "command_attempted": True,
+            "command_succeeded": not failed,
+            "edit_effect_observed": False,
+        }
+        substitution = _sed_substitution(command) if mechanism == "sed" else None
+        if substitution is not None:
+            search, replacement = substitution
+            item["search_text"] = search
+            item["replacement_text"] = replacement
+            item["search_matches_grounded_source"] = search.strip() in grounded_lines
+            item["replacement_matches_grounded_source"] = replacement.strip() in grounded_lines
+            item["possible_stale_or_reversed_edit"] = bool(
+                grounded_lines
+                and search.strip() not in grounded_lines
+                and replacement.strip() in grounded_lines
+            )
+        telemetry.append(item)
+    return telemetry
+
+
+def _sed_substitution(command: str) -> tuple[str, str] | None:
+    match = re.search(r"sed\s+-i(?:\s+[^\s]+)?\s+(['\"])(s)(.)(.*?)\3(.*?)\3[^'\"]*\1", command)
+    if not match:
+        return None
+    return match.group(4), match.group(5)
+
+
+def _verification_after_ineffective_edit(
+    edit_commands: list[dict[str, Any]],
+    test_attempts: list[dict[str, Any]],
+    target_changed: bool,
+) -> list[dict[str, Any]]:
+    if target_changed:
+        return []
+    successful_edits = [item for item in edit_commands if item["command_succeeded"]]
+    if not successful_edits:
+        return []
+    first_edit = successful_edits[0]
+    subsequent = [
+        item
+        for item in test_attempts
+        if item["step"] > first_edit["step"] and item["test_failed"]
+    ]
+    if not subsequent:
+        return []
+    return [
+        {
+            "edit_command": first_edit["command"],
+            "edit_step": first_edit["step"],
+            "test_steps": [item["step"] for item in subsequent],
+            "failure_fingerprint": _observation_fingerprint(
+                str(subsequent[0]["observation_evidence"])
+            ),
+        }
+    ]
 
 
 def _repeated_tests_without_change(

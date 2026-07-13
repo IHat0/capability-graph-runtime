@@ -109,3 +109,13 @@ Baseline results remain under `quixbugs.gcd/attempt-NNN`; CGR parent results
 use `quixbugs.gcd/run-NNN`. A model failure, no patch, failing verifier, or
 exhausted budget is serialized as a task outcome; infrastructure failures
 remain distinct.
+
+## Bounded Actionable Recovery
+
+`--max-attempts` remains the configured base-attempt budget. With three base
+attempts, CGR may grant one final actionable recovery attempt, up to an absolute
+hard cap of four, only when the last scheduled attempt reveals a grounded
+successful command that made no target-file change and therefore requires a
+confirmed edit. Generic budget exhaustion does not qualify. Result artifacts
+record `configured_base_attempts`, `actionable_recovery_attempts`, and
+`absolute_hard_cap` separately.

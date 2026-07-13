@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from cgr.quixbugs_diagnosis import (
     build_corrective_message,
     diagnose_attempt,
@@ -417,6 +419,105 @@ E   RecursionError: maximum recursion depth exceeded
     assert "`return gcd(a % b, b)`" in correction
     assert "Do not commit, push, modify remotes" in correction
     assert "def gcd(a, b):" not in correction
+
+
+def test_successful_noop_edit_is_distinct_from_edit_effect(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    test_command = "python -m pytest -q python_testcases/test_gcd.py"
+    failure = """python_programs/gcd.py:5: in gcd
+    return gcd(a % b, b)
+E   RecursionError: maximum recursion depth exceeded
+5 failed, 1 passed in 0.04s
+"""
+    edit = (
+        "sed -i 's/return gcd(b, a % b)/return gcd(a % b, b)/' "
+        "python_programs/gcd.py"
+    )
+    trajectory = tmp_path / "noop-edit.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {"action": edit, "observation": ""},
+                    {"action": test_command, "observation": failure},
+                    {"action": test_command, "observation": failure},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(
+        trajectory,
+        workspace,
+        {"classification": "budget_exhausted", "patch_size": 0},
+        task,
+    )
+    correction = build_corrective_message(diagnosis, task)
+
+    assert diagnosis["edit_command_observed"] is True
+    assert diagnosis["edit_command_attempted"] is True
+    assert diagnosis["edit_command_succeeded"] is True
+    assert diagnosis["edit_effect_observed"] is False
+    assert diagnosis["target_file_changed"] is False
+    assert diagnosis["no_op_edits"][0]["mechanism"] == "sed"
+    assert diagnosis["possible_stale_or_reversed_edit"] is True
+    assert diagnosis["verification_after_ineffective_edit"][0]["test_steps"] == [2, 3]
+    assert diagnosis["required_next_phase"] == "edit"
+    assert diagnosis["phase_exit_condition"] == {
+        "target": "python_programs/gcd.py",
+        "requires_nonempty_diff": True,
+    }
+    assert "no_op_edit" in diagnosis["failure_types"]
+    assert "possible_stale_or_reversed_edit" in diagnosis["failure_types"]
+    assert "verification_after_ineffective_edit" in diagnosis["failure_types"]
+    assert "attempted to edit python_programs/gcd.py, but the target file did not change" in correction
+    assert "Current grounded source:" in correction
+    assert "`return gcd(a % b, b)`" in correction
+    assert "Do not run pytest unless this diff is nonempty" in correction
+    assert "Do not commit, push, modify remotes" in correction
+    assert "def gcd(a, b):" not in correction
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "sed -i 's/old/new/' python_programs/gcd.py",
+        (
+            'python -c "from pathlib import Path; '
+            "Path('python_programs/gcd.py').write_text('changed')\""
+        ),
+        "cat > python_programs/gcd.py <<'EOF'\nchanged\nEOF",
+    ],
+)
+def test_successful_target_edit_records_effect(tmp_path: Path, action: str) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    source = workspace / "python_programs" / "gcd.py"
+    source.write_text("def gcd(a, b):\n    return gcd(b, a % b)\n", encoding="utf-8")
+    trajectory = tmp_path / "effective-edit.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": action,
+                        "observation": "",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(trajectory, workspace, {"patch_size": 1}, task)
+
+    assert diagnosis["edit_command_succeeded"] is True
+    assert diagnosis["edit_effect_observed"] is True
+    assert diagnosis["target_file_changed"] is True
+    assert diagnosis["edit_commands"][0]["edit_effect_observed"] is True
+    assert diagnosis["no_op_edits"] == []
 
 
 def test_selector_does_not_credit_test_environment_failure() -> None:

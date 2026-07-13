@@ -47,7 +47,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--correction-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--deterministic-profile",
-        choices=("success", "failed", "misassessment", "recovery"),
+        choices=("success", "failed", "misassessment", "noop_edit", "recovery"),
         default="success",
         help=argparse.SUPPRESS,
     )
@@ -318,6 +318,9 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
         "task_id": args.task_id,
         "mode": "cgr",
         "maximum_attempts": max_attempts,
+        "configured_base_attempts": max_attempts,
+        "actionable_recovery_attempts": 0,
+        "absolute_hard_cap": 4 if max_attempts >= 3 else max_attempts,
         "attempts_started": 0,
         "attempts_completed": 0,
         "child_artifact_paths": [],
@@ -345,8 +348,10 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
         child_results: list[dict[str, Any]] = []
         diagnoses: list[dict[str, Any] | None] = []
         latest_correction: Path | None = None
-        profiles = ("failed", "misassessment", "recovery")
-        for attempt_index in range(1, max_attempts + 1):
+        profiles = ("failed", "misassessment", "noop_edit", "recovery")
+        attempt_limit = max_attempts
+        attempt_index = 1
+        while attempt_index <= attempt_limit:
             child = _launch_child_attempt(
                 args,
                 run,
@@ -391,7 +396,15 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
                 }
             )
             lineage["diagnosis_path"] = str(diagnosis_path)
-            if attempt_index < max_attempts:
+            if (
+                attempt_index == attempt_limit
+                and attempt_limit < result["absolute_hard_cap"]
+                and _qualifies_for_actionable_recovery(diagnosis)
+            ):
+                attempt_limit += 1
+                result["actionable_recovery_attempts"] += 1
+                result["maximum_attempts_with_recovery"] = attempt_limit
+            if attempt_index < attempt_limit:
                 correction_path = run / f"corrective-message-{attempt_index:03d}.md"
                 correction_path.write_text(
                     build_corrective_message(diagnosis, task), encoding="utf-8"
@@ -404,6 +417,7 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
                     }
                 )
                 latest_correction = correction_path
+            attempt_index += 1
 
         result["recovery_occurred"] = len(child_results) > 1
         selected_index = _select_attempt(child_results, diagnoses)
@@ -757,9 +771,15 @@ def _deterministic_actions(
         return [failed]
     if profile == "misassessment":
         return [str(task["agent_verifier_command"])]
+    if profile == "noop_edit":
+        return [
+            f"sed -i 's/return gcd(b, a % b)/return gcd(a % b, b)/' {shlex_quote(source)}",
+            str(task["agent_verifier_command"]),
+        ]
     if profile == "recovery":
         return [
             f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
+            f"sed -n '1,30p' {shlex_quote(source)}",
             f"git diff -- {shlex_quote(source)}",
             str(task["agent_verifier_command"]),
             f"git diff -- {shlex_quote(source)}",
@@ -775,7 +795,7 @@ def _deterministic_actions(
 
 
 def _deterministic_discussions(profile: str) -> list[str] | None:
-    if profile != "misassessment":
+    if profile not in {"misassessment", "noop_edit"}:
         return None
     return [
         (
@@ -784,6 +804,14 @@ def _deterministic_discussions(profile: str) -> list[str] | None:
             "Run the focused test to verify it."
         )
     ]
+
+
+def _qualifies_for_actionable_recovery(diagnosis: dict[str, Any]) -> bool:
+    return bool(
+        diagnosis.get("required_next_phase") == "edit"
+        and diagnosis.get("no_op_edits")
+        and diagnosis.get("phase_exit_condition", {}).get("requires_nonempty_diff")
+    )
 
 
 def _trajectory_step_count(path: Path | None) -> int | None:
