@@ -125,15 +125,19 @@ def diagnose_attempt(
             re.I,
         )
     )
+    test_telemetry = _test_telemetry(actions, steps, focused_test)
     tests_run = [
-        normalized
-        for normalized in normalized_actions
-        if re.search(r"(?:^|[\s;&|])(?:pytest|[^\s]+\s+-m\s+pytest|unittest|tox)(?:[\s;&|]|$)", normalized)
+        item["normalized_action"]
+        for item in test_telemetry["attempts"]
+        if item["test_result_observed"]
     ]
     workspace_diff = _workspace_diff(workspace)
     tracked_change = bool(attempt_result.get("patch_size") or workspace_diff.strip())
     target_changed = bool(target and _diff_changes_path(workspace_diff, target))
-    focused_test_run = any(focused_test and focused_test in command for command in tests_run)
+    focused_test_run = any(
+        item["focused_test"] and item["test_result_observed"]
+        for item in test_telemetry["attempts"]
+    )
     git_diff_observed = any(
         re.search(r"(?:^|\s)git\s+diff(?:\s|$)", action) for action in normalized_actions
     )
@@ -160,6 +164,7 @@ def diagnose_attempt(
     ]
     origin_url = _origin_url(workspace)
     origin_type = "portable_bundle" if origin_url.endswith(".bundle") else "other"
+    unavailable_tools = _unavailable_tools(actions, steps)
     termination = attempt_result.get("termination_reason")
     budget_exhausted = bool(
         attempt_result.get("classification") == "budget_exhausted"
@@ -178,6 +183,17 @@ def diagnose_attempt(
         "tracked_change_observed": tracked_change,
         "git_diff_observed": git_diff_observed,
         "tests_run": tests_run,
+        "test_command_observed": test_telemetry["test_command_observed"],
+        "test_command_attempted": test_telemetry["test_command_attempted"],
+        "test_process_started": test_telemetry["test_process_started"],
+        "test_result_observed": test_telemetry["test_result_observed"],
+        "test_environment_failure": test_telemetry["test_environment_failure"],
+        "test_passed": test_telemetry["test_passed"],
+        "test_failed": test_telemetry["test_failed"],
+        "tests_executed": test_telemetry["tests_executed"],
+        "test_attempts": test_telemetry["attempts"],
+        "unavailable_tools": unavailable_tools,
+        "editing_attempt_failed": bool(unavailable_tools and not target_changed),
         "commit_attempted": commit_attempted,
         "push_attempted": bool(push_occurrences),
         "push_actions": push_actions,
@@ -260,15 +276,23 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
     outcome.extend(f"- {path} does not exist." for path in missing)
     if diagnosis.get("commit_attempted"):
         outcome.append("- A Git commit is not required.")
-    verifier = " ".join(str(part).replace("{python}", "python") for part in task["verifier_command"])
-    if diagnosis.get("possible_incorrect_source_assessment") or diagnosis.get("push_attempted"):
+    verifier = str(
+        task.get("agent_verifier_command")
+        or " ".join(str(part).replace("{python}", "python") for part in task["verifier_command"])
+    ).replace("{agent_python}", "python")
+    specialized = bool(
+        diagnosis.get("target_source_displayed")
+        and not diagnosis.get("target_file_changed")
+        and diagnosis.get("attempt_classification") != "resolved"
+    )
+    if specialized or diagnosis.get("possible_incorrect_source_assessment") or diagnosis.get("push_attempted"):
         source_evidence = diagnosis.get("observed_source_evidence") or []
         evidence = (
             [
                 "",
                 "Source evidence:",
-                f"- The recursive call currently uses `{source_evidence[0]}`.",
-                "- This keeps `b` in the second position and can repeat without reaching the base case.",
+                f"- The recursive call currently uses `{source_evidence[0].removeprefix('return ')}`.",
+                "- This keeps `b` in the second argument position and may repeat without reaching the base case.",
             ]
             if source_evidence
             else []
@@ -279,9 +303,9 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
                 "",
                 "Previous attempt outcome:",
                 f"- You inspected {source}.",
-                "- The focused verifier was already known to fail.",
+                "- The focused verifier is known to fail.",
                 "- No tracked file changed.",
-                "- You did not run the focused test.",
+                "- You did not successfully run the focused test.",
                 "- You attempted an unnecessary Git commit.",
                 "- You repeated an unnecessary Git push.",
                 "- Do not commit, push, or modify Git remotes.",
@@ -289,10 +313,11 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
                 "",
                 "Required recovery:",
                 "1. Reinspect the recursive argument order.",
-                "2. Edit only the existing source file.",
-                f"3. Run `{verifier}`.",
-                "4. Inspect `git diff`.",
-                "5. Submit the worktree patch without committing or pushing.",
+                "2. Edit the existing source file using a noninteractive shell command or available file-editing mechanism.",
+                "3. Do not use nano or other interactive editors.",
+                f"4. Run the verified in-environment test command: `{verifier}`.",
+                "5. Inspect `git diff`.",
+                "6. Submit the worktree patch without committing or pushing.",
                 "",
             ]
         )
@@ -392,6 +417,83 @@ def _repeated_step_observation(
 
 def _is_inspection(action: str) -> bool:
     return bool(re.search(r"(?:^|[\s;&|])(?:cat|sed\s+-n|head|tail|less|rg|grep|ls)(?:[\s;&|]|$)", action))
+
+
+def _test_telemetry(
+    actions: list[tuple[int, str, str]],
+    steps: list[dict[str, Any]],
+    focused_test: str,
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    command_pattern = re.compile(
+        r"(?:^|[\s;&|])(?:pytest|[^\s]+\s+-m\s+pytest|unittest|tox)(?:[\s;&|]|$)"
+    )
+    environment_pattern = re.compile(
+        r"no module named pytest|command not found|executable .* not found|permission denied",
+        re.I,
+    )
+    result_pattern = re.compile(
+        r"(?:\d+\s+passed|\d+\s+failed|=+\s*test session starts|collected\s+\d+)",
+        re.I,
+    )
+    for index, _raw, normalized in actions:
+        if not command_pattern.search(normalized):
+            continue
+        observation = _observation_for_step(steps, index)
+        environment_failure = bool(environment_pattern.search(observation))
+        result_observed = bool(result_pattern.search(observation)) and not environment_failure
+        passed = bool(re.search(r"\d+\s+passed", observation, re.I)) and not bool(
+            re.search(r"\d+\s+failed", observation, re.I)
+        )
+        failed = bool(re.search(r"\d+\s+failed|^FAILED\s", observation, re.I | re.M))
+        attempts.append(
+            {
+                "step": index,
+                "normalized_action": normalized,
+                "observation_evidence": observation.strip(),
+                "focused_test": bool(focused_test and focused_test in normalized),
+                "test_command_observed": True,
+                "test_command_attempted": True,
+                "test_process_started": result_observed,
+                "test_result_observed": result_observed,
+                "test_environment_failure": environment_failure,
+                "test_passed": passed,
+                "test_failed": failed and result_observed,
+            }
+        )
+    return {
+        "test_command_observed": bool(attempts),
+        "test_command_attempted": bool(attempts),
+        "test_process_started": any(item["test_process_started"] for item in attempts),
+        "test_result_observed": any(item["test_result_observed"] for item in attempts),
+        "test_environment_failure": any(
+            item["test_environment_failure"] for item in attempts
+        ),
+        "test_passed": any(item["test_passed"] for item in attempts),
+        "test_failed": any(item["test_failed"] for item in attempts),
+        "tests_executed": any(item["test_result_observed"] for item in attempts),
+        "attempts": attempts,
+    }
+
+
+def _unavailable_tools(
+    actions: list[tuple[int, str, str]], steps: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    unavailable = []
+    for index, _raw, normalized in actions:
+        if not re.search(r"(?:^|[\s;&|])nano(?:[\s;&|]|$)", normalized):
+            continue
+        observation = _observation_for_step(steps, index)
+        if re.search(r"nano:\s*(?:command not found|not found)", observation, re.I):
+            unavailable.append(
+                {
+                    "tool": "nano",
+                    "step": index,
+                    "normalized_action": normalized,
+                    "evidence": observation.strip(),
+                }
+            )
+    return unavailable
 
 
 def _workspace_diff(workspace: Path) -> str:

@@ -22,6 +22,7 @@
         "-q",
         "python_testcases/test_gcd.py"
       ],
+      "agent_verifier_command": "PYTHONPATH=.git/cgr-test-runtime {agent_python} -m pytest -q python_testcases/test_gcd.py",
       "problem_statement": "Fix the bug in python_programs/gcd.py so gcd returns the greatest common divisor for the provided nonnegative integer inputs. Preserve the public function and make the focused matching test pass.",
       "permitted_repository_root": ".",
       "timeout_seconds": 300,

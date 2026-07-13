@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,10 @@ def test_one_task_manifest_is_pinned_and_uses_focused_pytest() -> None:
     assert task["source_file"] == "python_programs/gcd.py"
     assert task["test_file"] == "python_testcases/test_gcd.py"
     assert task["verifier_command"][-1] == task["test_file"]
+    assert task["agent_verifier_command"] == (
+        "PYTHONPATH=.git/cgr-test-runtime {agent_python} -m pytest -q "
+        "python_testcases/test_gcd.py"
+    )
     assert manifest["dependencies"] == ["pytest==8.3.5"]
     assert len(manifest["tasks"]) == 1
 
@@ -42,6 +48,7 @@ def test_manifest_rejects_paths_outside_repository(tmp_path: Path) -> None:
                 "source_file": "../outside.py",
                 "test_file": "tests/test_x.py",
                 "verifier_command": ["{python}", "-m", "pytest"],
+                "agent_verifier_command": "python -m pytest tests/test_x.py",
                 "problem_statement": "fix it",
                 "timeout_seconds": 10,
             }
@@ -140,3 +147,30 @@ def test_verifier_command_uses_configured_python() -> None:
         "-q",
         "python_testcases/test_gcd.py",
     ]
+
+
+def test_agent_pytest_runtime_is_portable_and_preflighted(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+
+    runtime = pilot._prepare_agent_test_runtime(workspace, Path(sys.executable))
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(workspace / ".git" / "cgr-test-runtime")
+    imported = subprocess.run(
+        [sys.executable, "-S", "-c", "import pytest; print(pytest.__version__)"],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert imported.returncode == 0, imported.stderr
+    assert runtime["copied_entries"]
+    overlay = pilot._quixbugs_overlay()
+    assert "CGR_PYTEST_READY=" in overlay
+    assert "PYTHONPATH=.git/cgr-test-runtime" in overlay
+    assert "command -v python" in overlay
+    assert "command -v sed" in overlay
+    assert ".sandbox-sweagent-venv" not in overlay

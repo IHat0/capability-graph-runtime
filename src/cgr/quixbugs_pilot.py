@@ -88,6 +88,16 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         source_root = args.quixbugs_root.absolute()
         sweagent_source = args.sweagent_source.absolute()
         sweagent_python = args.sweagent_python.absolute()
+        deployment_type = args.deployment_type or ("local" if os.name == "nt" else "docker")
+        agent_python = (
+            cycle._git_bash_path(sweagent_python)
+            if deployment_type == "local" and os.name == "nt"
+            else "python"
+        )
+        task = dict(task)
+        task["agent_verifier_command"] = str(task["agent_verifier_command"]).replace(
+            "{agent_python}", agent_python
+        )
         runtime_identity = cycle._verify_runtime(sweagent_source, sweagent_python)
         _verify_quixbugs_checkout(source_root, task)
         (attempt / "task-manifest.json").write_text(
@@ -113,6 +123,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
 
         workspace = attempt / "workspace"
         _clone_attempt(source_root, workspace, str(task["pinned_commit"]))
+        test_runtime = _prepare_agent_test_runtime(workspace, sweagent_python)
+        test_runtime["preflight_command"] = _agent_test_preflight(agent_python)
         initial_status = cycle._git(workspace, "status", "--porcelain=v1").stdout
         (attempt / "initial-git-status.txt").write_text(initial_status, encoding="utf-8")
         if initial_status:
@@ -144,8 +156,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             cycle._wait_for_server(endpoint)
 
         overlay_path = attempt / "sweagent-config.yaml"
-        overlay_path.write_text(cycle._sandbox_overlay(), encoding="utf-8")
-        deployment_type = args.deployment_type or ("local" if os.name == "nt" else "docker")
+        overlay_path.write_text(_quixbugs_overlay(agent_python), encoding="utf-8")
         adapter_command = _adapter_command(
             sweagent_python,
             workspace,
@@ -206,6 +217,12 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         prediction = cycle._optional_artifact(attempt, "*.pred")
         submitted_patch = cycle._optional_artifact(attempt, "*.patch")
         termination = cycle._trajectory_exit_status(trajectory) if trajectory else None
+        model_requests = (
+            cycle._jsonl_count(interaction_path)
+            if interaction_path and interaction_path.is_file()
+            else _trajectory_step_count(trajectory)
+        )
+        preflight_status = "passed" if model_requests else "failed_or_unconfirmed"
 
         verifier: subprocess.CompletedProcess[str] | None = None
         classification: str
@@ -240,14 +257,22 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 "sweagent_source_modified": False,
                 "model_endpoint": endpoint,
                 "model_identifier": model,
-                "model_requests": cycle._jsonl_count(interaction_path)
-                if interaction_path
-                else _trajectory_step_count(trajectory),
+                "model_requests": model_requests,
                 "model_requests_source": "model_interactions_jsonl"
                 if interaction_path
                 else "trajectory_steps",
                 "repository_root": str(workspace),
                 "initial_repository_clean": initial_status == "",
+                "advertised_test_command": task["agent_verifier_command"],
+                "agent_test_runtime": test_runtime,
+                "preflight_test_command": test_runtime["preflight_command"],
+                "preflight_test_command_status": preflight_status,
+                "preflight_test_command_evidence": (
+                    "post_startup_gate_completed_before_model_request"
+                    if model_requests
+                    else "no_model_request_proved_the_post_startup_gate_completed"
+                ),
+                "agent_editing_mechanisms": ["python", "sed", "cat_heredoc"],
                 "pre_agent_verifier_exit_code": pre_verifier.returncode,
                 "termination_reason": termination,
                 "trajectory_path": str(trajectory) if trajectory else None,
@@ -307,6 +332,16 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
     }
     try:
         task, _manifest = _load_task(args.manifest.absolute(), args.task_id)
+        parent_deployment = args.deployment_type or ("local" if os.name == "nt" else "docker")
+        parent_agent_python = (
+            cycle._git_bash_path(args.sweagent_python.absolute())
+            if parent_deployment == "local" and os.name == "nt"
+            else "python"
+        )
+        task = dict(task)
+        task["agent_verifier_command"] = str(task["agent_verifier_command"]).replace(
+            "{agent_python}", parent_agent_python
+        )
         child_results: list[dict[str, Any]] = []
         diagnoses: list[dict[str, Any] | None] = []
         latest_correction: Path | None = None
@@ -488,7 +523,7 @@ def _select_attempt(
 ) -> int:
     evidence = diagnoses or [None] * len(results)
 
-    def score(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int, int, int, int]:
+    def score(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int, int, int, int, int]:
         index, result = item
         diagnosis = evidence[index] or {}
         verified = int(
@@ -496,10 +531,13 @@ def _select_attempt(
             and result.get("verifier_exit_code") == 0
         )
         patch = int(bool(result.get("patch_size")))
-        tests = int(bool(diagnosis.get("tests_run") or result.get("verifier_status") == "executed"))
+        test_passed = int(
+            bool(diagnosis.get("test_passed") or result.get("verifier_exit_code") == 0)
+        )
+        test_failed = int(bool(diagnosis.get("test_failed")))
         changed = int(bool(diagnosis.get("tracked_change_observed") or result.get("patch_size")))
         inspected = int(bool(diagnosis.get("inspected_source_paths")))
-        return verified, patch, tests, changed, inspected, index
+        return verified, patch, test_passed, test_failed, changed, inspected, index
 
     return max(enumerate(results), key=score)[0]
 
@@ -513,8 +551,10 @@ def _selection_rationale(
         rationale.append("verifier_passed")
     if result.get("patch_size"):
         rationale.append("nonempty_patch")
-    if evidence.get("tests_run") or result.get("verifier_status") == "executed":
-        rationale.append("tests_executed")
+    if evidence.get("test_passed") or result.get("verifier_exit_code") == 0:
+        rationale.append("focused_test_passed")
+    elif evidence.get("test_failed"):
+        rationale.append("focused_test_failed")
     if evidence.get("tracked_change_observed") or result.get("patch_size"):
         rationale.append("tracked_change_observed")
     if evidence.get("inspected_source_paths"):
@@ -540,6 +580,7 @@ def _load_task(path: Path, task_id: str) -> tuple[dict[str, Any], dict[str, Any]
         "source_file",
         "test_file",
         "verifier_command",
+        "agent_verifier_command",
         "problem_statement",
         "timeout_seconds",
     ):
@@ -590,6 +631,75 @@ def _clone_attempt(source: Path, workspace: Path, commit: str) -> None:
     cycle._git(workspace, "clean", "-fd")
 
 
+def _prepare_agent_test_runtime(workspace: Path, python: Path) -> dict[str, Any]:
+    module_names = (
+        "pytest",
+        "_pytest",
+        "pluggy",
+        "iniconfig",
+        "packaging",
+        "pygments",
+        "py",
+    )
+    distribution_names = ("pytest", "pluggy", "iniconfig", "packaging", "pygments")
+    discovery = (
+        "import importlib.metadata as m, importlib.util as u, json; "
+        f"mods={module_names!r}; dists={distribution_names!r}; "
+        "print(json.dumps({'modules': {n: "
+        "(list(u.find_spec(n).submodule_search_locations)[0] if "
+        "u.find_spec(n).submodule_search_locations else u.find_spec(n).origin) "
+        "for n in mods}, 'metadata': {n: str(m.distribution(n)._path) for n in dists}}))"
+    )
+    process = subprocess.run(
+        [str(python), "-c", discovery],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(f"Could not locate pinned pytest runtime: {process.stderr.strip()}")
+    located = json.loads(process.stdout)
+    runtime = workspace / ".git" / "cgr-test-runtime"
+    runtime.mkdir()
+    copied: list[str] = []
+    for source_value in [*located["modules"].values(), *located["metadata"].values()]:
+        source = Path(source_value)
+        target = runtime / source.name
+        if target.exists():
+            continue
+        if source.is_dir():
+            shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            shutil.copy2(source, target)
+        copied.append(source.name)
+    return {
+        "runtime_path": str(runtime),
+        "copied_entries": copied,
+    }
+
+
+def _quixbugs_overlay(agent_python: str = "python") -> str:
+    preflight = _agent_test_preflight(agent_python)
+    python_gate = (
+        "command -v python >/dev/null"
+        if agent_python == "python"
+        else f"test -x {shlex_quote(agent_python)}"
+    )
+    editor_gate = f"{python_gate} && command -v sed >/dev/null"
+    anchor = "    - git diff --cached --quiet --ignore-submodules --"
+    additions = "\n".join((anchor, f"    - {json.dumps(preflight)}", f"    - {json.dumps(editor_gate)}"))
+    return cycle._sandbox_overlay().replace(anchor, additions)
+
+
+def _agent_test_preflight(agent_python: str) -> str:
+    return (
+        f"PYTHONPATH=.git/cgr-test-runtime {agent_python} -c \"import pytest; "
+        "print('CGR_PYTEST_READY=' + pytest.__version__)\""
+    )
+
+
 def _verifier_command(task: dict[str, Any], python: Path) -> list[str]:
     command = task["verifier_command"]
     if not isinstance(command, list) or not all(isinstance(value, str) for value in command):
@@ -633,11 +743,10 @@ def _configured_model() -> tuple[str, str, str]:
 
 
 def _deterministic_actions(
-    task: dict[str, Any], python: Path, runtime_root: Path, *, profile: str = "success"
+    task: dict[str, Any], _python: Path, runtime_root: Path, *, profile: str = "success"
 ) -> list[str]:
     source = str(task["source_file"])
     test = str(task["test_file"])
-    python_posix = cycle._git_bash_path(python)
     submission = cycle._git_bash_path(runtime_root / "model.patch")
     if profile == "failed":
         failed = (
@@ -658,7 +767,7 @@ def _deterministic_actions(
     return [
         f"sed -n '1,100p' {shlex_quote(source)} && sed -n '1,120p' {shlex_quote(test)}",
         f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
-        f"{shlex_quote(python_posix)} -m pytest -q {shlex_quote(test)}",
+        str(task["agent_verifier_command"]),
         f"git diff -- {shlex_quote(source)}",
         f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\\n'",
     ]

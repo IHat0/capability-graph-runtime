@@ -162,7 +162,7 @@ def test_repository_activity_uses_actions_and_real_git_diff(tmp_path: Path) -> N
                 "trajectory": [
                     {"action": "cat python_programs/gcd.py", "observation": "source"},
                     {"action": "sed -i 's/a/b/' python_programs/gcd.py", "observation": ""},
-                    {"action": "python -m pytest -q tests/test_gcd.py", "observation": "passed"},
+                    {"action": "python -m pytest -q tests/test_gcd.py", "observation": "1 passed in 0.01s"},
                     {"action": "git diff", "observation": "diff"},
                 ]
             }
@@ -239,9 +239,96 @@ def test_second_failure_diagnosis_is_grounded_in_inspection_and_pushes(tmp_path:
     assert {item["category"] for item in diagnosis["repeated_errors"]} == {
         "git_push_failure"
     }
-    assert "`return gcd(a % b, b)`" in correction
+    assert "`gcd(a % b, b)`" in correction
     assert "Do not commit, push, or modify Git remotes" in correction
     assert "return gcd(b, a % b)" not in correction
+
+
+def test_missing_pytest_is_environment_failure_not_test_execution(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    trajectory = tmp_path / "missing-pytest.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "python -m pytest -q python_testcases/test_gcd.py",
+                        "observation": "/usr/local/bin/python: No module named pytest",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(trajectory, workspace, {"patch_size": 0}, task)
+
+    assert diagnosis["test_command_observed"] is True
+    assert diagnosis["test_command_attempted"] is True
+    assert diagnosis["test_process_started"] is False
+    assert diagnosis["test_result_observed"] is False
+    assert diagnosis["test_environment_failure"] is True
+    assert diagnosis["tests_executed"] is False
+    assert diagnosis["required_actions"]["run_focused_test"] is False
+
+
+def test_unavailable_nano_is_recorded_as_failed_edit_attempt(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    trajectory = tmp_path / "nano.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "nano python_programs/gcd.py",
+                        "observation": "bash: nano: command not found",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(trajectory, workspace, {"patch_size": 0})
+
+    assert diagnosis["unavailable_tools"][0]["tool"] == "nano"
+    assert diagnosis["editing_attempt_failed"] is True
+
+
+def test_displayed_target_routes_to_specialized_message_without_prose_or_push(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    trajectory = tmp_path / "displayed.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "cat python_programs/gcd.py",
+                        "observation": "def gcd(a, b):\n    return gcd(a % b, b)",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = {
+        "classification": "budget_exhausted",
+        "pre_agent_verifier_exit_code": 1,
+        "patch_size": 0,
+    }
+
+    correction = build_corrective_message(
+        diagnose_attempt(trajectory, workspace, result, task), task
+    )
+
+    assert "You inspected python_programs/gcd.py" in correction
+    assert "`gcd(a % b, b)`" in correction
+    assert "Do not use nano or other interactive editors" in correction
+    assert "PYTHONPATH=.git/cgr-test-runtime" in correction
 
 
 def test_selector_prefers_verified_then_nonempty_patch() -> None:

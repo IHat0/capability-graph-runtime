@@ -70,6 +70,20 @@ correction. Selection prefers a passing verifier, nonempty patch, tests,
 tracked changes, target inspection, then the later attempt. No LLM judges
 trajectory prose.
 
+Before SWE-agent starts, CGR copies the pinned host pytest runtime and its
+pure-Python dependencies into `.git/cgr-test-runtime`. A post-startup command
+imports that runtime inside the deployed environment before the first model
+request. Corrections advertise the resulting `PYTHONPATH=.git/cgr-test-runtime
+<agent-python> -m pytest ...` command, never a host-only interpreter path in
+Docker. The same startup gate verifies noninteractive `python` and `sed`
+editing mechanisms; guidance prohibits interactive editors, commits, pushes,
+and Git-remote changes.
+
+Test telemetry combines each action with its observation. A missing pytest
+module, missing executable, or pre-start permission failure is an environment
+failure, not an executed test. Selection credits tests only after recognizable
+pytest pass or failure output.
+
 ## External Model Run
 
 Set the existing provider variables and omit `--deterministic-model`:
