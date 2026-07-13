@@ -309,6 +309,7 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
                 "- You attempted an unnecessary Git commit.",
                 "- You repeated an unnecessary Git push.",
                 "- Do not commit, push, or modify Git remotes.",
+                "- Do not configure Git identity.",
                 *evidence,
                 "",
                 "Required recovery:",

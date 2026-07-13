@@ -241,6 +241,7 @@ def test_second_failure_diagnosis_is_grounded_in_inspection_and_pushes(tmp_path:
     }
     assert "`gcd(a % b, b)`" in correction
     assert "Do not commit, push, or modify Git remotes" in correction
+    assert "Do not configure Git identity" in correction
     assert "return gcd(b, a % b)" not in correction
 
 
