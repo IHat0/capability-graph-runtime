@@ -274,6 +274,37 @@ def test_missing_pytest_is_environment_failure_not_test_execution(tmp_path: Path
     assert diagnosis["required_actions"]["run_focused_test"] is False
 
 
+def test_pytest_cache_warning_does_not_hide_completed_failure(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    trajectory = tmp_path / "pytest-cache-warning.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "python -m pytest -q python_testcases/test_gcd.py",
+                        "observation": (
+                            "FAILED python_testcases/test_gcd.py::test_gcd - RecursionError\n"
+                            "PytestCacheWarning: cache could not write path: Permission denied\n"
+                            "5 failed, 1 passed, 1 warning in 0.14s"
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(trajectory, workspace, {"patch_size": 0}, task)
+
+    assert diagnosis["test_process_started"] is True
+    assert diagnosis["test_result_observed"] is True
+    assert diagnosis["test_environment_failure"] is False
+    assert diagnosis["test_failed"] is True
+    assert diagnosis["tests_executed"] is True
+
+
 def test_unavailable_nano_is_recorded_as_failed_edit_attempt(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     trajectory = tmp_path / "nano.traj"
@@ -330,6 +361,87 @@ def test_displayed_target_routes_to_specialized_message_without_prose_or_push(
     assert "`gcd(a % b, b)`" in correction
     assert "Do not use nano or other interactive editors" in correction
     assert "PYTHONPATH=.git/cgr-test-runtime" in correction
+
+
+def test_traceback_repetition_routes_to_edit_first_correction(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    command = "python -m pytest -q python_testcases/test_gcd.py"
+    observation = """python_programs/gcd.py:5: in gcd
+    return gcd(a % b, b)
+E   RecursionError: maximum recursion depth exceeded
+1 failed in 0.03s
+"""
+    response = (
+        "The source should be updated to an iterative implementation: "
+        "def gcd(a, b): while b != 0: a, b = b, a % b; return a."
+    )
+    trajectory = tmp_path / "repeated-tests.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {"action": command, "observation": observation, "response": response}
+                ]
+                * 8
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = {
+        "classification": "budget_exhausted",
+        "pre_agent_verifier_exit_code": 1,
+        "patch_size": 0,
+    }
+
+    diagnosis = diagnose_attempt(trajectory, workspace, result, task)
+    correction = build_corrective_message(diagnosis, task)
+
+    assert diagnosis["source_evidence"] == [
+        {
+            "path": "python_programs/gcd.py",
+            "line": 5,
+            "content": "return gcd(a % b, b)",
+            "source": "focused_test_traceback",
+            "occurrences": 8,
+            "first_step": 1,
+            "last_step": 8,
+        }
+    ]
+    assert diagnosis["repeated_test_without_change"][0]["count"] == 8
+    assert diagnosis["known_failure_reverified"] is True
+    assert diagnosis["possible_reasoning_action_mismatch"] is True
+    assert diagnosis["required_next_phase"] == "edit"
+    assert "Do not run the test again yet" in correction
+    assert "first action must modify python_programs/gcd.py" in correction
+    assert "`return gcd(a % b, b)`" in correction
+    assert "Do not commit, push, modify remotes" in correction
+    assert "def gcd(a, b):" not in correction
+
+
+def test_selector_does_not_credit_test_environment_failure() -> None:
+    failures = [
+        {"classification": "budget_exhausted", "patch_size": 0},
+        {"classification": "tests_failed", "patch_size": 0},
+    ]
+    diagnoses = [
+        {
+            "test_command_attempted": True,
+            "test_environment_failure": True,
+            "test_passed": False,
+            "test_failed": False,
+            "inspected_source_paths": ["python_programs/gcd.py"],
+        },
+        {
+            "test_command_attempted": True,
+            "test_environment_failure": False,
+            "test_passed": False,
+            "test_failed": True,
+            "inspected_source_paths": [],
+        },
+    ]
+
+    assert _select_attempt(failures, diagnoses) == 1
 
 
 def test_selector_prefers_verified_then_nonempty_patch() -> None:

@@ -400,6 +400,7 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
                     {
                         "after_attempt": f"attempt-{attempt_index:03d}",
                         "path": str(correction_path),
+                        "required_next_phase": diagnosis.get("required_next_phase"),
                     }
                 )
                 latest_correction = correction_path
@@ -755,14 +756,14 @@ def _deterministic_actions(
         )
         return [failed]
     if profile == "misassessment":
+        return [str(task["agent_verifier_command"])]
+    if profile == "recovery":
         return [
-            f"sed -n '1,100p' {shlex_quote(source)}",
-            (
-                f"git add {shlex_quote(source)} 2>&1\n"
-                'git commit -m "Fix gcd function" 2>&1\n'
-                "git push origin main 2>&1"
-            ),
-            "git push origin main 2>&1",
+            f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
+            f"git diff -- {shlex_quote(source)}",
+            str(task["agent_verifier_command"]),
+            f"git diff -- {shlex_quote(source)}",
+            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
         ]
     return [
         f"sed -n '1,100p' {shlex_quote(source)} && sed -n '1,120p' {shlex_quote(test)}",
@@ -777,9 +778,11 @@ def _deterministic_discussions(profile: str) -> list[str] | None:
     if profile != "misassessment":
         return None
     return [
-        "Inspect the requested source before deciding what to change.",
-        "The provided gcd function appears to be implementing the Euclidean algorithm correctly.",
-        "Retry the publication command.",
+        (
+            "The source should be updated to an iterative Euclidean implementation: "
+            "def gcd(a, b): while b != 0: a, b = b, a % b; return a. "
+            "Run the focused test to verify it."
+        )
     ]
 
 

@@ -165,6 +165,24 @@ def diagnose_attempt(
     origin_url = _origin_url(workspace)
     origin_type = "portable_bundle" if origin_url.endswith(".bundle") else "other"
     unavailable_tools = _unavailable_tools(actions, steps)
+    traceback_evidence = _traceback_source_evidence(observations, target)
+    repeated_tests = _repeated_tests_without_change(
+        test_telemetry["attempts"], tracked_change, target_changed
+    )
+    edit_proposed = bool(
+        re.search(
+            r"source should be (?:updated|changed|edited)|replace (?:the )?(?:function|implementation)|def\s+gcd\s*\([^)]*\).*while\s+b",
+            prose,
+            re.I | re.S,
+        )
+    )
+    edit_action_observed = any(_is_edit_action(action) for action in normalized_actions)
+    reasoning_action_mismatch = bool(
+        edit_proposed
+        and test_telemetry["test_command_attempted"]
+        and not edit_action_observed
+        and not tracked_change
+    )
     termination = attempt_result.get("termination_reason")
     budget_exhausted = bool(
         attempt_result.get("classification") == "budget_exhausted"
@@ -178,6 +196,7 @@ def diagnose_attempt(
         "repository_inspection_observed": any(_is_inspection(action) for action in normalized_actions),
         "inspected_source_paths": inspected_source_paths,
         "target_source_displayed": target_displayed,
+        "source_evidence": traceback_evidence,
         "target_file_changed": target_changed,
         "source_assessment_claimed_correct": claimed_correct,
         "tracked_change_observed": tracked_change,
@@ -194,6 +213,14 @@ def diagnose_attempt(
         "test_attempts": test_telemetry["attempts"],
         "unavailable_tools": unavailable_tools,
         "editing_attempt_failed": bool(unavailable_tools and not target_changed),
+        "repeated_test_without_change": repeated_tests,
+        "known_failure_reverified": bool(repeated_tests),
+        "possible_reasoning_action_mismatch": reasoning_action_mismatch,
+        "reasoning_action_evidence": {
+            "edit_proposed": edit_proposed,
+            "edit_action_observed": edit_action_observed,
+            "response_excerpt": _reasoning_excerpt(prose) if edit_proposed else None,
+        },
         "commit_attempted": commit_attempted,
         "push_attempted": bool(push_occurrences),
         "push_actions": push_actions,
@@ -216,6 +243,7 @@ def diagnose_attempt(
                 and attempt_result.get("patch_size")
             ),
         },
+        "required_next_phase": "edit" if repeated_tests else None,
     }
     possible_incorrect_assessment = bool(
         target_displayed
@@ -248,6 +276,10 @@ def diagnose_attempt(
         failure_types.append("unnecessary_git_push")
     if possible_incorrect_assessment:
         failure_types.append("possible_incorrect_source_assessment")
+    if repeated_tests:
+        failure_types.extend(("repeated_test_without_change", "known_failure_reverified"))
+    if reasoning_action_mismatch:
+        failure_types.append("possible_reasoning_action_mismatch")
     if budget_exhausted:
         failure_types.append("budget_exhausted")
     if attempt_result.get("classification") == "model_failure":
@@ -280,6 +312,39 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
         task.get("agent_verifier_command")
         or " ".join(str(part).replace("{python}", "python") for part in task["verifier_command"])
     ).replace("{agent_python}", "python")
+    repeated_tests = diagnosis.get("repeated_test_without_change") or []
+    traceback_evidence = diagnosis.get("source_evidence") or []
+    if repeated_tests and traceback_evidence:
+        repeated = repeated_tests[0]
+        source_item = traceback_evidence[0]
+        return "\n".join(
+            [
+                "## CGR corrective evidence",
+                "",
+                "Previous attempt outcome:",
+                "- The focused test ran and failed with a RecursionError.",
+                f"- The traceback repeatedly pointed to {source_item['path']} line {source_item['line']}.",
+                f"- The observed line was `{source_item['content']}`.",
+                f"- You ran the same failing test {repeated['count']} times without changing the repository.",
+                "- No tracked file changed.",
+                "- Do not commit, push, modify remotes, or configure Git identity.",
+                "",
+                "Immediate required action:",
+                "- Do not run the test again yet.",
+                f"- Your first action must modify {source} using one available noninteractive editing mechanism.",
+                "- Do not use nano or another interactive editor.",
+                f"- After the edit, run `git diff -- {source}`.",
+                f"- Only after a nonempty diff exists, run the focused test once: `{verifier}`.",
+                "- If the focused test passes, inspect the final diff and submit the worktree patch without committing.",
+                "- Your next executed action must perform the required edit phase.",
+                "",
+                "Source evidence:",
+                "- The failing recursion keeps `b` in the second argument position.",
+                "- Reinspect the recursive argument order so each call progresses toward the base case.",
+                "- Do not rerun an unchanged failing verifier; rerun only after a repository change or to gather different evidence.",
+                "",
+            ]
+        )
     specialized = bool(
         diagnosis.get("target_source_displayed")
         and not diagnosis.get("target_file_changed")
@@ -441,8 +506,8 @@ def _test_telemetry(
         if not command_pattern.search(normalized):
             continue
         observation = _observation_for_step(steps, index)
-        environment_failure = bool(environment_pattern.search(observation))
-        result_observed = bool(result_pattern.search(observation)) and not environment_failure
+        result_observed = bool(result_pattern.search(observation))
+        environment_failure = bool(environment_pattern.search(observation)) and not result_observed
         passed = bool(re.search(r"\d+\s+passed", observation, re.I)) and not bool(
             re.search(r"\d+\s+failed", observation, re.I)
         )
@@ -495,6 +560,94 @@ def _unavailable_tools(
                 }
             )
     return unavailable
+
+
+def _traceback_source_evidence(
+    observations: list[tuple[int, str]], target: str
+) -> list[dict[str, Any]]:
+    if not target:
+        return []
+    escaped_target = re.escape(target).replace("/", r"[\\/]")
+    path_pattern = re.compile(rf"{escaped_target}:(\d+)")
+    grouped: dict[tuple[int, str], dict[str, Any]] = {}
+    for step, observation in observations:
+        lines = observation.splitlines()
+        for index, line in enumerate(lines):
+            match = path_pattern.search(line)
+            if not match:
+                continue
+            content = next(
+                (
+                    candidate.strip()
+                    for candidate in lines[index + 1 : index + 4]
+                    if candidate.strip().startswith("return ")
+                ),
+                "",
+            )
+            if not content:
+                continue
+            key = (int(match.group(1)), content)
+            item = grouped.setdefault(
+                key,
+                {
+                    "path": target,
+                    "line": int(match.group(1)),
+                    "content": content,
+                    "source": "focused_test_traceback",
+                    "occurrences": 0,
+                    "first_step": step,
+                    "last_step": step,
+                },
+            )
+            item["occurrences"] += 1
+            item["last_step"] = step
+    return list(grouped.values())
+
+
+def _repeated_tests_without_change(
+    attempts: list[dict[str, Any]], tracked_change: bool, target_changed: bool
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for attempt in attempts:
+        if attempt["focused_test"] and attempt["test_failed"]:
+            grouped[str(attempt["normalized_action"])].append(attempt)
+    repeated = []
+    for command, occurrences in grouped.items():
+        if len(occurrences) < 2 or tracked_change or target_changed:
+            continue
+        fingerprints = Counter(
+            _observation_fingerprint(str(item["observation_evidence"]))
+            for item in occurrences
+        )
+        fingerprint, count = fingerprints.most_common(1)[0]
+        if count < 2:
+            continue
+        repeated.append(
+            {
+                "command": command,
+                "count": len(occurrences),
+                "first_step": occurrences[0]["step"],
+                "last_step": occurrences[-1]["step"],
+                "repeated_failure_fingerprint": fingerprint,
+                "tracked_change_between_executions": False,
+            }
+        )
+    return repeated
+
+
+def _is_edit_action(action: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:sed\s+-i|apply_patch|perl\s+-[pi]|(?:cat|printf)\b[^\n]*(?:>|>>)|python\b[^\n]*(?:write_text|open\())",
+            action,
+            re.I,
+        )
+    )
+
+
+def _reasoning_excerpt(prose: str) -> str:
+    normalized = " ".join(prose.split())
+    return normalized[:500]
 
 
 def _workspace_diff(workspace: Path) -> str:
