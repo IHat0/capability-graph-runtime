@@ -32,6 +32,7 @@ def diagnose_attempt(
     workspace: Path,
     attempt_result: dict[str, Any],
     task: dict[str, Any] | None = None,
+    required_phase: str | None = None,
 ) -> dict[str, Any]:
     steps = _trajectory_steps(trajectory_path)
     actions: list[tuple[int, str, str]] = []
@@ -203,11 +204,32 @@ def diagnose_attempt(
     verification_after_ineffective = _verification_after_ineffective_edit(
         edit_commands, test_telemetry["attempts"], target_changed
     )
+    declared_edits = _declared_edit_evidence(steps, target, required_phase)
+    for declared in declared_edits:
+        declared["edit_effect_observed"] = target_changed
+        declared["target_file_changed"] = target_changed
+    first_action = normalized_actions[0] if normalized_actions else ""
+    actual_action_kind = _action_kind(first_action)
+    declared_edit_not_executed = bool(
+        declared_edits and not edit_command_attempted and not tracked_change
+    )
+    edit_proposed = edit_proposed or bool(declared_edits)
+    phase_satisfied = _required_phase_satisfied(
+        required_phase,
+        actual_action_kind,
+        target_changed,
+        target_displayed,
+        git_diff_observed,
+    )
+    required_phase_violation = bool(required_phase and not phase_satisfied)
     reasoning_action_mismatch = bool(
-        edit_proposed
-        and test_telemetry["test_command_attempted"]
-        and not edit_action_observed
-        and not tracked_change
+        declared_edit_not_executed
+        or (
+            edit_proposed
+            and test_telemetry["test_command_attempted"]
+            and not edit_action_observed
+            and not tracked_change
+        )
     )
     termination = attempt_result.get("termination_reason")
     budget_exhausted = bool(
@@ -233,6 +255,19 @@ def diagnose_attempt(
         "possible_stale_or_reversed_edit": bool(stale_or_reversed),
         "stale_or_reversed_edit_evidence": stale_or_reversed,
         "verification_after_ineffective_edit": verification_after_ineffective,
+        "declared_edit_not_executed": declared_edits if declared_edit_not_executed else [],
+        "required_phase": required_phase,
+        "required_phase_action_violation": (
+            {
+                "required_phase": required_phase,
+                "actual_action_kind": actual_action_kind,
+                "phase_satisfied": phase_satisfied,
+                "target_file_changed": target_changed,
+                "tracked_change_observed": tracked_change,
+            }
+            if required_phase_violation
+            else None
+        ),
         "source_assessment_claimed_correct": claimed_correct,
         "tracked_change_observed": tracked_change,
         "git_diff_observed": git_diff_observed,
@@ -253,10 +288,18 @@ def diagnose_attempt(
         "possible_reasoning_action_mismatch": reasoning_action_mismatch,
         "reasoning_action_evidence": {
             "edit_proposed": edit_proposed,
+            "proposal_is_immediate": bool(declared_edits),
+            "proposed_target": declared_edits[0]["declared_target"] if declared_edits else None,
+            "proposed_mechanism": (
+                declared_edits[0]["declared_mechanism"] if declared_edits else None
+            ),
+            "actual_action_kind": actual_action_kind,
             "edit_command_observed": edit_action_observed,
+            "edit_command_attempted": edit_command_attempted,
             "edit_effect_observed": edit_effect_observed,
+            "response_action_conformant": not declared_edit_not_executed,
             "response_excerpt": _reasoning_excerpt(prose) if edit_proposed else None,
-            "action_excerpt": edit_commands[0]["command"][:500] if edit_commands else None,
+            "action_excerpt": first_action[:500] if first_action else None,
         },
         "commit_attempted": commit_attempted,
         "push_attempted": bool(push_occurrences),
@@ -280,10 +323,14 @@ def diagnose_attempt(
                 and attempt_result.get("patch_size")
             ),
         },
-        "required_next_phase": "edit" if repeated_tests or no_op_edits else None,
+        "required_next_phase": (
+            "edit"
+            if repeated_tests or no_op_edits or declared_edit_not_executed
+            else None
+        ),
         "phase_exit_condition": (
             {"target": target, "requires_nonempty_diff": True}
-            if repeated_tests or no_op_edits
+            if repeated_tests or no_op_edits or declared_edit_not_executed
             else None
         ),
     }
@@ -326,6 +373,14 @@ def diagnose_attempt(
         failure_types.append("possible_stale_or_reversed_edit")
     if verification_after_ineffective:
         failure_types.append("verification_after_ineffective_edit")
+    if declared_edit_not_executed:
+        failure_types.append("declared_edit_not_executed")
+    if required_phase_violation:
+        failure_types.append("required_phase_action_violation")
+    if edit_command_attempted and not edit_command_succeeded:
+        failure_types.append("malformed_edit")
+    if edit_command_attempted and tracked_change and not target_changed:
+        failure_types.append("wrong_file_edit")
     if reasoning_action_mismatch:
         failure_types.append("possible_reasoning_action_mismatch")
     if budget_exhausted:
@@ -363,6 +418,33 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
     repeated_tests = diagnosis.get("repeated_test_without_change") or []
     traceback_evidence = diagnosis.get("source_evidence") or []
     no_op_edits = diagnosis.get("no_op_edits") or []
+    declared_edits = diagnosis.get("declared_edit_not_executed") or []
+    if declared_edits:
+        return "\n".join(
+            [
+                "## CGR corrective evidence",
+                "",
+                "Previous attempt outcome:",
+                "- You described an edit command, but the executed action was not that edit.",
+                "- Commands written only in explanation do not modify the repository.",
+                "- No edit command reached execution.",
+                "- No tracked file changed.",
+                "- The same known failing verifier was repeated without a repository change.",
+                "- Do not commit, push, modify remotes, or configure Git identity.",
+                "",
+                "Immediate required phase: execute edit",
+                "",
+                "1. Do not provide a multi-step plan as the next response.",
+                f"2. Your next actual executed action must be one noninteractive command that modifies {source}.",
+                "3. Do not run the focused test yet.",
+                "4. After the edit executes, display the relevant target region.",
+                f"5. Run `git diff -- {source}`.",
+                "6. Continue only after the diff is nonempty.",
+                "7. Then run the focused test once, inspect the final diff, and submit the worktree patch without committing.",
+                "- Your next executed action must perform the required edit phase.",
+                "",
+            ]
+        )
     if no_op_edits and traceback_evidence:
         source_item = traceback_evidence[0]
         return "\n".join(
@@ -736,6 +818,77 @@ def _edit_command_telemetry(
             )
         telemetry.append(item)
     return telemetry
+
+
+def _declared_edit_evidence(
+    steps: list[dict[str, Any]], target: str, required_phase: str | None
+) -> list[dict[str, Any]]:
+    if not target:
+        return []
+    target_pattern = re.escape(target).replace("/", r"[\\/]")
+    declaration = re.compile(
+        rf"(?:execute|run|apply)(?:\s+this)?(?:\s+edit)?\s+now:\s*"
+        rf"(?P<command>(?P<mechanism>sed)\s+-i[^\r\n]*{target_pattern})",
+        re.I,
+    )
+    evidence = []
+    for step_number, step in enumerate(steps, start=1):
+        response = step.get("response")
+        action = step.get("action")
+        if not isinstance(response, str):
+            continue
+        match = declaration.search(response)
+        if not match:
+            continue
+        normalized_action = normalize_action(action) if isinstance(action, str) else ""
+        evidence.append(
+            {
+                "step": step_number,
+                "required_phase": required_phase or "edit",
+                "declared_edit": True,
+                "declared_target": target,
+                "declared_mechanism": match.group("mechanism").lower(),
+                "declared_command": normalize_action(match.group("command")),
+                "actual_action_kind": _action_kind(normalized_action),
+                "edit_command_attempted": _is_edit_action(normalized_action),
+                "edit_effect_observed": False,
+                "target_file_changed": False,
+            }
+        )
+    return evidence
+
+
+def _action_kind(action: str) -> str:
+    if _is_edit_action(action):
+        return "edit"
+    if re.search(r"(?:^|[\s;&|])(?:pytest|[^\s]+\s+-m\s+pytest)(?:[\s;&|]|$)", action):
+        return "test"
+    if re.search(r"(?:^|\s)git\s+diff(?:\s|$)", action):
+        return "diff"
+    if re.search(r"(?:^|\s)git\s+(?:commit|push)(?:\s|$)", action):
+        return "git_publication"
+    if _is_inspection(action):
+        return "inspect"
+    return "other" if action else "none"
+
+
+def _required_phase_satisfied(
+    required_phase: str | None,
+    actual_action_kind: str,
+    target_changed: bool,
+    target_displayed: bool,
+    git_diff_observed: bool,
+) -> bool:
+    if required_phase == "edit":
+        return actual_action_kind == "edit" and target_changed
+    if required_phase == "confirm_edit":
+        return (
+            actual_action_kind in {"inspect", "diff"}
+            and target_displayed
+            and git_diff_observed
+            and target_changed
+        )
+    return True
 
 
 def _sed_substitution(command: str) -> tuple[str, str] | None:

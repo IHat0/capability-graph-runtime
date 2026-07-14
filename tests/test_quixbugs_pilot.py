@@ -192,3 +192,10 @@ def test_actionable_recovery_requires_grounded_noop_edit() -> None:
             "budget_exhausted": True,
         }
     )
+    assert pilot._qualifies_for_actionable_recovery(
+        {
+            "required_next_phase": "edit",
+            "declared_edit_not_executed": [{"actual_action_kind": "test"}],
+            "phase_exit_condition": {"requires_nonempty_diff": True},
+        }
+    )

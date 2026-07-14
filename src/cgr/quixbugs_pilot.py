@@ -47,7 +47,14 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--correction-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--deterministic-profile",
-        choices=("success", "failed", "misassessment", "noop_edit", "recovery"),
+        choices=(
+            "success",
+            "failed",
+            "misassessment",
+            "noop_edit",
+            "declared_edit",
+            "recovery",
+        ),
         default="success",
         help=argparse.SUPPRESS,
     )
@@ -348,7 +355,8 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
         child_results: list[dict[str, Any]] = []
         diagnoses: list[dict[str, Any] | None] = []
         latest_correction: Path | None = None
-        profiles = ("failed", "misassessment", "noop_edit", "recovery")
+        latest_required_phase: str | None = None
+        profiles = ("failed", "misassessment", "declared_edit", "recovery")
         attempt_limit = max_attempts
         attempt_index = 1
         while attempt_index <= attempt_limit:
@@ -384,6 +392,7 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
                 Path(str(child["repository_root"])),
                 child,
                 task,
+                required_phase=latest_required_phase,
             )
             diagnoses.append(diagnosis)
             diagnosis_path = run / f"diagnosis-{attempt_index:03d}.json"
@@ -417,6 +426,7 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
                     }
                 )
                 latest_correction = correction_path
+                latest_required_phase = diagnosis.get("required_next_phase")
             attempt_index += 1
 
         result["recovery_occurred"] = len(child_results) > 1
@@ -776,6 +786,8 @@ def _deterministic_actions(
             f"sed -i 's/return gcd(b, a % b)/return gcd(a % b, b)/' {shlex_quote(source)}",
             str(task["agent_verifier_command"]),
         ]
+    if profile == "declared_edit":
+        return [str(task["agent_verifier_command"])]
     if profile == "recovery":
         return [
             f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
@@ -795,8 +807,15 @@ def _deterministic_actions(
 
 
 def _deterministic_discussions(profile: str) -> list[str] | None:
-    if profile not in {"misassessment", "noop_edit"}:
+    if profile not in {"misassessment", "noop_edit", "declared_edit"}:
         return None
+    if profile == "declared_edit":
+        return [
+            (
+                "Execute this edit now: sed -i 's/return gcd(a % b, b)/"
+                "return gcd(b, a % b)/' python_programs/gcd.py"
+            )
+        ]
     return [
         (
             "The source should be updated to an iterative Euclidean implementation: "
@@ -809,7 +828,10 @@ def _deterministic_discussions(profile: str) -> list[str] | None:
 def _qualifies_for_actionable_recovery(diagnosis: dict[str, Any]) -> bool:
     return bool(
         diagnosis.get("required_next_phase") == "edit"
-        and diagnosis.get("no_op_edits")
+        and (
+            diagnosis.get("no_op_edits")
+            or diagnosis.get("declared_edit_not_executed")
+        )
         and diagnosis.get("phase_exit_condition", {}).get("requires_nonempty_diff")
     )
 

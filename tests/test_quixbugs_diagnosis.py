@@ -461,6 +461,7 @@ E   RecursionError: maximum recursion depth exceeded
     assert diagnosis["edit_command_succeeded"] is True
     assert diagnosis["edit_effect_observed"] is False
     assert diagnosis["target_file_changed"] is False
+    assert diagnosis["declared_edit_not_executed"] == []
     assert diagnosis["no_op_edits"][0]["mechanism"] == "sed"
     assert diagnosis["possible_stale_or_reversed_edit"] is True
     assert diagnosis["verification_after_ineffective_edit"][0]["test_steps"] == [2, 3]
@@ -511,13 +512,198 @@ def test_successful_target_edit_records_effect(tmp_path: Path, action: str) -> N
         encoding="utf-8",
     )
 
-    diagnosis = diagnose_attempt(trajectory, workspace, {"patch_size": 1}, task)
+    diagnosis = diagnose_attempt(
+        trajectory, workspace, {"patch_size": 1}, task, required_phase="edit"
+    )
 
     assert diagnosis["edit_command_succeeded"] is True
     assert diagnosis["edit_effect_observed"] is True
     assert diagnosis["target_file_changed"] is True
     assert diagnosis["edit_commands"][0]["edit_effect_observed"] is True
     assert diagnosis["no_op_edits"] == []
+    assert diagnosis["required_phase_action_violation"] is None
+
+
+def test_immediate_declared_edit_but_test_executed_is_phase_violation(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    test_command = "python -m pytest -q python_testcases/test_gcd.py"
+    response = (
+        "Execute this edit now: sed -i 's/return gcd(a % b, b)/"
+        "return gcd(b, a % b)/' python_programs/gcd.py"
+    )
+    failure = """python_programs/gcd.py:5: in gcd
+    return gcd(a % b, b)
+E   RecursionError: maximum recursion depth exceeded
+5 failed, 1 passed in 0.04s
+"""
+    trajectory = tmp_path / "declared-not-executed.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {"action": test_command, "observation": failure, "response": response},
+                    {"action": test_command, "observation": failure, "response": response},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(
+        trajectory,
+        workspace,
+        {"classification": "budget_exhausted", "patch_size": 0},
+        task,
+        required_phase="edit",
+    )
+    correction = build_corrective_message(diagnosis, task)
+
+    declared = diagnosis["declared_edit_not_executed"][0]
+    assert declared["declared_target"] == "python_programs/gcd.py"
+    assert declared["declared_mechanism"] == "sed"
+    assert declared["actual_action_kind"] == "test"
+    assert diagnosis["edit_command_attempted"] is False
+    assert diagnosis["edit_effect_observed"] is False
+    assert diagnosis["target_file_changed"] is False
+    assert diagnosis["no_op_edits"] == []
+    assert diagnosis["required_phase_action_violation"] == {
+        "required_phase": "edit",
+        "actual_action_kind": "test",
+        "phase_satisfied": False,
+        "target_file_changed": False,
+        "tracked_change_observed": False,
+    }
+    evidence = diagnosis["reasoning_action_evidence"]
+    assert evidence["edit_proposed"] is True
+    assert evidence["proposal_is_immediate"] is True
+    assert evidence["response_action_conformant"] is False
+    assert "declared_edit_not_executed" in diagnosis["failure_types"]
+    assert "required_phase_action_violation" in diagnosis["failure_types"]
+    assert "Commands written only in explanation do not modify" in correction
+    assert "next actual executed action must be one noninteractive command" in correction
+    assert "return gcd(b, a % b)" not in correction
+
+
+def test_hypothetical_edit_discussion_is_not_declared_execution(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    trajectory = tmp_path / "hypothetical.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "python -m pytest -q python_testcases/test_gcd.py",
+                        "observation": "1 failed in 0.01s",
+                        "response": (
+                            "We could use sed to edit python_programs/gcd.py after "
+                            "inspecting the implementation."
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(trajectory, workspace, {"patch_size": 0}, task)
+
+    assert diagnosis["declared_edit_not_executed"] == []
+    assert "declared_edit_not_executed" not in diagnosis["failure_types"]
+
+
+def test_matching_declared_and_executed_edit_is_conformant(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    command = (
+        "sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' "
+        "python_programs/gcd.py"
+    )
+    (workspace / "python_programs" / "gcd.py").write_text(
+        "def gcd(a, b):\n    return gcd(b, a % b)\n", encoding="utf-8"
+    )
+    trajectory = tmp_path / "matching-edit.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": command,
+                        "observation": "",
+                        "response": f"Execute this edit now: {command}",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(
+        trajectory, workspace, {"patch_size": 1}, task, required_phase="edit"
+    )
+
+    assert diagnosis["declared_edit_not_executed"] == []
+    assert diagnosis["reasoning_action_evidence"]["response_action_conformant"] is True
+    assert diagnosis["edit_command_attempted"] is True
+    assert diagnosis["edit_effect_observed"] is True
+    assert diagnosis["required_phase_action_violation"] is None
+
+
+def test_malformed_executed_edit_is_not_noop(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    trajectory = tmp_path / "malformed-edit.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "sed -i 's/old/new/' python_programs/gcd.py",
+                        "observation": "sed: cannot read file: No such file or directory",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(
+        trajectory, workspace, {"patch_size": 0}, task, required_phase="edit"
+    )
+
+    assert diagnosis["edit_command_attempted"] is True
+    assert diagnosis["edit_command_succeeded"] is False
+    assert diagnosis["no_op_edits"] == []
+    assert "malformed_edit" in diagnosis["failure_types"]
+
+
+def test_test_action_does_not_satisfy_confirm_edit_phase(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    task, _ = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    trajectory = tmp_path / "confirm-edit-test.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "python -m pytest -q python_testcases/test_gcd.py",
+                        "observation": "1 failed in 0.01s",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnosis = diagnose_attempt(
+        trajectory, workspace, {"patch_size": 0}, task, required_phase="confirm_edit"
+    )
+
+    assert diagnosis["required_phase_action_violation"]["actual_action_kind"] == "test"
+    assert diagnosis["required_phase_action_violation"]["phase_satisfied"] is False
 
 
 def test_selector_does_not_credit_test_environment_failure() -> None:
