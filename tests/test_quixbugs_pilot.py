@@ -110,6 +110,9 @@ def test_post_run_reconciliation_retains_forensics_and_exactly_restores(
         phase="edit",
         target="src/module.py",
         focused_test="tests/test_module.py",
+        focused_test_command=(
+            "PYTHONPATH=.git/cgr-test-runtime python -m pytest -q tests/test_module.py"
+        ),
         state_path=state_path,
         edit_policy=EditPolicy(mode="modify_existing_source"),
     )
@@ -309,6 +312,9 @@ def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: P
         initial_phase="edit",
         target="src/module.py",
         focused_test="tests/test_module.py",
+        focused_test_command=(
+            "PYTHONPATH=.git/cgr-test-runtime python -m pytest -q tests/test_module.py"
+        ),
         verifier_failure_evidence={
             "available": True,
             "exit_code": 1,
@@ -338,6 +344,10 @@ def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: P
     assert config.is_absolute() and config.is_file()
     assert event_log.is_absolute() and event_log.is_file()
     assert state_path.is_absolute() and state_path.is_file()
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    assert payload["focused_test_command"] == (
+        "PYTHONPATH=.git/cgr-test-runtime python -m pytest -q tests/test_module.py"
+    )
     assert pilot._assert_phase_gate_config(config, environment) is not None
     payload = json.loads(config.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1

@@ -35,7 +35,9 @@ class CandidateAction:
     targets_unrelated_files: bool = False
     parsed_executable: str | None = None
     parsed_argv: tuple[str, ...] = ()
+    environment_assignments: tuple[str, ...] = ()
     redirection_operators: tuple[str, ...] = ()
+    write_capable: bool = False
     heredoc_present: bool = False
     heredoc_delimiter: str | None = None
     command_multiline: bool = False
@@ -137,6 +139,7 @@ class TransactionReconciliation:
 class _ParsedShellCommand:
     executable: str | None
     argv: tuple[str, ...]
+    environment_assignments: tuple[str, ...]
     redirections: tuple[str, ...]
     output_targets: tuple[str, ...]
     heredoc_delimiter: str | None = None
@@ -149,7 +152,9 @@ class _ShellActionAnalysis:
     write_targets: tuple[str, ...]
     parsed_executable: str | None
     parsed_argv: tuple[str, ...]
+    environment_assignments: tuple[str, ...]
     redirection_operators: tuple[str, ...]
+    write_capable: bool
     heredoc_delimiter: str | None
     command_multiline: bool
     physical_line_count: int
@@ -187,6 +192,15 @@ def build_initial_phase_state(
         "workflow_complete": False,
         "last_event_index": 0,
         "accepted_patch_fingerprint": None,
+        "accepted_target_fingerprint": None,
+        "pre_edit_target_fingerprint": None,
+        "confirmation_action_kind": None,
+        "confirmation_target_fingerprint": None,
+        "confirmation_matches_accepted_edit": False,
+        "confirmation_diff_nonempty": False,
+        "confirmed_patch_fingerprint": None,
+        "final_patch_fingerprint": None,
+        "submitted_patch_fingerprint": None,
         "terminal_reason": None,
         "last_postcondition_failures": [],
         "diagnostic_flags": [],
@@ -231,6 +245,7 @@ def authorize_phase_patch(
         failures.append("transactional_cleanup_unverified")
     requirements = (
         ("accepted_target_edit", "accepted_target_edit_missing"),
+        ("target_confirmed_after_edit", "accepted_target_edit_not_confirmed"),
         ("target_diff_inspected", "target_diff_not_inspected"),
         ("focused_test_executed", "focused_test_not_executed"),
         ("focused_test_passed", "focused_test_not_passed"),
@@ -249,6 +264,28 @@ def authorize_phase_patch(
         failures.append("accepted_patch_fingerprint_missing")
     elif fingerprint is not None and accepted != fingerprint:
         failures.append("final_patch_fingerprint_mismatch")
+    for key, missing, mismatch in (
+        (
+            "confirmed_patch_fingerprint",
+            "confirmed_patch_fingerprint_missing",
+            "confirmed_patch_fingerprint_mismatch",
+        ),
+        (
+            "final_patch_fingerprint",
+            "final_patch_fingerprint_missing",
+            "recorded_final_patch_fingerprint_mismatch",
+        ),
+        (
+            "submitted_patch_fingerprint",
+            "submitted_patch_fingerprint_missing",
+            "submitted_patch_fingerprint_mismatch",
+        ),
+    ):
+        recorded = state.get(key)
+        if not isinstance(recorded, str) or not recorded:
+            failures.append(missing)
+        elif fingerprint is not None and recorded != fingerprint:
+            failures.append(mismatch)
     return PatchAuthorization(
         not failures,
         tuple(dict.fromkeys(failures)),
@@ -494,6 +531,8 @@ def classify_candidate_action(
         kind = "interactive_editor"
     elif re.search(r"<<SWE_AGENT_SUBMISSION>>|model\.patch|^submit$", action, re.I):
         kind = "submission"
+    elif git_operation == "diff" and analysis.write_capable:
+        kind = "write_capable_inspection"
     elif git_operation == "diff":
         kind = "git_diff"
     elif (
@@ -528,7 +567,9 @@ def classify_candidate_action(
         targets_unrelated_files=unrelated,
         parsed_executable=analysis.parsed_executable,
         parsed_argv=analysis.parsed_argv,
+        environment_assignments=analysis.environment_assignments,
         redirection_operators=analysis.redirection_operators,
+        write_capable=analysis.write_capable,
         heredoc_present=analysis.heredoc_delimiter is not None,
         heredoc_delimiter=analysis.heredoc_delimiter,
         command_multiline=analysis.command_multiline,
@@ -601,6 +642,7 @@ class PhaseGate:
         state_path: Path | None = None,
         edit_policy: EditPolicy | None = None,
         snapshot_python: str = "python",
+        focused_test_command: str | None = None,
         verifier_failure_evidence: dict[str, Any] | None = None,
     ) -> None:
         if phase not in PHASES:
@@ -612,6 +654,7 @@ class PhaseGate:
         self.state_path = state_path
         self.edit_policy = edit_policy or EditPolicy()
         self.snapshot_python = snapshot_python
+        self.focused_test_command = focused_test_command or focused_test
         self.verifier_failure_evidence = (
             verifier_failure_evidence if isinstance(verifier_failure_evidence, dict) else {}
         )
@@ -644,6 +687,11 @@ class PhaseGate:
         reason: str | None = None
         if candidate.kind in {"commit", "push"}:
             reason = "Committing, pushing, changing remotes, and configuring Git identity are prohibited."
+        elif self.phase in {"inspect", "confirm_edit", "final_diff"} and candidate.write_capable:
+            reason = (
+                "This inspection action can modify the workspace. Read-only phases prohibit "
+                "redirection, file writes, deletion, patch application, and writable pipelines."
+            )
         elif self.phase == "inspect":
             if candidate.kind not in {"inspection", "target_confirmation"}:
                 reason = "Inspect the required source or relevant test before continuing."
@@ -655,9 +703,7 @@ class PhaseGate:
             elif candidate.kind != "noninteractive_edit":
                 reason = f"{_kind_label(candidate.kind)} cannot satisfy the edit phase."
         elif self.phase == "confirm_edit":
-            if candidate.kind == "noninteractive_edit":
-                pass
-            elif candidate.kind == "target_confirmation":
+            if candidate.kind == "target_confirmation":
                 pass
             elif candidate.kind == "git_diff" and candidate.references_required_file:
                 if not evidence.target_diff.strip():
@@ -682,6 +728,8 @@ class PhaseGate:
                 reason = "Submit the existing worktree patch in the submit phase."
             elif not evidence.tracked_diff.strip():
                 reason = "Submission requires a nonempty tracked patch."
+            elif not self._lineage_matches(evidence.tracked_diff):
+                reason = "The submitted canonical patch does not match the accepted edit lineage."
         if reason is None:
             return GateDecision(True, self.phase, candidate)
         self._register_rejection(candidate, model_text=model_text)
@@ -709,7 +757,18 @@ class PhaseGate:
         }
         declared = bool(self.state["declared_edit_without_edit_action"])
         level = int(self.state["coaching_level"])
-        if self.phase == "edit" and candidate.kind in test_kinds:
+        if self.phase in {"inspect", "confirm_edit", "final_diff"} and candidate.write_capable:
+            lines.extend(
+                (
+                    "Confirmation and diff inspection must be read-only. This action would "
+                    "modify the workspace.",
+                    reason,
+                    "Return exactly one read-only action that inspects the required target, "
+                    "such as a target-scoped Git diff or direct target read.",
+                )
+            )
+            constraint = "Do not redirect output, create files, apply patches, delete files, or run a writable pipeline."
+        elif self.phase == "edit" and candidate.kind in test_kinds:
             lines.append("The proposed test was not executed.")
             verifier = self._verifier_failure_clause()
             if verifier:
@@ -846,6 +905,85 @@ class PhaseGate:
             )
         )
         return "\n".join(lines)
+
+    def phase_transition_guidance(self) -> str:
+        headings = (
+            "CGR PHASE TRANSITION",
+            "",
+            f"Current phase: {self.phase}",
+        )
+        body: tuple[str, ...]
+        if self.phase == "confirm_edit":
+            body = (
+                f"Required target: {self.target}",
+                "",
+                "The source edit was accepted. Return exactly one read-only action that "
+                "inspects the current accepted edit in the required target. A target-scoped "
+                "Git diff or direct target read is acceptable. Do not redirect output, create "
+                "files, run tests, commit, or submit.",
+            )
+        elif self.phase == "test":
+            body = (
+                "",
+                "Run exactly the configured focused test:",
+                self.focused_test_command,
+                "",
+                "Do not edit, create files, commit, or submit.",
+            )
+        elif self.phase == "final_diff":
+            body = (
+                f"Required target: {self.target}",
+                "",
+                f"Inspect the canonical patch with exactly one read-only command: git diff -- {self.target}",
+                "Do not redirect output, create files, edit, commit, or submit yet.",
+            )
+        elif self.phase == "submit":
+            body = (
+                "",
+                "The canonical patch matches the accepted and confirmed edit. Submit the "
+                "existing worktree patch now. Do not edit or create files.",
+            )
+        else:
+            return self.phase_transition_coaching()
+        return "\n".join((*headings, *body))
+
+    def _lineage_matches(self, tracked_diff: str) -> bool:
+        if not tracked_diff.strip():
+            return False
+        fingerprint = patch_fingerprint(tracked_diff)
+        values = (
+            self.state.get("accepted_patch_fingerprint"),
+            self.state.get("confirmed_patch_fingerprint"),
+            self.state.get("final_patch_fingerprint"),
+        )
+        return all(isinstance(value, str) and value == fingerprint for value in values)
+
+    def confirmation_integrity_feedback(self) -> str:
+        return "\n".join(
+            (
+                "TARGET INTEGRITY CONFIRMATION FAILED",
+                "",
+                "Required phase: edit",
+                f"Required target: {self.target}",
+                "",
+                "The current target no longer matches the accepted transactional edit, or "
+                "its canonical target diff is empty or changed. Authorization remains blocked.",
+                "Return exactly one corrected noninteractive edit action for the required target.",
+            )
+        )
+
+    def patch_lineage_feedback(self, *, phase: str) -> str:
+        return "\n".join(
+            (
+                "PATCH LINEAGE CHECK FAILED",
+                "",
+                f"Required phase: {phase}",
+                f"Required target: {self.target}",
+                "",
+                "The current canonical patch does not match the accepted and confirmed edit. "
+                "Authorization remains blocked.",
+            )
+        )
 
     def begin_transaction(
         self, decision: GateDecision, snapshot: FileSnapshot
@@ -1021,9 +1159,11 @@ class PhaseGate:
         diff_evidence: DiffEvidence | None = None,
         execution_exit_code: int | None = None,
         transaction_details: dict[str, Any] | None = None,
-    ) -> None:
+        current_target_snapshot: FileSnapshot | None = None,
+    ) -> str | None:
         phase_before = self.phase
         kind = decision.candidate.kind
+        feedback: str | None = None
         if phase_before == "inspect" and kind == "target_confirmation":
             self.target_inspected = True
             self.state["target_inspected"] = True
@@ -1041,11 +1181,20 @@ class PhaseGate:
             self.state["final_diff_inspected"] = False
             self.state["submission_authorized"] = False
             self.state["workflow_complete"] = False
+            self.state["confirmation_action_kind"] = None
+            self.state["confirmation_target_fingerprint"] = None
+            self.state["confirmation_matches_accepted_edit"] = False
+            self.state["confirmation_diff_nonempty"] = False
+            self.state["confirmed_patch_fingerprint"] = None
+            self.state["final_patch_fingerprint"] = None
+            self.state["submitted_patch_fingerprint"] = None
             if accepted and evidence.target_diff.strip():
                 self.state["accepted_target_edit"] = True
                 self.state["accepted_patch_fingerprint"] = patch_fingerprint(
                     evidence.tracked_diff
                 )
+                self.state["accepted_target_fingerprint"] = post_action_fingerprint
+                self.state["pre_edit_target_fingerprint"] = pre_action_fingerprint
                 self.state["last_postcondition_failures"] = []
                 self.phase = "confirm_edit"
             else:
@@ -1060,6 +1209,9 @@ class PhaseGate:
                     if restored_accepted_edit
                     else None
                 )
+                if not restored_accepted_edit:
+                    self.state["accepted_target_fingerprint"] = None
+                    self.state["pre_edit_target_fingerprint"] = None
                 self.state["last_postcondition_failures"] = list(postcondition_failures)
                 self.state["rejected_edit_count"] += 1
                 if rolled_back:
@@ -1071,20 +1223,55 @@ class PhaseGate:
                 if rolled_back and "edit_rolled_back" not in flags:
                     flags.append("edit_rolled_back")
                 self.phase = "confirm_edit" if restored_accepted_edit else "edit"
-        elif phase_before == "confirm_edit" and kind == "target_confirmation":
-            self.target_inspected = True
-            self.state["target_inspected"] = True
-            self.target_confirmed_after_edit = True
-            self.state["target_confirmed_after_edit"] = True
-        elif phase_before == "confirm_edit" and kind == "git_diff":
-            self.target_diff_inspected = bool(evidence.target_diff.strip())
-            self.state["target_diff_inspected"] = self.target_diff_inspected
-        if (
-            self.phase == "confirm_edit"
-            and self.target_confirmed_after_edit
-            and self.target_diff_inspected
-        ):
-            self.phase = "test"
+        elif phase_before == "confirm_edit" and kind in {"target_confirmation", "git_diff"}:
+            current_fingerprint = (
+                current_target_snapshot.fingerprint if current_target_snapshot else None
+            )
+            accepted_target = self.state.get("accepted_target_fingerprint")
+            pre_edit_target = self.state.get("pre_edit_target_fingerprint")
+            current_patch = (
+                patch_fingerprint(evidence.tracked_diff)
+                if evidence.tracked_diff.strip()
+                else None
+            )
+            accepted_patch = self.state.get("accepted_patch_fingerprint")
+            matches = bool(
+                current_fingerprint
+                and isinstance(accepted_target, str)
+                and current_fingerprint == accepted_target
+                and isinstance(pre_edit_target, str)
+                and current_fingerprint != pre_edit_target
+                and isinstance(accepted_patch, str)
+                and current_patch == accepted_patch
+            )
+            diff_nonempty = bool(evidence.target_diff.strip())
+            self.state["confirmation_action_kind"] = kind
+            self.state["confirmation_target_fingerprint"] = current_fingerprint
+            self.state["confirmation_matches_accepted_edit"] = matches
+            self.state["confirmation_diff_nonempty"] = diff_nonempty
+            if matches and diff_nonempty:
+                self.target_inspected = True
+                self.state["target_inspected"] = True
+                self.target_confirmed_after_edit = True
+                self.target_diff_inspected = True
+                self.state["target_confirmed_after_edit"] = True
+                self.state["target_diff_inspected"] = True
+                self.state["confirmed_patch_fingerprint"] = current_patch
+                self.phase = "test"
+            else:
+                accepted = False
+                self.target_confirmed_after_edit = False
+                self.target_diff_inspected = False
+                self.state["target_confirmed_after_edit"] = False
+                self.state["target_diff_inspected"] = False
+                self.state["accepted_target_edit"] = False
+                self.state["confirmed_patch_fingerprint"] = None
+                self.state["final_patch_fingerprint"] = None
+                self.state["submitted_patch_fingerprint"] = None
+                self.state["submission_authorized"] = False
+                self.state["workflow_complete"] = False
+                self.phase = "edit"
+                feedback = self.confirmation_integrity_feedback()
         if phase_before == "test" and kind in {"focused_pytest", "focused_unittest"}:
             self.state["focused_test_executed"] = True
             if _test_passed(observation):
@@ -1097,17 +1284,30 @@ class PhaseGate:
                 self.last_failed_test_fingerprint = _fingerprint(observation)
                 self.last_failed_diff_fingerprint = _fingerprint(evidence.target_diff)
         elif phase_before == "final_diff" and kind == "git_diff" and evidence.tracked_diff.strip():
-            self.state["final_diff_inspected"] = True
-            self.state["accepted_patch_fingerprint"] = patch_fingerprint(
-                evidence.tracked_diff
+            fingerprint = patch_fingerprint(evidence.tracked_diff)
+            lineage = (
+                self.state.get("accepted_patch_fingerprint"),
+                self.state.get("confirmed_patch_fingerprint"),
             )
-            self.phase = "submit"
+            if all(isinstance(value, str) and value == fingerprint for value in lineage):
+                self.state["final_diff_inspected"] = True
+                self.state["final_patch_fingerprint"] = fingerprint
+                self.phase = "submit"
+            else:
+                accepted = False
+                self.state["final_diff_inspected"] = False
+                self.state["final_patch_fingerprint"] = None
+                feedback = self.patch_lineage_feedback(phase="final_diff")
         elif phase_before == "submit" and kind == "submission" and accepted:
-            self.state["submission_authorized"] = True
-            self.state["workflow_complete"] = True
-            self.state["accepted_patch_fingerprint"] = patch_fingerprint(
-                evidence.tracked_diff
-            )
+            fingerprint = patch_fingerprint(evidence.tracked_diff)
+            if self._lineage_matches(evidence.tracked_diff):
+                self.state["submission_authorized"] = True
+                self.state["workflow_complete"] = True
+                self.state["submitted_patch_fingerprint"] = fingerprint
+            else:
+                self.state["submission_authorized"] = False
+                self.state["workflow_complete"] = False
+                feedback = self.patch_lineage_feedback(phase="submit")
         self.state["current_phase"] = self.phase
         if self.phase != "inspect" and self.target_inspected:
             self.state["target_inspected"] = True
@@ -1136,6 +1336,7 @@ class PhaseGate:
             execution_exit_code=execution_exit_code,
             transaction_details=transaction_details,
         )
+        return feedback
 
     def record(
         self,
@@ -1177,8 +1378,12 @@ class PhaseGate:
             "diff_evidence": asdict(diff_evidence) if diff_evidence else None,
             "parsed_executable": decision.candidate.parsed_executable,
             "parsed_argv": list(decision.candidate.parsed_argv),
+            "environment_assignments": list(
+                decision.candidate.environment_assignments
+            ),
             "true_write_targets": list(decision.candidate.write_targets),
             "redirection_operators": list(decision.candidate.redirection_operators),
+            "write_capable": decision.candidate.write_capable,
             "heredoc_present": decision.candidate.heredoc_present,
             "heredoc_delimiter": decision.candidate.heredoc_delimiter,
             "command_multiline": decision.candidate.command_multiline,
@@ -1191,6 +1396,16 @@ class PhaseGate:
             "target_inspected": bool(self.state["target_inspected"]),
             "target_confirmed_after_edit": bool(
                 self.state["target_confirmed_after_edit"]
+            ),
+            "confirmation_action_kind": self.state["confirmation_action_kind"],
+            "confirmation_target_fingerprint": self.state[
+                "confirmation_target_fingerprint"
+            ],
+            "confirmation_matches_accepted_edit": bool(
+                self.state["confirmation_matches_accepted_edit"]
+            ),
+            "confirmation_diff_nonempty": bool(
+                self.state["confirmation_diff_nonempty"]
             ),
             "execution_attempted": bool(
                 executed and decision.candidate.kind == "noninteractive_edit"
@@ -1228,6 +1443,9 @@ class PhaseGate:
             self.state["last_edit_execution"] = {
                 "parsed_executable": decision.candidate.parsed_executable,
                 "parsed_argv": list(decision.candidate.parsed_argv),
+                "environment_assignments": list(
+                    decision.candidate.environment_assignments
+                ),
                 "write_targets": list(decision.candidate.write_targets),
                 "redirection_operators": list(decision.candidate.redirection_operators),
                 "heredoc_present": decision.candidate.heredoc_present,
@@ -1427,6 +1645,22 @@ def _handle_transactional_edit(
                 )
             if evaluation is not None and evaluation.accepted:
                 assert after is not None
+                canonical_evidence = _probe_repository(agent, gate.target)
+                if not canonical_evidence.target_diff.strip() or not canonical_evidence.tracked_diff.strip():
+                    failure_kind = "canonical_patch_missing_after_edit"
+                    evaluation = EditEvaluation(
+                        False,
+                        evaluation.evidence,
+                        tuple(
+                            dict.fromkeys(
+                                (*evaluation.failures, "canonical_patch_missing_after_edit")
+                            )
+                        ),
+                    )
+                else:
+                    evidence = canonical_evidence
+            if evaluation is not None and evaluation.accepted:
+                assert after is not None
                 completed = gate.finish_transaction(
                     transaction,
                     status="accepted",
@@ -1435,6 +1669,7 @@ def _handle_transactional_edit(
                     updates={
                         "validation_attempted": True,
                         "validation_completed": True,
+                        "post_action_fingerprint": after.fingerprint,
                     },
                 )
                 gate.record_execution(
@@ -1447,6 +1682,10 @@ def _handle_transactional_edit(
                     diff_evidence=evaluation.evidence,
                     execution_exit_code=execution_exit_code,
                     transaction_details=completed,
+                )
+                result.observation = _append_observation(
+                    _normalize_observation_text(result.observation),
+                    gate.phase_transition_guidance(),
                 )
                 return result
             if failure_kind is None:
@@ -1745,6 +1984,9 @@ def install_sweagent_phase_gate() -> None:
                 else None,
                 edit_policy=EditPolicy.from_mapping(config.get("edit_policy")),
                 snapshot_python=str(config.get("snapshot_python", "python")),
+                focused_test_command=str(
+                    config.get("focused_test_command", config["focused_test"])
+                ),
                 verifier_failure_evidence=config.get("verifier_failure_evidence"),
             )
             self._cgr_phase_gate_state = gate
@@ -1769,22 +2011,42 @@ def install_sweagent_phase_gate() -> None:
         result = original(self, step)
         if not result.done or decision.candidate.kind != "submission":
             evidence = _probe_repository(self, gate.target)
-        gate.record_execution(
+        current_snapshot = None
+        if decision.phase == "confirm_edit" and decision.candidate.kind in {
+            "target_confirmation",
+            "git_diff",
+        }:
+            try:
+                current_snapshot = _snapshot_target(
+                    self, gate.target, gate.snapshot_python, host_workspace_root
+                )
+            except Exception:
+                current_snapshot = None
+        feedback = gate.record_execution(
             decision,
             observation=_normalize_observation_text(result.observation),
             evidence=evidence,
+            current_target_snapshot=current_snapshot,
         )
-        if decision.phase == "inspect" and gate.phase == "edit":
-            source_observation = _normalize_observation_text(result.observation)
-            result.observation = (
-                source_observation.rstrip()
-                + "\n\n"
-                + gate.phase_transition_coaching()
+        if feedback is not None:
+            result.observation = _append_observation(
+                _normalize_observation_text(result.observation), feedback
+            )
+        elif decision.phase != gate.phase:
+            result.observation = _append_observation(
+                _normalize_observation_text(result.observation),
+                gate.phase_transition_guidance(),
             )
         return result
 
     handle_action._cgr_phase_gate = True  # type: ignore[attr-defined]
     DefaultAgent.handle_action = handle_action
+
+
+def _append_observation(observation: str, guidance: str) -> str:
+    if not observation.strip():
+        return guidance
+    return observation.rstrip() + "\n\n" + guidance
 
 
 def _snapshot_file(
@@ -2000,6 +2262,9 @@ def _analyze_shell_action(action: str) -> _ShellActionAnalysis:
     redirections = tuple(
         dict.fromkeys(operator for command in commands for operator in command.redirections)
     )
+    environment_assignments = tuple(
+        assignment for command in commands for assignment in command.environment_assignments
+    )
     heredoc = next(
         (command.heredoc_delimiter for command in commands if command.heredoc_delimiter),
         None,
@@ -2010,7 +2275,11 @@ def _analyze_shell_action(action: str) -> _ShellActionAnalysis:
         write_targets=tuple(targets),
         parsed_executable=selected.executable if selected else None,
         parsed_argv=_bounded_argv(selected.argv) if selected else (),
+        environment_assignments=tuple(
+            _redact_sensitive_text(value)[:500] for value in environment_assignments[:32]
+        ),
         redirection_operators=redirections,
+        write_capable=_analysis_is_write_capable(commands, tuple(targets)),
         heredoc_delimiter=heredoc,
         command_multiline="\n" in action.replace("\r", ""),
         physical_line_count=action.replace("\r\n", "\n").replace("\r", "\n").count("\n")
@@ -2048,6 +2317,8 @@ def _parse_shell_commands(action: str) -> _ShellParseResult:
             )
         logical_command = "".join(unit)
         if not logical_command.strip():
+            continue
+        if logical_command.lstrip().startswith("#"):
             continue
         parsed: list[_ParsedShellCommand] = []
         for segment in _split_shell_control_segments(logical_command):
@@ -2097,6 +2368,7 @@ def _parse_shell_commands(action: str) -> _ShellParseResult:
             commands[absolute_index] = _ParsedShellCommand(
                 executable=command.executable,
                 argv=command.argv,
+                environment_assignments=command.environment_assignments,
                 redirections=command.redirections,
                 output_targets=command.output_targets,
                 heredoc_delimiter=command.heredoc_delimiter,
@@ -2233,10 +2505,14 @@ def _parse_shell_segment(tokens: list[str]) -> _ParsedShellCommand | None:
         index += 1
     if not argv and not redirections:
         return None
+    assignments: list[str] = []
+    while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0], re.S):
+        assignments.append(argv.pop(0))
     executable = Path(argv[0]).name.lower() if argv else None
     return _ParsedShellCommand(
         executable=executable,
         argv=tuple(argv),
+        environment_assignments=tuple(assignments),
         redirections=tuple(redirections),
         output_targets=tuple(output_targets),
         heredoc_delimiter=heredoc_delimiter,
@@ -2245,6 +2521,71 @@ def _parse_shell_segment(tokens: list[str]) -> _ParsedShellCommand | None:
 
 def _is_redirection(token: str) -> bool:
     return token in {"<", ">", ">>", ">|", "<<", "<<<", "<&", ">&", "<>"}
+
+
+def _analysis_is_write_capable(
+    commands: tuple[_ParsedShellCommand, ...], write_targets: tuple[str, ...]
+) -> bool:
+    if write_targets:
+        return True
+    mutating = {
+        "apply_patch",
+        "bash",
+        "cmd",
+        "cp",
+        "install",
+        "ln",
+        "mkdir",
+        "mv",
+        "patch",
+        "rm",
+        "rmdir",
+        "sh",
+        "touch",
+        "truncate",
+        "unlink",
+    }
+    for command in commands:
+        if command.executable in mutating:
+            return True
+        if command.executable == "git" and len(command.argv) >= 2:
+            if command.argv[1].lower() in {
+                "am",
+                "apply",
+                "checkout",
+                "cherry-pick",
+                "clean",
+                "reset",
+                "restore",
+            }:
+                return True
+        if command.executable == "sed" and _sed_in_place_targets(command.argv):
+            return True
+        if command.executable == "perl" and any(
+            "i" in token[1:] for token in command.argv[1:] if token.startswith("-")
+        ):
+            return True
+    if len(commands) > 1 and any(
+        not _parsed_command_is_read_only(command) for command in commands[1:]
+    ):
+        return True
+    return False
+
+
+def _parsed_command_is_read_only(command: _ParsedShellCommand) -> bool:
+    if command.output_targets:
+        return False
+    if command.executable in {"cat", "grep", "head", "ls", "rg", "tail", "wc"}:
+        return True
+    if command.executable == "git":
+        return len(command.argv) >= 2 and command.argv[1].lower() in {
+            "diff",
+            "status",
+        }
+    return bool(
+        command.executable == "sed"
+        and any(token == "-n" or token.startswith("-n") for token in command.argv[1:])
+    )
 
 
 def _sed_in_place_targets(argv: tuple[str, ...]) -> tuple[str, ...]:
@@ -2306,6 +2647,9 @@ def _add_python_write_targets(source: str, add: Any) -> None:
         r"\bPath\(\s*(['\"])(?P<path>.+?)\1\s*\)\s*\.\s*(?:write_text|write_bytes)\b",
         r"\bPath\(\s*(['\"])(?P<path>.+?)\1\s*\)\s*\.\s*open"
         r"\(\s*(['\"])[wax][bt+]*\3",
+        r"\bPath\(\s*(['\"])(?P<path>.+?)\1\s*\)\s*\.\s*(?:unlink|rmdir)\b",
+        r"\bos\.(?:remove|unlink|rmdir)\(\s*(['\"])(?P<path>.+?)\1",
+        r"\bshutil\.rmtree\(\s*(['\"])(?P<path>.+?)\1",
     )
     for pattern in patterns:
         for match in re.finditer(pattern, source, re.I):

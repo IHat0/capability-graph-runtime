@@ -22,6 +22,7 @@ from cgr.swebench.phase_gate import (
     _ExecutionExitCapture,
     _normalize_observation_text,
     _probe_repository,
+    _parse_shell_commands,
     _restore_snapshot,
     _snapshot_host_target,
     _target_evidence_from_snapshots,
@@ -78,6 +79,104 @@ ATTEMPT_008_MULTILINE_SED = (
 )
 def test_candidate_action_classification(action: str, kind: str) -> None:
     assert classify_candidate_action(action, target=TARGET, focused_test=TEST).kind == kind
+
+
+def test_leading_comment_is_not_an_executable_command() -> None:
+    candidate = classify_candidate_action(
+        "  # inspect the accepted edit\n\ngit diff -- src/module.py",
+        target=TARGET,
+        focused_test=TEST,
+    )
+
+    assert candidate.kind == "git_diff"
+    assert candidate.parsed_command_count == 1
+    assert candidate.parsed_executable == "git"
+    assert candidate.parsed_argv == ("git", "diff", "--", TARGET)
+    assert candidate.raw.startswith("  # inspect")
+
+
+@pytest.mark.parametrize("quote", ("'", '"'))
+def test_hash_inside_quotes_is_preserved(quote: str) -> None:
+    action = f"sed -i {quote}s/# old/# new/{quote} {TARGET}"
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.parsed_argv[2] == "s/# old/# new/"
+
+
+def test_hash_in_heredoc_body_is_not_removed_as_a_comment() -> None:
+    parsed = _parse_shell_commands(f"cat > {TARGET} <<'EOF'\n# retained\nEOF")
+
+    assert len(parsed.commands) == 1
+    assert parsed.commands[0].heredoc_body == "# retained"
+
+
+def test_comment_only_action_fails_closed() -> None:
+    candidate = classify_candidate_action(
+        "  # no executable action", target=TARGET, focused_test=TEST
+    )
+
+    assert candidate.kind == "unknown"
+    assert candidate.parsed_command_count == 0
+    assert candidate.parsed_executable is None
+
+
+@pytest.mark.parametrize(
+    ("action", "assignments", "argv"),
+    [
+        (
+            "PYTHONPATH=.git/cgr-test-runtime python -m pytest -q tests/test_module.py",
+            ("PYTHONPATH=.git/cgr-test-runtime",),
+            ("python", "-m", "pytest", "-q", "tests/test_module.py"),
+        ),
+        (
+            "PYTHONPATH=.git/cgr-test-runtime MODE=focused python -m pytest -q tests/test_module.py",
+            ("PYTHONPATH=.git/cgr-test-runtime", "MODE=focused"),
+            ("python", "-m", "pytest", "-q", "tests/test_module.py"),
+        ),
+    ],
+)
+def test_leading_environment_assignments_preserve_executable_and_test_scope(
+    action: str, assignments: tuple[str, ...], argv: tuple[str, ...]
+) -> None:
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "focused_pytest"
+    assert candidate.environment_assignments == assignments
+    assert candidate.parsed_executable == "python"
+    assert candidate.parsed_argv == argv
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "git diff -- src/module.py > gcd.patch",
+        "git diff -- src/module.py >> gcd.patch",
+        "git diff -- src/module.py 1> gcd.patch",
+        "git diff -- src/module.py | tee gcd.patch",
+        "git diff -- src/module.py | cat > gcd.patch",
+        "git diff -- src/module.py; touch gcd.patch",
+        "# save the diff\ngit diff -- src/module.py > gcd.patch",
+        "   # save the diff\ngit diff -- src/module.py > gcd.patch",
+    ],
+)
+def test_redirected_target_diff_is_classified_write_capable(action: str) -> None:
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "write_capable_inspection"
+    assert candidate.write_capable is True
+    assert "gcd.patch" in candidate.write_targets
+
+
+def test_arbitrary_downstream_pipeline_is_write_capable_even_without_redirection() -> None:
+    candidate = classify_candidate_action(
+        "git diff -- src/module.py | python -c 'print(1)'",
+        target=TARGET,
+        focused_test=TEST,
+    )
+
+    assert candidate.kind == "write_capable_inspection"
+    assert candidate.write_capable is True
 
 
 @pytest.mark.parametrize(
@@ -598,12 +697,23 @@ def test_real_trajectory_shape_recovers_to_model_authored_complete_workflow() ->
     model_edit_action = "sed -i 's/old expression/new expression/' src/module.py"
     edit = gate.decide(model_edit_action, empty)
     assert edit.allowed and edit.candidate.kind == "noninteractive_edit"
-    gate.record_execution(edit, observation="", evidence=patch)
+    before = _snapshot("def transform(value):\n    return 'old expression'\n")
+    after = _snapshot("def transform(value):\n    return 'new expression'\n")
+    gate.record_execution(
+        edit,
+        observation="",
+        evidence=patch,
+        pre_action_fingerprint=before.fingerprint,
+        post_action_fingerprint=after.fingerprint,
+    )
 
     confirmation = gate.decide(f"cat {TARGET}", patch)
-    gate.record_execution(confirmation, observation="updated source", evidence=patch)
-    target_diff = gate.decide(f"git diff -- {TARGET}", patch)
-    gate.record_execution(target_diff, observation="model patch", evidence=patch)
+    gate.record_execution(
+        confirmation,
+        observation="updated source",
+        evidence=patch,
+        current_target_snapshot=after,
+    )
     focused = gate.decide(f"python -m pytest -q {TEST}", patch)
     gate.record_execution(focused, observation="1 passed in 0.01s", evidence=patch)
     final_diff = gate.decide("git diff -- HEAD", patch)
@@ -719,13 +829,23 @@ def test_generic_model_authored_sed_completes_authorized_workflow(
         edit,
         observation="",
         evidence=patch,
+        pre_action_fingerprint=_snapshot(
+            "def transform(value):\n    return value.strip()\n"
+        ).fingerprint,
+        post_action_fingerprint=_snapshot(
+            "def transform(value):\n    return value.upper()\n"
+        ).fingerprint,
         diff_evidence=evaluation.evidence,
         execution_exit_code=0,
     )
+    changed = _snapshot("def transform(value):\n    return value.upper()\n")
     confirmation = gate.decide(f"cat {TARGET}", patch)
-    gate.record_execution(confirmation, observation="generic changed source", evidence=patch)
-    target_diff = gate.decide(f"git diff -- {TARGET}", patch)
-    gate.record_execution(target_diff, observation="generic patch", evidence=patch)
+    gate.record_execution(
+        confirmation,
+        observation="generic changed source",
+        evidence=patch,
+        current_target_snapshot=changed,
+    )
     focused = gate.decide(f"python -m pytest -q {TEST}", patch)
     gate.record_execution(focused, observation="1 passed in 0.01s", evidence=patch)
     final_diff = gate.decide("git diff -- HEAD", patch)
@@ -881,30 +1001,204 @@ def test_mixed_target_edit_is_rejected_with_grounded_feedback() -> None:
     assert "mixes the required source edit" in str(decision.feedback)
 
 
-def test_confirm_edit_requires_inspection_and_nonempty_target_diff() -> None:
+def test_confirm_edit_requires_one_integrity_bound_read_only_inspection() -> None:
     evidence = RepositoryEvidence(
         target_diff="diff --git a/src/module.py b/src/module.py",
         tracked_diff="diff --git a/src/module.py b/src/module.py",
     )
     gate = PhaseGate(phase="confirm_edit", target=TARGET, focused_test=TEST)
+    before = _snapshot("def value():\n    return 1\n")
+    after = _snapshot("def value():\n    return 2\n")
+    gate.state.update(
+        {
+            "accepted_target_edit": True,
+            "accepted_target_fingerprint": after.fingerprint,
+            "pre_edit_target_fingerprint": before.fingerprint,
+            "accepted_patch_fingerprint": patch_fingerprint(evidence.tracked_diff),
+        }
+    )
 
     rejected_test = gate.decide("pytest -q tests/test_module.py", evidence)
     assert not rejected_test.allowed
 
     inspection = gate.decide("cat src/module.py", evidence)
     assert inspection.allowed
-    gate.record_execution(inspection, observation="changed", evidence=evidence)
-    assert gate.phase == "confirm_edit"
-
-    diff = gate.decide("git diff -- src/module.py", evidence)
-    assert diff.allowed
-    gate.record_execution(diff, observation=evidence.target_diff, evidence=evidence)
+    gate.record_execution(
+        inspection,
+        observation="changed",
+        evidence=evidence,
+        current_target_snapshot=after,
+    )
     assert gate.phase == "test"
+
+
+def _confirmation_gate(
+    *, action_phase: str = "confirm_edit",
+) -> tuple[PhaseGate, RepositoryEvidence, FileSnapshot, FileSnapshot]:
+    evidence = RepositoryEvidence(target_diff="canonical patch", tracked_diff="canonical patch")
+    before = _snapshot("def value():\n    return 1\n")
+    after = _snapshot("def value():\n    return 2\n")
+    gate = PhaseGate(phase=action_phase, target=TARGET, focused_test=TEST)
+    gate.state.update(
+        {
+            "accepted_target_edit": True,
+            "accepted_target_fingerprint": after.fingerprint,
+            "pre_edit_target_fingerprint": before.fingerprint,
+            "accepted_patch_fingerprint": patch_fingerprint(evidence.tracked_diff),
+        }
+    )
+    return gate, evidence, before, after
+
+
+@pytest.mark.parametrize(
+    ("action", "kind"),
+    [
+        (f"git diff -- {TARGET}", "git_diff"),
+        (f"cat {TARGET}", "target_confirmation"),
+        (f"sed -n '1,80p' {TARGET}", "target_confirmation"),
+    ],
+)
+def test_one_read_only_target_inspection_confirms_exact_accepted_bytes(
+    action: str, kind: str
+) -> None:
+    gate, evidence, _before, after = _confirmation_gate()
+    decision = gate.decide(action, evidence)
+
+    feedback = gate.record_execution(
+        decision,
+        observation="current target",
+        evidence=evidence,
+        current_target_snapshot=after,
+    )
+
+    assert decision.allowed and decision.candidate.kind == kind
+    assert feedback is None
+    assert gate.phase == "test"
+    assert gate.state["target_confirmed_after_edit"] is True
+    assert gate.state["confirmation_action_kind"] == kind
+    assert gate.state["confirmation_target_fingerprint"] == after.fingerprint
+    assert gate.state["confirmation_matches_accepted_edit"] is True
+    assert gate.state["confirmation_diff_nonempty"] is True
+    assert gate.state["confirmed_patch_fingerprint"] == gate.state[
+        "accepted_patch_fingerprint"
+    ]
+
+
+@pytest.mark.parametrize("current", ("stale", "reverted"))
+def test_stale_or_reverted_target_cannot_confirm(current: str) -> None:
+    gate, evidence, before, after = _confirmation_gate()
+    snapshot = (
+        before
+        if current == "reverted"
+        else _snapshot("def value():\n    return 3\n")
+    )
+    decision = gate.decide(f"git diff -- {TARGET}", evidence)
+
+    feedback = gate.record_execution(
+        decision,
+        observation="stale target",
+        evidence=evidence,
+        current_target_snapshot=snapshot,
+    )
+
+    assert after.fingerprint != snapshot.fingerprint
+    assert gate.phase == "edit"
+    assert gate.state["target_confirmed_after_edit"] is False
+    assert gate.state["confirmation_matches_accepted_edit"] is False
+    assert gate.state["accepted_target_edit"] is False
+    assert "TARGET INTEGRITY CONFIRMATION FAILED" in str(feedback)
+
+
+@pytest.mark.parametrize("phase", ("inspect", "confirm_edit", "final_diff"))
+@pytest.mark.parametrize(
+    "action",
+    (
+        f"git diff -- {TARGET} > patchfile",
+        f"cat {TARGET} | tee patchfile",
+        "rm patchfile",
+        "git apply change.patch",
+    ),
+)
+def test_inspection_phases_reject_write_capability_before_execution(
+    phase: str, action: str
+) -> None:
+    gate = PhaseGate(phase=phase, target=TARGET, focused_test=TEST)
+    decision = gate.decide(action, RepositoryEvidence(target_diff="patch", tracked_diff="patch"))
+
+    assert decision.allowed is False
+    assert decision.candidate.write_capable is True
+    assert gate.phase == phase
+    assert "must be read-only" in str(decision.feedback)
+
+
+def test_final_diff_read_only_target_diff_preserves_lineage() -> None:
+    gate, evidence, _before, _after = _confirmation_gate(action_phase="final_diff")
+    fingerprint = patch_fingerprint(evidence.tracked_diff)
+    gate.state["confirmed_patch_fingerprint"] = fingerprint
+    decision = gate.decide(f"git diff -- {TARGET}", evidence)
+
+    feedback = gate.record_execution(decision, observation="patch", evidence=evidence)
+
+    assert feedback is None
+    assert gate.phase == "submit"
+    assert gate.state["final_diff_inspected"] is True
+    assert gate.state["final_patch_fingerprint"] == fingerprint
+
+
+def test_phase_transition_guidance_is_configuration_derived() -> None:
+    command = "PYTHONPATH=.git/cgr-test-runtime python -m pytest -q tests/test_module.py"
+    gate = PhaseGate(
+        phase="test",
+        target=TARGET,
+        focused_test=TEST,
+        focused_test_command=command,
+    )
+
+    test_guidance = gate.phase_transition_guidance()
+    assert "Current phase: test" in test_guidance
+    assert command in test_guidance
+    gate.phase = "final_diff"
+    assert f"git diff -- {TARGET}" in gate.phase_transition_guidance()
+    gate.phase = "submit"
+    assert "Submit the existing worktree patch" in gate.phase_transition_guidance()
+
+
+def test_redirected_confirmation_diff_is_logged_unexecuted_and_creates_nothing(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / TARGET
+    target.parent.mkdir(parents=True)
+    accepted = b"def value():\n    return 2\n"
+    target.write_bytes(accepted)
+    log_path = tmp_path / "events.jsonl"
+    gate, evidence, _before, _after = _confirmation_gate()
+    gate.log_path = log_path
+    accepted_patch_fingerprint = gate.state["accepted_patch_fingerprint"]
+
+    decision = gate.decide(
+        f"# save evidence\ngit diff -- {TARGET} > gcd.patch", evidence
+    )
+
+    assert decision.allowed is False
+    assert decision.candidate.kind == "write_capable_inspection"
+    assert decision.candidate.parsed_command_count == 1
+    assert gate.phase == "confirm_edit"
+    assert gate.state["target_confirmed_after_edit"] is False
+    assert gate.state["accepted_patch_fingerprint"] == accepted_patch_fingerprint
+    assert target.read_bytes() == accepted
+    assert not (tmp_path / "gcd.patch").exists()
+    event = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert event["executed"] is False
+    assert event["candidate"]["write_capable"] is True
+    assert "must be read-only" in str(decision.feedback)
 
 
 def test_test_pass_final_diff_and_submission_transitions() -> None:
     evidence = RepositoryEvidence(target_diff="patch", tracked_diff="patch")
     gate = PhaseGate(phase="test", target=TARGET, focused_test=TEST)
+    fingerprint = patch_fingerprint(evidence.tracked_diff)
+    gate.state["accepted_patch_fingerprint"] = fingerprint
+    gate.state["confirmed_patch_fingerprint"] = fingerprint
 
     test = gate.decide("pytest -q tests/test_module.py", evidence)
     assert test.allowed
@@ -1111,6 +1405,7 @@ def _install_host_transaction_gate(
     initial_phase: str = "edit",
     target: str = TARGET,
     focused_test: str = TEST,
+    focused_test_command: str | None = None,
 ) -> tuple[Path, Path]:
     sweagent = ModuleType("sweagent")
     agent = ModuleType("sweagent.agent")
@@ -1128,6 +1423,7 @@ def _install_host_transaction_gate(
                 "initial_phase": initial_phase,
                 "target": target,
                 "focused_test": focused_test,
+                "focused_test_command": focused_test_command or focused_test,
                 "log_path": str(event_path),
                 "state_path": str(state_path),
                 "snapshot_python": sys.executable,
@@ -1257,6 +1553,7 @@ def test_phase_state_and_patch_fingerprint_fail_closed(tmp_path: Path) -> None:
     gate.state.update(
         {
             "accepted_target_edit": True,
+            "target_confirmed_after_edit": True,
             "target_diff_inspected": True,
             "focused_test_executed": True,
             "focused_test_passed": True,
@@ -1267,6 +1564,9 @@ def test_phase_state_and_patch_fingerprint_fail_closed(tmp_path: Path) -> None:
     )
     patch = "diff --git a/src/module.py b/src/module.py\n+changed\n"
     gate.state["accepted_patch_fingerprint"] = patch_fingerprint(patch)
+    gate.state["confirmed_patch_fingerprint"] = patch_fingerprint(patch)
+    gate.state["final_patch_fingerprint"] = patch_fingerprint(patch)
+    gate.state["submitted_patch_fingerprint"] = patch_fingerprint(patch)
     gate._persist_state()
 
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1536,7 +1836,7 @@ def test_valid_generic_sed_executes_transactionally(
     assert event["rollback_status"] == "not_required"
 
 
-def test_generic_transaction_completes_full_authorized_workflow(
+def test_exact_run_014_shape_completes_full_authorized_workflow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = _initialize_git_target(
@@ -1551,7 +1851,7 @@ def test_generic_transaction_completes_full_authorized_workflow(
             )
 
         def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
-            if step.action.startswith("sed "):
+            if "sed -i" in step.action:
                 target.write_text(
                     "def transform(value):\n    return value.upper()\n",
                     encoding="utf-8",
@@ -1560,10 +1860,10 @@ def test_generic_transaction_completes_full_authorized_workflow(
                 step.execution_exit_code = 0
             elif "pytest" in step.action:
                 step.observation = "1 passed in 0.01s"
-            elif step.action == "submit":
+            elif step.action.strip() == "submit":
                 step.observation = "submitted"
                 step.done = True
-            elif step.action.startswith("cat "):
+            elif "cat " in step.action:
                 step.observation = target.read_text(encoding="utf-8")
             else:
                 step.observation = self._env.communicate(
@@ -1575,28 +1875,43 @@ def test_generic_transaction_completes_full_authorized_workflow(
         tmp_path,
         monkeypatch,
         FakeAgent,
-        initial_phase="inspect",
+        initial_phase="edit",
+        focused_test_command=(
+            "PYTHONPATH=.git/cgr-test-runtime python -m pytest -q tests/test_module.py"
+        ),
     )
     fake = FakeAgent()
 
+    rejected = fake.handle_action(
+        SimpleNamespace(
+            action=f"python -m pytest -q {TEST}",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+    assert "ACTION REJECTED BY CGR" in rejected.observation
     actions = (
-        f"cat {TARGET}",
-        "sed -i 's/value.strip()/value.upper()/' src/module.py",
-        f"cat {TARGET}",
-        f"git diff -- {TARGET}",
-        f"python -m pytest -q {TEST}",
-        "git diff -- HEAD",
+        f"# Correct the implementation\nsed -i 's/value.strip()/value.upper()/' {TARGET}",
+        f"# Verify the accepted edit\ngit diff -- {TARGET}",
+        f"# Run the focused verifier\nPYTHONPATH=.git/cgr-test-runtime python -m pytest -q {TEST}",
+        f"# Inspect the final canonical patch\ngit diff -- {TARGET}",
         "submit",
     )
+    results = []
     for action in actions:
-        fake.handle_action(
-            SimpleNamespace(
-                action=action,
-                observation="",
-                state=None,
-                done=False,
-                thought="",
-                output="",
+        results.append(
+            fake.handle_action(
+                SimpleNamespace(
+                    action=action,
+                    observation="",
+                    state=None,
+                    done=False,
+                    thought="",
+                    output="",
+                )
             )
         )
 
@@ -1607,19 +1922,55 @@ def test_generic_transaction_completes_full_authorized_workflow(
     assert state["transactional_cleanup_verified"] is True
     assert state["workflow_complete"] is True
     assert state["submission_authorized"] is True
+    assert state["target_confirmed_after_edit"] is True
+    assert state["confirmation_matches_accepted_edit"] is True
+    assert state["confirmation_diff_nonempty"] is True
     authorization = authorize_phase_patch(state, patch)
     assert authorization.authorized is True
     assert authorization.fingerprint == state["accepted_patch_fingerprint"]
     events = [json.loads(line) for line in event_path.read_text().splitlines()]
     assert [event["phase_before"] for event in events] == [
-        "inspect",
         "edit",
-        "confirm_edit",
+        "edit",
         "confirm_edit",
         "test",
         "final_diff",
         "submit",
     ]
+    executed = [event for event in events if event["executed"]]
+    assert executed[0]["parsed_executable"] == "sed"
+    assert executed[0]["parsed_command_count"] == 1
+    assert executed[1]["parsed_executable"] == "git"
+    assert executed[1]["parsed_command_count"] == 1
+    assert executed[2]["parsed_executable"] == "python"
+    assert executed[2]["environment_assignments"] == [
+        "PYTHONPATH=.git/cgr-test-runtime"
+    ]
+    fingerprints = {
+        state["accepted_patch_fingerprint"],
+        state["confirmed_patch_fingerprint"],
+        state["final_patch_fingerprint"],
+        state["submitted_patch_fingerprint"],
+    }
+    assert len(fingerprints) == 1
+    assert not (tmp_path / "gcd.patch").exists()
+    assert "Current phase: confirm_edit" in results[0].observation
+    assert "Current phase: test" in results[1].observation
+    assert "PYTHONPATH=.git/cgr-test-runtime" in results[1].observation
+    assert "Current phase: final_diff" in results[2].observation
+    assert "Current phase: submit" in results[3].observation
+    outer = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from src.module import transform; assert transform(' a ') == ' A '",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert outer.returncode == 0, outer.stderr
 
 
 def test_attempt_007_internal_postinspection_timeout_is_contained_and_restored(
@@ -1819,9 +2170,9 @@ def test_attempt_008_multiline_edit_executes_and_rolls_back_normally(
     assert executed[-1] == ATTEMPT_008_MULTILINE_SED
     assert target.read_bytes() == prior
     assert target.stat().st_mode & 0o777 == prior_mode
-    assert _LocalPhaseEnvironment(tmp_path).communicate(
-        "git diff --binary HEAD --", check="ignore"
-    ).strip() == ""
+    assert subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--"], cwd=tmp_path, check=False
+    ).returncode == 0
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["current_phase"] == "edit"
     assert state["target_inspected"] is True
