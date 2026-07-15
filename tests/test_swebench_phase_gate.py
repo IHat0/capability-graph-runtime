@@ -46,6 +46,11 @@ EC2_HEREDOC_ACTION = (
     "return a\n"
     "EOF"
 )
+ATTEMPT_008_MULTILINE_SED = (
+    "sed -i '/def gcd(a, b):/a\n"
+    "while b != 0:\n"
+    "a, b = b, a % b' python_programs/gcd.py"
+)
 
 
 @pytest.mark.parametrize(
@@ -126,6 +131,7 @@ def test_redirected_write_targets_are_extracted(
     [
         ("echo x > src/module.py && git commit -am x", "commit"),
         ("touch src/module.py && git push origin main", "push"),
+        ("git diff -- src/module.py && git commit -am x", "commit"),
     ],
 )
 def test_prohibited_git_action_takes_precedence_over_edit(action: str, kind: str) -> None:
@@ -156,6 +162,117 @@ def test_real_ec2_sed_action_is_a_single_target_noninteractive_edit() -> None:
     assert candidate.parsed_argv[2].count(";") == 2
     assert "%" in candidate.parsed_argv[2]
     assert candidate.heredoc_present is False
+
+
+def test_exact_attempt_008_multiline_sed_is_one_parsed_edit_command() -> None:
+    candidate = classify_candidate_action(
+        ATTEMPT_008_MULTILINE_SED,
+        target="python_programs/gcd.py",
+        focused_test="test_gcd.py",
+    )
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.parsed_executable == "sed"
+    assert candidate.parsed_argv == (
+        "sed",
+        "-i",
+        "/def gcd(a, b):/a\nwhile b != 0:\na, b = b, a % b",
+        "python_programs/gcd.py",
+    )
+    assert candidate.write_targets == ("python_programs/gcd.py",)
+    assert candidate.targets_required_file is True
+    assert candidate.targets_unrelated_files is False
+    assert candidate.command_multiline is True
+    assert candidate.physical_line_count == 3
+    assert candidate.parsed_command_count == 1
+    assert candidate.quote_closed is True
+    assert candidate.parse_status == "parsed"
+    assert candidate.parse_failure_category is None
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_program", "continued"),
+    [
+        (
+            "sed -i 's/old/new/\ns/value/item/' src/module.py",
+            "s/old/new/\ns/value/item/",
+            False,
+        ),
+        (
+            'sed -i "s/old/new/\ns/value/item/" src/module.py',
+            "s/old/new/\ns/value/item/",
+            False,
+        ),
+        (
+            "sed -i 's/old/new/\\\ns/value/item/' src/module.py",
+            "s/old/new/\\\ns/value/item/",
+            False,
+        ),
+        (
+            'sed -i "s/old/new/\\\ns/value/item/" src/module.py',
+            "s/old/new/s/value/item/",
+            True,
+        ),
+        (
+            "sed -i \\\n's/old/new/' \\\nsrc/module.py",
+            "s/old/new/",
+            True,
+        ),
+    ],
+)
+def test_multiline_quote_and_continuation_tokenization(
+    action: str, expected_program: str, continued: bool
+) -> None:
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.parsed_argv[2] == expected_program
+    assert candidate.write_targets == (TARGET,)
+    assert candidate.quote_closed is True
+    assert candidate.continuation_detected is continued
+
+
+def test_multiline_quoted_control_operators_do_not_split_commands() -> None:
+    action = (
+        "sed -i 's/old/new/;\ns/a|b/c&d/ && literal\n"
+        "git commit; git diff; vim' src/module.py"
+    )
+
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.parsed_command_count == 1
+    assert ";\n" in candidate.parsed_argv[2]
+    assert "|" in candidate.parsed_argv[2]
+    assert "&&" in candidate.parsed_argv[2]
+    assert "git commit" in candidate.parsed_argv[2]
+
+
+def test_valid_multiline_python_c_write_is_one_edit_command() -> None:
+    action = (
+        'python -c "from pathlib import Path\n'
+        "Path('src/module.py').write_text('value = 2\\n')\""
+    )
+
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.parsed_executable == "python"
+    assert candidate.parsed_command_count == 1
+    assert "\n" in candidate.parsed_argv[2]
+    assert candidate.write_targets == (TARGET,)
+
+
+def test_genuine_multiline_commands_remain_separately_detectable() -> None:
+    candidate = classify_candidate_action(
+        "printf x > src/module.py\nprintf y > src/other.py",
+        target=TARGET,
+        focused_test=TEST,
+    )
+
+    assert candidate.kind == "edit_mixed_targets"
+    assert candidate.parsed_command_count == 2
+    assert candidate.write_targets == (TARGET, "src/other.py")
 
 
 @pytest.mark.parametrize(
@@ -277,8 +394,35 @@ def test_ambiguous_unclosed_shell_quote_fails_closed() -> None:
         "sed -i 's/old/new/ src/module.py", target=TARGET, focused_test=TEST
     )
 
-    assert candidate.kind == "unknown"
+    assert candidate.kind == "shell_parse_error"
     assert candidate.write_targets == ()
+    assert candidate.parse_status == "error"
+    assert candidate.parse_failure_category == "unterminated_quote"
+    assert candidate.quote_closed is False
+
+
+def test_shell_parse_error_feedback_is_accurate_and_bounded(tmp_path: Path) -> None:
+    log_path = tmp_path / "events.jsonl"
+    gate = PhaseGate(
+        phase="edit", target=TARGET, focused_test=TEST, log_path=log_path
+    )
+
+    decision = gate.decide(
+        "sed -i 's/old/new/ src/module.py",
+        RepositoryEvidence(),
+        model_text="I will change the required source now.",
+    )
+
+    assert decision.allowed is False
+    assert decision.candidate.kind == "shell_parse_error"
+    assert "ACTION COULD NOT BE PARSED SAFELY" in str(decision.feedback)
+    assert "shell quoting could not be parsed safely" in str(decision.feedback)
+    assert "did not apply" not in str(decision.feedback)
+    event = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["executed"] is False
+    assert event["parse_status"] == "error"
+    assert event["parse_failure_category"] == "unterminated_quote"
+    assert event["quote_closed"] is False
 
 
 @pytest.mark.parametrize(
@@ -1587,6 +1731,195 @@ def test_attempt_007_internal_postinspection_timeout_is_contained_and_restored(
     assert edit_event["transaction"]["rollback_verified"] is True
     assert edit_event["transaction"]["transaction_closed"] is True
     assert not authorize_phase_patch(state, "").authorized
+
+
+def test_attempt_008_multiline_edit_executes_and_rolls_back_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target_name = "python_programs/gcd.py"
+    prior = b"def placeholder(value):\n    return value\n"
+    target = _initialize_git_target(tmp_path, target_name, prior)
+    if os.name != "nt":
+        os.chmod(target, 0o600)
+    prior_mode = target.stat().st_mode & 0o777
+    executed: list[str] = []
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(
+                get_state=lambda env: {"working_dir": str(tmp_path)}
+            )
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            executed.append(step.action)
+            if step.action.startswith("sed "):
+                target.write_text("def broken(:\n", encoding="utf-8")
+                step.observation = "sed completed"
+                step.execution_exit_code = 0
+            else:
+                step.observation = target.read_text(encoding="utf-8")
+            step.done = False
+            return step
+
+    state_path, event_path = _install_host_transaction_gate(
+        tmp_path,
+        monkeypatch,
+        FakeAgent,
+        initial_phase="inspect",
+        target=target_name,
+        focused_test="test_target.py",
+    )
+    fake = FakeAgent()
+    commit = fake.handle_action(
+        SimpleNamespace(
+            action="git commit -am fix",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+    assert "ACTION REJECTED BY CGR" in commit.observation
+    fake.handle_action(
+        SimpleNamespace(
+            action=f"cat {target_name}",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+
+    first = fake.handle_action(
+        SimpleNamespace(
+            action=f"sed -i 's/return value/return (/' {target_name}",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+    second = fake.handle_action(
+        SimpleNamespace(
+            action=ATTEMPT_008_MULTILINE_SED,
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+
+    assert "invalid Python syntax" in first.observation
+    assert "invalid Python syntax" in second.observation
+    assert executed[-1] == ATTEMPT_008_MULTILINE_SED
+    assert target.read_bytes() == prior
+    assert target.stat().st_mode & 0o777 == prior_mode
+    assert _LocalPhaseEnvironment(tmp_path).communicate(
+        "git diff --binary HEAD --", check="ignore"
+    ).strip() == ""
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["current_phase"] == "edit"
+    assert state["target_inspected"] is True
+    assert state["target_confirmed_after_edit"] is False
+    assert state["rollback_count"] == 2
+    assert state["last_transaction"]["status"] == "rejected"
+    assert state["last_transaction"]["rollback_verified"] is True
+    assert state["transactional_cleanup_verified"] is True
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    multiline_event = events[-1]
+    assert multiline_event["candidate"]["kind"] == "noninteractive_edit"
+    assert multiline_event["executed"] is True
+    assert multiline_event["command_multiline"] is True
+    assert multiline_event["physical_line_count"] == 3
+    assert multiline_event["parsed_command_count"] == 1
+    assert multiline_event["parse_status"] == "parsed"
+    assert multiline_event["parsed_executable"] == "sed"
+    assert multiline_event["true_write_targets"] == [target_name]
+    assert multiline_event["target_inspected"] is True
+    assert multiline_event["target_confirmed_after_edit"] is False
+    assert multiline_event["transaction"]["rollback_verified"] is True
+    assert not authorize_phase_patch(state, "").authorized
+
+
+def test_valid_generic_multiline_sed_is_accepted_transactionally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bash = _bash_executable()
+    if bash is None:
+        pytest.skip("Bash is required to execute the multiline sed action.")
+    target = _initialize_git_target(
+        tmp_path, TARGET, b"def transform(value):\n    return value.strip()\n"
+    )
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(
+                get_state=lambda env: {"working_dir": str(tmp_path)}
+            )
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            process = subprocess.run(
+                [bash, "-lc", step.action],
+                cwd=tmp_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            step.observation = process.stdout + process.stderr
+            step.execution_exit_code = process.returncode
+            step.done = False
+            return step
+
+    state_path, event_path = _install_host_transaction_gate(
+        tmp_path, monkeypatch, FakeAgent, initial_phase="inspect"
+    )
+    fake = FakeAgent()
+    fake.handle_action(
+        SimpleNamespace(
+            action=f"cat {TARGET}",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+    action = (
+        "sed -i 's/value.strip()/value.upper()/\n"
+        "s/def transform/def transform/' src/module.py"
+    )
+
+    result = fake.handle_action(
+        SimpleNamespace(
+            action=action,
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+
+    assert result.execution_exit_code == 0
+    assert "return value.upper()" in target.read_text(encoding="utf-8")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["current_phase"] == "confirm_edit"
+    assert state["target_inspected"] is True
+    assert state["target_confirmed_after_edit"] is False
+    assert state["last_transaction"]["status"] == "accepted"
+    assert state["last_transaction"]["transaction_closed"] is True
+    event = json.loads(event_path.read_text().splitlines()[-1])
+    assert event["accepted"] is True
+    assert event["command_multiline"] is True
+    assert event["parsed_argv"][2].count("\n") == 1
 
 
 def test_model_action_timeout_is_distinguished_and_recovers_after_quiescence(

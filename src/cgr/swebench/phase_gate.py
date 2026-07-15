@@ -38,6 +38,13 @@ class CandidateAction:
     redirection_operators: tuple[str, ...] = ()
     heredoc_present: bool = False
     heredoc_delimiter: str | None = None
+    command_multiline: bool = False
+    physical_line_count: int = 1
+    parsed_command_count: int = 0
+    quote_closed: bool = True
+    continuation_detected: bool = False
+    parse_status: str = "parsed"
+    parse_failure_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +151,20 @@ class _ShellActionAnalysis:
     parsed_argv: tuple[str, ...]
     redirection_operators: tuple[str, ...]
     heredoc_delimiter: str | None
+    command_multiline: bool
+    physical_line_count: int
+    quote_closed: bool
+    continuation_detected: bool
+    parse_status: str
+    parse_failure_category: str | None
+
+
+@dataclass(frozen=True)
+class _ShellParseResult:
+    commands: tuple[_ParsedShellCommand, ...]
+    quote_closed: bool
+    continuation_detected: bool
+    failure_category: str | None = None
 
 
 def build_initial_phase_state(
@@ -156,6 +177,7 @@ def build_initial_phase_state(
         "target": target,
         "edit_policy": asdict(edit_policy),
         "target_inspected": False,
+        "target_confirmed_after_edit": False,
         "accepted_target_edit": False,
         "target_diff_inspected": False,
         "focused_test_executed": False,
@@ -457,14 +479,29 @@ def classify_candidate_action(
     )
     unrelated = any(path != normalized_target for path in write_targets)
     test_framework = _test_framework(action)
-    if re.search(r"(?:^|\s)git\s+(?:commit|push)(?:\s|$)", normalized):
-        kind = "commit" if re.search(r"(?:^|\s)git\s+commit(?:\s|$)", normalized) else "push"
-    elif _interactive_editor(action):
+    git_operation = _git_operation(analysis)
+    if git_operation in {"commit", "push"}:
+        kind = git_operation
+    elif analysis.parse_status == "error" and re.search(
+        r"(?:^|\s)git\s+(?:commit|push)(?:\s|$)", normalized
+    ):
+        kind = (
+            "commit"
+            if re.search(r"(?:^|\s)git\s+commit(?:\s|$)", normalized)
+            else "push"
+        )
+    elif _analysis_has_interactive_editor(analysis):
         kind = "interactive_editor"
     elif re.search(r"<<SWE_AGENT_SUBMISSION>>|model\.patch|^submit$", action, re.I):
         kind = "submission"
-    elif re.search(r"(?:^|\s)git\s+diff(?:\s|$)", normalized):
+    elif git_operation == "diff":
         kind = "git_diff"
+    elif (
+        analysis.parse_status == "error"
+        and references_target
+        and _appears_to_be_supported_edit(action)
+    ):
+        kind = "shell_parse_error"
     elif write_targets:
         if targets and unrelated:
             kind = "edit_mixed_targets"
@@ -477,7 +514,7 @@ def classify_candidate_action(
     elif test_framework:
         scope = "focused" if focused_test and normalized_test in action.replace("\\", "/") else "unrelated"
         kind = f"{scope}_{test_framework}"
-    elif _is_inspection(action):
+    elif _analysis_is_inspection(analysis):
         kind = "target_confirmation" if references_target else "inspection"
     else:
         kind = "unknown"
@@ -494,6 +531,13 @@ def classify_candidate_action(
         redirection_operators=analysis.redirection_operators,
         heredoc_present=analysis.heredoc_delimiter is not None,
         heredoc_delimiter=analysis.heredoc_delimiter,
+        command_multiline=analysis.command_multiline,
+        physical_line_count=analysis.physical_line_count,
+        parsed_command_count=len(analysis.commands),
+        quote_closed=analysis.quote_closed,
+        continuation_detected=analysis.continuation_detected,
+        parse_status=analysis.parse_status,
+        parse_failure_category=analysis.parse_failure_category,
     )
 
 
@@ -515,15 +559,35 @@ def _test_framework(action: str) -> str | None:
     return direct.group("framework").lower() if direct else None
 
 
-def _interactive_editor(action: str) -> bool:
-    for segment in re.split(r"\s*(?:&&|\|\||\||;|\n)\s*", action.replace("\r", "")):
-        try:
-            tokens = shlex.split(segment, posix=True)
-        except ValueError:
-            continue
-        if tokens and Path(tokens[0]).name.lower() in {"nano", "vim", "vi", "emacs", "pico"}:
-            return True
-    return False
+def _git_operation(analysis: _ShellActionAnalysis) -> str | None:
+    operations: list[str] = []
+    for command in analysis.commands:
+        if command.executable == "git" and len(command.argv) >= 2:
+            operation = command.argv[1].lower()
+            if operation in {"commit", "push", "diff"}:
+                operations.append(operation)
+    for prohibited in ("commit", "push"):
+        if prohibited in operations:
+            return prohibited
+    return "diff" if "diff" in operations else None
+
+
+def _analysis_has_interactive_editor(analysis: _ShellActionAnalysis) -> bool:
+    return any(
+        command.executable in {"nano", "vim", "vi", "emacs", "pico"}
+        for command in analysis.commands
+    )
+
+
+def _analysis_is_inspection(analysis: _ShellActionAnalysis) -> bool:
+    return any(
+        command.executable in {"cat", "head", "tail", "rg", "grep", "ls"}
+        or (
+            command.executable == "sed"
+            and any(token == "-n" or token.startswith("-n") for token in command.argv[1:])
+        )
+        for command in analysis.commands
+    )
 
 
 class PhaseGate:
@@ -552,6 +616,7 @@ class PhaseGate:
             verifier_failure_evidence if isinstance(verifier_failure_evidence, dict) else {}
         )
         self.target_inspected = False
+        self.target_confirmed_after_edit = False
         self.target_diff_inspected = False
         self.last_failed_test_fingerprint: str | None = None
         self.last_failed_diff_fingerprint: str | None = None
@@ -661,6 +726,21 @@ class PhaseGate:
             constraint = (
                 f"Return exactly one noninteractive command that edits {self.target}. "
                 "Do not create or modify tests, commit, submit, or run tests."
+            )
+        elif candidate.kind == "shell_parse_error":
+            return "\n".join(
+                (
+                    "ACTION COULD NOT BE PARSED SAFELY",
+                    "",
+                    f"Required phase: {self.phase}",
+                    f"Required target: {self.target}",
+                    "",
+                    "The action appears to target the required source using a supported "
+                    "noninteractive editor, but its shell quoting could not be parsed safely. "
+                    "It was not executed.",
+                    "Return one syntactically complete noninteractive edit command.",
+                    "Do not describe multiple future commands.",
+                )
             )
         elif candidate.kind in {"commit", "push"}:
             lines.append(reason)
@@ -947,12 +1027,14 @@ class PhaseGate:
         if phase_before == "inspect" and kind == "target_confirmation":
             self.target_inspected = True
             self.state["target_inspected"] = True
+            self.target_confirmed_after_edit = False
+            self.state["target_confirmed_after_edit"] = False
             self.phase = "edit"
         elif phase_before in {"edit", "confirm_edit"} and kind == "noninteractive_edit":
             prior_edit_accepted = bool(self.state["accepted_target_edit"])
-            self.target_inspected = False
+            self.target_confirmed_after_edit = False
             self.target_diff_inspected = False
-            self.state["target_inspected"] = False
+            self.state["target_confirmed_after_edit"] = False
             self.state["target_diff_inspected"] = False
             self.state["focused_test_executed"] = False
             self.state["focused_test_passed"] = False
@@ -992,10 +1074,16 @@ class PhaseGate:
         elif phase_before == "confirm_edit" and kind == "target_confirmation":
             self.target_inspected = True
             self.state["target_inspected"] = True
+            self.target_confirmed_after_edit = True
+            self.state["target_confirmed_after_edit"] = True
         elif phase_before == "confirm_edit" and kind == "git_diff":
             self.target_diff_inspected = bool(evidence.target_diff.strip())
             self.state["target_diff_inspected"] = self.target_diff_inspected
-        if self.phase == "confirm_edit" and self.target_inspected and self.target_diff_inspected:
+        if (
+            self.phase == "confirm_edit"
+            and self.target_confirmed_after_edit
+            and self.target_diff_inspected
+        ):
             self.phase = "test"
         if phase_before == "test" and kind in {"focused_pytest", "focused_unittest"}:
             self.state["focused_test_executed"] = True
@@ -1021,6 +1109,8 @@ class PhaseGate:
                 evidence.tracked_diff
             )
         self.state["current_phase"] = self.phase
+        if self.phase != "inspect" and self.target_inspected:
+            self.state["target_inspected"] = True
         if self.phase != phase_before:
             self._rejected_action_counts.clear()
             self._rejected_kind_counts.clear()
@@ -1091,6 +1181,17 @@ class PhaseGate:
             "redirection_operators": list(decision.candidate.redirection_operators),
             "heredoc_present": decision.candidate.heredoc_present,
             "heredoc_delimiter": decision.candidate.heredoc_delimiter,
+            "command_multiline": decision.candidate.command_multiline,
+            "physical_line_count": decision.candidate.physical_line_count,
+            "parsed_command_count": decision.candidate.parsed_command_count,
+            "quote_closed": decision.candidate.quote_closed,
+            "continuation_detected": decision.candidate.continuation_detected,
+            "parse_status": decision.candidate.parse_status,
+            "parse_failure_category": decision.candidate.parse_failure_category,
+            "target_inspected": bool(self.state["target_inspected"]),
+            "target_confirmed_after_edit": bool(
+                self.state["target_confirmed_after_edit"]
+            ),
             "execution_attempted": bool(
                 executed and decision.candidate.kind == "noninteractive_edit"
             ),
@@ -1131,6 +1232,13 @@ class PhaseGate:
                 "redirection_operators": list(decision.candidate.redirection_operators),
                 "heredoc_present": decision.candidate.heredoc_present,
                 "heredoc_delimiter": decision.candidate.heredoc_delimiter,
+                "command_multiline": decision.candidate.command_multiline,
+                "physical_line_count": decision.candidate.physical_line_count,
+                "parsed_command_count": decision.candidate.parsed_command_count,
+                "quote_closed": decision.candidate.quote_closed,
+                "continuation_detected": decision.candidate.continuation_detected,
+                "parse_status": decision.candidate.parse_status,
+                "parse_failure_category": decision.candidate.parse_failure_category,
                 "execution_attempted": True,
                 "execution_exit_code": execution_exit_code,
                 "target_changed": diff_evidence.target_changed if diff_evidence else False,
@@ -1846,7 +1954,8 @@ def _extract_write_targets(action: str) -> tuple[str, ...]:
 
 
 def _analyze_shell_action(action: str) -> _ShellActionAnalysis:
-    commands = _parse_shell_commands(action)
+    parsed = _parse_shell_commands(action)
+    commands = parsed.commands if parsed.failure_category is None else ()
     targets: list[str] = []
     selected: _ParsedShellCommand | None = None
 
@@ -1903,21 +2012,54 @@ def _analyze_shell_action(action: str) -> _ShellActionAnalysis:
         parsed_argv=_bounded_argv(selected.argv) if selected else (),
         redirection_operators=redirections,
         heredoc_delimiter=heredoc,
+        command_multiline="\n" in action.replace("\r", ""),
+        physical_line_count=action.replace("\r\n", "\n").replace("\r", "\n").count("\n")
+        + 1,
+        quote_closed=parsed.quote_closed,
+        continuation_detected=parsed.continuation_detected,
+        parse_status="error" if parsed.failure_category else "parsed",
+        parse_failure_category=parsed.failure_category,
     )
 
 
-def _parse_shell_commands(action: str) -> tuple[_ParsedShellCommand, ...]:
-    lines = action.replace("\r", "").splitlines()
+def _parse_shell_commands(action: str) -> _ShellParseResult:
+    lines = action.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     commands: list[_ParsedShellCommand] = []
+    continuation_detected = False
     index = 0
     while index < len(lines):
-        line = lines[index]
+        unit: list[str] = []
+        quote: str | None = None
+        while index < len(lines):
+            line, quote, continued = _consume_shell_physical_line(lines[index], quote)
+            unit.append(line)
+            continuation_detected = continuation_detected or continued
+            index += 1
+            if quote is None and not continued:
+                break
+            if index < len(lines) and quote is not None and not continued:
+                unit.append("\n")
+        if quote is not None:
+            return _ShellParseResult(
+                commands=tuple(commands),
+                quote_closed=False,
+                continuation_detected=continuation_detected,
+                failure_category="unterminated_quote",
+            )
+        logical_command = "".join(unit)
+        if not logical_command.strip():
+            continue
         parsed: list[_ParsedShellCommand] = []
-        for segment in _split_shell_control_segments(line):
+        for segment in _split_shell_control_segments(logical_command):
             try:
                 tokens = _shell_tokens(segment)
             except ValueError:
-                continue
+                return _ShellParseResult(
+                    commands=tuple(commands),
+                    quote_closed=True,
+                    continuation_detected=continuation_detected,
+                    failure_category="tokenization_error",
+                )
             command = _parse_shell_segment(tokens)
             if command is not None:
                 parsed.append(command)
@@ -1935,13 +2077,22 @@ def _parse_shell_commands(action: str) -> tuple[_ParsedShellCommand, ...]:
             assert command.heredoc_delimiter is not None
             body: list[str] = []
             strip_tabs = "<<-" in command.redirections
-            index += 1
+            delimiter_found = False
             while index < len(lines):
                 candidate = lines[index].lstrip("\t") if strip_tabs else lines[index]
                 if candidate == command.heredoc_delimiter:
+                    delimiter_found = True
+                    index += 1
                     break
                 body.append(lines[index])
                 index += 1
+            if not delimiter_found:
+                return _ShellParseResult(
+                    commands=tuple(commands),
+                    quote_closed=True,
+                    continuation_detected=continuation_detected,
+                    failure_category="unterminated_heredoc",
+                )
             absolute_index = len(commands) - len(parsed) + heredoc_index
             commands[absolute_index] = _ParsedShellCommand(
                 executable=command.executable,
@@ -1951,8 +2102,43 @@ def _parse_shell_commands(action: str) -> tuple[_ParsedShellCommand, ...]:
                 heredoc_delimiter=command.heredoc_delimiter,
                 heredoc_body="\n".join(body),
             )
+    return _ShellParseResult(
+        commands=tuple(commands),
+        quote_closed=True,
+        continuation_detected=continuation_detected,
+    )
+
+
+def _consume_shell_physical_line(
+    line: str, quote: str | None
+) -> tuple[str, str | None, bool]:
+    output: list[str] = []
+    index = 0
+    continuation = False
+    while index < len(line):
+        character = line[index]
+        if quote == "'":
+            output.append(character)
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character == "\\":
+            if index + 1 < len(line):
+                output.extend((character, line[index + 1]))
+                index += 2
+                continue
+            continuation = True
+            index += 1
+            continue
+        output.append(character)
+        if quote == '"':
+            if character == '"':
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
         index += 1
-    return tuple(commands)
+    return "".join(output), quote, continuation
 
 
 def _shell_tokens(line: str) -> list[str]:
@@ -2141,6 +2327,17 @@ def _has_write_intent(action: str) -> bool:
     )
 
 
+def _appears_to_be_supported_edit(action: str) -> bool:
+    return _has_write_intent(action) and bool(
+        re.search(
+            r"(?:^|[;&|\n])\s*(?:command\s+)?(?:sed|perl|python(?:3(?:\.\d+)*)?"
+            r"(?:\.exe)?|touch|tee|cat|apply_patch)\b",
+            action,
+            re.I,
+        )
+    )
+
+
 def _normalize_target(value: str) -> str:
     normalized = value.strip().strip("'\"").replace("\\", "/")
     while normalized.startswith("./"):
@@ -2304,10 +2501,6 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
-
-
-def _is_inspection(action: str) -> bool:
-    return bool(re.search(r"(?:^|[\s;&|])(?:cat|sed\s+-n|head|tail|rg|grep|ls)(?:[\s;&|]|$)", action))
 
 
 def _kind_label(kind: str) -> str:
