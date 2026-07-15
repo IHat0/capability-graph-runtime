@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from cgr import quixbugs_pilot as pilot
 from cgr.swebench.phase_gate import (
@@ -304,6 +305,19 @@ def test_agent_failures_are_classified(
     assert pilot._classify_agent_failure(adapter_result, termination) == expected
 
 
+def test_quixbugs_overlay_configures_the_official_single_submit_protocol() -> None:
+    overlay = yaml.safe_load(pilot._quixbugs_overlay())
+    tools = overlay["agent"]["tools"]
+
+    assert pilot.OFFICIAL_SUBMISSION_COMMAND == "submit"
+    assert tools["submit_command"] == pilot.OFFICIAL_SUBMISSION_COMMAND
+    assert tools["registry_variables"]["SUBMIT_REVIEW_MESSAGES"] == []
+    assert [bundle["path"] for bundle in tools["bundles"]] == [
+        "tools/registry",
+        "tools/review_on_submit_m",
+    ]
+
+
 def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: Path) -> None:
     attempt = tmp_path / "attempt-001"
     attempt.mkdir()
@@ -348,6 +362,7 @@ def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: P
     assert payload["focused_test_command"] == (
         "PYTHONPATH=.git/cgr-test-runtime python -m pytest -q tests/test_module.py"
     )
+    assert payload["submission_command"] == pilot.OFFICIAL_SUBMISSION_COMMAND
     assert pilot._assert_phase_gate_config(config, environment) is not None
     payload = json.loads(config.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
@@ -480,7 +495,7 @@ def test_transactional_deterministic_profiles_reject_then_recover(tmp_path: Path
     assert recovery[:5] == failure
     assert "sed -i" in recovery[5]
     assert "pytest" in recovery[8]
-    assert "SWE_AGENT_SUBMISSION" in recovery[-1]
+    assert recovery[-1] == pilot.OFFICIAL_SUBMISSION_COMMAND
     assert pilot._deterministic_max_calls("transactional_failure") == 6
     assert pilot._deterministic_max_calls("transactional_recovery") == 12
 

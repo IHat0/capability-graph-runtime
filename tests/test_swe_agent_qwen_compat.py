@@ -11,7 +11,10 @@ from cgr.swebench.qwen_action_contract import (
     extract_v1_1_thought_action,
     validate_qwen_action_contract,
 )
-from cgr.swebench.swe_agent_adapter import LOCAL_QWEN_OVERLAY
+from cgr.swebench.swe_agent_adapter import (
+    LOCAL_QWEN_OVERLAY,
+    OFFICIAL_SUBMISSION_COMMAND,
+)
 
 
 def test_overlay_has_complete_qwen_bash_contract() -> None:
@@ -40,6 +43,18 @@ def test_overlay_has_complete_qwen_bash_contract() -> None:
     parse_function = parsed["agent"]["tools"]["parse_function"]
     assert parse_function["type"] == "strict_thought_action"
     assert isinstance(parse_function["error_message"], str)
+
+
+def test_submission_command_matches_pinned_official_tool_configuration() -> None:
+    source = Path(".sandbox-sweagent-src")
+    tool_config = yaml.safe_load(
+        (source / "tools/review_on_submit_m/config.yaml").read_text(encoding="utf-8")
+    )
+    tools_source = (source / "sweagent/tools/tools.py").read_text(encoding="utf-8")
+
+    assert OFFICIAL_SUBMISSION_COMMAND == "submit"
+    assert tool_config["tools"][OFFICIAL_SUBMISSION_COMMAND]["signature"] == "submit"
+    assert 'submit_command: str = "submit"' in tools_source
 
 
 def test_official_sweagent_install_is_pinned_to_the_upstream_commit() -> None:

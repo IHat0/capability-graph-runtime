@@ -29,6 +29,7 @@ from cgr.swebench.phase_gate import (
     reconcile_incomplete_transaction,
     write_phase_state,
 )
+from cgr.swebench.swe_agent_adapter import OFFICIAL_SUBMISSION_COMMAND
 
 
 DEFAULT_MANIFEST = Path("benchmark-manifests/quixbugs-python-pilot-v1.json")
@@ -216,6 +217,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 target=str(task["source_file"]),
                 focused_test=str(task["test_file"]),
                 focused_test_command=str(task["agent_verifier_command"]),
+                submission_command=OFFICIAL_SUBMISSION_COMMAND,
                 snapshot_python=agent_python,
                 verifier_failure_evidence=verifier_failure_evidence,
                 host_workspace_root=workspace if deployment_type == "local" else None,
@@ -964,7 +966,17 @@ def _quixbugs_overlay(agent_python: str = "python") -> str:
     editor_gate = f"{python_gate} && command -v sed >/dev/null"
     anchor = "    - git diff --cached --quiet --ignore-submodules --"
     additions = "\n".join((anchor, f"    - {json.dumps(preflight)}", f"    - {json.dumps(editor_gate)}"))
-    return cycle._sandbox_overlay().replace(anchor, additions)
+    official_tools = f"""    bundles:
+      - path: tools/registry
+      - path: tools/review_on_submit_m
+    registry_variables:
+      SUBMIT_REVIEW_MESSAGES: []
+    submit_command: {OFFICIAL_SUBMISSION_COMMAND}"""
+    return (
+        cycle._sandbox_overlay()
+        .replace(anchor, additions)
+        .replace("    bundles: []", official_tools)
+    )
 
 
 def _agent_test_preflight(agent_python: str) -> str:
@@ -988,6 +1000,7 @@ def _write_phase_gate_config(
     target: str,
     focused_test: str,
     focused_test_command: str | None = None,
+    submission_command: str = OFFICIAL_SUBMISSION_COMMAND,
     snapshot_python: str = "python",
     verifier_failure_evidence: dict[str, Any] | None = None,
     host_workspace_root: Path | None = None,
@@ -1018,6 +1031,7 @@ def _write_phase_gate_config(
                     "target": target,
                     "focused_test": focused_test,
                     "focused_test_command": focused_test_command or focused_test,
+                    "submission_command": submission_command,
                     "log_path": str(log_path),
                     "state_path": str(state_path),
                     "snapshot_python": snapshot_python,
@@ -1337,11 +1351,10 @@ def _configured_model() -> tuple[str, str, str]:
 
 
 def _deterministic_actions(
-    task: dict[str, Any], _python: Path, runtime_root: Path, *, profile: str = "success"
+    task: dict[str, Any], _python: Path, _runtime_root: Path, *, profile: str = "success"
 ) -> list[str]:
     source = str(task["source_file"])
     test = str(task["test_file"])
-    submission = cycle._git_bash_path(runtime_root / "model.patch")
     if profile == "failed":
         failed = (
             f"git add {shlex_quote(source)} test_gcd.py 2>&1\n"
@@ -1363,7 +1376,7 @@ def _deterministic_actions(
             f"git diff -- {shlex_quote(source)}",
             str(task["agent_verifier_command"]),
             f"git diff -- {shlex_quote(source)}",
-            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
+            OFFICIAL_SUBMISSION_COMMAND,
         ]
     if profile == "recovery":
         return [
@@ -1372,7 +1385,7 @@ def _deterministic_actions(
             f"git diff -- {shlex_quote(source)}",
             str(task["agent_verifier_command"]),
             f"git diff -- {shlex_quote(source)}",
-            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
+            OFFICIAL_SUBMISSION_COMMAND,
         ]
     if profile == "phase_gate_realistic":
         return [
@@ -1384,7 +1397,7 @@ def _deterministic_actions(
             f"git diff -- {shlex_quote(source)}",
             str(task["agent_verifier_command"]),
             f"git diff -- {shlex_quote(source)}",
-            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
+            OFFICIAL_SUBMISSION_COMMAND,
         ]
     if profile in {"transactional_failure", "transactional_recovery"}:
         rejected_prefix = [
@@ -1408,14 +1421,14 @@ def _deterministic_actions(
             f"git diff -- {shlex_quote(source)}",
             str(task["agent_verifier_command"]),
             f"git diff -- {shlex_quote(source)}",
-            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
+            OFFICIAL_SUBMISSION_COMMAND,
         ]
     return [
         f"sed -n '1,100p' {shlex_quote(source)} && sed -n '1,120p' {shlex_quote(test)}",
         f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
         str(task["agent_verifier_command"]),
         f"git diff -- {shlex_quote(source)}",
-        f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\\n'",
+        OFFICIAL_SUBMISSION_COMMAND,
     ]
 
 

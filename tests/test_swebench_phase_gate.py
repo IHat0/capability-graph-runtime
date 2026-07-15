@@ -668,7 +668,11 @@ def test_real_trajectory_shape_recovers_to_model_authored_complete_workflow() ->
         },
     )
     empty = RepositoryEvidence()
-    patch = RepositoryEvidence(target_diff="model patch", tracked_diff="model patch")
+    patch = RepositoryEvidence(
+        target_diff="model patch",
+        tracked_diff="model patch",
+        status_porcelain=f" M {TARGET}",
+    )
 
     commit = gate.decide(
         "git commit -am fix",
@@ -718,8 +722,14 @@ def test_real_trajectory_shape_recovers_to_model_authored_complete_workflow() ->
     gate.record_execution(focused, observation="1 passed in 0.01s", evidence=patch)
     final_diff = gate.decide("git diff -- HEAD", patch)
     gate.record_execution(final_diff, observation="model patch", evidence=patch)
-    submission = gate.decide("submit", patch)
-    gate.record_execution(submission, observation="submitted", evidence=patch)
+    _mark_accepted_transaction(gate)
+    submission = gate.decide("submit", patch, current_target_snapshot=after)
+    gate.record_execution(
+        submission,
+        observation="submitted",
+        evidence=patch,
+        submitted_patch=patch.tracked_diff,
+    )
 
     assert gate.state["workflow_complete"] is True
     assert gate.state["submission_authorized"] is True
@@ -810,7 +820,11 @@ def test_generic_model_authored_sed_completes_authorized_workflow(
         phase="inspect", target=TARGET, focused_test=TEST, log_path=log_path
     )
     empty = RepositoryEvidence()
-    patch = RepositoryEvidence(target_diff="generic patch", tracked_diff="generic patch")
+    patch = RepositoryEvidence(
+        target_diff="generic patch",
+        tracked_diff="generic patch",
+        status_porcelain=f" M {TARGET}",
+    )
 
     inspection = gate.decide(f"cat {TARGET}", empty)
     gate.record_execution(inspection, observation="generic source", evidence=empty)
@@ -850,8 +864,14 @@ def test_generic_model_authored_sed_completes_authorized_workflow(
     gate.record_execution(focused, observation="1 passed in 0.01s", evidence=patch)
     final_diff = gate.decide("git diff -- HEAD", patch)
     gate.record_execution(final_diff, observation="generic patch", evidence=patch)
-    submission = gate.decide("submit", patch)
-    gate.record_execution(submission, observation="submitted", evidence=patch)
+    _mark_accepted_transaction(gate)
+    submission = gate.decide("submit", patch, current_target_snapshot=changed)
+    gate.record_execution(
+        submission,
+        observation="submitted",
+        evidence=patch,
+        submitted_patch=patch.tracked_diff,
+    )
 
     assert gate.state["workflow_complete"] is True
     assert gate.state["submission_authorized"] is True
@@ -1050,6 +1070,55 @@ def _confirmation_gate(
     return gate, evidence, before, after
 
 
+def _mark_accepted_transaction(gate: PhaseGate) -> None:
+    gate.state["last_transaction"] = {
+        "status": "accepted",
+        "transaction_closed": True,
+        "failure_kind": None,
+    }
+    gate.state["last_transaction_failure_kind"] = None
+    gate.state["transactional_cleanup_verified"] = True
+
+
+def _submission_gate(
+    *, log_path: Path | None = None, submission_command: str = "submit"
+) -> tuple[PhaseGate, RepositoryEvidence, FileSnapshot, FileSnapshot]:
+    before = _snapshot("def value():\n    return 1\n")
+    after = _snapshot("def value():\n    return 2\n")
+    evidence = RepositoryEvidence(
+        target_diff="canonical patch",
+        tracked_diff="canonical patch",
+        status_porcelain=f" M {TARGET}",
+    )
+    fingerprint = patch_fingerprint(evidence.tracked_diff)
+    gate = PhaseGate(
+        phase="submit",
+        target=TARGET,
+        focused_test=TEST,
+        submission_command=submission_command,
+        log_path=log_path,
+    )
+    gate.state.update(
+        {
+            "accepted_target_edit": True,
+            "accepted_target_fingerprint": after.fingerprint,
+            "pre_edit_target_fingerprint": before.fingerprint,
+            "target_confirmed_after_edit": True,
+            "confirmation_matches_accepted_edit": True,
+            "confirmation_diff_nonempty": True,
+            "target_diff_inspected": True,
+            "focused_test_executed": True,
+            "focused_test_passed": True,
+            "final_diff_inspected": True,
+            "accepted_patch_fingerprint": fingerprint,
+            "confirmed_patch_fingerprint": fingerprint,
+            "final_patch_fingerprint": fingerprint,
+        }
+    )
+    _mark_accepted_transaction(gate)
+    return gate, evidence, before, after
+
+
 @pytest.mark.parametrize(
     ("action", "kind"),
     [
@@ -1160,7 +1229,8 @@ def test_phase_transition_guidance_is_configuration_derived() -> None:
     gate.phase = "final_diff"
     assert f"git diff -- {TARGET}" in gate.phase_transition_guidance()
     gate.phase = "submit"
-    assert "Submit the existing worktree patch" in gate.phase_transition_guidance()
+    submit_guidance = gate.phase_transition_guidance()
+    assert "Return exactly this single action:\nsubmit" in submit_guidance
 
 
 def test_redirected_confirmation_diff_is_logged_unexecuted_and_creates_nothing(
@@ -1194,11 +1264,21 @@ def test_redirected_confirmation_diff_is_logged_unexecuted_and_creates_nothing(
 
 
 def test_test_pass_final_diff_and_submission_transitions() -> None:
-    evidence = RepositoryEvidence(target_diff="patch", tracked_diff="patch")
+    evidence = RepositoryEvidence(
+        target_diff="patch", tracked_diff="patch", status_porcelain=f" M {TARGET}"
+    )
     gate = PhaseGate(phase="test", target=TARGET, focused_test=TEST)
+    before = _snapshot("def value():\n    return 1\n")
+    after = _snapshot("def value():\n    return 2\n")
     fingerprint = patch_fingerprint(evidence.tracked_diff)
     gate.state["accepted_patch_fingerprint"] = fingerprint
     gate.state["confirmed_patch_fingerprint"] = fingerprint
+    gate.state["accepted_target_edit"] = True
+    gate.state["target_confirmed_after_edit"] = True
+    gate.state["confirmation_matches_accepted_edit"] = True
+    gate.state["accepted_target_fingerprint"] = after.fingerprint
+    gate.state["pre_edit_target_fingerprint"] = before.fingerprint
+    _mark_accepted_transaction(gate)
 
     test = gate.decide("pytest -q tests/test_module.py", evidence)
     assert test.allowed
@@ -1209,7 +1289,9 @@ def test_test_pass_final_diff_and_submission_transitions() -> None:
     assert diff.allowed
     gate.record_execution(diff, observation="patch", evidence=evidence)
     assert gate.phase == "submit"
-    assert gate.decide("submit", evidence).allowed
+    assert gate.decide(
+        "submit", evidence, current_target_snapshot=after
+    ).allowed
 
 
 def test_submission_without_patch_and_unknown_action_are_rejected() -> None:
@@ -1218,6 +1300,249 @@ def test_submission_without_patch_and_unknown_action_are_rejected() -> None:
 
     assert not submit.decide("submit", RepositoryEvidence()).allowed
     assert not unknown.decide("frobnicate", RepositoryEvidence()).allowed
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_kind"),
+    [
+        ("submit", "submission"),
+        ("# Submit the verified patch\n\nsubmit", "submission"),
+        ("submit --force", "unknown"),
+        ("submit extra", "unknown"),
+        ("submit; git status", "unknown"),
+        ("submit && git diff", "git_diff"),
+        ("submit > patchfile", "edit_wrong_file"),
+        ("submit | tee patchfile", "edit_wrong_file"),
+        ('"submit"', "unknown"),
+        ("echo 'submit'", "unknown"),
+    ],
+)
+def test_submission_action_classification_is_exact(
+    action: str, expected_kind: str
+) -> None:
+    candidate = classify_candidate_action(
+        action, target=TARGET, focused_test=TEST, submission_command="submit"
+    )
+
+    assert candidate.kind == expected_kind
+    if expected_kind == "submission":
+        assert candidate.parsed_command_count == 1
+        assert candidate.parsed_executable == "submit"
+
+
+def test_submission_command_and_guidance_are_configuration_derived() -> None:
+    gate, evidence, _before, after = _submission_gate(submission_command="finish")
+
+    decision = gate.decide("finish", evidence, current_target_snapshot=after)
+
+    assert decision.allowed
+    assert decision.candidate.kind == "submission"
+    assert "Return exactly this single action:\nfinish" in gate.phase_transition_guidance()
+    assert classify_candidate_action(
+        "submit", target=TARGET, focused_test=TEST, submission_command="finish"
+    ).kind == "unknown"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        f"git add {TARGET}",
+        "git commit -m fix",
+        "git format-patch HEAD^",
+        f"git diff -- {TARGET}",
+        f"git diff -- {TARGET} > patchfile",
+        "submit > patchfile",
+        "submit | tee patchfile",
+        "submit; git status",
+        "submit --force",
+        "submit && git diff",
+    ],
+)
+def test_submit_phase_rejections_name_the_only_permitted_action(action: str) -> None:
+    gate, evidence, _before, after = _submission_gate()
+
+    decision = gate.decide(action, evidence, current_target_snapshot=after)
+
+    assert not decision.allowed
+    assert gate.phase == "submit"
+    assert gate.state["submission_authorized"] is False
+    assert gate.state["workflow_complete"] is False
+    assert "Required phase: submit" in str(decision.feedback)
+    assert "Return exactly this single action:\nsubmit" in str(decision.feedback)
+    assert "current inspect phase" not in str(decision.feedback)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "failure"),
+    [
+        ("focused_test_executed", "focused_test_not_executed"),
+        ("focused_test_passed", "focused_test_not_passed"),
+        ("final_diff_inspected", "final_diff_not_inspected"),
+        ("target_confirmed_after_edit", "target_confirmation_missing"),
+    ],
+)
+def test_submission_preconditions_reject_incomplete_workflow(
+    mutation: str, failure: str
+) -> None:
+    gate, evidence, _before, after = _submission_gate()
+    gate.state[mutation] = False
+
+    decision = gate.decide("submit", evidence, current_target_snapshot=after)
+
+    assert not decision.allowed
+    assert failure in gate.state["last_submission_failures"]
+    assert "Return exactly this single action:\nsubmit" in str(decision.feedback)
+
+
+@pytest.mark.parametrize("phase", ("inspect", "edit", "confirm_edit", "test", "final_diff"))
+def test_premature_submission_never_executes_or_authorizes(phase: str) -> None:
+    gate = PhaseGate(phase=phase, target=TARGET, focused_test=TEST)
+
+    decision = gate.decide("submit", RepositoryEvidence())
+
+    assert not decision.allowed
+    assert decision.candidate.kind == "submission"
+    assert gate.state["explicit_submission_action_seen"] is False
+    assert gate.state["submission_authorized"] is False
+    assert gate.state["workflow_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("state_update", "failure"),
+    [
+        ({"last_transaction": None}, "accepted_transaction_missing"),
+        (
+            {
+                "last_transaction": {
+                    "status": "started",
+                    "transaction_closed": False,
+                    "failure_kind": None,
+                }
+            },
+            "accepted_transaction_not_closed",
+        ),
+        ({"transactional_cleanup_verified": False}, "transactional_cleanup_unverified"),
+        ({"last_transaction_failure_kind": "timeout"}, "transaction_failure_unresolved"),
+    ],
+)
+def test_submission_requires_closed_clean_transaction(
+    state_update: dict[str, object], failure: str
+) -> None:
+    gate, evidence, _before, after = _submission_gate()
+    gate.state.update(state_update)
+
+    decision = gate.decide("submit", evidence, current_target_snapshot=after)
+
+    assert not decision.allowed
+    assert failure in gate.state["last_submission_failures"]
+
+
+def test_submission_rejects_changed_target_bytes() -> None:
+    gate, evidence, _before, _after = _submission_gate()
+    changed = _snapshot("def value():\n    return 3\n")
+
+    decision = gate.decide("submit", evidence, current_target_snapshot=changed)
+
+    assert not decision.allowed
+    assert "current_target_fingerprint_mismatch" in gate.state[
+        "last_submission_failures"
+    ]
+
+
+@pytest.mark.parametrize(
+    "status",
+    (f" M {TARGET}\n?? patchfile", f" M {TARGET}\n M src/unrelated.py"),
+)
+def test_submission_rejects_unrelated_tracked_or_untracked_files(status: str) -> None:
+    gate, evidence, _before, after = _submission_gate()
+    evidence.status_porcelain = status
+
+    decision = gate.decide("submit", evidence, current_target_snapshot=after)
+
+    assert not decision.allowed
+    assert "unrelated_workspace_changes" in gate.state["last_submission_failures"]
+
+
+def test_submission_rejects_canonical_fingerprint_mismatch() -> None:
+    gate, evidence, _before, after = _submission_gate()
+    mismatched = RepositoryEvidence(
+        target_diff=evidence.target_diff,
+        tracked_diff=evidence.tracked_diff + "\n+unrelated\n",
+        status_porcelain=evidence.status_porcelain,
+    )
+
+    decision = gate.decide("submit", mismatched, current_target_snapshot=after)
+
+    assert not decision.allowed
+    assert "canonical_patch_fingerprint_mismatch" in gate.state[
+        "last_submission_failures"
+    ]
+
+
+def test_explicit_submission_records_matching_fingerprint_and_event(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "submission-events.jsonl"
+    gate, evidence, _before, after = _submission_gate(log_path=log_path)
+    decision = gate.decide("submit", evidence, current_target_snapshot=after)
+
+    feedback = gate.record_execution(
+        decision,
+        observation=evidence.tracked_diff,
+        evidence=evidence,
+        accepted=True,
+        submitted_patch=evidence.tracked_diff,
+    )
+
+    assert feedback is None
+    assert gate.state["explicit_submission_action_seen"] is True
+    assert gate.state["submission_authorized"] is True
+    assert gate.state["workflow_complete"] is True
+    assert gate.state["completion_status"] == "completed_explicit_submission"
+    assert gate.state["submitted_patch_fingerprint"] == gate.state[
+        "final_patch_fingerprint"
+    ]
+    assert authorize_phase_patch(gate.state, evidence.tracked_diff).authorized
+    event = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert event["candidate"]["raw"] == "submit"
+    assert event["explicit_submission_action_seen"] is True
+    assert event["submitted_patch_fingerprint"] == gate.state[
+        "submitted_patch_fingerprint"
+    ]
+
+
+def test_official_submission_patch_mismatch_remains_unauthorized() -> None:
+    gate, evidence, _before, after = _submission_gate()
+    decision = gate.decide("submit", evidence, current_target_snapshot=after)
+
+    feedback = gate.record_execution(
+        decision,
+        observation="different patch",
+        evidence=evidence,
+        accepted=True,
+        submitted_patch="different patch",
+    )
+
+    assert gate.state["explicit_submission_action_seen"] is True
+    assert gate.state["submission_authorized"] is False
+    assert gate.state["workflow_complete"] is False
+    assert "submitted_patch_fingerprint_mismatch" in str(feedback)
+
+
+@pytest.mark.parametrize("terminal_reason", ("exit_cost", "attempt_timeout"))
+def test_autosubmission_without_explicit_model_action_remains_unauthorized(
+    terminal_reason: str,
+) -> None:
+    gate, evidence, _before, _after = _submission_gate()
+    gate.state["terminal_reason"] = terminal_reason
+
+    authorization = authorize_phase_patch(gate.state, evidence.tracked_diff)
+
+    assert gate.state["explicit_submission_action_seen"] is False
+    assert gate.state["submission_authorized"] is False
+    assert gate.state["workflow_complete"] is False
+    assert not authorization.authorized
+    assert "explicit_submission_action_missing" in authorization.failures
 
 
 def test_repeated_known_failure_without_change_is_rejected() -> None:
@@ -1258,12 +1583,16 @@ def test_repository_probe_normalizes_swerex_observation_objects() -> None:
             assert check == "ignore"
             if "--binary" in command:
                 return SimpleNamespace(output="tracked patch")
+            if "status --porcelain" in command:
+                return SimpleNamespace(output=f" M {TARGET}")
             return {"output": "target patch"}
 
     evidence = _probe_repository(SimpleNamespace(_env=FakeEnvironment()), TARGET)
 
     assert evidence == RepositoryEvidence(
-        target_diff="target patch", tracked_diff="tracked patch"
+        target_diff="target patch",
+        tracked_diff="tracked patch",
+        status_porcelain=f" M {TARGET}",
     )
 
 
@@ -1414,9 +1743,11 @@ def _install_host_transaction_gate(
     monkeypatch.setitem(sys.modules, "sweagent", sweagent)
     monkeypatch.setitem(sys.modules, "sweagent.agent", agent)
     monkeypatch.setitem(sys.modules, "sweagent.agent.agents", agents)
-    state_path = tmp_path / "state.json"
-    event_path = tmp_path / "events.jsonl"
-    config = tmp_path / "phase-gate.json"
+    gate_root = tmp_path / ".git" / "cgr-phase-gate"
+    gate_root.mkdir(parents=True, exist_ok=True)
+    state_path = gate_root / "state.json"
+    event_path = gate_root / "events.jsonl"
+    config = gate_root / "phase-gate.json"
     config.write_text(
         json.dumps(
             {
@@ -1560,6 +1891,7 @@ def test_phase_state_and_patch_fingerprint_fail_closed(tmp_path: Path) -> None:
             "final_diff_inspected": True,
             "submission_authorized": True,
             "workflow_complete": True,
+            "explicit_submission_action_seen": True,
         }
     )
     patch = "diff --git a/src/module.py b/src/module.py\n+changed\n"
@@ -1836,7 +2168,7 @@ def test_valid_generic_sed_executes_transactionally(
     assert event["rollback_status"] == "not_required"
 
 
-def test_exact_run_014_shape_completes_full_authorized_workflow(
+def test_exact_run_015_shape_completes_full_authorized_workflow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = _initialize_git_target(
@@ -1861,7 +2193,12 @@ def test_exact_run_014_shape_completes_full_authorized_workflow(
             elif "pytest" in step.action:
                 step.observation = "1 passed in 0.01s"
             elif step.action.strip() == "submit":
-                step.observation = "submitted"
+                submitted = self._env.communicate(
+                    "git diff --binary HEAD --", check="ignore"
+                )
+                step.observation = submitted
+                step.submission = submitted
+                step.exit_status = "submitted"
                 step.done = True
             elif "cat " in step.action:
                 step.observation = target.read_text(encoding="utf-8")
@@ -1922,6 +2259,8 @@ def test_exact_run_014_shape_completes_full_authorized_workflow(
     assert state["transactional_cleanup_verified"] is True
     assert state["workflow_complete"] is True
     assert state["submission_authorized"] is True
+    assert state["explicit_submission_action_seen"] is True
+    assert state["completion_status"] == "completed_explicit_submission"
     assert state["target_confirmed_after_edit"] is True
     assert state["confirmation_matches_accepted_edit"] is True
     assert state["confirmation_diff_nonempty"] is True
@@ -1959,6 +2298,7 @@ def test_exact_run_014_shape_completes_full_authorized_workflow(
     assert "PYTHONPATH=.git/cgr-test-runtime" in results[1].observation
     assert "Current phase: final_diff" in results[2].observation
     assert "Current phase: submit" in results[3].observation
+    assert "Return exactly this single action:\nsubmit" in results[3].observation
     outer = subprocess.run(
         [
             sys.executable,
@@ -1971,6 +2311,14 @@ def test_exact_run_014_shape_completes_full_authorized_workflow(
         check=False,
     )
     assert outer.returncode == 0, outer.stderr
+    assert len(actions) + 1 == 6
+    assert len(actions) + 1 <= 8
+    classification = (
+        "resolved"
+        if authorization.authorized and outer.returncode == 0
+        else "phase_incomplete"
+    )
+    assert classification == "resolved"
 
 
 def test_attempt_007_internal_postinspection_timeout_is_contained_and_restored(
@@ -1997,7 +2345,7 @@ def test_attempt_007_internal_postinspection_timeout_is_contained_and_restored(
         def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
             original_calls.append(step.action)
             if step.action.startswith("sed "):
-                state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+                state = json.loads(state_path.read_text(encoding="utf-8"))
                 journal_seen_before_edit.append(
                     state["active_transaction_status"] == "started"
                 )

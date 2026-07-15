@@ -27,6 +27,7 @@ SWE_AGENT_COMMIT = "0f3acaf"
 SWE_AGENT_PYTHON_REQUIRES = ">=3.11"
 _PATCH_KEYS = ("patch", "model_patch", "submission")
 _SECRET_VALUES = ("CGR_DRAFT_API_KEY",)
+OFFICIAL_SUBMISSION_COMMAND = "submit"
 _DEPLOYED_REPO_ROOT = (
     'repo_root="$(git rev-parse --show-toplevel)" '
     '|| { echo "Unable to identify the deployed Git repository." >&2; exit 1; }; '

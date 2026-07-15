@@ -61,6 +61,7 @@ class GateDecision:
 class RepositoryEvidence:
     target_diff: str = ""
     tracked_diff: str = ""
+    status_porcelain: str = ""
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,10 @@ def build_initial_phase_state(
         "confirmed_patch_fingerprint": None,
         "final_patch_fingerprint": None,
         "submitted_patch_fingerprint": None,
+        "submission_command": None,
+        "explicit_submission_action_seen": False,
+        "last_submission_failures": [],
+        "completion_status": "incomplete",
         "terminal_reason": None,
         "last_postcondition_failures": [],
         "diagnostic_flags": [],
@@ -250,6 +255,7 @@ def authorize_phase_patch(
         ("focused_test_executed", "focused_test_not_executed"),
         ("focused_test_passed", "focused_test_not_passed"),
         ("final_diff_inspected", "final_diff_not_inspected"),
+        ("explicit_submission_action_seen", "explicit_submission_action_missing"),
         ("submission_authorized", "submission_not_authorized"),
         ("workflow_complete", "workflow_incomplete"),
     )
@@ -502,7 +508,11 @@ def evaluate_edit(
 
 
 def classify_candidate_action(
-    action: str, *, target: str, focused_test: str
+    action: str,
+    *,
+    target: str,
+    focused_test: str,
+    submission_command: str = "submit",
 ) -> CandidateAction:
     normalized = " ".join(action.replace("\r", "").split())
     analysis = _analyze_shell_action(action)
@@ -529,7 +539,7 @@ def classify_candidate_action(
         )
     elif _analysis_has_interactive_editor(analysis):
         kind = "interactive_editor"
-    elif re.search(r"<<SWE_AGENT_SUBMISSION>>|model\.patch|^submit$", action, re.I):
+    elif _is_exact_submission_action(action, analysis, submission_command):
         kind = "submission"
     elif git_operation == "diff" and analysis.write_capable:
         kind = "write_capable_inspection"
@@ -600,6 +610,35 @@ def _test_framework(action: str) -> str | None:
     return direct.group("framework").lower() if direct else None
 
 
+def _is_exact_submission_action(
+    action: str, analysis: _ShellActionAnalysis, submission_command: str
+) -> bool:
+    try:
+        expected = tuple(shlex.split(submission_command, posix=True))
+    except ValueError:
+        return False
+    executable_lines = [
+        line.strip()
+        for line in action.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if (
+        len(expected) != 1
+        or len(executable_lines) != 1
+        or executable_lines[0] != submission_command
+        or len(analysis.commands) != 1
+    ):
+        return False
+    command = analysis.commands[0]
+    return bool(
+        analysis.parse_status == "parsed"
+        and not analysis.write_capable
+        and not command.environment_assignments
+        and not command.redirections
+        and command.argv == expected
+    )
+
+
 def _git_operation(analysis: _ShellActionAnalysis) -> str | None:
     operations: list[str] = []
     for command in analysis.commands:
@@ -643,6 +682,7 @@ class PhaseGate:
         edit_policy: EditPolicy | None = None,
         snapshot_python: str = "python",
         focused_test_command: str | None = None,
+        submission_command: str = "submit",
         verifier_failure_evidence: dict[str, Any] | None = None,
     ) -> None:
         if phase not in PHASES:
@@ -655,6 +695,10 @@ class PhaseGate:
         self.edit_policy = edit_policy or EditPolicy()
         self.snapshot_python = snapshot_python
         self.focused_test_command = focused_test_command or focused_test
+        submission_tokens = shlex.split(submission_command, posix=True)
+        if len(submission_tokens) != 1:
+            raise ValueError("The configured submission command must be one executable token.")
+        self.submission_command = submission_tokens[0]
         self.verifier_failure_evidence = (
             verifier_failure_evidence if isinstance(verifier_failure_evidence, dict) else {}
         )
@@ -672,6 +716,7 @@ class PhaseGate:
             self.verifier_failure_evidence.get("available")
             and self.verifier_failure_evidence.get("summary")
         )
+        self.state["submission_command"] = self.submission_command
         self._persist_state()
 
     def decide(
@@ -680,9 +725,13 @@ class PhaseGate:
         evidence: RepositoryEvidence,
         *,
         model_text: str = "",
+        current_target_snapshot: FileSnapshot | None = None,
     ) -> GateDecision:
         candidate = classify_candidate_action(
-            action, target=self.target, focused_test=self.focused_test
+            action,
+            target=self.target,
+            focused_test=self.focused_test,
+            submission_command=self.submission_command,
         )
         reason: str | None = None
         if candidate.kind in {"commit", "push"}:
@@ -726,10 +775,13 @@ class PhaseGate:
         elif self.phase == "submit":
             if candidate.kind != "submission":
                 reason = "Submit the existing worktree patch in the submit phase."
-            elif not evidence.tracked_diff.strip():
-                reason = "Submission requires a nonempty tracked patch."
-            elif not self._lineage_matches(evidence.tracked_diff):
-                reason = "The submitted canonical patch does not match the accepted edit lineage."
+            else:
+                failures = self._submission_failures(
+                    evidence, current_target_snapshot=current_target_snapshot
+                )
+                self.state["last_submission_failures"] = list(failures)
+                if failures:
+                    reason = "Submission preconditions failed: " + ", ".join(failures)
         if reason is None:
             return GateDecision(True, self.phase, candidate)
         self._register_rejection(candidate, model_text=model_text)
@@ -739,6 +791,32 @@ class PhaseGate:
         return decision
 
     def _rejection_feedback(self, candidate: CandidateAction, reason: str) -> str:
+        if self.phase == "submit":
+            failures = self.state.get("last_submission_failures")
+            grounded = (
+                ", ".join(str(value) for value in failures)
+                if isinstance(failures, list) and failures
+                else reason
+            )
+            return "\n".join(
+                (
+                    "ACTION REJECTED BY CGR",
+                    "",
+                    "Required phase: submit",
+                    f"Candidate kind: {candidate.kind}",
+                    "",
+                    "Committing, pushing, changing remotes, creating patch files, and "
+                    "configuring Git identity are prohibited.",
+                    "The verified worktree patch already exists.",
+                    f"Grounded result: {grounded}",
+                    "",
+                    "Return exactly this single action:",
+                    self.submission_command,
+                    "",
+                    "Do not add comments, Git commands, arguments, redirections, patch "
+                    "files, or additional actions.",
+                )
+            )
         lines = [
             "ACTION REJECTED BY CGR",
             "",
@@ -940,8 +1018,13 @@ class PhaseGate:
         elif self.phase == "submit":
             body = (
                 "",
-                "The canonical patch matches the accepted and confirmed edit. Submit the "
-                "existing worktree patch now. Do not edit or create files.",
+                "The canonical patch matches the accepted and confirmed edit.",
+                "",
+                "Return exactly this single action:",
+                self.submission_command,
+                "",
+                "Do not add comments, arguments, Git commands, redirections, patch files, "
+                "commits, or additional commands.",
             )
         else:
             return self.phase_transition_coaching()
@@ -957,6 +1040,71 @@ class PhaseGate:
             self.state.get("final_patch_fingerprint"),
         )
         return all(isinstance(value, str) and value == fingerprint for value in values)
+
+    def _submission_failures(
+        self,
+        evidence: RepositoryEvidence,
+        *,
+        current_target_snapshot: FileSnapshot | None,
+    ) -> tuple[str, ...]:
+        failures: list[str] = []
+        if self.phase != "submit":
+            failures.append("current_phase_not_submit")
+        if not self.state.get("accepted_target_edit"):
+            failures.append("accepted_target_edit_missing")
+        if self.state.get("active_transaction") is not None:
+            failures.append("active_transaction_incomplete")
+        transaction = self.state.get("last_transaction")
+        if not isinstance(transaction, dict):
+            failures.append("accepted_transaction_missing")
+        else:
+            if transaction.get("status") != "accepted":
+                failures.append("accepted_transaction_not_closed")
+            if transaction.get("transaction_closed") is not True:
+                failures.append("accepted_transaction_not_closed")
+            if transaction.get("failure_kind") is not None:
+                failures.append("transaction_failure_unresolved")
+        if self.state.get("transactional_cleanup_verified") is not True:
+            failures.append("transactional_cleanup_unverified")
+        if self.state.get("last_transaction_failure_kind") is not None:
+            failures.append("transaction_failure_unresolved")
+        for key, failure in (
+            ("target_confirmed_after_edit", "target_confirmation_missing"),
+            ("confirmation_matches_accepted_edit", "target_confirmation_mismatch"),
+            ("focused_test_executed", "focused_test_not_executed"),
+            ("focused_test_passed", "focused_test_not_passed"),
+            ("final_diff_inspected", "final_diff_not_inspected"),
+        ):
+            if not self.state.get(key):
+                failures.append(failure)
+        if current_target_snapshot is None:
+            failures.append("current_target_snapshot_missing")
+        else:
+            accepted_target = self.state.get("accepted_target_fingerprint")
+            if (
+                not isinstance(accepted_target, str)
+                or current_target_snapshot.fingerprint != accepted_target
+            ):
+                failures.append("current_target_fingerprint_mismatch")
+        if not evidence.target_diff.strip():
+            failures.append("canonical_target_patch_empty")
+        if not evidence.tracked_diff.strip():
+            failures.append("canonical_patch_empty")
+        elif not self._lineage_matches(evidence.tracked_diff):
+            failures.append("canonical_patch_fingerprint_mismatch")
+        paths = _porcelain_paths(evidence.status_porcelain)
+        if not paths:
+            failures.append("workspace_status_missing")
+        elif any(path != _normalize_target(self.target) for path in paths):
+            failures.append("unrelated_workspace_changes")
+        return tuple(dict.fromkeys(failures))
+
+    def submission_execution_feedback(self, failure: str) -> str:
+        self.state["last_submission_failures"] = [failure]
+        return self._rejection_feedback(
+            CandidateAction(raw=self.submission_command, kind="submission", targets_required_file=False),
+            failure,
+        )
 
     def confirmation_integrity_feedback(self) -> str:
         return "\n".join(
@@ -1160,6 +1308,7 @@ class PhaseGate:
         execution_exit_code: int | None = None,
         transaction_details: dict[str, Any] | None = None,
         current_target_snapshot: FileSnapshot | None = None,
+        submitted_patch: str | None = None,
     ) -> str | None:
         phase_before = self.phase
         kind = decision.candidate.kind
@@ -1298,16 +1447,43 @@ class PhaseGate:
                 self.state["final_diff_inspected"] = False
                 self.state["final_patch_fingerprint"] = None
                 feedback = self.patch_lineage_feedback(phase="final_diff")
-        elif phase_before == "submit" and kind == "submission" and accepted:
-            fingerprint = patch_fingerprint(evidence.tracked_diff)
-            if self._lineage_matches(evidence.tracked_diff):
+        elif phase_before == "submit" and kind == "submission":
+            self.state["explicit_submission_action_seen"] = True
+            official_submission_completed = accepted
+            canonical_fingerprint = patch_fingerprint(evidence.tracked_diff)
+            submitted_fingerprint = (
+                patch_fingerprint(submitted_patch)
+                if isinstance(submitted_patch, str) and submitted_patch.strip()
+                else None
+            )
+            if (
+                official_submission_completed
+                and
+                self._lineage_matches(evidence.tracked_diff)
+                and submitted_fingerprint == canonical_fingerprint
+            ):
                 self.state["submission_authorized"] = True
                 self.state["workflow_complete"] = True
-                self.state["submitted_patch_fingerprint"] = fingerprint
+                self.state["completion_status"] = "completed_explicit_submission"
+                self.state["submitted_patch_fingerprint"] = submitted_fingerprint
+                self.state["last_submission_failures"] = []
             else:
+                accepted = False
                 self.state["submission_authorized"] = False
                 self.state["workflow_complete"] = False
-                feedback = self.patch_lineage_feedback(phase="submit")
+                self.state["completion_status"] = "incomplete"
+                self.state["last_submission_failures"] = [
+                    "submitted_patch_fingerprint_mismatch"
+                    if submitted_fingerprint is not None
+                    else (
+                        "official_submission_patch_missing"
+                        if official_submission_completed
+                        else "official_submission_did_not_complete"
+                    )
+                ]
+                feedback = self.submission_execution_feedback(
+                    str(self.state["last_submission_failures"][0])
+                )
         self.state["current_phase"] = self.phase
         if self.phase != "inspect" and self.target_inspected:
             self.state["target_inspected"] = True
@@ -1407,6 +1583,14 @@ class PhaseGate:
             "confirmation_diff_nonempty": bool(
                 self.state["confirmation_diff_nonempty"]
             ),
+            "submission_command": self.submission_command,
+            "explicit_submission_action_seen": bool(
+                self.state["explicit_submission_action_seen"]
+            ),
+            "submitted_patch_fingerprint": self.state[
+                "submitted_patch_fingerprint"
+            ],
+            "submission_failures": list(self.state["last_submission_failures"]),
             "execution_attempted": bool(
                 executed and decision.candidate.kind == "noninteractive_edit"
             ),
@@ -1987,6 +2171,7 @@ def install_sweagent_phase_gate() -> None:
                 focused_test_command=str(
                     config.get("focused_test_command", config["focused_test"])
                 ),
+                submission_command=str(config.get("submission_command", "submit")),
                 verifier_failure_evidence=config.get("verifier_failure_evidence"),
             )
             self._cgr_phase_gate_state = gate
@@ -1994,7 +2179,20 @@ def install_sweagent_phase_gate() -> None:
         model_text = _normalize_observation_text(
             getattr(step, "thought", "") or getattr(step, "output", "")
         )
-        decision = gate.decide(step.action, evidence, model_text=model_text)
+        pre_action_snapshot = None
+        if gate.phase == "submit":
+            try:
+                pre_action_snapshot = _snapshot_target(
+                    self, gate.target, gate.snapshot_python, host_workspace_root
+                )
+            except Exception:
+                pre_action_snapshot = None
+        decision = gate.decide(
+            step.action,
+            evidence,
+            model_text=model_text,
+            current_target_snapshot=pre_action_snapshot,
+        )
         if not decision.allowed:
             step.observation = decision.feedback or "Action rejected by CGR."
             step.state = self.tools.get_state(env=self._env)
@@ -2022,11 +2220,25 @@ def install_sweagent_phase_gate() -> None:
                 )
             except Exception:
                 current_snapshot = None
+        submitted_patch = getattr(result, "submission", None)
+        submission_completed = bool(
+            decision.candidate.kind == "submission"
+            and getattr(result, "done", False)
+            and isinstance(submitted_patch, str)
+            and submitted_patch.strip()
+            and str(getattr(result, "exit_status", "")).startswith("submitted")
+        )
         feedback = gate.record_execution(
             decision,
             observation=_normalize_observation_text(result.observation),
             evidence=evidence,
+            accepted=(
+                submission_completed
+                if decision.candidate.kind == "submission"
+                else True
+            ),
             current_target_snapshot=current_snapshot,
+            submitted_patch=submitted_patch if isinstance(submitted_patch, str) else None,
         )
         if feedback is not None:
             result.observation = _append_observation(
@@ -2208,7 +2420,29 @@ def _probe_repository(agent: Any, target: str) -> RepositoryEvidence:
     tracked_diff = _normalize_observation_text(
         env.communicate("git diff --binary HEAD --", check="ignore")
     )
-    return RepositoryEvidence(target_diff=target_diff, tracked_diff=tracked_diff)
+    status_porcelain = _normalize_observation_text(
+        env.communicate("git status --porcelain=v1 --untracked-files=all", check="ignore")
+    )
+    return RepositoryEvidence(
+        target_diff=target_diff,
+        tracked_diff=tracked_diff,
+        status_porcelain=status_porcelain,
+    )
+
+
+def _porcelain_paths(status: str) -> tuple[str, ...]:
+    paths: list[str] = []
+    for raw_line in status.splitlines():
+        if len(raw_line) < 4:
+            paths.append("<unparseable-status-entry>")
+            continue
+        value = raw_line[3:].strip()
+        candidates = value.split(" -> ") if " -> " in value else [value]
+        for candidate in candidates:
+            normalized = _normalize_target(candidate)
+            if normalized and normalized not in paths:
+                paths.append(normalized)
+    return tuple(paths)
 
 
 def _extract_write_targets(action: str) -> tuple[str, ...]:
