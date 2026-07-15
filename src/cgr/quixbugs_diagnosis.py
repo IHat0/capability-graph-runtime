@@ -257,6 +257,45 @@ def diagnose_attempt(
         )
     )
     phase_at_termination = phase_state.get("current_phase")
+    phase_events = _phase_gate_events(attempt_result.get("phase_gate_event_log_path"))
+    rejected_phase_events = [event for event in phase_events if event.get("allowed") is False]
+    rejected_kinds = [
+        str(event.get("candidate", {}).get("kind"))
+        for event in rejected_phase_events
+        if isinstance(event.get("candidate"), dict)
+    ]
+    test_kinds = {
+        "focused_pytest",
+        "unrelated_pytest",
+        "focused_unittest",
+        "unrelated_unittest",
+    }
+    interactive_editor_attempted = "interactive_editor" in rejected_kinds
+    edit_phase_test_events = [
+        event
+        for event in rejected_phase_events
+        if event.get("phase_before") == "edit"
+        and isinstance(event.get("candidate"), dict)
+        and event["candidate"].get("kind") in test_kinds
+    ]
+    test_attempted_during_edit = bool(edit_phase_test_events)
+    repeated_disallowed_test = len(edit_phase_test_events) >= 2
+    declared_edit_in_action = any(
+        bool(event.get("declared_edit_without_edit_action"))
+        for event in rejected_phase_events
+    )
+    phase_stalled = bool(phase_state.get("phase_stalled_repeated_action"))
+    no_target_edit_before_budget = bool(
+        phase_state
+        and budget_exhausted
+        and not phase_state.get("accepted_target_edit")
+    )
+    verifier_failure_evidence = attempt_result.get("pre_agent_verifier_failure_evidence")
+    if not isinstance(verifier_failure_evidence, dict):
+        verifier_failure_evidence = {}
+    model_claim_conflicts = bool(
+        claimed_correct and verifier_failure_evidence.get("available")
+    )
     diagnosis: dict[str, Any] = {
         "failure_types": [],
         "repeated_actions": sorted(repeated_actions, key=lambda item: item["first_step"]),
@@ -347,6 +386,15 @@ def diagnose_attempt(
         "phase_incomplete_autosubmission": bool(
             phase_incomplete and attempt_result.get("autosubmission_detected")
         ),
+        "phase_gate_events_observed": len(phase_events),
+        "interactive_editor_attempted": interactive_editor_attempted,
+        "test_attempted_during_edit": test_attempted_during_edit,
+        "repeated_disallowed_test": repeated_disallowed_test,
+        "declared_edit_not_executed_in_action": declared_edit_in_action,
+        "model_claim_conflicts_with_verifier": model_claim_conflicts,
+        "phase_stalled_in_edit": bool(phase_stalled and phase_at_termination == "edit"),
+        "no_target_edit_before_budget_exhaustion": no_target_edit_before_budget,
+        "verifier_failure_evidence": verifier_failure_evidence or None,
         "required_actions": {
             "inspect_target": bool(inspected_source_paths),
             "edit_target": target_changed,
@@ -358,11 +406,17 @@ def diagnose_attempt(
             ),
         },
         "required_next_phase": phase_at_termination
-        if phase_incomplete and isinstance(phase_at_termination, str)
+        if isinstance(phase_at_termination, str)
+        and not phase_state.get("workflow_complete")
         else ("edit" if repeated_tests or no_op_edits or declared_edit_not_executed else None),
         "phase_exit_condition": (
             {"target": target, "requires_nonempty_diff": True}
-            if repeated_tests or no_op_edits or declared_edit_not_executed
+            if (
+                repeated_tests
+                or no_op_edits
+                or declared_edit_not_executed
+                or phase_at_termination == "edit"
+            )
             else None
         ),
     }
@@ -415,6 +469,20 @@ def diagnose_attempt(
         failure_types.append("wrong_file_edit")
     if reasoning_action_mismatch:
         failure_types.append("possible_reasoning_action_mismatch")
+    if interactive_editor_attempted:
+        failure_types.append("interactive_editor_attempted")
+    if test_attempted_during_edit:
+        failure_types.append("test_attempted_during_edit")
+    if repeated_disallowed_test:
+        failure_types.append("repeated_disallowed_test")
+    if declared_edit_in_action:
+        failure_types.append("declared_edit_not_executed_in_action")
+    if model_claim_conflicts:
+        failure_types.append("model_claim_conflicts_with_verifier")
+    if phase_stalled and phase_at_termination == "edit":
+        failure_types.append("phase_stalled_in_edit")
+    if no_target_edit_before_budget:
+        failure_types.append("no_target_edit_before_budget_exhaustion")
     for flag in phase_flags:
         if flag not in failure_types:
             failure_types.append(flag)
@@ -459,6 +527,43 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
     no_op_edits = diagnosis.get("no_op_edits") or []
     declared_edits = diagnosis.get("declared_edit_not_executed") or []
     postcondition_failures = diagnosis.get("edit_postcondition_failures") or []
+    if (
+        diagnosis.get("no_target_edit_before_budget_exhaustion")
+        or diagnosis.get("phase_stalled_in_edit")
+    ) and not (postcondition_failures or declared_edits or no_op_edits or repeated_tests):
+        verifier_evidence = diagnosis.get("verifier_failure_evidence") or {}
+        verifier_summary = verifier_evidence.get("summary")
+        facts = []
+        if diagnosis.get("inspected_source_paths"):
+            facts.append(f"- The required source was inspected: {source}.")
+        if isinstance(verifier_summary, str) and verifier_summary:
+            facts.append(f"- {verifier_summary}")
+        if diagnosis.get("test_attempted_during_edit"):
+            facts.append("- Test actions were rejected because the required phase was edit.")
+        if diagnosis.get("interactive_editor_attempted"):
+            facts.append("- Interactive editor actions were rejected without execution.")
+        if diagnosis.get("declared_edit_not_executed_in_action"):
+            facts.append("- A source change was described, but no edit action applied it.")
+        facts.append("- No accepted target edit occurred before the attempt ended.")
+        return "\n".join(
+            [
+                "## CGR corrective evidence",
+                "",
+                "Previous attempt outcome:",
+                *facts,
+                "- Do not commit, push, modify remotes, or configure Git identity.",
+                "",
+                "Immediate required phase: edit",
+                "",
+                f"1. Issue exactly one noninteractive shell command that modifies {source}.",
+                "2. Do not run tests or open an interactive editor before that edit executes.",
+                "3. Display the changed target and inspect its target-specific diff.",
+                f"4. Run the configured focused verifier once: `{verifier}`.",
+                "5. Inspect the final diff and submit only after the verifier passes.",
+                "- The repair must remain your own; convert your reasoning into the edit action.",
+                "",
+            ]
+        )
     if postcondition_failures:
         labels = {
             "append_only_nonrepair_edit": "the change only appended content",
@@ -692,6 +797,23 @@ def _trajectory_steps(path: Path | None) -> list[dict[str, Any]]:
     return [step for step in steps if isinstance(step, dict)] if isinstance(steps, list) else []
 
 
+def _phase_gate_events(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, str) or not value:
+        return []
+    path = Path(value)
+    if not path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
 def _observation_for_step(steps: list[dict[str, Any]], index: int) -> str:
     value = steps[index - 1].get("observation")
     return value if isinstance(value, str) else ""
@@ -732,7 +854,8 @@ def _test_telemetry(
 ) -> dict[str, Any]:
     attempts: list[dict[str, Any]] = []
     command_pattern = re.compile(
-        r"(?:^|[\s;&|])(?:pytest|[^\s]+\s+-m\s+pytest|unittest|tox)(?:[\s;&|]|$)"
+        r"(?:^|[\s;&|])(?:pytest|[^\s]+\s+-m\s+(?:pytest|unittest)|unittest|tox)"
+        r"(?:[\s;&|]|$)"
     )
     environment_pattern = re.compile(
         r"no module named pytest|command not found|executable .* not found|permission denied",

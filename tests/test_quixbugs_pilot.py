@@ -144,6 +144,12 @@ def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: P
         initial_phase="edit",
         target="src/module.py",
         focused_test="tests/test_module.py",
+        verifier_failure_evidence={
+            "available": True,
+            "exit_code": 1,
+            "category": "recursion_error",
+            "summary": "The configured verifier failed with RecursionError.",
+        },
     )
     environment = os.environ.copy()
     environment["CGR_PHASE_GATE_CONFIG"] = str(config)
@@ -176,7 +182,97 @@ def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: P
         "prohibit_test_scaffolding": True,
         "require_existing_content_change": True,
     }
+    assert payload["verifier_failure_evidence"]["category"] == "recursion_error"
     assert json.loads(state_path.read_text(encoding="utf-8"))["current_phase"] == "edit"
+
+
+def test_posix_sweagent_executable_resolves_beside_python(tmp_path: Path) -> None:
+    python = tmp_path / "bin" / "python"
+    executable = tmp_path / "bin" / "sweagent"
+    python.parent.mkdir()
+    python.touch()
+    executable.touch()
+    executable.chmod(0o755)
+
+    resolved = pilot._resolve_sweagent_executable(
+        python, configured="", platform_name="posix"
+    )
+
+    assert resolved == executable.absolute()
+    assert resolved.is_absolute()
+
+
+def test_windows_sweagent_executable_resolves_beside_python(tmp_path: Path) -> None:
+    python = tmp_path / "Scripts" / "python.exe"
+    executable = tmp_path / "Scripts" / "sweagent.exe"
+    python.parent.mkdir()
+    python.touch()
+    executable.touch()
+
+    resolved = pilot._resolve_sweagent_executable(
+        python, configured="", platform_name="nt"
+    )
+
+    assert resolved == executable.absolute()
+
+
+def test_explicit_sweagent_executable_override_takes_precedence(tmp_path: Path) -> None:
+    python = tmp_path / "venv" / "bin" / "python"
+    override = tmp_path / "custom" / "sweagent"
+    override.parent.mkdir(parents=True)
+    override.touch()
+    override.chmod(0o755)
+
+    resolved = pilot._resolve_sweagent_executable(
+        python, configured=str(override), platform_name="posix"
+    )
+
+    assert resolved == override.absolute()
+
+
+def test_missing_sweagent_executable_is_adapter_bootstrap_error(tmp_path: Path) -> None:
+    with pytest.raises(pilot.AdapterBootstrapError, match="unavailable") as raised:
+        pilot._resolve_sweagent_executable(
+            tmp_path / "bin" / "python", configured="", platform_name="posix"
+        )
+
+    assert (
+        pilot._bootstrap_error_classification(raised.value, "infrastructure_error")
+        == "adapter_bootstrap_error"
+    )
+
+
+def test_nonexecutable_posix_sweagent_fails_clearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "bin" / "sweagent"
+    executable.parent.mkdir()
+    executable.touch()
+    monkeypatch.setattr(pilot.os, "access", lambda path, mode: False)
+
+    with pytest.raises(pilot.AdapterBootstrapError, match="not executable"):
+        pilot._resolve_sweagent_executable(
+            tmp_path / "bin" / "python", configured="", platform_name="posix"
+        )
+
+
+def test_adapter_environment_records_resolved_executable(tmp_path: Path) -> None:
+    executable = tmp_path / "bin" / "sweagent"
+    executable.parent.mkdir()
+    executable.touch()
+
+    environment = pilot._adapter_environment(
+        endpoint="http://127.0.0.1:8000/v1",
+        model="model",
+        api_key="key",
+        sweagent_source=tmp_path / "source",
+        sweagent_python=tmp_path / "bin" / "python",
+        runtime_root=tmp_path / "runtime",
+        deployment_type="docker",
+        sweagent_executable=executable.absolute(),
+    )
+
+    assert environment["CGR_SWE_AGENT_EXECUTABLE"] == str(executable.absolute())
 
 
 def test_unauthorized_autosubmission_is_retained_but_phase_incomplete() -> None:
@@ -365,6 +461,42 @@ def test_verifier_command_uses_configured_python() -> None:
         "-q",
         "python_testcases/test_gcd.py",
     ]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "category", "label"),
+    [
+        ("1 failed\nRecursionError: depth", "", "recursion_error", "RecursionError"),
+        ("2 failed", "AssertionError", "assertion_failure", "assertion failure"),
+        ("", "ModuleNotFoundError: missing", "import_error", "import error"),
+        ("", "SyntaxError: invalid syntax", "syntax_error", "SyntaxError"),
+    ],
+)
+def test_verifier_failure_summary_is_grounded_and_bounded(
+    stdout: str, stderr: str, category: str, label: str
+) -> None:
+    process = subprocess.CompletedProcess(["pytest"], 1, stdout, stderr)
+
+    evidence = pilot._summarize_verifier_failure(process, limit=120)
+
+    assert evidence["available"] is True
+    assert evidence["category"] == category
+    assert label in evidence["summary"]
+    assert len(evidence["summary"]) <= 120
+    assert "depth" not in evidence["summary"]
+
+
+def test_successful_pre_verifier_does_not_invent_failure_evidence() -> None:
+    evidence = pilot._summarize_verifier_failure(
+        subprocess.CompletedProcess(["pytest"], 0, "1 passed", "")
+    )
+
+    assert evidence == {
+        "available": False,
+        "exit_code": 0,
+        "category": None,
+        "summary": None,
+    }
 
 
 def test_agent_pytest_runtime_is_portable_and_preflighted(tmp_path: Path) -> None:

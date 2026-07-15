@@ -35,12 +35,18 @@ TEST = "tests/test_module.py"
     [
         ("cat src/module.py", "target_confirmation"),
         ("ls tests", "inspection"),
-        ("sed -i 's/a/b/' src/module.py", "edit_target_file"),
-        ("python -c \"open('src/module.py','w').write('x')\"", "edit_target_file"),
-        ("cat > src/module.py <<'EOF'\nx\nEOF", "edit_target_file"),
+        ("sed -i 's/a/b/' src/module.py", "noninteractive_edit"),
+        ("python -c \"open('src/module.py','w').write('x')\"", "noninteractive_edit"),
+        ("cat > src/module.py <<'EOF'\nx\nEOF", "noninteractive_edit"),
         ("git diff -- src/module.py", "git_diff"),
-        ("python -m pytest -q tests/test_module.py", "focused_test"),
-        ("pytest -q tests/test_other.py", "unrelated_test"),
+        ("python -m pytest -q tests/test_module.py", "focused_pytest"),
+        ("pytest -q tests/test_other.py", "unrelated_pytest"),
+        ("python -m unittest tests/test_module.py", "focused_unittest"),
+        ("python3 -m unittest discover", "unrelated_unittest"),
+        ("nano src/module.py", "interactive_editor"),
+        ("vim src/module.py", "interactive_editor"),
+        ("vi src/module.py", "interactive_editor"),
+        ("emacs src/module.py", "interactive_editor"),
         ("git commit -m x", "commit"),
         ("git push origin main", "push"),
         ("submit", "submission"),
@@ -54,10 +60,10 @@ def test_candidate_action_classification(action: str, kind: str) -> None:
 @pytest.mark.parametrize(
     ("action", "kind", "targets"),
     [
-        ("echo x > src/module.py", "edit_target_file", ("src/module.py",)),
-        ("printf x >> src/module.py", "edit_target_file", ("src/module.py",)),
-        ("printf x | tee src/module.py", "edit_target_file", ("src/module.py",)),
-        ("printf x | tee -a src/module.py", "edit_target_file", ("src/module.py",)),
+        ("echo x > src/module.py", "noninteractive_edit", ("src/module.py",)),
+        ("printf x >> src/module.py", "noninteractive_edit", ("src/module.py",)),
+        ("printf x | tee src/module.py", "noninteractive_edit", ("src/module.py",)),
+        ("printf x | tee -a src/module.py", "noninteractive_edit", ("src/module.py",)),
         ("touch tests/test_module.py", "edit_wrong_file", ("tests/test_module.py",)),
         ("echo x > tests/test_module.py", "edit_wrong_file", ("tests/test_module.py",)),
         (
@@ -72,18 +78,18 @@ def test_candidate_action_classification(action: str, kind: str) -> None:
         ),
         (
             "cat <<'EOF' > src/module.py\nx\nEOF",
-            "edit_target_file",
+            "noninteractive_edit",
             ("src/module.py",),
         ),
         (
             "python - <<'PY'\nfrom pathlib import Path\n"
             "Path('src/module.py').write_text('x')\nPY",
-            "edit_target_file",
+            "noninteractive_edit",
             ("src/module.py",),
         ),
         (
             "python -c \"from pathlib import Path; Path('src/module.py').open('w+').write('x')\"",
-            "edit_target_file",
+            "noninteractive_edit",
             ("src/module.py",),
         ),
     ],
@@ -153,6 +159,190 @@ def test_test_is_rejected_during_edit_without_execution() -> None:
     assert "Required phase: edit" in decision.feedback
 
 
+def test_edit_phase_test_feedback_uses_grounded_verifier_evidence() -> None:
+    gate = PhaseGate(
+        phase="edit",
+        target=TARGET,
+        focused_test=TEST,
+        verifier_failure_evidence={
+            "available": True,
+            "category": "recursion_error",
+            "summary": "The configured verifier failed with RecursionError.",
+        },
+    )
+
+    decision = gate.decide("python -m unittest test_module.py", RepositoryEvidence())
+
+    assert not decision.allowed
+    assert decision.candidate.kind == "unrelated_unittest"
+    assert "was not executed" in str(decision.feedback)
+    assert "RecursionError" in str(decision.feedback)
+    assert "Testing cannot satisfy the edit phase" in str(decision.feedback)
+
+
+def test_interactive_editor_is_classified_and_rejected_before_execution() -> None:
+    gate = PhaseGate(phase="edit", target=TARGET, focused_test=TEST)
+
+    decision = gate.decide(f"nano {TARGET}", RepositoryEvidence())
+
+    assert not decision.allowed
+    assert decision.candidate.kind == "interactive_editor"
+    assert "editor was not opened" in str(decision.feedback)
+    assert "sed -i" in str(decision.feedback)
+
+
+def test_repeated_test_coaching_escalates_but_remains_bounded(tmp_path: Path) -> None:
+    log_path = tmp_path / "events.jsonl"
+    gate = PhaseGate(
+        phase="edit",
+        target=TARGET,
+        focused_test=TEST,
+        log_path=log_path,
+        verifier_failure_evidence={
+            "available": True,
+            "summary": "The configured verifier failed with an assertion failure.",
+        },
+    )
+    action = "python -m unittest test_module.py"
+
+    feedback = [str(gate.decide(action, RepositoryEvidence()).feedback) for _ in range(3)]
+
+    assert "repository is unchanged" not in feedback[0]
+    assert "repository is unchanged" in feedback[1]
+    assert "Supported mechanisms include" in feedback[2]
+    assert max(map(len, feedback)) < 1500
+    assert gate.state["phase_rejection_count"] == 3
+    assert gate.state["repeated_candidate_count"] == 3
+    assert gate.state["repeated_kind_count"] == 3
+    assert gate.state["phase_stalled_repeated_action"] is True
+    assert gate.state["coaching_level"] == 3
+    events = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [event["coaching_level"] for event in events] == [1, 2, 3]
+    assert len({event["last_rejected_action_fingerprint"] for event in events}) == 1
+
+
+def test_declared_edit_without_action_is_telemetry_only() -> None:
+    gate = PhaseGate(phase="edit", target=TARGET, focused_test=TEST)
+    proposed = "I will modify the function implementation to return a different expression."
+
+    decision = gate.decide(
+        "git commit -am fix", RepositoryEvidence(), model_text=proposed
+    )
+
+    assert not decision.allowed
+    assert gate.state["declared_edit_without_edit_action"] is True
+    assert "did not apply" in str(decision.feedback)
+    assert "different expression" not in str(decision.feedback)
+    assert proposed not in str(decision.feedback)
+
+
+def test_phase_entry_coaching_is_grounded_and_does_not_reveal_repair() -> None:
+    gate = PhaseGate(
+        phase="inspect",
+        target=TARGET,
+        focused_test=TEST,
+        verifier_failure_evidence={
+            "available": True,
+            "summary": "The configured verifier failed with an assertion failure.",
+        },
+    )
+    decision = gate.decide(f"cat {TARGET}", RepositoryEvidence())
+    gate.record_execution(decision, observation="return a - b", evidence=RepositoryEvidence())
+
+    coaching = gate.phase_transition_coaching()
+
+    assert gate.phase == "edit"
+    assert "Current phase: edit" in coaching
+    assert "assertion failure" in coaching
+    assert "noninteractive shell action" in coaching
+    assert "return a + b" not in coaching
+
+
+def test_real_trajectory_shape_recovers_to_model_authored_complete_workflow() -> None:
+    gate = PhaseGate(
+        phase="inspect",
+        target=TARGET,
+        focused_test=TEST,
+        verifier_failure_evidence={
+            "available": True,
+            "summary": "The configured verifier failed with RecursionError.",
+        },
+    )
+    empty = RepositoryEvidence()
+    patch = RepositoryEvidence(target_diff="model patch", tracked_diff="model patch")
+
+    commit = gate.decide(
+        "git commit -am fix",
+        empty,
+        model_text="I propose modifying the function implementation.",
+    )
+    assert not commit.allowed
+    assert gate.state["declared_edit_without_edit_action"] is True
+
+    inspection = gate.decide(f"cat {TARGET}", empty)
+    gate.record_execution(inspection, observation="current source", evidence=empty)
+    assert gate.phase == "edit"
+
+    first_test = gate.decide(
+        "python -m unittest test_module.py",
+        empty,
+        model_text="The current implementation appears correct.",
+    )
+    editor = gate.decide(f"nano {TARGET}", empty)
+    repeated_test = gate.decide("python -m unittest test_module.py", empty)
+    assert first_test.candidate.kind == "unrelated_unittest"
+    assert editor.candidate.kind == "interactive_editor"
+    assert repeated_test.candidate.kind == "unrelated_unittest"
+    assert "repository is unchanged" in str(repeated_test.feedback)
+
+    model_edit_action = "sed -i 's/old expression/new expression/' src/module.py"
+    edit = gate.decide(model_edit_action, empty)
+    assert edit.allowed and edit.candidate.kind == "noninteractive_edit"
+    gate.record_execution(edit, observation="", evidence=patch)
+
+    confirmation = gate.decide(f"cat {TARGET}", patch)
+    gate.record_execution(confirmation, observation="updated source", evidence=patch)
+    target_diff = gate.decide(f"git diff -- {TARGET}", patch)
+    gate.record_execution(target_diff, observation="model patch", evidence=patch)
+    focused = gate.decide(f"python -m pytest -q {TEST}", patch)
+    gate.record_execution(focused, observation="1 passed in 0.01s", evidence=patch)
+    final_diff = gate.decide("git diff -- HEAD", patch)
+    gate.record_execution(final_diff, observation="model patch", evidence=patch)
+    submission = gate.decide("submit", patch)
+    gate.record_execution(submission, observation="submitted", evidence=patch)
+
+    assert gate.state["workflow_complete"] is True
+    assert gate.state["submission_authorized"] is True
+    assert gate.state["accepted_target_edit"] is True
+    assert model_edit_action == edit.candidate.raw
+
+
+def test_real_trajectory_shape_without_edit_fails_closed_at_budget_boundary() -> None:
+    gate = PhaseGate(
+        phase="inspect",
+        target=TARGET,
+        focused_test=TEST,
+        verifier_failure_evidence={
+            "available": True,
+            "summary": "The configured verifier failed with an assertion failure.",
+        },
+    )
+    empty = RepositoryEvidence()
+    inspection = gate.decide(f"cat {TARGET}", empty)
+    gate.record_execution(inspection, observation="current source", evidence=empty)
+    for action in (
+        "python -m unittest test_module.py",
+        f"nano {TARGET}",
+        "python -m unittest test_module.py",
+    ):
+        assert not gate.decide(action, empty).allowed
+
+    assert gate.phase == "edit"
+    assert gate.state["accepted_target_edit"] is False
+    assert gate.state["workflow_complete"] is False
+    assert gate.state["phase_stalled_repeated_action"] is True
+
+
 def test_inspection_is_allowed_during_inspect() -> None:
     gate = PhaseGate(phase="inspect", target=TARGET, focused_test=TEST)
 
@@ -195,14 +385,68 @@ def test_wrapper_returns_rejection_without_calling_executor(
     monkeypatch.setenv("CGR_PHASE_GATE_CONFIG", str(config))
 
     install_sweagent_phase_gate()
-    step = SimpleNamespace(
-        action="pytest -q tests/test_module.py", observation="", state=None
-    )
-    result = FakeAgent().handle_action(step)
+    results = []
+    for action in ("pytest -q tests/test_module.py", f"nano {TARGET}"):
+        step = SimpleNamespace(action=action, observation="", state=None)
+        results.append(FakeAgent().handle_action(step))
 
     assert executor_calls == []
-    assert "ACTION REJECTED BY CGR" in result.observation
-    assert result.state == {"working_dir": "/repo"}
+    assert all("ACTION REJECTED BY CGR" in result.observation for result in results)
+    assert all(result.state == {"working_dir": "/repo"} for result in results)
+    assert "editor was not opened" in results[1].observation
+
+
+def test_wrapper_preserves_source_observation_and_appends_phase_coaching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor_calls: list[str] = []
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = SimpleNamespace(communicate=lambda command, check: "")
+            self.tools = SimpleNamespace(get_state=lambda env: {"working_dir": "/repo"})
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            executor_calls.append(step.action)
+            step.observation = "def value():\n    return 1"
+            step.done = False
+            return step
+
+    sweagent = ModuleType("sweagent")
+    agent = ModuleType("sweagent.agent")
+    agents = ModuleType("sweagent.agent.agents")
+    agents.DefaultAgent = FakeAgent  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sweagent", sweagent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent", agent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent.agents", agents)
+    config = tmp_path / "phase-gate.json"
+    config.write_text(
+        json.dumps(
+            {
+                "initial_phase": "inspect",
+                "target": TARGET,
+                "focused_test": TEST,
+                "log_path": str(tmp_path / "events.jsonl"),
+                "verifier_failure_evidence": {
+                    "available": True,
+                    "summary": "The configured verifier failed with RecursionError.",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CGR_PHASE_GATE_CONFIG", str(config))
+    install_sweagent_phase_gate()
+    step = SimpleNamespace(
+        action=f"cat {TARGET}", observation="", state=None, thought="", output=""
+    )
+
+    result = FakeAgent().handle_action(step)
+
+    assert executor_calls == [f"cat {TARGET}"]
+    assert result.observation.startswith("def value():\n    return 1")
+    assert "CGR PHASE TRANSITION" in result.observation
+    assert "RecursionError" in result.observation
 
 
 def test_noop_and_malformed_edits_remain_in_edit() -> None:

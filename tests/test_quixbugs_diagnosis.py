@@ -802,6 +802,94 @@ def test_transaction_rejection_and_incomplete_autosubmission_drive_recovery(
     assert "gcd(a" not in correction
 
 
+def test_grounded_phase_stall_diagnosis_uses_gate_events(tmp_path: Path) -> None:
+    task, _manifest = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    events = tmp_path / "phase-gate-events.jsonl"
+    payloads = [
+        {
+            "allowed": False,
+            "phase_before": "edit",
+            "candidate": {"kind": "unrelated_unittest"},
+            "declared_edit_without_edit_action": True,
+        },
+        {
+            "allowed": False,
+            "phase_before": "edit",
+            "candidate": {"kind": "interactive_editor"},
+            "declared_edit_without_edit_action": False,
+        },
+        {
+            "allowed": False,
+            "phase_before": "edit",
+            "candidate": {"kind": "unrelated_unittest"},
+            "declared_edit_without_edit_action": False,
+        },
+    ]
+    events.write_text(
+        "".join(json.dumps(payload) + "\n" for payload in payloads), encoding="utf-8"
+    )
+    trajectory = tmp_path / "grounded-stall.traj"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "trajectory": [
+                    {
+                        "action": "cat python_programs/gcd.py",
+                        "observation": "def gcd(a, b):\n    return 0",
+                        "response": "The current implementation appears correct.",
+                    },
+                    {
+                        "action": "python -m unittest test_gcd.py",
+                        "observation": "ACTION REJECTED BY CGR",
+                    },
+                    {
+                        "action": "nano python_programs/gcd.py",
+                        "observation": "ACTION REJECTED BY CGR",
+                    },
+                    {
+                        "action": "python -m unittest test_gcd.py",
+                        "observation": "ACTION REJECTED BY CGR",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = {
+        "classification": "budget_exhausted",
+        "patch_size": 0,
+        "termination_reason": "exit_cost",
+        "phase_gate_event_log_path": str(events),
+        "phase_gate_state": {
+            "current_phase": "edit",
+            "workflow_complete": False,
+            "accepted_target_edit": False,
+            "phase_stalled_repeated_action": True,
+            "diagnostic_flags": [],
+        },
+        "pre_agent_verifier_failure_evidence": {
+            "available": True,
+            "category": "recursion_error",
+            "summary": "The configured verifier failed with RecursionError.",
+        },
+    }
+
+    diagnosis = diagnose_attempt(trajectory, tmp_path, result, task)
+    correction = build_corrective_message(diagnosis, task)
+
+    assert diagnosis["interactive_editor_attempted"] is True
+    assert diagnosis["test_attempted_during_edit"] is True
+    assert diagnosis["repeated_disallowed_test"] is True
+    assert diagnosis["declared_edit_not_executed_in_action"] is True
+    assert diagnosis["phase_stalled_in_edit"] is True
+    assert diagnosis["no_target_edit_before_budget_exhaustion"] is True
+    assert diagnosis["model_claim_conflicts_with_verifier"] is True
+    assert diagnosis["required_next_phase"] == "edit"
+    assert "RecursionError" in correction
+    assert "noninteractive shell command" in correction
+    assert "gcd(a" not in correction
+
+
 def test_unauthorized_patch_cannot_outrank_authorized_candidate() -> None:
     unauthorized = {
         "classification": "resolved",

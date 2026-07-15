@@ -39,6 +39,10 @@ class PhaseGateBootstrapError(RuntimeError):
     """Raised when the configured phase gate cannot be loaded before adapter startup."""
 
 
+class AdapterBootstrapError(RuntimeError):
+    """Raised when the official adapter executable cannot be launched safely."""
+
+
 def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one pinned Python QuixBugs task through SWE-agent.")
     parser.add_argument("--task-id", required=True)
@@ -113,6 +117,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     phase_config_path: Path | None = None
     phase_log_path: Path | None = None
     phase_state_path: Path | None = None
+    resolved_sweagent_executable: Path | None = None
     started = time.perf_counter()
     result: dict[str, Any] = {
         "task_id": args.task_id,
@@ -127,6 +132,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         source_root = args.quixbugs_root.absolute()
         sweagent_source = args.sweagent_source.absolute()
         sweagent_python = args.sweagent_python.absolute()
+        resolved_sweagent_executable = _resolve_sweagent_executable(sweagent_python)
         deployment_type = args.deployment_type or ("local" if os.name == "nt" else "docker")
         agent_python = (
             cycle._git_bash_path(sweagent_python)
@@ -157,6 +163,10 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         verifier_command = _verifier_command(task, sweagent_python)
         pre_verifier = _run_verifier(verifier_command, source_root, int(task["timeout_seconds"]))
         _write_process_artifacts(attempt, "pre-agent-verifier", verifier_command, pre_verifier)
+        verifier_failure_evidence = _summarize_verifier_failure(pre_verifier)
+        (attempt / "pre-agent-verifier-summary.json").write_text(
+            json.dumps(verifier_failure_evidence, indent=2), encoding="utf-8"
+        )
         if pre_verifier.returncode == 0:
             raise RuntimeError("Selected QuixBugs task does not fail before the agent run.")
 
@@ -203,6 +213,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 target=str(task["source_file"]),
                 focused_test=str(task["test_file"]),
                 snapshot_python=agent_python,
+                verifier_failure_evidence=verifier_failure_evidence,
             )
         adapter_command = _adapter_command(
             sweagent_python,
@@ -226,6 +237,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             runtime_root=runtime_root,
             deployment_type=deployment_type,
             phase_config=phase_config_path,
+            sweagent_executable=resolved_sweagent_executable,
         )
         _assert_phase_gate_config(phase_config_path, environment)
         (attempt / "environment.json").write_text(
@@ -237,6 +249,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                     "deployment_type": deployment_type,
                     "sweagent_source": str(sweagent_source),
                     "sweagent_python": str(sweagent_python),
+                    "sweagent_executable": str(resolved_sweagent_executable),
                     "action_level_interception": phase_config_path is not None,
                     "required_phase": args.required_phase,
                     "phase_gate_config_path": str(phase_config_path)
@@ -353,6 +366,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 "swe_rex_version": runtime_identity["swe_rex_version"],
                 "litellm_version": runtime_identity["litellm_version"],
                 "sweagent_source_modified": False,
+                "resolved_sweagent_executable": str(resolved_sweagent_executable),
                 "model_endpoint": endpoint,
                 "model_identifier": model,
                 "model_requests": model_requests,
@@ -372,6 +386,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 ),
                 "agent_editing_mechanisms": ["python", "sed", "cat_heredoc"],
                 "pre_agent_verifier_exit_code": pre_verifier.returncode,
+                "pre_agent_verifier_failure_evidence": verifier_failure_evidence,
                 "termination_reason": termination,
                 "trajectory_path": str(trajectory) if trajectory else None,
                 "prediction_path": str(prediction) if prediction else None,
@@ -419,12 +434,11 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:
         (attempt / "failure-traceback.log").write_text(traceback.format_exc(), encoding="utf-8")
-        phase_bootstrap = isinstance(exc, PhaseGateBootstrapError)
         result.update(
             {
-                "classification": "phase_gate_bootstrap_error"
-                if phase_bootstrap
-                else result["classification"],
+                "classification": _bootstrap_error_classification(
+                    exc, str(result["classification"])
+                ),
                 "infrastructure_status": "failed",
                 "top_level_exit_code": 1,
                 "error": str(exc),
@@ -434,6 +448,9 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 "phase_gate_event_log_path": str(phase_log_path) if phase_log_path else None,
                 "phase_gate_state_path": str(phase_state_path)
                 if phase_state_path
+                else None,
+                "resolved_sweagent_executable": str(resolved_sweagent_executable)
+                if resolved_sweagent_executable
                 else None,
                 "elapsed_seconds": time.perf_counter() - started,
             }
@@ -932,6 +949,7 @@ def _write_phase_gate_config(
     target: str,
     focused_test: str,
     snapshot_python: str = "python",
+    verifier_failure_evidence: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, Path]:
     attempt = attempt.resolve(strict=True)
     config_path = attempt / "phase-gate-config.json"
@@ -961,6 +979,13 @@ def _write_phase_gate_config(
                     "log_path": str(log_path),
                     "state_path": str(state_path),
                     "snapshot_python": snapshot_python,
+                    "verifier_failure_evidence": verifier_failure_evidence
+                    or {
+                        "available": False,
+                        "exit_code": None,
+                        "category": None,
+                        "summary": None,
+                    },
                     "edit_policy": {
                         "mode": edit_policy.mode,
                         "prohibit_test_scaffolding": edit_policy.prohibit_test_scaffolding,
@@ -1016,6 +1041,7 @@ def _assert_phase_gate_config(
         "state_path",
         "edit_policy",
         "snapshot_python",
+        "verifier_failure_evidence",
     }
     missing = sorted(required.difference(payload))
     if missing:
@@ -1045,6 +1071,14 @@ def _assert_phase_gate_config(
         raise PhaseGateBootstrapError("Phase-gate edit policy is missing or unsupported.")
     if not isinstance(payload["snapshot_python"], str) or not payload["snapshot_python"].strip():
         raise PhaseGateBootstrapError("Phase-gate snapshot interpreter is missing.")
+    verifier_evidence = payload["verifier_failure_evidence"]
+    if not isinstance(verifier_evidence, dict) or not isinstance(
+        verifier_evidence.get("available"), bool
+    ):
+        raise PhaseGateBootstrapError("Phase-gate verifier evidence is invalid.")
+    summary = verifier_evidence.get("summary")
+    if summary is not None and (not isinstance(summary, str) or len(summary) > 400):
+        raise PhaseGateBootstrapError("Phase-gate verifier summary is invalid.")
     return payload
 
 
@@ -1131,6 +1165,56 @@ def _run_verifier(command: list[str], cwd: Path, timeout: int) -> subprocess.Com
         timeout=timeout,
         check=False,
     )
+
+
+def _summarize_verifier_failure(
+    process: subprocess.CompletedProcess[str], *, limit: int = 400
+) -> dict[str, Any]:
+    if process.returncode == 0:
+        return {
+            "available": False,
+            "exit_code": 0,
+            "category": None,
+            "summary": None,
+        }
+    combined = "\n".join(part for part in (process.stdout, process.stderr) if part).strip()
+    category = "nonzero_exit"
+    label = "a nonzero exit"
+    patterns = (
+        (r"\bRecursionError\b", "recursion_error", "RecursionError"),
+        (r"\b(?:AssertionError|assertion failed)\b", "assertion_failure", "an assertion failure"),
+        (
+            r"\b(?:ModuleNotFoundError|ImportError)\b",
+            "import_error",
+            "an import error",
+        ),
+        (r"\bSyntaxError\b", "syntax_error", "a SyntaxError"),
+    )
+    for pattern, candidate_category, candidate_label in patterns:
+        if re.search(pattern, combined, re.I):
+            category = candidate_category
+            label = candidate_label
+            break
+    if category == "nonzero_exit":
+        exception = re.search(r"\b([A-Z][A-Za-z]+(?:Error|Exception))\b", combined)
+        if exception:
+            category = "exception"
+            label = exception.group(1)
+    failing_count = None
+    count_match = re.search(r"\b(\d+)\s+failed\b", combined, re.I)
+    if count_match:
+        failing_count = int(count_match.group(1))
+    summary = f"The configured verifier failed with {label}"
+    if failing_count is not None:
+        summary += f" ({failing_count} failing test{'s' if failing_count != 1 else ''})"
+    summary += "."
+    return {
+        "available": True,
+        "exit_code": process.returncode,
+        "category": category,
+        "failing_test_count": failing_count,
+        "summary": summary[:limit],
+    }
 
 
 def _write_process_artifacts(
@@ -1339,10 +1423,12 @@ def _adapter_environment(
     runtime_root: Path,
     deployment_type: str,
     phase_config: Path | None = None,
+    sweagent_executable: Path | None = None,
 ) -> dict[str, str]:
     if not endpoint or not model or not api_key:
         raise ValueError("CGR_DRAFT_BASE_URL, CGR_DRAFT_MODEL, and CGR_DRAFT_API_KEY are required.")
     environment = os.environ.copy()
+    executable = sweagent_executable or _resolve_sweagent_executable(sweagent_python)
     environment.update(
         {
             "CGR_DRAFT_BASE_URL": endpoint,
@@ -1350,9 +1436,7 @@ def _adapter_environment(
             "CGR_DRAFT_API_KEY": api_key,
             "CGR_DRAFT_MAX_MODEL_LEN": os.getenv("CGR_DRAFT_MAX_MODEL_LEN", "8192"),
             "CGR_SWE_AGENT_SOURCE": str(sweagent_source),
-            "CGR_SWE_AGENT_EXECUTABLE": os.getenv(
-                "CGR_SWE_AGENT_EXECUTABLE", str(sweagent_python.parent / "sweagent.exe")
-            ),
+            "CGR_SWE_AGENT_EXECUTABLE": str(executable),
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
             "GIT_CONFIG_COUNT": "1",
@@ -1379,6 +1463,44 @@ def _adapter_environment(
         if compat_text not in environment.get("PYTHONPATH", "").split(os.pathsep):
             environment["PYTHONPATH"] = compat_text + os.pathsep + environment.get("PYTHONPATH", "")
     return environment
+
+
+def _resolve_sweagent_executable(
+    sweagent_python: Path,
+    *,
+    configured: str | None = None,
+    platform_name: str | None = None,
+) -> Path:
+    platform = platform_name or os.name
+    override = configured if configured is not None else os.getenv("CGR_SWE_AGENT_EXECUTABLE")
+    if override:
+        expanded = Path(override).expanduser()
+        if expanded.is_absolute():
+            candidate = expanded
+        else:
+            located = shutil.which(override)
+            candidate = Path(located) if located else Path(os.path.abspath(expanded))
+    else:
+        filename = "sweagent.exe" if platform == "nt" else "sweagent"
+        candidate = sweagent_python.parent / filename
+    candidate = Path(os.path.abspath(candidate))
+    if not candidate.is_file():
+        raise AdapterBootstrapError(
+            f"Pinned official SWE-agent executable is unavailable: {candidate}"
+        )
+    if platform != "nt" and not os.access(candidate, os.X_OK):
+        raise AdapterBootstrapError(
+            f"Pinned official SWE-agent executable is not executable: {candidate}"
+        )
+    return candidate
+
+
+def _bootstrap_error_classification(exc: Exception, current: str) -> str:
+    if isinstance(exc, PhaseGateBootstrapError):
+        return "phase_gate_bootstrap_error"
+    if isinstance(exc, AdapterBootstrapError):
+        return "adapter_bootstrap_error"
+    return current
 
 
 def _classify_adapter_failure(

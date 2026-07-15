@@ -109,6 +109,28 @@ phase state as authoritative. An automatic patch emitted before phase
 completion is retained, classified `phase_incomplete`, and excluded from CGR
 selection even if an outer verifier happens to pass.
 
+The pilot resolves the official SWE-agent executable beside the configured
+SWE-agent Python interpreter: `sweagent.exe` on Windows and `sweagent` on
+POSIX. The resulting absolute path must exist and, on POSIX, be executable.
+`CGR_SWE_AGENT_EXECUTABLE` remains an explicit override, but a normal pinned
+virtual environment no longer needs that variable.
+
+The pre-agent verifier's full stdout and stderr remain separate retained
+artifacts. The phase configuration receives only a bounded normalized category,
+such as an assertion failure, `RecursionError`, import error, or syntax error.
+After target inspection, SWE-agent receives the unchanged source observation
+plus concise `edit` phase coaching grounded in that verifier result. Pytest,
+unittest, and interactive editors are classified explicitly and rejected before
+execution when they cannot satisfy the current phase. Repeated violations raise
+a bounded three-level coaching signal without increasing the model-call budget.
+
+SWE-agent's supported `StepOutput` supplies the parsed thought and raw response
+to the existing action wrapper. CGR can therefore record when the model
+describes a source change but submits a non-edit action. It never extracts,
+executes, or converts that prose into code; the next edit command must still be
+authored by the model. If those fields are absent in a future upstream version,
+the telemetry safely remains false and normal phase enforcement continues.
+
 ## External Model Run
 
 Set the existing provider variables and omit `--deterministic-model`:
@@ -120,7 +142,6 @@ export CGR_DRAFT_MODEL="Qwen/Qwen2.5-Coder-7B-Instruct"
 export CGR_DRAFT_MAX_MODEL_LEN=16384
 export CGR_SWE_AGENT_SOURCE="$PWD/.sandbox-sweagent-src"
 export CGR_SWE_AGENT_PYTHON="$PWD/.sandbox-sweagent-venv/bin/python"
-export CGR_SWE_AGENT_EXECUTABLE="$PWD/.sandbox-sweagent-venv/bin/sweagent"
 
 cgr-quixbugs-pilot \
   --mode baseline \

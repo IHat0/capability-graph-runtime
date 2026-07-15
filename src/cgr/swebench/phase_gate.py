@@ -128,6 +128,15 @@ def build_initial_phase_state(
         "diagnostic_flags": [],
         "rejected_edit_count": 0,
         "rollback_count": 0,
+        "phase_rejection_count": 0,
+        "repeated_candidate_count": 0,
+        "repeated_kind_count": 0,
+        "last_rejected_kind": None,
+        "last_rejected_action_fingerprint": None,
+        "declared_edit_without_edit_action": False,
+        "verifier_failure_summary_available": False,
+        "phase_stalled_repeated_action": False,
+        "coaching_level": 0,
     }
 
 
@@ -313,8 +322,11 @@ def classify_candidate_action(
         _looks_like_test_path(path) for path in write_targets
     )
     unrelated = any(path != normalized_target for path in write_targets)
+    test_framework = _test_framework(action)
     if re.search(r"(?:^|\s)git\s+(?:commit|push)(?:\s|$)", normalized):
         kind = "commit" if re.search(r"(?:^|\s)git\s+commit(?:\s|$)", normalized) else "push"
+    elif _interactive_editor(action):
+        kind = "interactive_editor"
     elif re.search(r"<<SWE_AGENT_SUBMISSION>>|model\.patch|^submit$", action, re.I):
         kind = "submission"
     elif re.search(r"(?:^|\s)git\s+diff(?:\s|$)", normalized):
@@ -323,13 +335,14 @@ def classify_candidate_action(
         if targets and unrelated:
             kind = "edit_mixed_targets"
         elif targets:
-            kind = "edit_target_file"
+            kind = "noninteractive_edit"
         else:
             kind = "edit_wrong_file"
     elif _has_write_intent(action):
         kind = "unknown"
-    elif re.search(r"(?:^|[\s;&|])(?:pytest|[^\s]+\s+-m\s+pytest)(?:[\s;&|]|$)", normalized):
-        kind = "focused_test" if focused_test and focused_test in action else "unrelated_test"
+    elif test_framework:
+        scope = "focused" if focused_test and normalized_test in action.replace("\\", "/") else "unrelated"
+        kind = f"{scope}_{test_framework}"
     elif _is_inspection(action):
         kind = "target_confirmation" if references_target else "inspection"
     else:
@@ -345,6 +358,35 @@ def classify_candidate_action(
     )
 
 
+def _test_framework(action: str) -> str | None:
+    normalized = " ".join(action.replace("\r", "").split())
+    module = re.search(
+        r"(?:^|[\s;&|])[^\s;&|]*python(?:3(?:\.\d+)?)?(?:\.exe)?\s+-m\s+"
+        r"(?P<framework>pytest|unittest)(?:[\s;&|]|$)",
+        normalized,
+        re.I,
+    )
+    if module:
+        return module.group("framework").lower()
+    direct = re.search(
+        r"(?:^|[\s;&|])(?P<framework>pytest|unittest)(?:\.exe)?(?:[\s;&|]|$)",
+        normalized,
+        re.I,
+    )
+    return direct.group("framework").lower() if direct else None
+
+
+def _interactive_editor(action: str) -> bool:
+    for segment in re.split(r"\s*(?:&&|\|\||\||;|\n)\s*", action.replace("\r", "")):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            continue
+        if tokens and Path(tokens[0]).name.lower() in {"nano", "vim", "vi", "emacs", "pico"}:
+            return True
+    return False
+
+
 class PhaseGate:
     def __init__(
         self,
@@ -356,6 +398,7 @@ class PhaseGate:
         state_path: Path | None = None,
         edit_policy: EditPolicy | None = None,
         snapshot_python: str = "python",
+        verifier_failure_evidence: dict[str, Any] | None = None,
     ) -> None:
         if phase not in PHASES:
             raise ValueError(f"Unsupported required phase: {phase}")
@@ -366,16 +409,31 @@ class PhaseGate:
         self.state_path = state_path
         self.edit_policy = edit_policy or EditPolicy()
         self.snapshot_python = snapshot_python
+        self.verifier_failure_evidence = (
+            verifier_failure_evidence if isinstance(verifier_failure_evidence, dict) else {}
+        )
         self.target_inspected = False
         self.target_diff_inspected = False
         self.last_failed_test_fingerprint: str | None = None
         self.last_failed_diff_fingerprint: str | None = None
+        self._rejected_action_counts: dict[str, int] = {}
+        self._rejected_kind_counts: dict[str, int] = {}
         self.state = build_initial_phase_state(
             initial_phase=phase, target=target, edit_policy=self.edit_policy
         )
+        self.state["verifier_failure_summary_available"] = bool(
+            self.verifier_failure_evidence.get("available")
+            and self.verifier_failure_evidence.get("summary")
+        )
         self._persist_state()
 
-    def decide(self, action: str, evidence: RepositoryEvidence) -> GateDecision:
+    def decide(
+        self,
+        action: str,
+        evidence: RepositoryEvidence,
+        *,
+        model_text: str = "",
+    ) -> GateDecision:
         candidate = classify_candidate_action(
             action, target=self.target, focused_test=self.focused_test
         )
@@ -390,10 +448,10 @@ class PhaseGate:
                 reason = "The edit does not modify the required production source file."
             elif candidate.kind == "edit_mixed_targets":
                 reason = "The command mixes the required source edit with unrelated or test-file writes."
-            elif candidate.kind != "edit_target_file":
+            elif candidate.kind != "noninteractive_edit":
                 reason = f"{_kind_label(candidate.kind)} cannot satisfy the edit phase."
         elif self.phase == "confirm_edit":
-            if candidate.kind == "edit_target_file":
+            if candidate.kind == "noninteractive_edit":
                 pass
             elif candidate.kind == "target_confirmation":
                 pass
@@ -403,7 +461,7 @@ class PhaseGate:
             else:
                 reason = f"{_kind_label(candidate.kind)} cannot satisfy confirm_edit."
         elif self.phase == "test":
-            if candidate.kind != "focused_test":
+            if candidate.kind not in {"focused_pytest", "focused_unittest"}:
                 reason = "Run only the configured focused verifier in the test phase."
             elif (
                 self.last_failed_test_fingerprint is not None
@@ -422,6 +480,7 @@ class PhaseGate:
                 reason = "Submission requires a nonempty tracked patch."
         if reason is None:
             return GateDecision(True, self.phase, candidate)
+        self._register_rejection(candidate, model_text=model_text)
         feedback = self._rejection_feedback(candidate, reason)
         decision = GateDecision(False, self.phase, candidate, feedback)
         self.record(decision, executed=False, accepted=False, phase_after=self.phase)
@@ -437,23 +496,136 @@ class PhaseGate:
         if candidate.write_targets:
             label = "Observed write target" if len(candidate.write_targets) == 1 else "Observed write targets"
             lines.append(f"{label}: {', '.join(candidate.write_targets)}")
-        lines.extend((f"Candidate kind: {candidate.kind}", "", reason))
-        if candidate.kind in {"edit_wrong_file", "edit_mixed_targets"}:
+        lines.extend((f"Candidate kind: {candidate.kind}", ""))
+        test_kinds = {
+            "focused_pytest",
+            "unrelated_pytest",
+            "focused_unittest",
+            "unrelated_unittest",
+        }
+        declared = bool(self.state["declared_edit_without_edit_action"])
+        level = int(self.state["coaching_level"])
+        if self.phase == "edit" and candidate.kind in test_kinds:
+            lines.append("The proposed test was not executed.")
+            verifier = self._verifier_failure_clause()
+            if verifier:
+                lines.append(verifier)
+            lines.append("Testing cannot satisfy the edit phase while the target is unchanged.")
+            if level >= 2:
+                lines.append("The repository is unchanged, so the repeated test remains blocked.")
+            constraint = self._edit_action_constraint(include_mechanisms=level >= 3)
+        elif candidate.kind == "interactive_editor":
+            lines.append("The editor was not opened because actions must be noninteractive.")
+            constraint = self._edit_action_constraint(include_mechanisms=True)
+        elif candidate.kind in {"edit_wrong_file", "edit_mixed_targets"}:
+            lines.append(reason)
             constraint = (
                 f"Return exactly one noninteractive command that edits {self.target}. "
                 "Do not create or modify tests, commit, submit, or run tests."
             )
         elif candidate.kind in {"commit", "push"}:
-            constraint = (
-                f"The {candidate.kind} was not executed and the required phase remains {self.phase}. "
-                "Return exactly one action that satisfies the current phase."
-            )
+            lines.append(reason)
+            if declared:
+                lines.append(
+                    "You described a possible source change but did not apply it. "
+                    "The executable action did not apply the described change."
+                )
+                constraint = (
+                    self._edit_action_constraint(include_mechanisms=level >= 2)
+                    if self.phase == "edit"
+                    else "The commit was not executed. First return exactly one inspection "
+                    "action that satisfies the current inspect phase."
+                )
+            else:
+                constraint = (
+                    f"The {candidate.kind} was not executed and the required phase remains "
+                    f"{self.phase}. Return exactly one action that satisfies the current phase."
+                )
         else:
-            constraint = (
-                "The proposed action was not executed. Return exactly one action that satisfies "
-                "the required phase."
-            )
+            lines.append(reason)
+            if self.phase == "edit" and declared:
+                lines.append(
+                    "You described a source change, but your executable action did not apply it. "
+                    "The action was not executed."
+                )
+                constraint = self._edit_action_constraint(include_mechanisms=level >= 2)
+            elif self.phase == "edit":
+                constraint = self._edit_action_constraint(include_mechanisms=level >= 3)
+            else:
+                constraint = (
+                    "The proposed action was not executed. Return exactly one action that "
+                    "satisfies the required phase."
+                )
         lines.extend((constraint, "Do not describe multiple future commands."))
+        return "\n".join(lines)
+
+    def _edit_action_constraint(self, *, include_mechanisms: bool) -> str:
+        message = (
+            "Return exactly one noninteractive shell command that changes the existing "
+            f"implementation in {self.target}."
+        )
+        if include_mechanisms:
+            message += (
+                " Supported mechanisms include sed -i, a Python file-writing command, or a "
+                "heredoc/full-file rewrite."
+            )
+        return message + " Do not run tests, open an editor, commit, or submit."
+
+    def _verifier_failure_clause(self) -> str:
+        summary = self.verifier_failure_evidence.get("summary")
+        return str(summary)[:400] if isinstance(summary, str) else ""
+
+    def _register_rejection(self, candidate: CandidateAction, *, model_text: str) -> None:
+        fingerprint = _fingerprint(" ".join(candidate.raw.split()))
+        self._rejected_action_counts[fingerprint] = (
+            self._rejected_action_counts.get(fingerprint, 0) + 1
+        )
+        self._rejected_kind_counts[candidate.kind] = (
+            self._rejected_kind_counts.get(candidate.kind, 0) + 1
+        )
+        self.state["phase_rejection_count"] += 1
+        self.state["repeated_candidate_count"] = self._rejected_action_counts[fingerprint]
+        self.state["repeated_kind_count"] = self._rejected_kind_counts[candidate.kind]
+        self.state["last_rejected_kind"] = candidate.kind
+        self.state["last_rejected_action_fingerprint"] = fingerprint
+        declared = candidate.kind not in {
+            "noninteractive_edit",
+            "edit_mixed_targets",
+        } and _declares_source_change(model_text, self.target)
+        self.state["declared_edit_without_edit_action"] = declared
+        if int(self.state["repeated_candidate_count"]) >= 2:
+            self.state["phase_stalled_repeated_action"] = True
+        self.state["coaching_level"] = min(
+            3,
+            max(
+                1,
+                int(self.state["repeated_candidate_count"]),
+                int(self.state["repeated_kind_count"]),
+            ),
+        )
+
+    def phase_transition_coaching(self) -> str:
+        lines = [
+            "CGR PHASE TRANSITION",
+            "",
+            "Current phase: edit",
+            f"Required target: {self.target}",
+            "",
+        ]
+        verifier = self._verifier_failure_clause()
+        if verifier:
+            lines.append(verifier)
+        lines.extend(
+            (
+                "Inspection alone does not satisfy the task. Return exactly one "
+                "noninteractive shell action that changes the existing implementation in "
+                "the required target.",
+                "Allowed mechanisms include sed -i, a Python file-writing command, or a "
+                "heredoc/full-file rewrite.",
+                "Do not run tests, open an interactive editor, commit, submit, or merely "
+                "describe the change.",
+            )
+        )
         return "\n".join(lines)
 
     def transactional_rejection_feedback(self, evaluation: EditEvaluation) -> str:
@@ -475,7 +647,7 @@ class PhaseGate:
         return (
             "ACTION REJECTED BY CGR\n\n"
             f"Required phase: edit\nRequired target: {self.target}\n"
-            "Candidate kind: edit_target_file\n\n"
+            "Candidate kind: noninteractive_edit\n\n"
             "The command executed, but its resulting change was rejected and rolled back. "
             f"{reason}. The required phase remains edit.\n"
             f"Return exactly one noninteractive command that changes the existing production "
@@ -501,7 +673,7 @@ class PhaseGate:
             self.target_inspected = True
             self.state["target_inspected"] = True
             self.phase = "edit"
-        elif phase_before in {"edit", "confirm_edit"} and kind == "edit_target_file":
+        elif phase_before in {"edit", "confirm_edit"} and kind == "noninteractive_edit":
             prior_edit_accepted = bool(self.state["accepted_target_edit"])
             self.target_inspected = False
             self.target_diff_inspected = False
@@ -550,7 +722,7 @@ class PhaseGate:
             self.state["target_diff_inspected"] = self.target_diff_inspected
         if self.phase == "confirm_edit" and self.target_inspected and self.target_diff_inspected:
             self.phase = "test"
-        if phase_before == "test" and kind == "focused_test":
+        if phase_before == "test" and kind in {"focused_pytest", "focused_unittest"}:
             self.state["focused_test_executed"] = True
             if _test_passed(observation):
                 self.last_failed_test_fingerprint = None
@@ -574,6 +746,16 @@ class PhaseGate:
                 evidence.tracked_diff
             )
         self.state["current_phase"] = self.phase
+        if self.phase != phase_before:
+            self._rejected_action_counts.clear()
+            self._rejected_kind_counts.clear()
+            self.state["phase_rejection_count"] = 0
+            self.state["repeated_candidate_count"] = 0
+            self.state["repeated_kind_count"] = 0
+            self.state["last_rejected_kind"] = None
+            self.state["last_rejected_action_fingerprint"] = None
+            self.state["declared_edit_without_edit_action"] = False
+            self.state["coaching_level"] = 1 if self.phase == "edit" else 0
         self.record(
             decision,
             executed=True,
@@ -622,6 +804,23 @@ class PhaseGate:
             "post_action_fingerprint": post_action_fingerprint,
             "postcondition_failures": list(postcondition_failures),
             "diff_evidence": asdict(diff_evidence) if diff_evidence else None,
+            "phase_rejection_count": self.state["phase_rejection_count"],
+            "repeated_candidate_count": self.state["repeated_candidate_count"],
+            "repeated_kind_count": self.state["repeated_kind_count"],
+            "last_rejected_kind": self.state["last_rejected_kind"],
+            "last_rejected_action_fingerprint": self.state[
+                "last_rejected_action_fingerprint"
+            ],
+            "declared_edit_without_edit_action": self.state[
+                "declared_edit_without_edit_action"
+            ],
+            "verifier_failure_summary_available": self.state[
+                "verifier_failure_summary_available"
+            ],
+            "phase_stalled_repeated_action": self.state[
+                "phase_stalled_repeated_action"
+            ],
+            "coaching_level": self.state["coaching_level"],
         }
         if self.log_path is not None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -665,15 +864,19 @@ def install_sweagent_phase_gate() -> None:
                 else None,
                 edit_policy=EditPolicy.from_mapping(config.get("edit_policy")),
                 snapshot_python=str(config.get("snapshot_python", "python")),
+                verifier_failure_evidence=config.get("verifier_failure_evidence"),
             )
             self._cgr_phase_gate_state = gate
         evidence = _probe_repository(self, gate.target)
-        decision = gate.decide(step.action, evidence)
+        model_text = _normalize_observation_text(
+            getattr(step, "thought", "") or getattr(step, "output", "")
+        )
+        decision = gate.decide(step.action, evidence, model_text=model_text)
         if not decision.allowed:
             step.observation = decision.feedback or "Action rejected by CGR."
             step.state = self.tools.get_state(env=self._env)
             return step
-        if decision.candidate.kind == "edit_target_file":
+        if decision.candidate.kind == "noninteractive_edit":
             before = _snapshot_file(self, gate.target, gate.snapshot_python)
             try:
                 result = original(self, step)
@@ -724,6 +927,13 @@ def install_sweagent_phase_gate() -> None:
             observation=_normalize_observation_text(result.observation),
             evidence=evidence,
         )
+        if decision.phase == "inspect" and gate.phase == "edit":
+            source_observation = _normalize_observation_text(result.observation)
+            result.observation = (
+                source_observation.rstrip()
+                + "\n\n"
+                + gate.phase_transition_coaching()
+            )
         return result
 
     handle_action._cgr_phase_gate = True  # type: ignore[attr-defined]
@@ -961,12 +1171,32 @@ def _is_inspection(action: str) -> bool:
 
 def _kind_label(kind: str) -> str:
     return {
-        "focused_test": "Testing",
-        "unrelated_test": "An unrelated test",
+        "focused_pytest": "Testing with pytest",
+        "unrelated_pytest": "An unrelated pytest invocation",
+        "focused_unittest": "Testing with unittest",
+        "unrelated_unittest": "An unrelated unittest invocation",
+        "interactive_editor": "An interactive editor",
         "commit": "A commit",
         "push": "A push",
         "submission": "Submission",
     }.get(kind, f"Action kind {kind!r}")
+
+
+def _declares_source_change(model_text: str, target: str) -> bool:
+    if not model_text.strip():
+        return False
+    lowered = model_text.lower()
+    target_name = Path(target).name.lower()
+    intent = bool(
+        re.search(
+            r"\b(?:change|edit|implement|modify|replace|rewrite|update|fix)\w*\b",
+            lowered,
+        )
+    )
+    source_context = target_name in lowered or bool(
+        re.search(r"\b(?:source|implementation|function|method|class|code)\b", lowered)
+    )
+    return intent and source_context
 
 
 def _test_passed(observation: str) -> bool:
