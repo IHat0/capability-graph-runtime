@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 
 
+if os.getenv("CGR_PHASE_GATE_CONFIG"):
+    from cgr.swebench.phase_gate import install_sweagent_phase_gate
+
+    install_sweagent_phase_gate()
+
+
 if os.getenv("CGR_SANDBOX_WINDOWS_SWEREX") == "1":
     import pexpect  # type: ignore[import-untyped]
 
@@ -156,7 +162,7 @@ if os.getenv("CGR_SANDBOX_WINDOWS_SWEREX") == "1":
         raise RuntimeError("The Windows sandbox uses a preexisting repository; upload is disabled.")
 
     _local._check_bash_command = _check_bash_command
-    _local.LocalRuntime.create_session = _create_session
-    _local.LocalRuntime.read_file = _read_file
-    _local.LocalRuntime.write_file = _write_file
-    _local.LocalRuntime.upload = _upload
+    _local.LocalRuntime.create_session = _create_session  # type: ignore[method-assign]
+    _local.LocalRuntime.read_file = _read_file  # type: ignore[method-assign]
+    _local.LocalRuntime.write_file = _write_file  # type: ignore[method-assign]
+    _local.LocalRuntime.upload = _upload  # type: ignore[method-assign]

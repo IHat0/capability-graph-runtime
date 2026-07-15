@@ -199,3 +199,46 @@ def test_actionable_recovery_requires_grounded_noop_edit() -> None:
             "phase_exit_condition": {"requires_nonempty_diff": True},
         }
     )
+
+
+def test_attempt_timeout_default_is_bounded_and_configurable() -> None:
+    assert pilot.DEFAULT_ATTEMPT_TIMEOUT_SECONDS == 600
+
+
+def test_adapter_timeout_terminates_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProcess:
+        pid = 123
+        returncode = -1
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def communicate(self, timeout: int | None = None) -> tuple[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(["adapter"], timeout)
+            return "partial stdout", "partial stderr"
+
+    fake = FakeProcess()
+    popen_arguments: dict[str, object] = {}
+    terminated: list[object] = []
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
+        popen_arguments.update(kwargs)
+        return fake
+
+    monkeypatch.setattr(pilot.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(pilot, "_terminate_process_group", terminated.append)
+
+    result, timed_out = pilot._run_adapter_process(
+        ["adapter"], cwd=pilot.Path.cwd(), timeout=600, environment={}
+    )
+
+    assert timed_out is True
+    assert result.stdout == "partial stdout"
+    assert result.stderr == "partial stderr"
+    assert terminated == [fake]
+    if pilot.os.name == "nt":
+        assert popen_arguments["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert popen_arguments["start_new_session"] is True

@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from cgr.quixbugs_diagnosis import build_corrective_message, diagnose_attempt
 
 DEFAULT_MANIFEST = Path("benchmark-manifests/quixbugs-python-pilot-v1.json")
 DEFAULT_RESULT_ROOT = Path("benchmark-results/quixbugs-python-pilot-v1")
+DEFAULT_ATTEMPT_TIMEOUT_SECONDS = 600
 
 
 def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
@@ -34,6 +36,9 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deterministic-model", action="store_true")
     parser.add_argument("--deployment-type", choices=("docker", "local"))
     parser.add_argument(
+        "--attempt-timeout-seconds", type=int, default=DEFAULT_ATTEMPT_TIMEOUT_SECONDS
+    )
+    parser.add_argument(
         "--sweagent-source",
         type=Path,
         default=Path(os.getenv("CGR_SWE_AGENT_SOURCE", ".sandbox-sweagent-src")),
@@ -45,6 +50,11 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--attempt-parent", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--correction-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--required-phase",
+        choices=("inspect", "edit", "confirm_edit", "test", "final_diff", "submit"),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--deterministic-profile",
         choices=(
@@ -65,6 +75,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         max_attempts = 1 if args.mode == "baseline" else 2
     if max_attempts < 1:
         parser.error("--max-attempts must be at least 1")
+    if args.attempt_timeout_seconds <= 0:
+        parser.error("--attempt-timeout-seconds must be positive")
     if args.mode == "baseline" and max_attempts != 1:
         parser.error("baseline mode supports exactly one attempt")
     if args.mode == "cgr" and max_attempts > 3:
@@ -164,6 +176,21 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
 
         overlay_path = attempt / "sweagent-config.yaml"
         overlay_path.write_text(_quixbugs_overlay(agent_python), encoding="utf-8")
+        phase_config_path: Path | None = None
+        if args.required_phase:
+            phase_config_path = attempt / "phase-gate-config.json"
+            phase_config_path.write_text(
+                json.dumps(
+                    {
+                        "initial_phase": args.required_phase,
+                        "target": task["source_file"],
+                        "focused_test": task["test_file"],
+                        "log_path": str(attempt / "phase-gate-events.jsonl"),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         adapter_command = _adapter_command(
             sweagent_python,
             workspace,
@@ -182,6 +209,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             sweagent_python=sweagent_python,
             runtime_root=runtime_root,
             deployment_type=deployment_type,
+            phase_config=phase_config_path,
         )
         (attempt / "environment.json").write_text(
             json.dumps(
@@ -192,22 +220,19 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                     "deployment_type": deployment_type,
                     "sweagent_source": str(sweagent_source),
                     "sweagent_python": str(sweagent_python),
-                    "action_level_interception": False,
+                    "action_level_interception": phase_config_path is not None,
+                    "required_phase": args.required_phase,
+                    "attempt_timeout_seconds": args.attempt_timeout_seconds,
                 },
                 indent=2,
             ),
             encoding="utf-8",
         )
-        adapter = subprocess.run(
+        adapter, attempt_timed_out = _run_adapter_process(
             adapter_command,
             cwd=Path.cwd(),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=int(task["timeout_seconds"]),
-            check=False,
-            env=environment,
+            timeout=args.attempt_timeout_seconds,
+            environment=environment,
         )
         (attempt / "adapter.stdout.log").write_text(adapter.stdout, encoding="utf-8")
         (attempt / "adapter.stderr.log").write_text(adapter.stderr, encoding="utf-8")
@@ -233,7 +258,9 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
 
         verifier: subprocess.CompletedProcess[str] | None = None
         classification: str
-        if adapter.returncode == 0 and adapter_result.get("ok"):
+        if attempt_timed_out:
+            classification = "attempt_timeout"
+        elif adapter.returncode == 0 and adapter_result.get("ok"):
             if not diff.strip():
                 classification = "no_patch"
             else:
@@ -296,6 +323,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 "infrastructure_status": "completed",
                 "top_level_exit_code": 0,
                 "adapter_exit_code": adapter.returncode,
+                "attempt_timed_out": attempt_timed_out,
+                "attempt_timeout_seconds": args.attempt_timeout_seconds,
                 "elapsed_seconds": time.perf_counter() - started,
                 "artifact_hash_manifest": str(attempt / "artifact-sha256.json"),
             }
@@ -364,6 +393,7 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
                 args,
                 run,
                 correction=latest_correction,
+                required_phase=latest_required_phase,
                 profile=profiles[attempt_index - 1],
             )
             child_results.append(child)
@@ -471,6 +501,7 @@ def _launch_child_attempt(
     run: Path,
     *,
     correction: Path | None = None,
+    required_phase: str | None = None,
     profile: str,
 ) -> dict[str, Any]:
     command = [
@@ -497,6 +528,8 @@ def _launch_child_attempt(
         str(run),
         "--deterministic-profile",
         profile,
+        "--attempt-timeout-seconds",
+        str(args.attempt_timeout_seconds),
     ]
     if args.deployment_type:
         command.extend(["--deployment-type", args.deployment_type])
@@ -504,6 +537,8 @@ def _launch_child_attempt(
         command.append("--deterministic-model")
     if correction is not None:
         command.extend(["--correction-file", str(correction)])
+    if required_phase is not None:
+        command.extend(["--required-phase", required_phase])
     index = len(list(run.glob("attempt-*/final-result.json"))) + 1
     process = subprocess.run(
         command,
@@ -732,6 +767,59 @@ def _verifier_command(task: dict[str, Any], python: Path) -> list[str]:
     return [value.replace("{python}", str(python)) for value in command]
 
 
+def _run_adapter_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    environment: dict[str, str],
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        start_new_session=os.name != "nt",
+        creationflags=creationflags,
+    )
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(process)
+        stdout, stderr = process.communicate()
+    return (
+        subprocess.CompletedProcess(command, process.returncode, stdout, stderr),
+        timed_out,
+    )
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)  # type: ignore[attr-defined]
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+    except ProcessLookupError:
+        pass
+
+
 def _run_verifier(command: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
@@ -787,7 +875,15 @@ def _deterministic_actions(
             str(task["agent_verifier_command"]),
         ]
     if profile == "declared_edit":
-        return [str(task["agent_verifier_command"])]
+        return [
+            str(task["agent_verifier_command"]),
+            f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
+            f"sed -n '1,30p' {shlex_quote(source)}",
+            f"git diff -- {shlex_quote(source)}",
+            str(task["agent_verifier_command"]),
+            f"git diff -- {shlex_quote(source)}",
+            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
+        ]
     if profile == "recovery":
         return [
             f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
@@ -896,6 +992,7 @@ def _adapter_environment(
     sweagent_python: Path,
     runtime_root: Path,
     deployment_type: str,
+    phase_config: Path | None = None,
 ) -> dict[str, str]:
     if not endpoint or not model or not api_key:
         raise ValueError("CGR_DRAFT_BASE_URL, CGR_DRAFT_MODEL, and CGR_DRAFT_API_KEY are required.")
@@ -919,6 +1016,10 @@ def _adapter_environment(
     )
     environment.pop("CGR_ACTION_VALIDATOR_COMMAND", None)
     environment.pop("CGR_ACTION_VALIDATION_LOG", None)
+    if phase_config is not None:
+        environment["CGR_PHASE_GATE_CONFIG"] = str(phase_config)
+        compat = Path(cycle.__file__).with_name("sandbox_compat").absolute()
+        environment["PYTHONPATH"] = str(compat) + os.pathsep + environment.get("PYTHONPATH", "")
     if deployment_type == "local" and os.name == "nt":
         environment.update(
             {
@@ -928,7 +1029,9 @@ def _adapter_environment(
             }
         )
         compat = Path(cycle.__file__).with_name("sandbox_compat").absolute()
-        environment["PYTHONPATH"] = str(compat) + os.pathsep + environment.get("PYTHONPATH", "")
+        compat_text = str(compat)
+        if compat_text not in environment.get("PYTHONPATH", "").split(os.pathsep):
+            environment["PYTHONPATH"] = compat_text + os.pathsep + environment.get("PYTHONPATH", "")
     return environment
 
 
