@@ -917,6 +917,45 @@ def test_model_request_count_can_be_derived_from_trajectory(tmp_path: Path) -> N
     assert _trajectory_step_count(trajectory) == 2
 
 
+def test_diagnosis_attributes_postinspection_timeout_to_cgr_not_model(
+    tmp_path: Path,
+) -> None:
+    result = {
+        "classification": "phase_incomplete",
+        "patch_size": 0,
+        "termination_reason": "exit_cost",
+        "phase_gate_state": {
+            "current_phase": "edit",
+            "workflow_complete": False,
+            "transactional_cleanup_verified": True,
+            "last_transaction_failure_kind": "cgr_postinspection_timeout",
+            "last_transaction": {
+                "status": "rejected",
+                "failure_kind": "cgr_postinspection_timeout",
+                "timeout_owner": "cgr_internal_inspection",
+                "timeout_operation": "post_edit_target_snapshot_and_diff",
+                "execution_returned_normally": True,
+                "model_action_completed_before_timeout": True,
+                "rollback_verified": True,
+                "transaction_closed": True,
+            },
+        },
+    }
+
+    diagnosis = diagnose_attempt(None, tmp_path, result)
+
+    assert diagnosis["transaction_failure_kind"] == "cgr_postinspection_timeout"
+    assert diagnosis["transaction_timeout_owner"] == "cgr_internal_inspection"
+    assert (
+        diagnosis["transaction_timeout_operation"]
+        == "post_edit_target_snapshot_and_diff"
+    )
+    assert diagnosis["transaction_closed"] is True
+    assert diagnosis["transactional_cleanup_verified"] is True
+    assert "cgr_postinspection_timeout" in diagnosis["failure_types"]
+    assert "model_failure" not in diagnosis["failure_types"]
+
+
 def _write_trajectory(tmp_path: Path) -> Path:
     path = tmp_path / "failed.traj"
     path.write_text(

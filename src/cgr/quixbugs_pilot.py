@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,10 @@ from cgr.swebench import sandbox_full_cycle as cycle
 from cgr.swebench.phase_gate import (
     EditPolicy,
     PatchAuthorization,
+    TransactionReconciliation,
     authorize_phase_patch,
     build_initial_phase_state,
+    reconcile_incomplete_transaction,
     write_phase_state,
 )
 
@@ -214,6 +217,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 focused_test=str(task["test_file"]),
                 snapshot_python=agent_python,
                 verifier_failure_evidence=verifier_failure_evidence,
+                host_workspace_root=workspace if deployment_type == "local" else None,
             )
         adapter_command = _adapter_command(
             sweagent_python,
@@ -278,15 +282,30 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             json.dumps(adapter_result, indent=2), encoding="utf-8"
         )
 
-        final_status = cycle._git(workspace, "status", "--porcelain=v1").stdout
-        diff = cycle._git(workspace, "diff", "--binary", "HEAD", "--").stdout
-        (attempt / "final-git-status.txt").write_text(final_status, encoding="utf-8")
-        (attempt / "workspace.patch").write_text(diff, encoding="utf-8")
+        precleanup_status = cycle._git(workspace, "status", "--porcelain=v1").stdout
+        precleanup_diff = cycle._git(workspace, "diff", "--binary", "HEAD", "--").stdout
         trajectory = cycle._optional_artifact(attempt, "*.traj")
         prediction = cycle._optional_artifact(attempt, "*.pred")
         submitted_patch = cycle._optional_artifact(attempt, "*.patch")
         termination = cycle._trajectory_exit_status(trajectory) if trajectory else None
         phase_state = _load_phase_gate_state(phase_state_path)
+        (
+            phase_state,
+            reconciliation,
+            unauthorized_precleanup_path,
+            unauthorized_precleanup_status_path,
+        ) = _reconcile_phase_transaction(
+            attempt,
+            workspace,
+            phase_state,
+            phase_state_path,
+            precleanup_status,
+            precleanup_diff,
+        )
+        final_status = cycle._git(workspace, "status", "--porcelain=v1").stdout
+        diff = cycle._git(workspace, "diff", "--binary", "HEAD", "--").stdout
+        (attempt / "final-git-status.txt").write_text(final_status, encoding="utf-8")
+        (attempt / "workspace.patch").write_text(diff, encoding="utf-8")
         if phase_state is not None:
             assert phase_state_path is not None
             phase_state["terminal_reason"] = termination
@@ -297,8 +316,9 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             else PatchAuthorization(bool(diff.strip()), (), None)
         )
         patch_emitted = bool(diff.strip())
+        precleanup_patch_emitted = bool(precleanup_diff.strip())
         autosubmission_detected = bool(
-            patch_emitted
+            precleanup_patch_emitted
             and phase_state is not None
             and not phase_state.get("submission_authorized")
         )
@@ -311,7 +331,11 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
 
         verifier: subprocess.CompletedProcess[str] | None = None
         classification: str
-        if attempt_timed_out:
+        if reconciliation.required and not reconciliation.verified:
+            classification = "transactional_cleanup_failure"
+        elif reconciliation.required:
+            classification = "phase_incomplete"
+        elif attempt_timed_out:
             classification = "attempt_timeout"
         elif adapter.returncode == 0 and adapter_result.get("ok"):
             if not diff.strip():
@@ -335,12 +359,13 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 stderr=adapter.stderr,
                 phase_config=phase_config_path,
             )
-        classification = _phase_aware_classification(
-            classification,
-            gate_enabled=phase_config_path is not None,
-            patch_emitted=patch_emitted,
-            authorization=phase_authorization,
-        )
+        if not reconciliation.required:
+            classification = _phase_aware_classification(
+                classification,
+                gate_enabled=phase_config_path is not None,
+                patch_emitted=patch_emitted,
+                authorization=phase_authorization,
+            )
         if verifier is not None:
             _write_process_artifacts(attempt, "verifier", verifier_command, verifier)
         else:
@@ -349,8 +374,10 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             )
 
         bootstrap_failure = classification in BOOTSTRAP_CLASSIFICATIONS
-        infrastructure_failure = bootstrap_failure or (
-            classification == "model_failure" and model_requests == 0
+        infrastructure_failure = (
+            bootstrap_failure
+            or classification == "transactional_cleanup_failure"
+            or (classification == "model_failure" and model_requests == 0)
         )
         adapter_error = (
             adapter_result.get("error")
@@ -404,6 +431,17 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 else None,
                 "workflow_complete": bool(phase_state and phase_state.get("workflow_complete")),
                 "patch_emitted": patch_emitted,
+                "precleanup_patch_emitted": precleanup_patch_emitted,
+                "precleanup_patch_size": len(precleanup_diff.encode("utf-8")),
+                "unauthorized_precleanup_patch_path": str(unauthorized_precleanup_path)
+                if unauthorized_precleanup_path
+                else None,
+                "unauthorized_precleanup_status_path": str(
+                    unauthorized_precleanup_status_path
+                )
+                if unauthorized_precleanup_status_path
+                else None,
+                "transaction_reconciliation": asdict(reconciliation),
                 "patch_phase_authorized": phase_authorization.authorized,
                 "patch_authorization_failures": list(phase_authorization.failures),
                 "final_patch_fingerprint": phase_authorization.fingerprint,
@@ -950,6 +988,7 @@ def _write_phase_gate_config(
     focused_test: str,
     snapshot_python: str = "python",
     verifier_failure_evidence: dict[str, Any] | None = None,
+    host_workspace_root: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     attempt = attempt.resolve(strict=True)
     config_path = attempt / "phase-gate-config.json"
@@ -979,6 +1018,9 @@ def _write_phase_gate_config(
                     "log_path": str(log_path),
                     "state_path": str(state_path),
                     "snapshot_python": snapshot_python,
+                    "host_workspace_root": str(host_workspace_root.absolute())
+                    if host_workspace_root is not None
+                    else None,
                     "verifier_failure_evidence": verifier_failure_evidence
                     or {
                         "available": False,
@@ -1071,6 +1113,11 @@ def _assert_phase_gate_config(
         raise PhaseGateBootstrapError("Phase-gate edit policy is missing or unsupported.")
     if not isinstance(payload["snapshot_python"], str) or not payload["snapshot_python"].strip():
         raise PhaseGateBootstrapError("Phase-gate snapshot interpreter is missing.")
+    host_workspace = payload.get("host_workspace_root")
+    if host_workspace is not None and (
+        not isinstance(host_workspace, str) or not Path(host_workspace).is_absolute()
+    ):
+        raise PhaseGateBootstrapError("Phase-gate host workspace root is invalid.")
     verifier_evidence = payload["verifier_failure_evidence"]
     if not isinstance(verifier_evidence, dict) or not isinstance(
         verifier_evidence.get("available"), bool
@@ -1092,6 +1139,53 @@ def _load_phase_gate_state(path: Path | None) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         raise PhaseGateBootstrapError("Phase-gate state must be a JSON object.")
     return payload
+
+
+def _reconcile_phase_transaction(
+    attempt: Path,
+    workspace: Path,
+    phase_state: dict[str, Any] | None,
+    phase_state_path: Path | None,
+    precleanup_status: str,
+    precleanup_diff: str,
+) -> tuple[
+    dict[str, Any] | None,
+    TransactionReconciliation,
+    Path | None,
+    Path | None,
+]:
+    reconciliation = TransactionReconciliation(False, False, True, True)
+    patch_path: Path | None = None
+    status_path: Path | None = None
+    if phase_state is None or phase_state_path is None:
+        return phase_state, reconciliation, patch_path, status_path
+    incomplete_transaction = bool(
+        phase_state.get("active_transaction") is not None
+        or phase_state.get("transactional_cleanup_verified") is False
+    )
+    dirty_without_accepted_edit = bool(
+        precleanup_diff.strip() and not phase_state.get("accepted_target_edit")
+    )
+    if not incomplete_transaction and not dirty_without_accepted_edit:
+        return phase_state, reconciliation, patch_path, status_path
+    patch_path = attempt / "unauthorized-precleanup.patch"
+    status_path = attempt / "unauthorized-precleanup-status.txt"
+    patch_path.write_text(precleanup_diff, encoding="utf-8")
+    status_path.write_text(precleanup_status, encoding="utf-8")
+    if not incomplete_transaction:
+        reconciliation = TransactionReconciliation(
+            required=True,
+            attempted=False,
+            succeeded=False,
+            verified=False,
+            error="Dirty workspace has no accepted edit or restorable transaction journal.",
+        )
+        return phase_state, reconciliation, patch_path, status_path
+    reconciliation = reconcile_incomplete_transaction(
+        workspace, phase_state, phase_state_path
+    )
+    phase_state = _load_phase_gate_state(phase_state_path) or phase_state
+    return phase_state, reconciliation, patch_path, status_path
 
 
 def _parse_adapter_result(stdout: str) -> tuple[dict[str, Any], str | None]:

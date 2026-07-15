@@ -10,12 +10,18 @@ import json
 import os
 import re
 import shlex
+import stat
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 
 PHASES = ("inspect", "edit", "confirm_edit", "test", "final_diff", "submit")
+
+
+class TransactionalCleanupError(RuntimeError):
+    """Raised when CGR cannot prove that an incomplete edit was restored."""
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,17 @@ class PatchAuthorization:
 
 
 @dataclass(frozen=True)
+class TransactionReconciliation:
+    required: bool
+    attempted: bool
+    succeeded: bool
+    verified: bool
+    target: str | None = None
+    snapshot_path: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class _ParsedShellCommand:
     executable: str | None
     argv: tuple[str, ...]
@@ -163,6 +180,13 @@ def build_initial_phase_state(
         "phase_stalled_repeated_action": False,
         "coaching_level": 0,
         "last_edit_execution": None,
+        "active_transaction": None,
+        "active_transaction_status": None,
+        "active_transaction_target": None,
+        "active_transaction_snapshot_fingerprint": None,
+        "last_transaction": None,
+        "last_transaction_failure_kind": None,
+        "transactional_cleanup_verified": True,
     }
 
 
@@ -179,6 +203,10 @@ def authorize_phase_patch(
     failures: list[str] = []
     if not isinstance(state, dict):
         return PatchAuthorization(False, ("phase_state_missing",), None)
+    if state.get("active_transaction") is not None:
+        failures.append("active_transaction_incomplete")
+    if state.get("transactional_cleanup_verified") is False:
+        failures.append("transactional_cleanup_unverified")
     requirements = (
         ("accepted_target_edit", "accepted_target_edit_missing"),
         ("target_diff_inspected", "target_diff_not_inspected"),
@@ -208,6 +236,85 @@ def authorize_phase_patch(
 
 def write_phase_state(path: Path, state: dict[str, Any]) -> None:
     _atomic_write_json(path, state)
+
+
+def reconcile_incomplete_transaction(
+    workspace: Path,
+    state: dict[str, Any],
+    state_path: Path,
+) -> TransactionReconciliation:
+    active = state.get("active_transaction")
+    transaction = active if isinstance(active, dict) else state.get("last_transaction")
+    required = bool(
+        isinstance(active, dict)
+        or state.get("transactional_cleanup_verified") is False
+    )
+    if not required or not isinstance(transaction, dict):
+        return TransactionReconciliation(required=False, attempted=False, succeeded=True, verified=True)
+    target = transaction.get("target")
+    snapshot_path_value = transaction.get("snapshot_path")
+    try:
+        if not isinstance(target, str) or not target:
+            raise ValueError("Incomplete transaction does not identify its target.")
+        if isinstance(snapshot_path_value, str) and snapshot_path_value:
+            snapshot_path = Path(snapshot_path_value).absolute()
+            journal_root = state_path.parent.absolute()
+            try:
+                snapshot_path.relative_to(journal_root)
+            except ValueError as exc:
+                raise ValueError("Transaction snapshot is outside the attempt artifacts.") from exc
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        else:
+            payload = transaction.get("snapshot")
+            snapshot_path = None
+        snapshot = _snapshot_from_payload(payload)
+        if snapshot.path != target:
+            raise ValueError("Transaction target does not match its snapshot.")
+        _restore_host_target(workspace, snapshot)
+        restored = _snapshot_host_target(workspace, target)
+        if not _snapshots_equal(snapshot, restored):
+            raise RuntimeError("Post-run restoration verification failed.")
+        reconciled = dict(transaction)
+        reconciled.update(
+            {
+                "status": "reconciled",
+                "transaction_closed": True,
+                "rollback_attempted": True,
+                "rollback_succeeded": True,
+                "rollback_verified": True,
+                "restored_fingerprint": restored.fingerprint,
+            }
+        )
+        state["active_transaction"] = None
+        state["active_transaction_status"] = "reconciled"
+        state["last_transaction"] = reconciled
+        state["transactional_cleanup_verified"] = True
+        write_phase_state(state_path, state)
+        return TransactionReconciliation(
+            required=True,
+            attempted=True,
+            succeeded=True,
+            verified=True,
+            target=target,
+            snapshot_path=str(snapshot_path) if snapshot_path else None,
+        )
+    except Exception as exc:
+        state["active_transaction_status"] = "cleanup_incomplete"
+        state["last_transaction_failure_kind"] = "post_run_reconciliation_error"
+        state["transactional_cleanup_verified"] = False
+        try:
+            write_phase_state(state_path, state)
+        except OSError:
+            pass
+        return TransactionReconciliation(
+            required=True,
+            attempted=True,
+            succeeded=False,
+            verified=False,
+            target=target if isinstance(target, str) else None,
+            snapshot_path=snapshot_path_value if isinstance(snapshot_path_value, str) else None,
+            error=_redact_sensitive_text(str(exc))[:1000],
+        )
 
 
 def _diff_evidence(
@@ -660,6 +767,121 @@ class PhaseGate:
         )
         return "\n".join(lines)
 
+    def begin_transaction(
+        self, decision: GateDecision, snapshot: FileSnapshot
+    ) -> dict[str, Any]:
+        transaction_id = (
+            f"tx-{int(self.state['last_event_index']) + 1:06d}-"
+            f"{_fingerprint(decision.candidate.raw)}"
+        )
+        snapshot_payload = _snapshot_payload(snapshot)
+        snapshot_path: str | None = None
+        if self.state_path is not None:
+            path = self.state_path.with_name(f"{transaction_id}.snapshot.json")
+            _atomic_write_json(path, snapshot_payload)
+            snapshot_path = str(path)
+        transaction: dict[str, Any] = {
+            "transaction_id": transaction_id,
+            "target": snapshot.path,
+            "candidate_fingerprint": _fingerprint(decision.candidate.raw),
+            "candidate_kind": decision.candidate.kind,
+            "status": "started",
+            "start_event_index": int(self.state["last_event_index"]) + 1,
+            "snapshot_path": snapshot_path,
+            "snapshot": snapshot_payload if snapshot_path is None else None,
+            "pre_action_fingerprint": snapshot.fingerprint,
+            "pre_action_mode": snapshot.mode,
+            "execution_attempted": False,
+            "execution_returned_normally": False,
+            "execution_exception_category": None,
+            "validation_attempted": False,
+            "validation_completed": False,
+            "rollback_attempted": False,
+            "rollback_succeeded": False,
+            "rollback_verified": False,
+            "restored_fingerprint": None,
+            "failure_kind": None,
+            "timeout_owner": None,
+            "timeout_operation": None,
+            "timeout_seconds": None,
+            "timeout_command_preview": None,
+            "model_action_completed_before_timeout": False,
+            "transaction_closed": False,
+        }
+        self.state["active_transaction"] = transaction
+        self.state["active_transaction_status"] = "started"
+        self.state["active_transaction_target"] = snapshot.path
+        self.state["active_transaction_snapshot_fingerprint"] = snapshot.fingerprint
+        self.state["last_transaction_failure_kind"] = None
+        self.state["transactional_cleanup_verified"] = False
+        self._persist_state()
+        return transaction
+
+    def finish_transaction(
+        self,
+        transaction: dict[str, Any],
+        *,
+        status: str,
+        failure_kind: str | None,
+        cleanup_verified: bool,
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        completed = dict(transaction)
+        completed.update(updates)
+        completed["status"] = status
+        completed["failure_kind"] = failure_kind
+        completed["transaction_closed"] = status in {"accepted", "rejected", "reconciled"}
+        self.state["active_transaction_status"] = status
+        self.state["last_transaction_failure_kind"] = failure_kind
+        self.state["transactional_cleanup_verified"] = cleanup_verified
+        self.state["last_transaction"] = completed
+        self.state["active_transaction"] = (
+            None if completed["transaction_closed"] else completed
+        )
+        self._persist_state()
+        return completed
+
+    def update_transaction(
+        self, transaction: dict[str, Any], **updates: Any
+    ) -> dict[str, Any]:
+        transaction.update(updates)
+        self.state["active_transaction"] = dict(transaction)
+        self.state["active_transaction_status"] = str(transaction.get("status", "started"))
+        self._persist_state()
+        return transaction
+
+    def transactional_failure_feedback(
+        self,
+        *,
+        failure_kind: str,
+        target_changed: bool,
+        rollback_verified: bool,
+    ) -> str:
+        if failure_kind == "cgr_postinspection_timeout":
+            cause = "an internal inspection operation timed out"
+        elif failure_kind == "model_action_timeout":
+            cause = "the model-authored command timed out"
+        else:
+            cause = "CGR could not complete post-edit validation"
+        changed = " changed the target, but" if target_changed else " did not complete because"
+        restoration = (
+            "The original target was restored and verified."
+            if rollback_verified
+            else "CGR could not verify restoration, so the transaction remains incomplete."
+        )
+        return "\n".join(
+            (
+                "ACTION DID NOT COMPLETE TRANSACTIONAL VALIDATION",
+                "",
+                "Required phase: edit",
+                f"Required target: {self.target}",
+                "",
+                f"The model-authored command{changed} {cause}.",
+                restoration,
+                "Return exactly one corrected noninteractive edit action.",
+            )
+        )
+
     def transactional_rejection_feedback(
         self,
         evaluation: EditEvaluation,
@@ -718,6 +940,7 @@ class PhaseGate:
         postcondition_failures: tuple[str, ...] = (),
         diff_evidence: DiffEvidence | None = None,
         execution_exit_code: int | None = None,
+        transaction_details: dict[str, Any] | None = None,
     ) -> None:
         phase_before = self.phase
         kind = decision.candidate.kind
@@ -821,6 +1044,7 @@ class PhaseGate:
             postcondition_failures=postcondition_failures,
             diff_evidence=diff_evidence,
             execution_exit_code=execution_exit_code,
+            transaction_details=transaction_details,
         )
 
     def record(
@@ -838,6 +1062,7 @@ class PhaseGate:
         postcondition_failures: tuple[str, ...] = (),
         diff_evidence: DiffEvidence | None = None,
         execution_exit_code: int | None = None,
+        transaction_details: dict[str, Any] | None = None,
     ) -> None:
         self.state["last_event_index"] += 1
         self.state["current_phase"] = phase_after
@@ -879,6 +1104,7 @@ class PhaseGate:
             )
             if executed and decision.candidate.kind == "noninteractive_edit"
             else None,
+            "transaction": _bounded_transaction_details(transaction_details),
             "phase_rejection_count": self.state["phase_rejection_count"],
             "repeated_candidate_count": self.state["repeated_candidate_count"],
             "repeated_kind_count": self.state["repeated_kind_count"],
@@ -911,6 +1137,28 @@ class PhaseGate:
                 "rolled_back": rolled_back,
                 "postcondition_outcome": "accepted" if accepted else "rejected",
                 "postcondition_failures": list(postcondition_failures),
+                "transaction_id": transaction_details.get("transaction_id")
+                if transaction_details
+                else None,
+                "execution_returned_normally": bool(
+                    transaction_details
+                    and transaction_details.get("execution_returned_normally")
+                ),
+                "validation_attempted": bool(
+                    transaction_details and transaction_details.get("validation_attempted")
+                ),
+                "validation_completed": bool(
+                    transaction_details and transaction_details.get("validation_completed")
+                ),
+                "rollback_attempted": bool(
+                    transaction_details and transaction_details.get("rollback_attempted")
+                ),
+                "rollback_verified": bool(
+                    transaction_details and transaction_details.get("rollback_verified")
+                ),
+                "transaction_closed": bool(
+                    transaction_details and transaction_details.get("transaction_closed")
+                ),
             }
         if self.log_path is not None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -961,6 +1209,399 @@ class _ExecutionExitCapture:
             setattr(self._runtime, "run_in_session", self._original)
 
 
+def _handle_transactional_edit(
+    agent: Any,
+    step: Any,
+    gate: PhaseGate,
+    decision: GateDecision,
+    original: Any,
+    host_workspace_root: Path | None,
+) -> Any:
+    before = _snapshot_target(
+        agent, gate.target, gate.snapshot_python, host_workspace_root
+    )
+    transaction = gate.begin_transaction(decision, before)
+    result = step
+    after: FileSnapshot | None = None
+    evidence = RepositoryEvidence()
+    evaluation: EditEvaluation | None = None
+    execution_exit_code: int | None = None
+    failure_kind: str | None = None
+    failure_exception: Exception | None = None
+    gate.update_transaction(transaction, execution_attempted=True)
+    try:
+        try:
+            with _ExecutionExitCapture(agent._env) as execution:
+                result = original(agent, step)
+        except Exception as exc:
+            failure_exception = exc
+            failure_kind = (
+                "model_action_timeout" if _is_timeout_exception(exc) else "model_action_error"
+            )
+            transaction["execution_exception_category"] = type(exc).__name__
+            if failure_kind == "model_action_timeout":
+                transaction.update(
+                    _timeout_details(
+                        owner="model_action",
+                        operation="model_authored_edit",
+                        seconds=_execution_timeout_seconds(agent),
+                        command_preview=decision.candidate.raw,
+                        model_action_completed=False,
+                    )
+                )
+                if not _ensure_command_quiescence(agent):
+                    return _transaction_cleanup_failure(
+                        agent,
+                        step,
+                        gate,
+                        decision,
+                        transaction,
+                        before,
+                        evidence,
+                        failure_kind="model_action_quiescence_error",
+                        execution_exit_code=None,
+                    )
+        else:
+            transaction["execution_returned_normally"] = True
+            execution_exit_code = execution.exit_code
+            if execution_exit_code is None:
+                value = getattr(result, "execution_exit_code", None)
+                execution_exit_code = value if isinstance(value, int) else None
+        gate.update_transaction(transaction)
+
+        try:
+            after = _snapshot_target(
+                agent, gate.target, gate.snapshot_python, host_workspace_root
+            )
+            evidence = _target_evidence_from_snapshots(before, after)
+        except Exception as exc:
+            failure_exception = failure_exception or exc
+            failure_kind = (
+                "cgr_postinspection_timeout"
+                if _is_timeout_exception(exc)
+                else "cgr_postcondition_error"
+            )
+            if failure_kind == "cgr_postinspection_timeout":
+                transaction.update(
+                    _timeout_details(
+                        owner="cgr_internal_inspection",
+                        operation="post_edit_target_snapshot_and_diff",
+                        seconds=10,
+                        command_preview=f"inspect {gate.target}",
+                        model_action_completed=bool(
+                            transaction["execution_returned_normally"]
+                        ),
+                    )
+                )
+
+        if failure_kind is None:
+            transaction["validation_attempted"] = True
+            gate.update_transaction(transaction)
+            try:
+                assert after is not None
+                evaluation = evaluate_edit(
+                    before,
+                    after,
+                    target=gate.target,
+                    policy=gate.edit_policy,
+                )
+                transaction["validation_completed"] = True
+            except Exception as exc:
+                failure_exception = exc
+                failure_kind = "cgr_postcondition_error"
+            if execution_exit_code not in {None, 0} and evaluation is not None:
+                evaluation = EditEvaluation(
+                    False,
+                    evaluation.evidence,
+                    tuple(
+                        dict.fromkeys((*evaluation.failures, "command_nonzero_exit"))
+                    ),
+                )
+            if evaluation is not None and evaluation.accepted:
+                assert after is not None
+                completed = gate.finish_transaction(
+                    transaction,
+                    status="accepted",
+                    failure_kind=None,
+                    cleanup_verified=True,
+                    updates={
+                        "validation_attempted": True,
+                        "validation_completed": True,
+                    },
+                )
+                gate.record_execution(
+                    decision,
+                    observation=_normalize_observation_text(result.observation),
+                    evidence=evidence,
+                    accepted=True,
+                    pre_action_fingerprint=before.fingerprint,
+                    post_action_fingerprint=after.fingerprint,
+                    diff_evidence=evaluation.evidence,
+                    execution_exit_code=execution_exit_code,
+                    transaction_details=completed,
+                )
+                return result
+            if failure_kind is None:
+                failure_kind = "postcondition_rejected"
+
+        return _reject_and_restore_transaction(
+            agent,
+            result,
+            gate,
+            decision,
+            transaction,
+            before,
+            after,
+            evidence,
+            evaluation,
+            failure_kind=failure_kind or "cgr_postcondition_error",
+            failure_exception=failure_exception,
+            execution_exit_code=execution_exit_code,
+            host_workspace_root=host_workspace_root,
+        )
+    except TransactionalCleanupError:
+        raise
+    except Exception as exc:
+        return _reject_and_restore_transaction(
+            agent,
+            result,
+            gate,
+            decision,
+            transaction,
+            before,
+            after,
+            evidence,
+            evaluation,
+            failure_kind="cgr_postcondition_error",
+            failure_exception=exc,
+            execution_exit_code=execution_exit_code,
+            host_workspace_root=host_workspace_root,
+        )
+
+
+def _reject_and_restore_transaction(
+    agent: Any,
+    result: Any,
+    gate: PhaseGate,
+    decision: GateDecision,
+    transaction: dict[str, Any],
+    before: FileSnapshot,
+    after: FileSnapshot | None,
+    evidence: RepositoryEvidence,
+    evaluation: EditEvaluation | None,
+    *,
+    failure_kind: str,
+    failure_exception: Exception | None,
+    execution_exit_code: int | None,
+    host_workspace_root: Path | None,
+) -> Any:
+    transaction["failure_kind"] = failure_kind
+    transaction["rollback_attempted"] = True
+    gate.update_transaction(transaction)
+    try:
+        _restore_target(agent, before, gate.snapshot_python, host_workspace_root)
+        transaction["rollback_succeeded"] = True
+    except Exception as exc:
+        if _is_timeout_exception(exc):
+            transaction.update(
+                _timeout_details(
+                    owner="cgr_rollback",
+                    operation="restore_target_snapshot",
+                    seconds=10,
+                    command_preview=f"restore {gate.target}",
+                    model_action_completed=bool(
+                        transaction.get("execution_returned_normally")
+                    ),
+                )
+            )
+        return _transaction_cleanup_failure(
+            agent,
+            result,
+            gate,
+            decision,
+            transaction,
+            before,
+            evidence,
+            failure_kind="cgr_rollback_error",
+            execution_exit_code=execution_exit_code,
+            failure_exception=exc,
+        )
+    try:
+        restored = _snapshot_target(
+            agent, before.path, gate.snapshot_python, host_workspace_root
+        )
+        if not _snapshots_equal(before, restored):
+            raise RuntimeError("Restored snapshot did not match original bytes and mode.")
+        transaction["rollback_verified"] = True
+        transaction["restored_fingerprint"] = restored.fingerprint
+    except Exception as exc:
+        if _is_timeout_exception(exc):
+            transaction.update(
+                _timeout_details(
+                    owner="cgr_rollback",
+                    operation="verify_restored_snapshot",
+                    seconds=10,
+                    command_preview=f"verify restoration {gate.target}",
+                    model_action_completed=bool(
+                        transaction.get("execution_returned_normally")
+                    ),
+                )
+            )
+        return _transaction_cleanup_failure(
+            agent,
+            result,
+            gate,
+            decision,
+            transaction,
+            before,
+            evidence,
+            failure_kind="cgr_rollback_verification_error",
+            execution_exit_code=execution_exit_code,
+            failure_exception=exc,
+        )
+    if failure_exception is not None:
+        transaction["execution_exception_category"] = type(failure_exception).__name__
+    completed = gate.finish_transaction(
+        transaction,
+        status="rejected",
+        failure_kind=failure_kind,
+        cleanup_verified=True,
+        updates=transaction,
+    )
+    diff_evidence = (
+        evaluation.evidence
+        if evaluation is not None
+        else (_diff_evidence(before, after, target=gate.target) if after else None)
+    )
+    if failure_kind == "postcondition_rejected" and evaluation is not None:
+        feedback = gate.transactional_rejection_feedback(
+            evaluation,
+            observation=_normalize_observation_text(getattr(result, "observation", "")),
+            execution_exit_code=execution_exit_code,
+        )
+        failures = evaluation.failures
+    else:
+        feedback = gate.transactional_failure_feedback(
+            failure_kind=failure_kind,
+            target_changed=bool(diff_evidence and diff_evidence.target_changed),
+            rollback_verified=True,
+        )
+        failures = (failure_kind,)
+    result.observation = feedback
+    result.state = agent.tools.get_state(env=agent._env)
+    gate.record_execution(
+        decision,
+        observation=feedback,
+        evidence=RepositoryEvidence(),
+        accepted=False,
+        rolled_back=True,
+        pre_action_fingerprint=before.fingerprint,
+        post_action_fingerprint=after.fingerprint if after else None,
+        postcondition_failures=failures,
+        diff_evidence=diff_evidence,
+        execution_exit_code=execution_exit_code,
+        transaction_details=completed,
+    )
+    return result
+
+
+def _transaction_cleanup_failure(
+    agent: Any,
+    result: Any,
+    gate: PhaseGate,
+    decision: GateDecision,
+    transaction: dict[str, Any],
+    before: FileSnapshot,
+    evidence: RepositoryEvidence,
+    *,
+    failure_kind: str,
+    execution_exit_code: int | None,
+    failure_exception: Exception | None = None,
+) -> Any:
+    transaction["failure_kind"] = failure_kind
+    if failure_exception is not None:
+        transaction["execution_exception_category"] = type(failure_exception).__name__
+    incomplete = gate.finish_transaction(
+        transaction,
+        status="cleanup_incomplete",
+        failure_kind=failure_kind,
+        cleanup_verified=False,
+        updates=transaction,
+    )
+    feedback = gate.transactional_failure_feedback(
+        failure_kind=failure_kind,
+        target_changed=bool(evidence.target_diff),
+        rollback_verified=False,
+    )
+    result.observation = feedback
+    try:
+        result.state = agent.tools.get_state(env=agent._env)
+    except Exception:
+        result.state = {}
+    gate.record_execution(
+        decision,
+        observation=feedback,
+        evidence=evidence,
+        accepted=False,
+        rolled_back=False,
+        pre_action_fingerprint=before.fingerprint,
+        postcondition_failures=(failure_kind,),
+        execution_exit_code=execution_exit_code,
+        transaction_details=incomplete,
+    )
+    raise TransactionalCleanupError(
+        f"Transactional cleanup could not be verified: {failure_kind}."
+    )
+
+
+def _is_timeout_exception(exc: BaseException) -> bool:
+    return isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) or "timeout" in type(
+        exc
+    ).__name__.lower()
+
+
+def _execution_timeout_seconds(agent: Any) -> int | float | None:
+    tools = getattr(agent, "tools", None)
+    config = getattr(tools, "config", None)
+    value = getattr(config, "execution_timeout", None)
+    return value if isinstance(value, (int, float)) else None
+
+
+def _timeout_details(
+    *,
+    owner: str,
+    operation: str,
+    seconds: int | float | None,
+    command_preview: str,
+    model_action_completed: bool,
+) -> dict[str, Any]:
+    return {
+        "timeout_owner": owner,
+        "timeout_operation": operation,
+        "timeout_seconds": seconds,
+        "timeout_command_preview": _redact_sensitive_text(command_preview)[:500],
+        "model_action_completed_before_timeout": model_action_completed,
+    }
+
+
+def _ensure_command_quiescence(agent: Any) -> bool:
+    environment = getattr(agent, "_env", None)
+    interrupt = getattr(environment, "interrupt_session", None)
+    if not callable(interrupt):
+        return False
+    try:
+        interrupt()
+    except Exception:
+        close = getattr(environment, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return False
+    return True
+
+
 def install_sweagent_phase_gate() -> None:
     config_path = os.getenv("CGR_PHASE_GATE_CONFIG")
     if not config_path:
@@ -977,6 +1618,11 @@ def install_sweagent_phase_gate() -> None:
     if not isinstance(config, dict) or not required.issubset(config):
         raise RuntimeError("CGR phase-gate configuration is incomplete.")
     original = DefaultAgent.handle_action
+    host_workspace_root = (
+        Path(str(config["host_workspace_root"]))
+        if config.get("host_workspace_root")
+        else None
+    )
 
     def handle_action(self: Any, step: Any) -> Any:
         gate = getattr(self, "_cgr_phase_gate_state", None)
@@ -1004,67 +1650,14 @@ def install_sweagent_phase_gate() -> None:
             step.state = self.tools.get_state(env=self._env)
             return step
         if decision.candidate.kind == "noninteractive_edit":
-            before = _snapshot_file(self, gate.target, gate.snapshot_python)
-            try:
-                with _ExecutionExitCapture(self._env) as execution:
-                    result = original(self, step)
-            except Exception:
-                _restore_snapshot(self, before, gate.snapshot_python)
-                raise
-            execution_exit_code = execution.exit_code
-            if execution_exit_code is None:
-                value = getattr(result, "execution_exit_code", None)
-                execution_exit_code = value if isinstance(value, int) else None
-            after = _snapshot_file(self, gate.target, gate.snapshot_python)
-            post_evidence = _probe_repository(self, gate.target)
-            evaluation = evaluate_edit(
-                before,
-                after,
-                target=gate.target,
-                policy=gate.edit_policy,
-            )
-            if execution_exit_code not in {None, 0}:
-                evaluation = EditEvaluation(
-                    False,
-                    evaluation.evidence,
-                    tuple(
-                        dict.fromkeys((*evaluation.failures, "command_nonzero_exit"))
-                    ),
-                )
-            if not evaluation.accepted:
-                _restore_snapshot(self, before, gate.snapshot_python)
-                restored_evidence = _probe_repository(self, gate.target)
-                feedback = gate.transactional_rejection_feedback(
-                    evaluation,
-                    observation=_normalize_observation_text(result.observation),
-                    execution_exit_code=execution_exit_code,
-                )
-                result.observation = feedback
-                result.state = self.tools.get_state(env=self._env)
-                gate.record_execution(
-                    decision,
-                    observation=feedback,
-                    evidence=restored_evidence,
-                    accepted=False,
-                    rolled_back=True,
-                    pre_action_fingerprint=before.fingerprint,
-                    post_action_fingerprint=after.fingerprint,
-                    postcondition_failures=evaluation.failures,
-                    diff_evidence=evaluation.evidence,
-                    execution_exit_code=execution_exit_code,
-                )
-                return result
-            gate.record_execution(
+            return _handle_transactional_edit(
+                self,
+                step,
+                gate,
                 decision,
-                observation=_normalize_observation_text(result.observation),
-                evidence=post_evidence,
-                accepted=True,
-                pre_action_fingerprint=before.fingerprint,
-                post_action_fingerprint=after.fingerprint,
-                diff_evidence=evaluation.evidence,
-                execution_exit_code=execution_exit_code,
+                original,
+                host_workspace_root,
             )
-            return result
         result = original(self, step)
         if not result.done or decision.candidate.kind != "submission":
             evidence = _probe_repository(self, gate.target)
@@ -1087,7 +1680,7 @@ def install_sweagent_phase_gate() -> None:
 
 
 def _snapshot_file(
-    agent: Any, target: str, python_command: str = "python"
+    agent: Any, target: str, python_command: str = "python", *, timeout: int = 10
 ) -> FileSnapshot:
     path_literal = json.dumps(target)
     script = (
@@ -1099,8 +1692,11 @@ def _snapshot_file(
         "print(json.dumps({'existed':e,'content':d,'mode':m}))"
     )
     output = _normalize_observation_text(
-        agent._env.communicate(
-            shlex.quote(python_command) + " -c " + shlex.quote(script), check="raise"
+        _bounded_communicate(
+            agent._env,
+            shlex.quote(python_command) + " -c " + shlex.quote(script),
+            check="raise",
+            timeout=timeout,
         )
     )
     payload = _last_json_mapping(output)
@@ -1113,7 +1709,11 @@ def _snapshot_file(
 
 
 def _restore_snapshot(
-    agent: Any, snapshot: FileSnapshot, python_command: str = "python"
+    agent: Any,
+    snapshot: FileSnapshot,
+    python_command: str = "python",
+    *,
+    timeout: int = 10,
 ) -> None:
     path_literal = json.dumps(snapshot.path)
     content_literal = json.dumps(base64.b64encode(snapshot.content).decode())
@@ -1131,9 +1731,100 @@ def _restore_snapshot(
             f"p=pathlib.Path({path_literal});"
             "p.unlink() if p.exists() or p.is_symlink() else None;"
         )
-    agent._env.communicate(
-        shlex.quote(python_command) + " -c " + shlex.quote(script), check="raise"
+    _bounded_communicate(
+        agent._env,
+        shlex.quote(python_command) + " -c " + shlex.quote(script),
+        check="raise",
+        timeout=timeout,
     )
+
+
+def _snapshot_target(
+    agent: Any,
+    target: str,
+    python_command: str,
+    host_workspace_root: Path | None,
+) -> FileSnapshot:
+    if host_workspace_root is not None:
+        return _snapshot_host_target(host_workspace_root, target)
+    return _snapshot_file(agent, target, python_command)
+
+
+def _snapshot_host_target(workspace: Path, target: str) -> FileSnapshot:
+    path = _confined_target_path(workspace, target)
+    existed = path.is_file()
+    return FileSnapshot(
+        path=target,
+        existed=existed,
+        content=path.read_bytes() if existed else b"",
+        mode=stat.S_IMODE(path.stat().st_mode) if existed else None,
+    )
+
+
+def _restore_target(
+    agent: Any,
+    snapshot: FileSnapshot,
+    python_command: str,
+    host_workspace_root: Path | None,
+) -> None:
+    if host_workspace_root is not None:
+        _restore_host_target(host_workspace_root, snapshot)
+        return
+    _restore_snapshot(agent, snapshot, python_command)
+
+
+def _restore_host_target(workspace: Path, snapshot: FileSnapshot) -> None:
+    path = _confined_target_path(workspace, snapshot.path)
+    if snapshot.existed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(snapshot.content)
+        if snapshot.mode is not None:
+            os.chmod(path, snapshot.mode)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _target_evidence_from_snapshots(
+    before: FileSnapshot, after: FileSnapshot, *, limit: int = 12000
+) -> RepositoryEvidence:
+    if _snapshots_equal(before, after):
+        return RepositoryEvidence()
+    before_text = before.content.decode("utf-8", errors="replace")
+    after_text = after.content.decode("utf-8", errors="replace")
+    diff = "".join(
+        difflib.unified_diff(
+            before_text.splitlines(keepends=True),
+            after_text.splitlines(keepends=True),
+            fromfile=f"a/{before.path}",
+            tofile=f"b/{after.path}",
+        )
+    )
+    if len(diff) > limit:
+        diff = diff[:limit] + "\n... CGR target diff truncated ...\n"
+    return RepositoryEvidence(target_diff=diff, tracked_diff=diff)
+
+
+def _snapshots_equal(left: FileSnapshot, right: FileSnapshot) -> bool:
+    return (
+        left.existed == right.existed
+        and left.content == right.content
+        and left.mode == right.mode
+    )
+
+
+def _bounded_communicate(
+    environment: Any, command: str, *, check: str, timeout: int
+) -> Any:
+    try:
+        return environment.communicate(
+            input=command,
+            check=check,
+            timeout=timeout,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return environment.communicate(command, check=check)
 
 
 def _probe_repository(agent: Any, target: str) -> RepositoryEvidence:
@@ -1520,6 +2211,82 @@ def _last_json_mapping(value: str) -> dict[str, Any]:
         if isinstance(payload, dict):
             return payload
     raise RuntimeError("SWE-agent file snapshot did not return a JSON object.")
+
+
+def _snapshot_payload(snapshot: FileSnapshot) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "path": snapshot.path,
+        "existed": snapshot.existed,
+        "content_base64": base64.b64encode(snapshot.content).decode("ascii"),
+        "mode": snapshot.mode,
+        "fingerprint": snapshot.fingerprint,
+    }
+
+
+def _snapshot_from_payload(value: Any) -> FileSnapshot:
+    if not isinstance(value, dict):
+        raise ValueError("Transaction snapshot payload is missing.")
+    path = value.get("path")
+    content = value.get("content_base64")
+    if not isinstance(path, str) or not isinstance(content, str):
+        raise ValueError("Transaction snapshot payload is invalid.")
+    snapshot = FileSnapshot(
+        path=path,
+        existed=bool(value.get("existed")),
+        content=base64.b64decode(content, validate=True),
+        mode=int(value["mode"]) if value.get("mode") is not None else None,
+    )
+    if value.get("fingerprint") != snapshot.fingerprint:
+        raise ValueError("Transaction snapshot fingerprint does not match its content.")
+    return snapshot
+
+
+def _confined_target_path(workspace: Path, target: str) -> Path:
+    root = workspace.absolute()
+    candidate = (root / _normalize_target(target)).resolve(strict=False)
+    try:
+        candidate.relative_to(root.resolve(strict=True))
+    except ValueError as exc:
+        raise ValueError("Transaction target escapes the workspace.") from exc
+    return candidate
+
+
+def _bounded_transaction_details(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        "transaction_id",
+        "target",
+        "candidate_fingerprint",
+        "candidate_kind",
+        "status",
+        "start_event_index",
+        "snapshot_path",
+        "pre_action_fingerprint",
+        "pre_action_mode",
+        "execution_attempted",
+        "execution_returned_normally",
+        "execution_exception_category",
+        "validation_attempted",
+        "validation_completed",
+        "rollback_attempted",
+        "rollback_succeeded",
+        "rollback_verified",
+        "restored_fingerprint",
+        "failure_kind",
+        "timeout_owner",
+        "timeout_operation",
+        "timeout_seconds",
+        "timeout_command_preview",
+        "model_action_completed_before_timeout",
+        "transaction_closed",
+    }
+    bounded = {key: value.get(key) for key in sorted(allowed)}
+    preview = bounded.get("timeout_command_preview")
+    if isinstance(preview, str):
+        bounded["timeout_command_preview"] = _redact_sensitive_text(preview)[:500]
+    return bounded
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:

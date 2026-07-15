@@ -239,6 +239,22 @@ def diagnose_attempt(
     phase_state = attempt_result.get("phase_gate_state")
     if not isinstance(phase_state, dict):
         phase_state = {}
+    transaction = phase_state.get("last_transaction")
+    if not isinstance(transaction, dict):
+        transaction = phase_state.get("active_transaction")
+    if not isinstance(transaction, dict):
+        transaction = {}
+    transaction_failure_kind = phase_state.get("last_transaction_failure_kind")
+    if not isinstance(transaction_failure_kind, str):
+        transaction_failure_kind = transaction.get("failure_kind")
+    if not isinstance(transaction_failure_kind, str):
+        transaction_failure_kind = None
+    timeout_owner = transaction.get("timeout_owner")
+    if not isinstance(timeout_owner, str):
+        timeout_owner = None
+    timeout_operation = transaction.get("timeout_operation")
+    if not isinstance(timeout_operation, str):
+        timeout_operation = None
     phase_flags = [
         str(item)
         for item in phase_state.get("diagnostic_flags", [])
@@ -374,6 +390,13 @@ def diagnose_attempt(
         "trajectory_steps": len(steps),
         "budget_exhausted": budget_exhausted,
         "phase_gate_state": phase_state or None,
+        "transaction_failure_kind": transaction_failure_kind,
+        "transaction_timeout_owner": timeout_owner,
+        "transaction_timeout_operation": timeout_operation,
+        "transaction_closed": bool(transaction.get("transaction_closed")),
+        "transactional_cleanup_verified": phase_state.get(
+            "transactional_cleanup_verified"
+        ),
         "phase_at_termination": phase_at_termination,
         "phase_workflow_complete": bool(phase_state.get("workflow_complete")),
         "phase_diagnostic_flags": phase_flags,
@@ -488,6 +511,8 @@ def diagnose_attempt(
             failure_types.append(flag)
     if phase_incomplete and attempt_result.get("autosubmission_detected"):
         failure_types.append("phase_incomplete_autosubmission")
+    if transaction_failure_kind and transaction_failure_kind not in failure_types:
+        failure_types.append(transaction_failure_kind)
     if budget_exhausted and phase_state and not phase_state.get("workflow_complete"):
         failure_types.append("budget_exhausted_before_phase_completion")
     if budget_exhausted:

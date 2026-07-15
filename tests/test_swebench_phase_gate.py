@@ -12,15 +12,19 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from cgr.swebench import phase_gate as phase_gate_module
 from cgr.swebench.phase_gate import (
     EditPolicy,
     FileSnapshot,
     PhaseGate,
     RepositoryEvidence,
+    TransactionalCleanupError,
     _ExecutionExitCapture,
     _normalize_observation_text,
     _probe_repository,
     _restore_snapshot,
+    _snapshot_host_target,
+    _target_evidence_from_snapshots,
     authorize_phase_patch,
     classify_candidate_action,
     evaluate_edit,
@@ -869,6 +873,50 @@ def _snapshot(content: str, *, existed: bool = True, mode: int = 0o644) -> FileS
     return FileSnapshot(TARGET, existed, content.encode(), mode if existed else None)
 
 
+def test_transaction_journal_is_durable_before_execution_with_exact_snapshot(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "phase-state.json"
+    gate = PhaseGate(
+        phase="edit", target=TARGET, focused_test=TEST, state_path=state_path
+    )
+    decision = gate.decide(
+        "sed -i 's/old/new/' src/module.py", RepositoryEvidence()
+    )
+    before = FileSnapshot(TARGET, True, b"exact\x00bytes\r\n", 0o600)
+
+    transaction = gate.begin_transaction(decision, before)
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["active_transaction_status"] == "started"
+    assert persisted["transactional_cleanup_verified"] is False
+    assert persisted["active_transaction"]["transaction_id"] == transaction["transaction_id"]
+    snapshot_path = Path(transaction["snapshot_path"])
+    snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot_payload["fingerprint"] == before.fingerprint
+    assert snapshot_payload["mode"] == 0o600
+    assert snapshot_payload["content_base64"] == "ZXhhY3QAYnl0ZXMNCg=="
+
+
+def test_host_snapshot_comparison_detects_change_noop_and_builds_bounded_diff(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / TARGET
+    target.parent.mkdir(parents=True)
+    target.write_text("def value():\n    return 'old'\n", encoding="utf-8")
+    before = _snapshot_host_target(tmp_path, TARGET)
+    target.write_text("def value():\n    return 'new'\n", encoding="utf-8")
+    after = _snapshot_host_target(tmp_path, TARGET)
+
+    changed = _target_evidence_from_snapshots(before, after, limit=200)
+    noop = _target_evidence_from_snapshots(after, after, limit=200)
+
+    assert changed.target_diff.startswith(f"--- a/{TARGET}")
+    assert "+    return 'new'" in changed.target_diff
+    assert len(changed.target_diff) <= 240
+    assert noop == RepositoryEvidence()
+
+
 def _initialize_git_target(tmp_path: Path, target_name: str, content: bytes) -> Path:
     target = tmp_path / target_name
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -909,6 +957,48 @@ class _LocalPhaseEnvironment:
         if check == "raise" and process.returncode:
             raise RuntimeError(process.stderr)
         return process.stdout + process.stderr
+
+
+def _install_host_transaction_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_type: type,
+    *,
+    initial_phase: str = "edit",
+    target: str = TARGET,
+    focused_test: str = TEST,
+) -> tuple[Path, Path]:
+    sweagent = ModuleType("sweagent")
+    agent = ModuleType("sweagent.agent")
+    agents = ModuleType("sweagent.agent.agents")
+    agents.DefaultAgent = agent_type  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sweagent", sweagent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent", agent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent.agents", agents)
+    state_path = tmp_path / "state.json"
+    event_path = tmp_path / "events.jsonl"
+    config = tmp_path / "phase-gate.json"
+    config.write_text(
+        json.dumps(
+            {
+                "initial_phase": initial_phase,
+                "target": target,
+                "focused_test": focused_test,
+                "log_path": str(event_path),
+                "state_path": str(state_path),
+                "snapshot_python": sys.executable,
+                "host_workspace_root": str(tmp_path),
+                "edit_policy": {
+                    "mode": "modify_existing_source",
+                    "require_existing_content_change": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CGR_PHASE_GATE_CONFIG", str(config))
+    install_sweagent_phase_gate()
+    return state_path, event_path
 
 
 @pytest.mark.parametrize(
@@ -1207,6 +1297,9 @@ def test_nonzero_single_target_edit_rolls_back_changed_bytes_and_stays_in_edit(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["current_phase"] == "edit"
     assert state["accepted_target_edit"] is False
+    assert state["active_transaction"] is None
+    assert state["active_transaction_status"] == "rejected"
+    assert state["transactional_cleanup_verified"] is True
     assert state["last_edit_execution"]["execution_exit_code"] == 2
     assert state["last_edit_execution"]["target_changed"] is True
     assert state["last_edit_execution"]["rolled_back"] is True
@@ -1288,9 +1381,379 @@ def test_valid_generic_sed_executes_transactionally(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["current_phase"] == "confirm_edit"
     assert state["accepted_target_edit"] is True
+    assert state["active_transaction"] is None
+    assert state["active_transaction_status"] == "accepted"
+    assert state["transactional_cleanup_verified"] is True
     assert state["last_edit_execution"]["execution_exit_code"] == 0
     assert state["last_edit_execution"]["postcondition_outcome"] == "accepted"
     event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
     assert event["execution_attempted"] is True
     assert event["target_changed"] is True
     assert event["rollback_status"] == "not_required"
+
+
+def test_generic_transaction_completes_full_authorized_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _initialize_git_target(
+        tmp_path, TARGET, b"def transform(value):\n    return value.strip()\n"
+    )
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(
+                get_state=lambda env: {"working_dir": str(tmp_path)}
+            )
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            if step.action.startswith("sed "):
+                target.write_text(
+                    "def transform(value):\n    return value.upper()\n",
+                    encoding="utf-8",
+                )
+                step.observation = "edit complete"
+                step.execution_exit_code = 0
+            elif "pytest" in step.action:
+                step.observation = "1 passed in 0.01s"
+            elif step.action == "submit":
+                step.observation = "submitted"
+                step.done = True
+            elif step.action.startswith("cat "):
+                step.observation = target.read_text(encoding="utf-8")
+            else:
+                step.observation = self._env.communicate(
+                    f"git diff -- {TARGET}", check="ignore"
+                )
+            return step
+
+    state_path, event_path = _install_host_transaction_gate(
+        tmp_path,
+        monkeypatch,
+        FakeAgent,
+        initial_phase="inspect",
+    )
+    fake = FakeAgent()
+
+    actions = (
+        f"cat {TARGET}",
+        "sed -i 's/value.strip()/value.upper()/' src/module.py",
+        f"cat {TARGET}",
+        f"git diff -- {TARGET}",
+        f"python -m pytest -q {TEST}",
+        "git diff -- HEAD",
+        "submit",
+    )
+    for action in actions:
+        fake.handle_action(
+            SimpleNamespace(
+                action=action,
+                observation="",
+                state=None,
+                done=False,
+                thought="",
+                output="",
+            )
+        )
+
+    patch = fake._env.communicate("git diff --binary HEAD --", check="ignore")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["last_transaction"]["status"] == "accepted"
+    assert state["last_transaction"]["transaction_closed"] is True
+    assert state["transactional_cleanup_verified"] is True
+    assert state["workflow_complete"] is True
+    assert state["submission_authorized"] is True
+    authorization = authorize_phase_patch(state, patch)
+    assert authorization.authorized is True
+    assert authorization.fingerprint == state["accepted_patch_fingerprint"]
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    assert [event["phase_before"] for event in events] == [
+        "inspect",
+        "edit",
+        "confirm_edit",
+        "confirm_edit",
+        "test",
+        "final_diff",
+        "submit",
+    ]
+
+
+def test_attempt_007_internal_postinspection_timeout_is_contained_and_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CommandTimeoutError(RuntimeError):
+        pass
+
+    target_name = "python_programs/gcd.py"
+    prior = b"def placeholder(value):\n    return value\n"
+    target = _initialize_git_target(tmp_path, target_name, prior)
+    if os.name != "nt":
+        os.chmod(target, 0o600)
+    prior_mode = target.stat().st_mode & 0o777
+    original_calls: list[str] = []
+    journal_seen_before_edit: list[bool] = []
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(get_state=lambda env: {"working_dir": str(tmp_path)})
+            self._n_consecutive_timeouts = 0
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            original_calls.append(step.action)
+            if step.action.startswith("sed "):
+                state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+                journal_seen_before_edit.append(
+                    state["active_transaction_status"] == "started"
+                )
+                target.write_text("def broken(:\n", encoding="utf-8")
+                step.observation = "model edit returned"
+                step.execution_exit_code = 0
+            else:
+                step.observation = prior.decode()
+            step.done = False
+            return step
+
+    state_path, event_path = _install_host_transaction_gate(
+        tmp_path,
+        monkeypatch,
+        FakeAgent,
+        initial_phase="inspect",
+        target=target_name,
+        focused_test="test_target.py",
+    )
+
+    def timeout_after_snapshot(*_args: object, **_kwargs: object) -> RepositoryEvidence:
+        raise CommandTimeoutError("legacy git diff equivalent timed out")
+
+    monkeypatch.setattr(
+        phase_gate_module, "_target_evidence_from_snapshots", timeout_after_snapshot
+    )
+    fake = FakeAgent()
+    rejected_commit = fake.handle_action(
+        SimpleNamespace(
+            action="git commit -am fix",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+    assert "ACTION REJECTED BY CGR" in rejected_commit.observation
+    fake.handle_action(
+        SimpleNamespace(
+            action=f"cat {target_name}",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+
+    result = fake.handle_action(
+        SimpleNamespace(
+            action=EC2_SED_ACTION,
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+
+    assert journal_seen_before_edit == [True]
+    assert original_calls == [f"cat {target_name}", EC2_SED_ACTION]
+    assert fake._n_consecutive_timeouts == 0
+    assert result.done is False
+    assert "internal inspection operation timed out" in result.observation
+    assert "restored and verified" in result.observation
+    assert target.read_bytes() == prior
+    assert target.stat().st_mode & 0o777 == prior_mode
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["current_phase"] == "edit"
+    assert state["active_transaction"] is None
+    assert state["active_transaction_status"] == "rejected"
+    assert state["last_transaction_failure_kind"] == "cgr_postinspection_timeout"
+    assert state["transactional_cleanup_verified"] is True
+    assert state["last_transaction"]["timeout_owner"] == "cgr_internal_inspection"
+    assert state["last_transaction"]["model_action_completed_before_timeout"] is True
+    assert state["last_transaction"]["rollback_verified"] is True
+    events = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    edit_event = events[-1]
+    assert edit_event["execution_attempted"] is True
+    assert edit_event["transaction"]["validation_completed"] is False
+    assert edit_event["transaction"]["rollback_verified"] is True
+    assert edit_event["transaction"]["transaction_closed"] is True
+    assert not authorize_phase_patch(state, "").authorized
+
+
+def test_model_action_timeout_is_distinguished_and_recovers_after_quiescence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CommandTimeoutError(RuntimeError):
+        pass
+
+    prior = b"def transform(value):\n    return value\n"
+    target = _initialize_git_target(tmp_path, TARGET, prior)
+
+    class Environment(_LocalPhaseEnvironment):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.interrupts = 0
+
+        def interrupt_session(self) -> None:
+            self.interrupts += 1
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = Environment(tmp_path)
+            self.tools = SimpleNamespace(
+                get_state=lambda env: {"working_dir": str(tmp_path)},
+                config=SimpleNamespace(execution_timeout=25),
+            )
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            target.write_text("def transform(value):\n    return changed\n", encoding="utf-8")
+            raise CommandTimeoutError("model command timed out")
+
+    state_path, _event_path = _install_host_transaction_gate(
+        tmp_path, monkeypatch, FakeAgent
+    )
+    fake = FakeAgent()
+
+    result = fake.handle_action(
+        SimpleNamespace(
+            action="sed -i 's/value/changed/' src/module.py",
+            observation="",
+            state=None,
+            done=False,
+            thought="",
+            output="",
+        )
+    )
+
+    assert fake._env.interrupts == 1
+    assert target.read_bytes() == prior
+    assert "model-authored command timed out" in result.observation
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["last_transaction_failure_kind"] == "model_action_timeout"
+    assert state["last_transaction"]["timeout_owner"] == "model_action"
+    assert state["last_transaction"]["timeout_seconds"] == 25
+    assert state["last_transaction"]["rollback_verified"] is True
+
+
+def test_rollback_timeout_leaves_incomplete_journal_and_blocks_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RollbackTimeoutError(RuntimeError):
+        pass
+
+    target = _initialize_git_target(
+        tmp_path, TARGET, b"def transform(value):\n    return value\n"
+    )
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(get_state=lambda env: {"working_dir": str(tmp_path)})
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            target.write_text("def broken(:\n", encoding="utf-8")
+            step.observation = "edit complete"
+            step.execution_exit_code = 0
+            step.done = False
+            return step
+
+    state_path, event_path = _install_host_transaction_gate(
+        tmp_path, monkeypatch, FakeAgent
+    )
+
+    def rollback_timeout(*_args: object, **_kwargs: object) -> None:
+        raise RollbackTimeoutError("rollback timed out")
+
+    monkeypatch.setattr(phase_gate_module, "_restore_target", rollback_timeout)
+    fake = FakeAgent()
+
+    with pytest.raises(TransactionalCleanupError):
+        fake.handle_action(
+            SimpleNamespace(
+                action="sed -i 's/value/broken/' src/module.py",
+                observation="",
+                state=None,
+                done=False,
+                thought="",
+                output="",
+            )
+        )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["active_transaction"] is not None
+    assert state["active_transaction_status"] == "cleanup_incomplete"
+    assert state["transactional_cleanup_verified"] is False
+    assert state["last_transaction_failure_kind"] == "cgr_rollback_error"
+    assert state["last_transaction"]["timeout_owner"] == "cgr_rollback"
+    assert not authorize_phase_patch(state, "patch").authorized
+    event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["transaction"]["transaction_closed"] is False
+    assert event["transaction"]["rollback_verified"] is False
+
+
+def test_rollback_verification_failure_remains_incomplete_and_unauthorized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _initialize_git_target(
+        tmp_path, TARGET, b"def transform(value):\n    return value\n"
+    )
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(get_state=lambda env: {"working_dir": str(tmp_path)})
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            target.write_text("def broken(:\n", encoding="utf-8")
+            step.observation = "edit complete"
+            step.execution_exit_code = 0
+            step.done = False
+            return step
+
+    state_path, event_path = _install_host_transaction_gate(
+        tmp_path, monkeypatch, FakeAgent
+    )
+    real_snapshot = phase_gate_module._snapshot_target
+    calls = 0
+
+    def mismatched_verification_snapshot(*args: object, **kwargs: object) -> FileSnapshot:
+        nonlocal calls
+        calls += 1
+        snapshot = real_snapshot(*args, **kwargs)
+        if calls == 3:
+            return FileSnapshot(snapshot.path, True, b"unverified", snapshot.mode)
+        return snapshot
+
+    monkeypatch.setattr(
+        phase_gate_module, "_snapshot_target", mismatched_verification_snapshot
+    )
+
+    with pytest.raises(TransactionalCleanupError):
+        FakeAgent().handle_action(
+            SimpleNamespace(
+                action="sed -i 's/value/broken/' src/module.py",
+                observation="",
+                state=None,
+                done=False,
+                thought="",
+                output="",
+            )
+        )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["last_transaction_failure_kind"] == "cgr_rollback_verification_error"
+    assert state["transactional_cleanup_verified"] is False
+    assert not authorize_phase_patch(state, "patch").authorized
+    event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["transaction"]["rollback_attempted"] is True
+    assert event["transaction"]["rollback_succeeded"] is True
+    assert event["transaction"]["rollback_verified"] is False

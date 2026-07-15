@@ -11,7 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from cgr import quixbugs_pilot as pilot
-from cgr.swebench.phase_gate import PatchAuthorization
+from cgr.swebench.phase_gate import (
+    EditPolicy,
+    PhaseGate,
+    PatchAuthorization,
+    RepositoryEvidence,
+    _snapshot_host_target,
+    authorize_phase_patch,
+)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -82,6 +89,164 @@ def test_attempt_clone_is_disposable_and_pinned(tmp_path: Path) -> None:
     assert _git(workspace, "rev-parse", "HEAD") == commit
     assert _git(source, "status", "--porcelain=v1") == ""
     assert tracked.read_text(encoding="utf-8") == "buggy = True\n"
+
+
+def test_post_run_reconciliation_retains_forensics_and_exactly_restores(
+    tmp_path: Path,
+) -> None:
+    attempt = tmp_path / "attempt-007"
+    workspace = attempt / "workspace"
+    target = workspace / "src" / "module.py"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"def value():\n    return 1\n")
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@example.com")
+    _git(workspace, "config", "user.name", "Test")
+    _git(workspace, "add", "src/module.py")
+    _git(workspace, "commit", "-qm", "initial")
+    original_mode = target.stat().st_mode
+    state_path = attempt / "phase-gate-state.json"
+    gate = PhaseGate(
+        phase="edit",
+        target="src/module.py",
+        focused_test="tests/test_module.py",
+        state_path=state_path,
+        edit_policy=EditPolicy(mode="modify_existing_source"),
+    )
+    decision = gate.decide(
+        "sed -i 's/return 1/return 2/' src/module.py", RepositoryEvidence()
+    )
+    transaction = gate.begin_transaction(
+        decision, _snapshot_host_target(workspace, "src/module.py")
+    )
+    target.write_bytes(b"def value():\n    return 2\n")
+    target.chmod(0o600)
+    precleanup_status = _git(workspace, "status", "--porcelain=v1")
+    precleanup_diff = _git(workspace, "diff", "--binary", "HEAD", "--")
+
+    state, reconciliation, patch_path, status_path = pilot._reconcile_phase_transaction(
+        attempt,
+        workspace,
+        gate.state,
+        state_path,
+        precleanup_status,
+        precleanup_diff,
+    )
+
+    assert transaction["status"] == "started"
+    assert reconciliation.required and reconciliation.attempted
+    assert reconciliation.succeeded and reconciliation.verified
+    assert patch_path is not None and "return 2" in patch_path.read_text(encoding="utf-8")
+    assert status_path is not None and "src/module.py" in status_path.read_text(
+        encoding="utf-8"
+    )
+    assert target.read_bytes() == b"def value():\n    return 1\n"
+    assert target.stat().st_mode == original_mode
+    assert _git(workspace, "status", "--porcelain=v1") == ""
+    assert _git(workspace, "diff", "--binary", "HEAD", "--") == ""
+    assert state is not None
+    assert state["active_transaction"] is None
+    assert state["last_transaction"]["status"] == "reconciled"
+    assert state["last_transaction"]["rollback_verified"] is True
+    assert state["transactional_cleanup_verified"] is True
+    assert authorize_phase_patch(state, "").authorized is False
+    assert Path(transaction["snapshot_path"]).is_file()
+
+
+def test_post_run_reconciliation_failure_preserves_dirty_workspace_and_journal(
+    tmp_path: Path,
+) -> None:
+    attempt = tmp_path / "attempt-007"
+    workspace = attempt / "workspace"
+    target = workspace / "src" / "module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("value = 1\n", encoding="utf-8")
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@example.com")
+    _git(workspace, "config", "user.name", "Test")
+    _git(workspace, "add", "src/module.py")
+    _git(workspace, "commit", "-qm", "initial")
+    state_path = attempt / "phase-gate-state.json"
+    gate = PhaseGate(
+        phase="edit",
+        target="src/module.py",
+        focused_test="tests/test_module.py",
+        state_path=state_path,
+    )
+    decision = gate.decide(
+        "sed -i 's/value = 1/value = 2/' src/module.py", RepositoryEvidence()
+    )
+    transaction = gate.begin_transaction(
+        decision, _snapshot_host_target(workspace, "src/module.py")
+    )
+    target.write_text("value = 2\n", encoding="utf-8")
+    Path(transaction["snapshot_path"]).write_text("not json", encoding="utf-8")
+    precleanup_status = _git(workspace, "status", "--porcelain=v1")
+    precleanup_diff = _git(workspace, "diff", "--binary", "HEAD", "--")
+
+    state, reconciliation, patch_path, _status_path = pilot._reconcile_phase_transaction(
+        attempt,
+        workspace,
+        gate.state,
+        state_path,
+        precleanup_status,
+        precleanup_diff,
+    )
+
+    assert reconciliation.required and reconciliation.attempted
+    assert not reconciliation.succeeded and not reconciliation.verified
+    assert reconciliation.error
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert patch_path is not None and "value = 2" in patch_path.read_text(encoding="utf-8")
+    assert state is not None
+    assert state["active_transaction"] is not None
+    assert state["transactional_cleanup_verified"] is False
+    assert state["last_transaction_failure_kind"] == "post_run_reconciliation_error"
+    assert authorize_phase_patch(state, precleanup_diff).authorized is False
+
+
+def test_dirty_workspace_without_accepted_edit_or_journal_fails_closed(
+    tmp_path: Path,
+) -> None:
+    attempt = tmp_path / "attempt-007"
+    workspace = attempt / "workspace"
+    target = workspace / "src" / "module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("value = 1\n", encoding="utf-8")
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@example.com")
+    _git(workspace, "config", "user.name", "Test")
+    _git(workspace, "add", "src/module.py")
+    _git(workspace, "commit", "-qm", "initial")
+    target.write_text("value = 2\n", encoding="utf-8")
+    state_path = attempt / "phase-gate-state.json"
+    state = {
+        "accepted_target_edit": False,
+        "active_transaction": None,
+        "transactional_cleanup_verified": True,
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    precleanup_status = _git(workspace, "status", "--porcelain=v1")
+    precleanup_diff = _git(workspace, "diff", "--binary", "HEAD", "--")
+
+    final_state, reconciliation, patch_path, _status_path = (
+        pilot._reconcile_phase_transaction(
+            attempt,
+            workspace,
+            state,
+            state_path,
+            precleanup_status,
+            precleanup_diff,
+        )
+    )
+
+    assert reconciliation.required is True
+    assert reconciliation.attempted is False
+    assert reconciliation.verified is False
+    assert "no accepted edit" in str(reconciliation.error)
+    assert patch_path is not None and patch_path.read_text(encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert final_state == state
 
 
 def test_real_quixbugs_workspace_origin_survives_relocation(tmp_path: Path) -> None:
