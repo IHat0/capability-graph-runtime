@@ -10,6 +10,8 @@ import pytest
 from cgr.swebench.phase_gate import (
     PhaseGate,
     RepositoryEvidence,
+    _normalize_observation_text,
+    _probe_repository,
     classify_candidate_action,
     install_sweagent_phase_gate,
 )
@@ -24,9 +26,9 @@ TEST = "tests/test_module.py"
     [
         ("cat src/module.py", "target_confirmation"),
         ("ls tests", "inspection"),
-        ("sed -i 's/a/b/' src/module.py", "edit"),
-        ("python -c \"open('src/module.py','w').write('x')\"", "edit"),
-        ("cat > src/module.py <<'EOF'\nx\nEOF", "edit"),
+        ("sed -i 's/a/b/' src/module.py", "edit_target_file"),
+        ("python -c \"open('src/module.py','w').write('x')\"", "edit_target_file"),
+        ("cat > src/module.py <<'EOF'\nx\nEOF", "edit_target_file"),
         ("git diff -- src/module.py", "git_diff"),
         ("python -m pytest -q tests/test_module.py", "focused_test"),
         ("pytest -q tests/test_other.py", "unrelated_test"),
@@ -38,6 +40,74 @@ TEST = "tests/test_module.py"
 )
 def test_candidate_action_classification(action: str, kind: str) -> None:
     assert classify_candidate_action(action, target=TARGET, focused_test=TEST).kind == kind
+
+
+@pytest.mark.parametrize(
+    ("action", "kind", "targets"),
+    [
+        ("echo x > src/module.py", "edit_target_file", ("src/module.py",)),
+        ("printf x >> src/module.py", "edit_target_file", ("src/module.py",)),
+        ("printf x | tee src/module.py", "edit_target_file", ("src/module.py",)),
+        ("printf x | tee -a src/module.py", "edit_target_file", ("src/module.py",)),
+        ("touch tests/test_module.py", "edit_wrong_file", ("tests/test_module.py",)),
+        ("echo x > tests/test_module.py", "edit_wrong_file", ("tests/test_module.py",)),
+        (
+            "echo x > src/one.py\nprintf y >> src/two.py",
+            "edit_wrong_file",
+            ("src/one.py", "src/two.py"),
+        ),
+        (
+            "echo x > src/module.py\necho y > tests/test_module.py",
+            "edit_mixed_targets",
+            ("src/module.py", "tests/test_module.py"),
+        ),
+        (
+            "cat <<'EOF' > src/module.py\nx\nEOF",
+            "edit_target_file",
+            ("src/module.py",),
+        ),
+        (
+            "python - <<'PY'\nfrom pathlib import Path\n"
+            "Path('src/module.py').write_text('x')\nPY",
+            "edit_target_file",
+            ("src/module.py",),
+        ),
+        (
+            "python -c \"from pathlib import Path; Path('src/module.py').open('w+').write('x')\"",
+            "edit_target_file",
+            ("src/module.py",),
+        ),
+    ],
+)
+def test_redirected_write_targets_are_extracted(
+    action: str, kind: str, targets: tuple[str, ...]
+) -> None:
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == kind
+    assert candidate.write_targets == targets
+
+
+@pytest.mark.parametrize(
+    ("action", "kind"),
+    [
+        ("echo x > src/module.py && git commit -am x", "commit"),
+        ("touch src/module.py && git push origin main", "push"),
+    ],
+)
+def test_prohibited_git_action_takes_precedence_over_edit(action: str, kind: str) -> None:
+    assert classify_candidate_action(action, target=TARGET, focused_test=TEST).kind == kind
+
+
+def test_python_read_open_is_not_misclassified_as_write() -> None:
+    candidate = classify_candidate_action(
+        "python -c \"from pathlib import Path; Path('src/module.py').open().read()\"",
+        target=TARGET,
+        focused_test=TEST,
+    )
+
+    assert candidate.write_targets == ()
+    assert candidate.kind == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -139,7 +209,23 @@ def test_wrong_file_edit_does_not_satisfy_target_edit() -> None:
     decision = gate.decide("sed -i 's/a/b/' src/other.py", RepositoryEvidence())
 
     assert not decision.allowed
-    assert "does not target" in str(decision.feedback)
+    assert decision.candidate.kind == "edit_wrong_file"
+    assert "Required target: src/module.py" in str(decision.feedback)
+    assert "Observed write target: src/other.py" in str(decision.feedback)
+    assert "does not modify the required production source" in str(decision.feedback)
+    assert "s/a/b" not in str(decision.feedback)
+
+
+def test_mixed_target_edit_is_rejected_with_grounded_feedback() -> None:
+    gate = PhaseGate(phase="edit", target=TARGET, focused_test=TEST)
+    action = "echo x > src/module.py\necho y > tests/test_module.py"
+
+    decision = gate.decide(action, RepositoryEvidence())
+
+    assert not decision.allowed
+    assert decision.candidate.kind == "edit_mixed_targets"
+    assert "src/module.py, tests/test_module.py" in str(decision.feedback)
+    assert "mixes the required source edit" in str(decision.feedback)
 
 
 def test_confirm_edit_requires_inspection_and_nonempty_target_diff() -> None:
@@ -204,3 +290,31 @@ def test_commit_and_push_are_rejected_in_every_phase() -> None:
         gate = PhaseGate(phase=phase, target=TARGET, focused_test=TEST)
         assert not gate.decide("git commit -am x", RepositoryEvidence()).allowed
         assert not gate.decide("git push", RepositoryEvidence()).allowed
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("raw output", "raw output"),
+        ({"output": "mapping output"}, "mapping output"),
+        (SimpleNamespace(output="object output"), "object output"),
+        (SimpleNamespace(stdout="stdout output"), "stdout output"),
+    ],
+)
+def test_observation_text_normalization(value: object, expected: str) -> None:
+    assert _normalize_observation_text(value) == expected
+
+
+def test_repository_probe_normalizes_swerex_observation_objects() -> None:
+    class FakeEnvironment:
+        def communicate(self, command: str, check: str) -> object:
+            assert check == "ignore"
+            if "--binary" in command:
+                return SimpleNamespace(output="tracked patch")
+            return {"output": "target patch"}
+
+    evidence = _probe_repository(SimpleNamespace(_env=FakeEnvironment()), TARGET)
+
+    assert evidence == RepositoryEvidence(
+        target_diff="target patch", tracked_diff="tracked patch"
+    )

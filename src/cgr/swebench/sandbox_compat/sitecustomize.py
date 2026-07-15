@@ -18,7 +18,10 @@ from typing import Any
 if os.getenv("CGR_PHASE_GATE_CONFIG"):
     from cgr.swebench.phase_gate import install_sweagent_phase_gate
 
-    install_sweagent_phase_gate()
+    try:
+        install_sweagent_phase_gate()
+    except Exception as exc:
+        raise SystemExit(f"CGR phase-gate bootstrap error: {exc}") from exc
 
 
 if os.getenv("CGR_SANDBOX_WINDOWS_SWEREX") == "1":

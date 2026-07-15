@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,12 @@ from cgr.quixbugs_diagnosis import build_corrective_message, diagnose_attempt
 DEFAULT_MANIFEST = Path("benchmark-manifests/quixbugs-python-pilot-v1.json")
 DEFAULT_RESULT_ROOT = Path("benchmark-results/quixbugs-python-pilot-v1")
 DEFAULT_ATTEMPT_TIMEOUT_SECONDS = 600
+PHASE_GATE_SCHEMA_VERSION = 1
+BOOTSTRAP_CLASSIFICATIONS = {"adapter_bootstrap_error", "phase_gate_bootstrap_error"}
+
+
+class PhaseGateBootstrapError(RuntimeError):
+    """Raised when the configured phase gate cannot be loaded before adapter startup."""
 
 
 def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
@@ -64,6 +71,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             "noop_edit",
             "declared_edit",
             "recovery",
+            "phase_gate_realistic",
         ),
         default="success",
         help=argparse.SUPPRESS,
@@ -93,6 +101,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     final_path = attempt / "final-result.json"
     server = None
     server_thread: threading.Thread | None = None
+    phase_config_path: Path | None = None
+    phase_log_path: Path | None = None
     started = time.perf_counter()
     result: dict[str, Any] = {
         "task_id": args.task_id,
@@ -176,20 +186,12 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
 
         overlay_path = attempt / "sweagent-config.yaml"
         overlay_path.write_text(_quixbugs_overlay(agent_python), encoding="utf-8")
-        phase_config_path: Path | None = None
         if args.required_phase:
-            phase_config_path = attempt / "phase-gate-config.json"
-            phase_config_path.write_text(
-                json.dumps(
-                    {
-                        "initial_phase": args.required_phase,
-                        "target": task["source_file"],
-                        "focused_test": task["test_file"],
-                        "log_path": str(attempt / "phase-gate-events.jsonl"),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
+            phase_config_path, phase_log_path = _write_phase_gate_config(
+                attempt,
+                initial_phase=args.required_phase,
+                target=str(task["source_file"]),
+                focused_test=str(task["test_file"]),
             )
         adapter_command = _adapter_command(
             sweagent_python,
@@ -197,6 +199,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             problem_path,
             overlay_path,
             deployment_type,
+            max_calls=10 if args.deterministic_profile == "phase_gate_realistic" else 8,
         )
         (attempt / "adapter-command.json").write_text(
             json.dumps(adapter_command, indent=2), encoding="utf-8"
@@ -211,6 +214,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             deployment_type=deployment_type,
             phase_config=phase_config_path,
         )
+        _assert_phase_gate_config(phase_config_path, environment)
         (attempt / "environment.json").write_text(
             json.dumps(
                 {
@@ -222,6 +226,10 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                     "sweagent_python": str(sweagent_python),
                     "action_level_interception": phase_config_path is not None,
                     "required_phase": args.required_phase,
+                    "phase_gate_config_path": str(phase_config_path)
+                    if phase_config_path
+                    else None,
+                    "phase_gate_event_log_path": str(phase_log_path) if phase_log_path else None,
                     "attempt_timeout_seconds": args.attempt_timeout_seconds,
                 },
                 indent=2,
@@ -236,7 +244,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         )
         (attempt / "adapter.stdout.log").write_text(adapter.stdout, encoding="utf-8")
         (attempt / "adapter.stderr.log").write_text(adapter.stderr, encoding="utf-8")
-        adapter_result = cycle._last_json_object(adapter.stdout)
+        adapter_result, adapter_parse_error = _parse_adapter_result(adapter.stdout)
         (attempt / "adapter-result.json").write_text(
             json.dumps(adapter_result, indent=2), encoding="utf-8"
         )
@@ -253,7 +261,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             cycle._jsonl_count(interaction_path)
             if interaction_path and interaction_path.is_file()
             else _trajectory_step_count(trajectory)
-        )
+        ) or 0
         preflight_status = "passed" if model_requests else "failed_or_unconfirmed"
 
         verifier: subprocess.CompletedProcess[str] | None = None
@@ -272,7 +280,16 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 except (OSError, subprocess.SubprocessError):
                     classification = "verifier_error"
         else:
-            classification = _classify_agent_failure(adapter_result, termination)
+            classification = _classify_adapter_failure(
+                adapter_result,
+                termination,
+                model_requests=model_requests,
+                trajectory=trajectory,
+                prediction=prediction,
+                diff=diff,
+                stderr=adapter.stderr,
+                phase_config=phase_config_path,
+            )
         if verifier is not None:
             _write_process_artifacts(attempt, "verifier", verifier_command, verifier)
         else:
@@ -280,6 +297,15 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 json.dumps(verifier_command, indent=2), encoding="utf-8"
             )
 
+        bootstrap_failure = classification in BOOTSTRAP_CLASSIFICATIONS
+        infrastructure_failure = bootstrap_failure or (
+            classification == "model_failure" and model_requests == 0
+        )
+        adapter_error = (
+            adapter_result.get("error")
+            or adapter_parse_error
+            or (adapter.stderr.strip() if adapter.returncode else None)
+        )
         result.update(
             {
                 "pinned_quixbugs_commit": task["pinned_commit"],
@@ -312,6 +338,14 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 "trajectory_path": str(trajectory) if trajectory else None,
                 "prediction_path": str(prediction) if prediction else None,
                 "submitted_patch_path": str(submitted_patch) if submitted_patch else None,
+                "phase_gate_config_path": str(phase_config_path)
+                if phase_config_path
+                else None,
+                "phase_gate_event_log_path": str(phase_log_path) if phase_log_path else None,
+                "adapter_result": adapter_result,
+                "adapter_error": adapter_error,
+                "adapter_stdout_path": str(attempt / "adapter.stdout.log"),
+                "adapter_stderr_path": str(attempt / "adapter.stderr.log"),
                 "patch_status": "patch" if diff.strip() else "no_patch",
                 "patch_size": len(diff.encode("utf-8")),
                 "verifier_command": verifier_command,
@@ -320,8 +354,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 "verifier_exit_code": verifier.returncode if verifier else None,
                 "verifier_status": "executed" if verifier else "skipped",
                 "classification": classification,
-                "infrastructure_status": "completed",
-                "top_level_exit_code": 0,
+                "infrastructure_status": "failed" if infrastructure_failure else "completed",
+                "top_level_exit_code": 1 if infrastructure_failure else 0,
                 "adapter_exit_code": adapter.returncode,
                 "attempt_timed_out": attempt_timed_out,
                 "attempt_timeout_seconds": args.attempt_timeout_seconds,
@@ -331,7 +365,26 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:
         (attempt / "failure-traceback.log").write_text(traceback.format_exc(), encoding="utf-8")
-        result.update({"error": str(exc), "elapsed_seconds": time.perf_counter() - started})
+        phase_bootstrap = isinstance(exc, PhaseGateBootstrapError)
+        result.update(
+            {
+                "classification": "phase_gate_bootstrap_error"
+                if phase_bootstrap
+                else result["classification"],
+                "infrastructure_status": "failed",
+                "top_level_exit_code": 1,
+                "error": str(exc),
+                "phase_gate_config_path": str(phase_config_path)
+                if phase_config_path
+                else None,
+                "phase_gate_event_log_path": str(phase_log_path) if phase_log_path else None,
+                "elapsed_seconds": time.perf_counter() - started,
+            }
+        )
+        for name in ("adapter.stdout.log", "adapter.stderr.log"):
+            path = attempt / name
+            if not path.exists():
+                path.write_text("", encoding="utf-8")
     finally:
         if server is not None:
             server.shutdown()
@@ -369,6 +422,9 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
         "corrective_messages_generated": [],
         "attempt_lineage": [],
     }
+    child_results: list[dict[str, Any]] = []
+    diagnoses: list[dict[str, Any] | None] = []
+    bootstrap_signatures: set[str] = set()
     try:
         task, _manifest = _load_task(args.manifest.absolute(), args.task_id)
         parent_deployment = args.deployment_type or ("local" if os.name == "nt" else "docker")
@@ -381,8 +437,6 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
         task["agent_verifier_command"] = str(task["agent_verifier_command"]).replace(
             "{agent_python}", parent_agent_python
         )
-        child_results: list[dict[str, Any]] = []
-        diagnoses: list[dict[str, Any] | None] = []
         latest_correction: Path | None = None
         latest_required_phase: str | None = None
         profiles = ("failed", "misassessment", "declared_edit", "recovery")
@@ -400,10 +454,6 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
             result["attempts_started"] = attempt_index
             result["attempts_completed"] = attempt_index
             result["child_artifact_paths"].append(child["artifact_directory"])
-            if child.get("infrastructure_status") != "completed":
-                raise RuntimeError(
-                    f"QuixBugs child attempt {attempt_index} had an infrastructure failure."
-                )
             lineage = {
                 "attempt": f"attempt-{attempt_index:03d}",
                 "artifact_path": child["artifact_directory"],
@@ -413,6 +463,25 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
                 "model_requests_source": child.get("model_requests_source"),
             }
             result["attempt_lineage"].append(lineage)
+            bootstrap_signature, duplicate_bootstrap = _register_bootstrap_failure(
+                bootstrap_signatures, child
+            )
+            if bootstrap_signature is not None:
+                diagnoses.append(None)
+                lineage["bootstrap_failure_signature"] = bootstrap_signature
+                result["bootstrap_failure_signature"] = bootstrap_signature
+                if duplicate_bootstrap or attempt_index >= attempt_limit:
+                    qualifier = "repeated " if duplicate_bootstrap else ""
+                    raise RuntimeError(
+                        f"QuixBugs child attempt {attempt_index} had a {qualifier}"
+                        f"{child['classification']}."
+                    )
+                attempt_index += 1
+                continue
+            if child.get("infrastructure_status") != "completed":
+                raise RuntimeError(
+                    f"QuixBugs child attempt {attempt_index} had an infrastructure failure."
+                )
             if child.get("classification") == "resolved":
                 diagnoses.append(None)
                 break
@@ -486,7 +555,13 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
             result["final_patch_path"] = str(parent_patch)
     except Exception as exc:
         (run / "failure-traceback.log").write_text(traceback.format_exc(), encoding="utf-8")
-        result["error"] = str(exc)
+        result.update(
+            {
+                "error": str(exc),
+                "attempt_results": child_results,
+                "total_model_attempts": len(child_results),
+            }
+        )
     finally:
         result["total_elapsed_seconds"] = time.perf_counter() - started
         result["artifact_hash_manifest"] = str(run / "artifact-sha256.json")
@@ -767,6 +842,87 @@ def _verifier_command(task: dict[str, Any], python: Path) -> list[str]:
     return [value.replace("{python}", str(python)) for value in command]
 
 
+def _write_phase_gate_config(
+    attempt: Path,
+    *,
+    initial_phase: str,
+    target: str,
+    focused_test: str,
+) -> tuple[Path, Path]:
+    attempt = attempt.resolve(strict=True)
+    config_path = attempt / "phase-gate-config.json"
+    log_path = attempt / "phase-gate-events.jsonl"
+    try:
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": PHASE_GATE_SCHEMA_VERSION,
+                    "initial_phase": initial_phase,
+                    "target": target,
+                    "focused_test": focused_test,
+                    "log_path": str(log_path),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        log_path.touch()
+    except OSError as exc:
+        raise PhaseGateBootstrapError(
+            f"Phase-gate artifacts could not be created in {attempt}."
+        ) from exc
+    _assert_phase_gate_config(config_path, {"CGR_PHASE_GATE_CONFIG": str(config_path)})
+    return config_path, log_path
+
+
+def _assert_phase_gate_config(
+    config_path: Path | None, environment: dict[str, str]
+) -> dict[str, Any] | None:
+    configured = environment.get("CGR_PHASE_GATE_CONFIG")
+    if config_path is None:
+        if configured:
+            raise PhaseGateBootstrapError(
+                "CGR_PHASE_GATE_CONFIG was set without a phase-gate configuration."
+            )
+        return None
+    if not config_path.is_absolute():
+        raise PhaseGateBootstrapError("Phase-gate configuration path must be absolute.")
+    if configured != str(config_path):
+        raise PhaseGateBootstrapError(
+            "Adapter environment does not contain the exact persistent phase-gate path."
+        )
+    try:
+        with config_path.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PhaseGateBootstrapError(
+            f"Phase-gate configuration is missing, unreadable, or invalid: {config_path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PhaseGateBootstrapError("Phase-gate configuration must be a JSON object.")
+    required = {"schema_version", "initial_phase", "target", "focused_test", "log_path"}
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise PhaseGateBootstrapError(
+            "Phase-gate configuration is missing fields: " + ", ".join(missing)
+        )
+    if payload["schema_version"] != PHASE_GATE_SCHEMA_VERSION:
+        raise PhaseGateBootstrapError("Phase-gate configuration schema version is unsupported.")
+    log_path = Path(str(payload["log_path"]))
+    if not log_path.is_absolute() or log_path.parent != config_path.parent:
+        raise PhaseGateBootstrapError(
+            "Phase-gate event log must use an absolute path in the attempt directory."
+        )
+    return payload
+
+
+def _parse_adapter_result(stdout: str) -> tuple[dict[str, Any], str | None]:
+    try:
+        return cycle._last_json_object(stdout), None
+    except RuntimeError as exc:
+        return {}, str(exc)
+
+
 def _run_adapter_process(
     command: list[str],
     *,
@@ -893,6 +1049,18 @@ def _deterministic_actions(
             f"git diff -- {shlex_quote(source)}",
             f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
         ]
+    if profile == "phase_gate_realistic":
+        return [
+            f"git add {shlex_quote(source)} && git commit -m 'premature commit'",
+            f"cat {shlex_quote(source)}",
+            "touch test_gcd.py\necho 'assert False' > test_gcd.py",
+            f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
+            f"sed -n '1,30p' {shlex_quote(source)}",
+            f"git diff -- {shlex_quote(source)}",
+            str(task["agent_verifier_command"]),
+            f"git diff -- {shlex_quote(source)}",
+            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
+        ]
     return [
         f"sed -n '1,100p' {shlex_quote(source)} && sed -n '1,120p' {shlex_quote(test)}",
         f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
@@ -952,6 +1120,8 @@ def _adapter_command(
     problem: Path,
     overlay: Path,
     deployment_type: str,
+    *,
+    max_calls: int = 8,
 ) -> list[str]:
     command = [
         str(python),
@@ -966,7 +1136,7 @@ def _adapter_command(
         "--max-steps",
         "10",
         "--max-calls",
-        "8",
+        str(max_calls),
         "--deployment-type",
         deployment_type,
         "--config-overlay",
@@ -1035,15 +1205,74 @@ def _adapter_environment(
     return environment
 
 
-def _classify_agent_failure(adapter_result: dict[str, Any], termination: str | None) -> str:
+def _classify_adapter_failure(
+    adapter_result: dict[str, Any],
+    termination: str | None,
+    *,
+    model_requests: int,
+    trajectory: Path | None,
+    prediction: Path | None,
+    diff: str,
+    stderr: str,
+    phase_config: Path | None,
+) -> str:
+    detail = " ".join((json.dumps(adapter_result), stderr)).lower()
+    if model_requests == 0 and trajectory is None and prediction is None and not diff.strip():
+        if phase_config is not None and re.search(
+            r"phase.?gate|cgr_phase_gate_config|sitecustomize", detail
+        ):
+            return "phase_gate_bootstrap_error"
+        if re.search(r"litellm|provider|api call|connection|model response", detail):
+            return "model_failure"
+        return "adapter_bootstrap_error"
     if termination and re.search(r"cost|call|budget", termination, re.IGNORECASE):
         return "budget_exhausted"
-    detail = json.dumps(adapter_result).lower()
     if re.search(r"litellm|provider|api call|connection|model response", detail):
         return "model_failure"
     if "no non-empty unified patch" in detail or termination == "submitted":
         return "no_patch"
     return "agent_failure"
+
+
+def _classify_agent_failure(adapter_result: dict[str, Any], termination: str | None) -> str:
+    return _classify_adapter_failure(
+        adapter_result,
+        termination,
+        model_requests=1,
+        trajectory=None,
+        prediction=None,
+        diff="",
+        stderr="",
+        phase_config=None,
+    )
+
+
+def _bootstrap_failure_signature(result: dict[str, Any]) -> str | None:
+    if result.get("classification") not in BOOTSTRAP_CLASSIFICATIONS:
+        return None
+    error = str(result.get("adapter_error") or result.get("error") or "")
+    normalized = re.sub(r"\b(?:run|attempt)-\d+\b", "attempt-N", error.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    evidence = {
+        "classification": result.get("classification"),
+        "adapter_exit_code": result.get("adapter_exit_code"),
+        "error": normalized,
+        "model_requests": int(result.get("model_requests") or 0),
+        "trajectory_absent": not bool(result.get("trajectory_path")),
+        "prediction_absent": not bool(result.get("prediction_path")),
+    }
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _register_bootstrap_failure(
+    seen: set[str], result: dict[str, Any]
+) -> tuple[str | None, bool]:
+    signature = _bootstrap_failure_signature(result)
+    if signature is None:
+        return None, False
+    duplicate = signature in seen
+    seen.add(signature)
+    return signature, duplicate
 
 
 if __name__ == "__main__":

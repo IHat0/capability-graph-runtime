@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -132,6 +133,178 @@ def test_agent_failures_are_classified(
     adapter_result: dict[str, str], termination: str | None, expected: str
 ) -> None:
     assert pilot._classify_agent_failure(adapter_result, termination) == expected
+
+
+def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt-001"
+    attempt.mkdir()
+    config, event_log = pilot._write_phase_gate_config(
+        attempt,
+        initial_phase="edit",
+        target="src/module.py",
+        focused_test="tests/test_module.py",
+    )
+    environment = os.environ.copy()
+    environment["CGR_PHASE_GATE_CONFIG"] = str(config)
+    script = (
+        "import json, os, pathlib, time; "
+        "p=pathlib.Path(os.environ['CGR_PHASE_GATE_CONFIG']); "
+        "a=json.loads(p.read_text())['initial_phase']; time.sleep(.05); "
+        "b=json.loads(p.read_text())['initial_phase']; print(a + ':' + b)"
+    )
+
+    process, timed_out = pilot._run_adapter_process(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        timeout=5,
+        environment=environment,
+    )
+
+    assert not timed_out
+    assert process.returncode == 0
+    assert process.stdout.strip() == "edit:edit"
+    assert config.is_absolute() and config.is_file()
+    assert event_log.is_absolute() and event_log.is_file()
+    assert pilot._assert_phase_gate_config(config, environment) is not None
+    assert json.loads(config.read_text(encoding="utf-8"))["schema_version"] == 1
+
+
+def test_missing_phase_gate_config_fails_closed(tmp_path: Path) -> None:
+    missing = (tmp_path / "missing.json").absolute()
+
+    with pytest.raises(pilot.PhaseGateBootstrapError, match="missing, unreadable, or invalid"):
+        pilot._assert_phase_gate_config(
+            missing, {"CGR_PHASE_GATE_CONFIG": str(missing)}
+        )
+
+
+def test_unreadable_phase_gate_config_fails_closed(tmp_path: Path) -> None:
+    unreadable = (tmp_path / "phase-gate-config.json").absolute()
+    unreadable.mkdir()
+
+    with pytest.raises(pilot.PhaseGateBootstrapError, match="missing, unreadable, or invalid"):
+        pilot._assert_phase_gate_config(
+            unreadable, {"CGR_PHASE_GATE_CONFIG": str(unreadable)}
+        )
+
+
+def test_adapter_failure_before_model_contact_is_bootstrap_error(tmp_path: Path) -> None:
+    classification = pilot._classify_adapter_failure(
+        {"error": "Official SWE-agent exited with code 1."},
+        None,
+        model_requests=0,
+        trajectory=None,
+        prediction=None,
+        diff="",
+        stderr="startup failed",
+        phase_config=None,
+    )
+
+    assert classification == "adapter_bootstrap_error"
+
+
+def test_provider_failure_before_recorded_step_remains_model_failure() -> None:
+    classification = pilot._classify_adapter_failure(
+        {"error": "Provider API call failed"},
+        None,
+        model_requests=0,
+        trajectory=None,
+        prediction=None,
+        diff="",
+        stderr="connection refused",
+        phase_config=None,
+    )
+
+    assert classification == "model_failure"
+
+
+def test_phase_gate_startup_failure_is_distinct(tmp_path: Path) -> None:
+    config = tmp_path / "phase-gate-config.json"
+    classification = pilot._classify_adapter_failure(
+        {},
+        None,
+        model_requests=0,
+        trajectory=None,
+        prediction=None,
+        diff="",
+        stderr="Error in sitecustomize while loading CGR_PHASE_GATE_CONFIG",
+        phase_config=config,
+    )
+
+    assert classification == "phase_gate_bootstrap_error"
+
+
+def test_normal_model_no_patch_is_not_bootstrap_failure() -> None:
+    classification = pilot._classify_adapter_failure(
+        {"error": "No non-empty unified patch"},
+        "submitted",
+        model_requests=2,
+        trajectory=Path("attempt.traj"),
+        prediction=Path("attempt.pred"),
+        diff="",
+        stderr="",
+        phase_config=None,
+    )
+
+    assert classification == "no_patch"
+
+
+def test_repeated_bootstrap_signature_is_stable_and_detected() -> None:
+    seen: set[str] = set()
+    first = {
+        "classification": "adapter_bootstrap_error",
+        "adapter_exit_code": 1,
+        "adapter_error": "failure in run-001/attempt-001",
+        "model_requests": 0,
+        "trajectory_path": None,
+        "prediction_path": None,
+    }
+    second = {**first, "adapter_error": "failure in run-002/attempt-002"}
+
+    first_signature, first_duplicate = pilot._register_bootstrap_failure(seen, first)
+    second_signature, second_duplicate = pilot._register_bootstrap_failure(seen, second)
+
+    assert first_signature == second_signature
+    assert not first_duplicate
+    assert second_duplicate
+
+
+def test_repeated_bootstrap_stops_outer_run_without_model_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+
+    def fake_attempt(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append(len(calls) + 1)
+        return {
+            "artifact_directory": str(tmp_path / f"attempt-{len(calls):03d}"),
+            "classification": "adapter_bootstrap_error",
+            "infrastructure_status": "failed",
+            "top_level_exit_code": 1,
+            "adapter_exit_code": 1,
+            "adapter_error": "stable startup failure",
+            "model_requests": 0,
+            "model_requests_source": "trajectory_steps",
+            "trajectory_path": None,
+            "prediction_path": None,
+        }
+
+    monkeypatch.setattr(pilot, "_launch_child_attempt", fake_attempt)
+    args = SimpleNamespace(
+        result_root=tmp_path,
+        task_id="quixbugs.gcd",
+        manifest=pilot.DEFAULT_MANIFEST,
+        deployment_type="local",
+        sweagent_python=Path(sys.executable),
+    )
+
+    assert pilot._run_cgr(args, 3) == 1
+    result = json.loads((tmp_path / "quixbugs.gcd" / "run-001" / "run-result.json").read_text())
+    assert calls == [1, 2]
+    assert result["attempts_completed"] == 2
+    assert result["diagnoses_generated"] == []
+    assert result["corrective_messages_generated"] == []
+    assert result["top_level_exit_code"] == 1
 
 
 def test_verifier_command_uses_configured_python() -> None:
