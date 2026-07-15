@@ -27,6 +27,11 @@ class CandidateAction:
     write_targets: tuple[str, ...] = ()
     targets_test_file: bool = False
     targets_unrelated_files: bool = False
+    parsed_executable: str | None = None
+    parsed_argv: tuple[str, ...] = ()
+    redirection_operators: tuple[str, ...] = ()
+    heredoc_present: bool = False
+    heredoc_delimiter: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,26 @@ class PatchAuthorization:
     fingerprint: str | None
 
 
+@dataclass(frozen=True)
+class _ParsedShellCommand:
+    executable: str | None
+    argv: tuple[str, ...]
+    redirections: tuple[str, ...]
+    output_targets: tuple[str, ...]
+    heredoc_delimiter: str | None = None
+    heredoc_body: str = ""
+
+
+@dataclass(frozen=True)
+class _ShellActionAnalysis:
+    commands: tuple[_ParsedShellCommand, ...]
+    write_targets: tuple[str, ...]
+    parsed_executable: str | None
+    parsed_argv: tuple[str, ...]
+    redirection_operators: tuple[str, ...]
+    heredoc_delimiter: str | None
+
+
 def build_initial_phase_state(
     *, initial_phase: str, target: str, edit_policy: EditPolicy
 ) -> dict[str, Any]:
@@ -137,6 +162,7 @@ def build_initial_phase_state(
         "verifier_failure_summary_available": False,
         "phase_stalled_repeated_action": False,
         "coaching_level": 0,
+        "last_edit_execution": None,
     }
 
 
@@ -313,7 +339,8 @@ def classify_candidate_action(
     action: str, *, target: str, focused_test: str
 ) -> CandidateAction:
     normalized = " ".join(action.replace("\r", "").split())
-    write_targets = _extract_write_targets(action)
+    analysis = _analyze_shell_action(action)
+    write_targets = analysis.write_targets
     normalized_target = _normalize_target(target)
     normalized_test = _normalize_target(focused_test)
     targets = normalized_target in write_targets
@@ -348,13 +375,18 @@ def classify_candidate_action(
     else:
         kind = "unknown"
     return CandidateAction(
-        action,
-        kind,
-        targets,
-        references_target,
-        write_targets,
-        targets_test,
-        unrelated,
+        raw=action,
+        kind=kind,
+        targets_required_file=targets,
+        references_required_file=references_target,
+        write_targets=write_targets,
+        targets_test_file=targets_test,
+        targets_unrelated_files=unrelated,
+        parsed_executable=analysis.parsed_executable,
+        parsed_argv=analysis.parsed_argv,
+        redirection_operators=analysis.redirection_operators,
+        heredoc_present=analysis.heredoc_delimiter is not None,
+        heredoc_delimiter=analysis.heredoc_delimiter,
     )
 
 
@@ -628,7 +660,13 @@ class PhaseGate:
         )
         return "\n".join(lines)
 
-    def transactional_rejection_feedback(self, evaluation: EditEvaluation) -> str:
+    def transactional_rejection_feedback(
+        self,
+        evaluation: EditEvaluation,
+        *,
+        observation: str = "",
+        execution_exit_code: int | None = None,
+    ) -> str:
         descriptions = {
             "test_scaffolding_in_production_source": (
                 "It added test scaffolding to a production source target"
@@ -641,18 +679,31 @@ class PhaseGate:
             "comment_only_change": "It changed only comments",
             "no_target_change": "It produced no target change",
             "invalid_python_syntax": "It left invalid Python syntax",
+            "command_nonzero_exit": "The command exited unsuccessfully",
         }
         grounded = [descriptions[item] for item in evaluation.failures if item in descriptions]
         reason = " and ".join(grounded[:2]) or "It did not satisfy the configured edit policy"
-        return (
-            "ACTION REJECTED BY CGR\n\n"
-            f"Required phase: edit\nRequired target: {self.target}\n"
-            "Candidate kind: noninteractive_edit\n\n"
-            "The command executed, but its resulting change was rejected and rolled back. "
-            f"{reason}. The required phase remains edit.\n"
-            f"Return exactly one noninteractive command that changes the existing production "
-            f"implementation in {self.target}. Do not add tests, commit, submit, or run tests."
+        evidence = _bounded_execution_evidence(observation, execution_exit_code)
+        lines = [
+            "ACTION EXECUTED BUT DID NOT PRODUCE AN ACCEPTABLE EDIT",
+            "",
+            "Required phase: edit",
+            f"Required target: {self.target}",
+            "",
+            "The noninteractive command targeted the required file, but its resulting change "
+            "was rejected and rolled back.",
+            f"Grounded outcome: {reason}.",
+        ]
+        if evidence:
+            lines.append(evidence)
+        lines.extend(
+            (
+                "The required phase remains edit.",
+                f"Return exactly one corrected noninteractive command that edits {self.target}.",
+                "Do not add tests, commit, submit, or run tests.",
+            )
         )
+        return "\n".join(lines)
 
     def record_execution(
         self,
@@ -666,6 +717,7 @@ class PhaseGate:
         post_action_fingerprint: str | None = None,
         postcondition_failures: tuple[str, ...] = (),
         diff_evidence: DiffEvidence | None = None,
+        execution_exit_code: int | None = None,
     ) -> None:
         phase_before = self.phase
         kind = decision.candidate.kind
@@ -768,6 +820,7 @@ class PhaseGate:
             post_action_fingerprint=post_action_fingerprint,
             postcondition_failures=postcondition_failures,
             diff_evidence=diff_evidence,
+            execution_exit_code=execution_exit_code,
         )
 
     def record(
@@ -784,9 +837,12 @@ class PhaseGate:
         post_action_fingerprint: str | None = None,
         postcondition_failures: tuple[str, ...] = (),
         diff_evidence: DiffEvidence | None = None,
+        execution_exit_code: int | None = None,
     ) -> None:
         self.state["last_event_index"] += 1
         self.state["current_phase"] = phase_after
+        candidate_payload = asdict(decision.candidate)
+        candidate_payload["raw"] = _redact_sensitive_text(decision.candidate.raw)[:4000]
         payload = {
             "event_index": self.state["last_event_index"],
             "phase_before": decision.phase,
@@ -795,15 +851,34 @@ class PhaseGate:
             "executed": executed,
             "accepted": accepted,
             "rolled_back": rolled_back,
-            "candidate": asdict(decision.candidate),
+            "candidate": candidate_payload,
             "feedback": decision.feedback,
-            "observation_preview": observation[:1000],
+            "observation_preview": _redact_sensitive_text(observation)[:1000],
             "target_diff_nonempty": bool(evidence and evidence.target_diff.strip()),
             "tracked_diff_nonempty": bool(evidence and evidence.tracked_diff.strip()),
             "pre_action_fingerprint": pre_action_fingerprint,
             "post_action_fingerprint": post_action_fingerprint,
             "postcondition_failures": list(postcondition_failures),
             "diff_evidence": asdict(diff_evidence) if diff_evidence else None,
+            "parsed_executable": decision.candidate.parsed_executable,
+            "parsed_argv": list(decision.candidate.parsed_argv),
+            "true_write_targets": list(decision.candidate.write_targets),
+            "redirection_operators": list(decision.candidate.redirection_operators),
+            "heredoc_present": decision.candidate.heredoc_present,
+            "heredoc_delimiter": decision.candidate.heredoc_delimiter,
+            "execution_attempted": bool(
+                executed and decision.candidate.kind == "noninteractive_edit"
+            ),
+            "execution_exit_code": execution_exit_code,
+            "target_changed": diff_evidence.target_changed if diff_evidence else False,
+            "rollback_status": "rolled_back"
+            if rolled_back
+            else ("not_required" if executed else "not_executed"),
+            "postcondition_outcome": (
+                "accepted" if accepted else "rejected"
+            )
+            if executed and decision.candidate.kind == "noninteractive_edit"
+            else None,
             "phase_rejection_count": self.state["phase_rejection_count"],
             "repeated_candidate_count": self.state["repeated_candidate_count"],
             "repeated_kind_count": self.state["repeated_kind_count"],
@@ -822,6 +897,21 @@ class PhaseGate:
             ],
             "coaching_level": self.state["coaching_level"],
         }
+        if decision.candidate.kind == "noninteractive_edit" and executed:
+            self.state["last_edit_execution"] = {
+                "parsed_executable": decision.candidate.parsed_executable,
+                "parsed_argv": list(decision.candidate.parsed_argv),
+                "write_targets": list(decision.candidate.write_targets),
+                "redirection_operators": list(decision.candidate.redirection_operators),
+                "heredoc_present": decision.candidate.heredoc_present,
+                "heredoc_delimiter": decision.candidate.heredoc_delimiter,
+                "execution_attempted": True,
+                "execution_exit_code": execution_exit_code,
+                "target_changed": diff_evidence.target_changed if diff_evidence else False,
+                "rolled_back": rolled_back,
+                "postcondition_outcome": "accepted" if accepted else "rejected",
+                "postcondition_failures": list(postcondition_failures),
+            }
         if self.log_path is not None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.log_path.open("a", encoding="utf-8") as handle:
@@ -832,6 +922,43 @@ class PhaseGate:
         if self.state_path is None:
             return
         _atomic_write_json(self.state_path, self.state)
+
+
+class _ExecutionExitCapture:
+    def __init__(self, environment: Any) -> None:
+        self.environment = environment
+        self.exit_code: int | None = None
+        self._runtime: Any = None
+        self._original: Any = None
+        self._installed = False
+
+    def __enter__(self) -> _ExecutionExitCapture:
+        deployment = getattr(self.environment, "deployment", None)
+        runtime = getattr(deployment, "runtime", None)
+        original = getattr(runtime, "run_in_session", None)
+        if runtime is None or not callable(original):
+            return self
+        self._runtime = runtime
+        self._original = original
+
+        async def observed(action: Any) -> Any:
+            response = await original(action)
+            if self.exit_code is None and isinstance(getattr(action, "command", None), str):
+                value = getattr(response, "exit_code", None)
+                if isinstance(value, int):
+                    self.exit_code = value
+            return response
+
+        try:
+            setattr(runtime, "run_in_session", observed)
+        except (AttributeError, TypeError):
+            return self
+        self._installed = True
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        if self._installed:
+            setattr(self._runtime, "run_in_session", self._original)
 
 
 def install_sweagent_phase_gate() -> None:
@@ -879,10 +1006,15 @@ def install_sweagent_phase_gate() -> None:
         if decision.candidate.kind == "noninteractive_edit":
             before = _snapshot_file(self, gate.target, gate.snapshot_python)
             try:
-                result = original(self, step)
+                with _ExecutionExitCapture(self._env) as execution:
+                    result = original(self, step)
             except Exception:
                 _restore_snapshot(self, before, gate.snapshot_python)
                 raise
+            execution_exit_code = execution.exit_code
+            if execution_exit_code is None:
+                value = getattr(result, "execution_exit_code", None)
+                execution_exit_code = value if isinstance(value, int) else None
             after = _snapshot_file(self, gate.target, gate.snapshot_python)
             post_evidence = _probe_repository(self, gate.target)
             evaluation = evaluate_edit(
@@ -891,10 +1023,22 @@ def install_sweagent_phase_gate() -> None:
                 target=gate.target,
                 policy=gate.edit_policy,
             )
+            if execution_exit_code not in {None, 0}:
+                evaluation = EditEvaluation(
+                    False,
+                    evaluation.evidence,
+                    tuple(
+                        dict.fromkeys((*evaluation.failures, "command_nonzero_exit"))
+                    ),
+                )
             if not evaluation.accepted:
                 _restore_snapshot(self, before, gate.snapshot_python)
                 restored_evidence = _probe_repository(self, gate.target)
-                feedback = gate.transactional_rejection_feedback(evaluation)
+                feedback = gate.transactional_rejection_feedback(
+                    evaluation,
+                    observation=_normalize_observation_text(result.observation),
+                    execution_exit_code=execution_exit_code,
+                )
                 result.observation = feedback
                 result.state = self.tools.get_state(env=self._env)
                 gate.record_execution(
@@ -907,6 +1051,7 @@ def install_sweagent_phase_gate() -> None:
                     post_action_fingerprint=after.fingerprint,
                     postcondition_failures=evaluation.failures,
                     diff_evidence=evaluation.evidence,
+                    execution_exit_code=execution_exit_code,
                 )
                 return result
             gate.record_execution(
@@ -917,6 +1062,7 @@ def install_sweagent_phase_gate() -> None:
                 pre_action_fingerprint=before.fingerprint,
                 post_action_fingerprint=after.fingerprint,
                 diff_evidence=evaluation.evidence,
+                execution_exit_code=execution_exit_code,
             )
             return result
         result = original(self, step)
@@ -1005,89 +1151,292 @@ def _probe_repository(agent: Any, target: str) -> RepositoryEvidence:
 
 
 def _extract_write_targets(action: str) -> tuple[str, ...]:
-    targets: list[str] = []
+    return _analyze_shell_action(action).write_targets
 
-    def add(value: str) -> None:
+
+def _analyze_shell_action(action: str) -> _ShellActionAnalysis:
+    commands = _parse_shell_commands(action)
+    targets: list[str] = []
+    selected: _ParsedShellCommand | None = None
+
+    def add(value: str, command: _ParsedShellCommand) -> None:
+        nonlocal selected
         normalized = _normalize_target(value)
         if normalized and normalized not in targets and not _ambiguous_target(normalized):
             targets.append(normalized)
+            selected = selected or command
 
-    for line in action.replace("\r", "").splitlines():
-        for segment in re.split(r"\s*(?:&&|\|\||\||;)\s*", line):
+    for command in commands:
+        for target in command.output_targets:
+            add(target, command)
+        argv = command.argv
+        executable = command.executable
+        if executable == "touch":
+            for token in argv[1:]:
+                if not token.startswith("-"):
+                    add(token, command)
+        elif executable == "tee":
+            for token in argv[1:]:
+                if not token.startswith("-"):
+                    add(token, command)
+        elif executable == "sed":
+            for target in _sed_in_place_targets(argv):
+                add(target, command)
+        elif executable == "perl" and any(
+            "i" in token[1:] for token in argv[1:] if token.startswith("-")
+        ):
+            if len(argv) >= 3:
+                add(argv[-1], command)
+        elif executable and re.fullmatch(r"python(?:3(?:\.\d+)*)?(?:\.exe)?", executable):
+            python_source = "\n".join((" ".join(argv[1:]), command.heredoc_body))
+            _add_python_write_targets(python_source, lambda value: add(value, command))
+        elif executable == "apply_patch":
+            for match in re.finditer(
+                r"^\+\+\+\s+(?:[ab]/)?([^\s]+)", command.heredoc_body, re.M
+            ):
+                if match.group(1) != "/dev/null":
+                    add(match.group(1), command)
+
+    redirections = tuple(
+        dict.fromkeys(operator for command in commands for operator in command.redirections)
+    )
+    heredoc = next(
+        (command.heredoc_delimiter for command in commands if command.heredoc_delimiter),
+        None,
+    )
+    selected = selected or (commands[0] if commands else None)
+    return _ShellActionAnalysis(
+        commands=commands,
+        write_targets=tuple(targets),
+        parsed_executable=selected.executable if selected else None,
+        parsed_argv=_bounded_argv(selected.argv) if selected else (),
+        redirection_operators=redirections,
+        heredoc_delimiter=heredoc,
+    )
+
+
+def _parse_shell_commands(action: str) -> tuple[_ParsedShellCommand, ...]:
+    lines = action.replace("\r", "").splitlines()
+    commands: list[_ParsedShellCommand] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        parsed: list[_ParsedShellCommand] = []
+        for segment in _split_shell_control_segments(line):
             try:
-                tokens = shlex.split(segment, posix=True)
+                tokens = _shell_tokens(segment)
             except ValueError:
                 continue
-            if not tokens:
-                continue
-            for index, token in enumerate(tokens):
-                if token in {">", ">>"} and index + 1 < len(tokens):
-                    add(tokens[index + 1])
-                elif token.startswith(">>") and len(token) > 2:
-                    add(token[2:])
-                elif token.startswith(">") and len(token) > 1 and not token.startswith(">&"):
-                    add(token[1:])
-            command = Path(tokens[0]).name
-            if command == "touch":
-                for token in tokens[1:]:
-                    if not token.startswith("-"):
-                        add(token)
-            elif command == "tee":
-                for token in tokens[1:]:
-                    if not token.startswith("-"):
-                        add(token)
-            elif command == "sed" and any(token.startswith("-i") for token in tokens[1:]):
-                _add_sed_targets(tokens, add)
-            elif command == "perl" and any("i" in token[1:] for token in tokens[1:] if token.startswith("-")):
-                if len(tokens) >= 3:
-                    add(tokens[-1])
-
-    for match in re.finditer(
-        r"\bopen\(\s*(['\"])(?P<path>.+?)\1\s*,\s*(['\"])[wax][bt+]*\3",
-        action,
-        re.I,
-    ):
-        add(match.group("path"))
-    for match in re.finditer(
-        r"\bPath\(\s*(['\"])(?P<path>.+?)\1\s*\)\s*\.\s*(?:write_text|write_bytes)\b",
-        action,
-        re.I,
-    ):
-        add(match.group("path"))
-    for match in re.finditer(
-        r"\bPath\(\s*(['\"])(?P<path>.+?)\1\s*\)\s*\.\s*open"
-        r"\(\s*(['\"])[wax][bt+]*\3",
-        action,
-        re.I,
-    ):
-        add(match.group("path"))
-    for match in re.finditer(r"^\+\+\+\s+(?:[ab]/)?([^\s]+)", action, re.M):
-        if match.group(1) != "/dev/null":
-            add(match.group(1))
-    return tuple(targets)
+            command = _parse_shell_segment(tokens)
+            if command is not None:
+                parsed.append(command)
+        commands.extend(parsed)
+        heredoc_index = next(
+            (
+                offset
+                for offset, command in enumerate(parsed)
+                if command.heredoc_delimiter is not None
+            ),
+            None,
+        )
+        if heredoc_index is not None:
+            command = parsed[heredoc_index]
+            assert command.heredoc_delimiter is not None
+            body: list[str] = []
+            strip_tabs = "<<-" in command.redirections
+            index += 1
+            while index < len(lines):
+                candidate = lines[index].lstrip("\t") if strip_tabs else lines[index]
+                if candidate == command.heredoc_delimiter:
+                    break
+                body.append(lines[index])
+                index += 1
+            absolute_index = len(commands) - len(parsed) + heredoc_index
+            commands[absolute_index] = _ParsedShellCommand(
+                executable=command.executable,
+                argv=command.argv,
+                redirections=command.redirections,
+                output_targets=command.output_targets,
+                heredoc_delimiter=command.heredoc_delimiter,
+                heredoc_body="\n".join(body),
+            )
+        index += 1
+    return tuple(commands)
 
 
-def _add_sed_targets(tokens: list[str], add: Any) -> None:
-    expression_seen = False
-    index = 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "--":
-            for value in tokens[index + 1 :]:
-                add(value)
-            return
-        if token in {"-e", "--expression"} and index + 1 < len(tokens):
-            expression_seen = True
-            index += 2
-            continue
-        if token.startswith("-"):
+def _shell_tokens(line: str) -> list[str]:
+    lexer = shlex.shlex(line, posix=True, punctuation_chars="<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def _split_shell_control_segments(line: str) -> list[str]:
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            current.append(character)
+            escaped = False
             index += 1
             continue
-        if not expression_seen:
-            expression_seen = True
-        else:
-            add(token)
+        if character == "\\" and quote != "'":
+            current.append(character)
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            current.append(character)
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            current.append(character)
+            index += 1
+            continue
+        if character in {";", "|", "&"}:
+            previous = line[index - 1] if index else ""
+            following = line[index + 1] if index + 1 < len(line) else ""
+            if previous in {"<", ">"} or (character == "&" and following == ">"):
+                current.append(character)
+                index += 1
+                continue
+            width = 2 if following == character and character in {"|", "&"} else 1
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += width
+            continue
+        current.append(character)
         index += 1
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _parse_shell_segment(tokens: list[str]) -> _ParsedShellCommand | None:
+    argv: list[str] = []
+    redirections: list[str] = []
+    output_targets: list[str] = []
+    heredoc_delimiter: str | None = None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.isdigit() and index + 1 < len(tokens) and _is_redirection(tokens[index + 1]):
+            index += 1
+            continue
+        if _is_redirection(token):
+            operator = token
+            destination = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if operator == "<<" and destination.startswith("-"):
+                operator = "<<-"
+                destination = destination[1:]
+            elif operator in {"<", ">"} and destination.startswith("&"):
+                operator += "&"
+                destination = destination[1:]
+            elif operator == ">" and destination.startswith("|"):
+                operator = ">|"
+                destination = destination[1:]
+            redirections.append(operator)
+            if operator in {">", ">>", ">|"} and destination:
+                output_targets.append(destination)
+            elif operator in {"<<", "<<-"} and destination:
+                heredoc_delimiter = destination
+            index += 2 if destination else 1
+            continue
+        argv.append(token)
+        index += 1
+    if not argv and not redirections:
+        return None
+    executable = Path(argv[0]).name.lower() if argv else None
+    return _ParsedShellCommand(
+        executable=executable,
+        argv=tuple(argv),
+        redirections=tuple(redirections),
+        output_targets=tuple(output_targets),
+        heredoc_delimiter=heredoc_delimiter,
+    )
+
+
+def _is_redirection(token: str) -> bool:
+    return token in {"<", ">", ">>", ">|", "<<", "<<<", "<&", ">&", "<>"}
+
+
+def _sed_in_place_targets(argv: tuple[str, ...]) -> tuple[str, ...]:
+    in_place = False
+    expression_supplied = False
+    operands: list[str] = []
+    options = True
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if options and token == "--":
+            options = False
+            index += 1
+            continue
+        if options and token in {"-e", "--expression", "-f", "--file"}:
+            expression_supplied = True
+            index += 2
+            continue
+        if options and (
+            token.startswith("--expression=") or token.startswith("--file=")
+        ):
+            expression_supplied = True
+            index += 1
+            continue
+        if options and token.startswith("-e") and token != "-e":
+            expression_supplied = True
+            index += 1
+            continue
+        if options and token.startswith("-f") and token != "-f":
+            expression_supplied = True
+            index += 1
+            continue
+        if options and (
+            token == "--in-place"
+            or token.startswith("--in-place=")
+            or (token.startswith("-") and not token.startswith("--") and "i" in token[1:])
+        ):
+            in_place = True
+            if token == "-i" and index + 1 < len(argv) and argv[index + 1] == "":
+                index += 2
+            else:
+                index += 1
+            continue
+        if options and token.startswith("-"):
+            index += 1
+            continue
+        operands.append(token)
+        index += 1
+    if not in_place:
+        return ()
+    if not expression_supplied and operands:
+        operands.pop(0)
+    return tuple(operands)
+
+
+def _add_python_write_targets(source: str, add: Any) -> None:
+    patterns = (
+        r"\bopen\(\s*(['\"])(?P<path>.+?)\1\s*,\s*(['\"])[wax][bt+]*\3",
+        r"\bPath\(\s*(['\"])(?P<path>.+?)\1\s*\)\s*\.\s*(?:write_text|write_bytes)\b",
+        r"\bPath\(\s*(['\"])(?P<path>.+?)\1\s*\)\s*\.\s*open"
+        r"\(\s*(['\"])[wax][bt+]*\3",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, source, re.I):
+            add(match.group("path"))
+
+
+def _bounded_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_redact_sensitive_text(token)[:500] for token in argv[:64])
 
 
 def _has_write_intent(action: str) -> bool:
@@ -1135,6 +1484,31 @@ def _normalize_observation_text(value: Any) -> str:
         if hasattr(value, attribute):
             return _normalize_observation_text(getattr(value, attribute))
     return str(value)
+
+
+def _bounded_execution_evidence(observation: str, exit_code: int | None) -> str:
+    normalized = " ".join(_normalize_observation_text(observation).split())
+    normalized = _redact_sensitive_text(normalized)
+    parts: list[str] = []
+    if exit_code is not None:
+        parts.append(f"Execution exit code: {exit_code}.")
+    if normalized:
+        parts.append(f"Bounded shell output: {normalized[:400]}")
+    return " ".join(parts)
+
+
+def _redact_sensitive_text(value: str) -> str:
+    redacted = re.sub(
+        r"(?i)(authorization\s*:\s*)(?:bearer\s+)?\S+",
+        r"\1<redacted>",
+        value,
+    )
+    redacted = re.sub(r"(?i)\bbearer\s+\S+", "Bearer <redacted>", redacted)
+    return re.sub(
+        r"(?i)(api[_-]?key|token)(\s*[:=]\s*)(\S+)",
+        r"\1\2<redacted>",
+        redacted,
+    )
 
 
 def _last_json_mapping(value: str) -> dict[str, Any]:

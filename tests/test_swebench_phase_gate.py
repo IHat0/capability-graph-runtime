@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import asyncio
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -15,6 +17,7 @@ from cgr.swebench.phase_gate import (
     FileSnapshot,
     PhaseGate,
     RepositoryEvidence,
+    _ExecutionExitCapture,
     _normalize_observation_text,
     _probe_repository,
     _restore_snapshot,
@@ -28,6 +31,17 @@ from cgr.swebench.phase_gate import (
 
 TARGET = "src/module.py"
 TEST = "tests/test_module.py"
+EC2_SED_ACTION = (
+    "sed -i 's/def gcd(a, b):/def gcd(a, b):/; "
+    "s/return gcd(a % b, b)/while b != 0:/; s/^/    /' python_programs/gcd.py"
+)
+EC2_HEREDOC_ACTION = (
+    "sed -i '/def gcd(a, b):/,/return a/' python_programs/gcd.py <<EOF\n"
+    "while b != 0:\n"
+    "a, b = b, a % b\n"
+    "return a\n"
+    "EOF"
+)
 
 
 @pytest.mark.parametrize(
@@ -123,6 +137,144 @@ def test_python_read_open_is_not_misclassified_as_write() -> None:
 
     assert candidate.write_targets == ()
     assert candidate.kind == "unknown"
+
+
+def test_real_ec2_sed_action_is_a_single_target_noninteractive_edit() -> None:
+    candidate = classify_candidate_action(
+        EC2_SED_ACTION,
+        target="python_programs/gcd.py",
+        focused_test="test_gcd.py",
+    )
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.write_targets == ("python_programs/gcd.py",)
+    assert candidate.parsed_executable == "sed"
+    assert candidate.parsed_argv[2].count(";") == 2
+    assert "%" in candidate.parsed_argv[2]
+    assert candidate.heredoc_present is False
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        r"sed -i 's/value\(x\)/value(y)/; s#old/path#new\\path#' src/module.py",
+        "sed -i'' 's/a/b/' src/module.py",
+        "sed -i '' 's/a/b/' src/module.py",
+        "sed -i.bak 's/a/b/' src/module.py",
+        "sed --in-place 's/a/b/' src/module.py",
+        "sed --in-place=.bak 's/a/b/' src/module.py",
+        "sed -e 's/a/b/' -i src/module.py",
+        "sed -n -i -e 's/a/b/' src/module.py",
+        "sed -e 's/a/b/' -e 's/c/d/' -i src/module.py",
+    ],
+)
+def test_sed_in_place_variants_extract_only_positional_file_operands(action: str) -> None:
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.write_targets == (TARGET,)
+    assert candidate.parsed_executable == "sed"
+
+
+def test_quoted_sed_program_metacharacters_are_not_paths_or_command_separators() -> None:
+    action = r"sed -i 's#x/y%z#x\\y%;z#; s/(old)/[new]/' src/module.py"
+
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.write_targets == (TARGET,)
+    assert len(candidate.parsed_argv) == 4
+    assert ";" in candidate.parsed_argv[2]
+    assert "%" in candidate.parsed_argv[2]
+    assert "\\" in candidate.parsed_argv[2]
+
+
+@pytest.mark.parametrize("literal", [r"\;", "';'", '";"'])
+def test_escaped_or_quoted_standalone_semicolon_is_an_argument(literal: str) -> None:
+    action = f"printf {literal} > src/module.py"
+
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.write_targets == (TARGET,)
+    assert candidate.parsed_argv == ("printf", ";")
+
+
+@pytest.mark.parametrize(
+    ("operator", "expected_operator"),
+    [
+        ("<<EOF", "<<"),
+        ("<< EOF", "<<"),
+        ("<<'EOF'", "<<"),
+        ('<<"EOF"', "<<"),
+        ("<<-EOF", "<<-"),
+    ],
+)
+def test_heredoc_syntax_is_metadata_not_a_write_target(
+    operator: str, expected_operator: str
+) -> None:
+    action = (
+        f"sed -i 's/old/new/' {TARGET} {operator}\n"
+        "tests/not_a_target.py\n"
+        "Path('also_not_a_target.py').write_text('x')\n"
+        "EOF"
+    )
+
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.write_targets == (TARGET,)
+    assert candidate.heredoc_present is True
+    assert candidate.heredoc_delimiter == "EOF"
+    assert expected_operator in candidate.redirection_operators
+
+
+def test_real_ec2_heredoc_action_is_not_a_mixed_target_edit() -> None:
+    candidate = classify_candidate_action(
+        EC2_HEREDOC_ACTION,
+        target="python_programs/gcd.py",
+        focused_test="test_gcd.py",
+    )
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.write_targets == ("python_programs/gcd.py",)
+    assert candidate.heredoc_present is True
+    assert candidate.heredoc_delimiter == "EOF"
+    assert candidate.redirection_operators == ("<<",)
+
+
+def test_custom_heredoc_delimiter_is_recorded_without_becoming_a_target() -> None:
+    action = (
+        "sed -i 's/old/new/' src/module.py <<'CGR_INPUT'\n"
+        "arbitrary body text\n"
+        "CGR_INPUT"
+    )
+
+    candidate = classify_candidate_action(action, target=TARGET, focused_test=TEST)
+
+    assert candidate.kind == "noninteractive_edit"
+    assert candidate.write_targets == (TARGET,)
+    assert candidate.heredoc_delimiter == "CGR_INPUT"
+
+
+def test_genuine_multi_file_sed_edit_remains_mixed_target() -> None:
+    candidate = classify_candidate_action(
+        "sed -i 's/old/new/' src/module.py src/other.py",
+        target=TARGET,
+        focused_test=TEST,
+    )
+
+    assert candidate.kind == "edit_mixed_targets"
+    assert candidate.write_targets == (TARGET, "src/other.py")
+
+
+def test_ambiguous_unclosed_shell_quote_fails_closed() -> None:
+    candidate = classify_candidate_action(
+        "sed -i 's/old/new/ src/module.py", target=TARGET, focused_test=TEST
+    )
+
+    assert candidate.kind == "unknown"
+    assert candidate.write_targets == ()
 
 
 @pytest.mark.parametrize(
@@ -341,6 +493,106 @@ def test_real_trajectory_shape_without_edit_fails_closed_at_budget_boundary() ->
     assert gate.state["accepted_target_edit"] is False
     assert gate.state["workflow_complete"] is False
     assert gate.state["phase_stalled_repeated_action"] is True
+
+
+def test_exact_attempt_006_shell_actions_progress_through_transactional_evaluation(
+    tmp_path: Path,
+) -> None:
+    target = "python_programs/gcd.py"
+    log_path = tmp_path / "events.jsonl"
+    gate = PhaseGate(
+        phase="inspect", target=target, focused_test="test_gcd.py", log_path=log_path
+    )
+    empty = RepositoryEvidence()
+
+    commit = gate.decide("git commit -am fix", empty)
+    assert not commit.allowed
+    inspection = gate.decide(f"cat {target}", empty)
+    gate.record_execution(inspection, observation="model-inspected source", evidence=empty)
+    assert gate.phase == "edit"
+
+    unchanged = evaluate_edit(
+        FileSnapshot(target, True, b"def placeholder():\n    return 1\n", 0o644),
+        FileSnapshot(target, True, b"def placeholder():\n    return 1\n", 0o644),
+        target=target,
+        policy=EditPolicy(),
+    )
+    for action, exit_code in ((EC2_SED_ACTION, 1), (EC2_HEREDOC_ACTION, 2)):
+        decision = gate.decide(action, empty)
+        assert decision.allowed
+        assert decision.candidate.kind == "noninteractive_edit"
+        assert decision.candidate.write_targets == (target,)
+        gate.record_execution(
+            decision,
+            observation=f"shell exited {exit_code}",
+            evidence=empty,
+            accepted=False,
+            rolled_back=True,
+            postcondition_failures=("no_target_change", "command_nonzero_exit"),
+            diff_evidence=unchanged.evidence,
+            execution_exit_code=exit_code,
+        )
+
+    assert gate.phase == "edit"
+    assert gate.state["accepted_target_edit"] is False
+    assert gate.state["workflow_complete"] is False
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    edit_events = [event for event in events if event["execution_attempted"]]
+    assert len(edit_events) == 2
+    assert [event["execution_exit_code"] for event in edit_events] == [1, 2]
+    assert all(event["true_write_targets"] == [target] for event in edit_events)
+    assert edit_events[1]["heredoc_delimiter"] == "EOF"
+
+
+def test_generic_model_authored_sed_completes_authorized_workflow(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "events.jsonl"
+    gate = PhaseGate(
+        phase="inspect", target=TARGET, focused_test=TEST, log_path=log_path
+    )
+    empty = RepositoryEvidence()
+    patch = RepositoryEvidence(target_diff="generic patch", tracked_diff="generic patch")
+
+    inspection = gate.decide(f"cat {TARGET}", empty)
+    gate.record_execution(inspection, observation="generic source", evidence=empty)
+    action = "sed -i 's/value.strip()/value.upper()/' src/module.py"
+    edit = gate.decide(action, empty)
+    evaluation = evaluate_edit(
+        _snapshot("def transform(value):\n    return value.strip()\n"),
+        _snapshot("def transform(value):\n    return value.upper()\n"),
+        target=TARGET,
+        policy=EditPolicy(
+            mode="modify_existing_source", require_existing_content_change=True
+        ),
+    )
+    assert evaluation.accepted
+    gate.record_execution(
+        edit,
+        observation="",
+        evidence=patch,
+        diff_evidence=evaluation.evidence,
+        execution_exit_code=0,
+    )
+    confirmation = gate.decide(f"cat {TARGET}", patch)
+    gate.record_execution(confirmation, observation="generic changed source", evidence=patch)
+    target_diff = gate.decide(f"git diff -- {TARGET}", patch)
+    gate.record_execution(target_diff, observation="generic patch", evidence=patch)
+    focused = gate.decide(f"python -m pytest -q {TEST}", patch)
+    gate.record_execution(focused, observation="1 passed in 0.01s", evidence=patch)
+    final_diff = gate.decide("git diff -- HEAD", patch)
+    gate.record_execution(final_diff, observation="generic patch", evidence=patch)
+    submission = gate.decide("submit", patch)
+    gate.record_execution(submission, observation="submitted", evidence=patch)
+
+    assert gate.state["workflow_complete"] is True
+    assert gate.state["submission_authorized"] is True
+    assert authorize_phase_patch(gate.state, "generic patch").authorized
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    edit_event = next(event for event in events if event["execution_attempted"])
+    assert edit_event["parsed_executable"] == "sed"
+    assert edit_event["parsed_argv"] == shlex.split(action)
+    assert edit_event["postcondition_outcome"] == "accepted"
 
 
 def test_inspection_is_allowed_during_inspect() -> None:
@@ -573,8 +825,90 @@ def test_repository_probe_normalizes_swerex_observation_objects() -> None:
     )
 
 
+def test_execution_exit_capture_observes_runtime_result_without_changing_action() -> None:
+    observed_actions: list[object] = []
+
+    class FakeRuntime:
+        async def run_in_session(self, action: object) -> object:
+            observed_actions.append(action)
+            return SimpleNamespace(exit_code=7, output="failure")
+
+    runtime = FakeRuntime()
+    environment = SimpleNamespace(deployment=SimpleNamespace(runtime=runtime))
+    action = SimpleNamespace(command="sed -i 'malformed' src/module.py")
+
+    with _ExecutionExitCapture(environment) as capture:
+        response = asyncio.run(runtime.run_in_session(action))
+
+    assert response.exit_code == 7
+    assert capture.exit_code == 7
+    assert observed_actions == [action]
+    assert runtime.run_in_session.__func__ is FakeRuntime.run_in_session
+
+
+def test_action_event_telemetry_is_bounded_and_redacts_secrets(tmp_path: Path) -> None:
+    log_path = tmp_path / "events.jsonl"
+    gate = PhaseGate(phase="edit", target=TARGET, focused_test=TEST, log_path=log_path)
+    action = "echo x > src/module.py && echo API_KEY=do-not-store"
+    decision = gate.decide(action, RepositoryEvidence())
+
+    gate.record_execution(
+        decision,
+        observation="Authorization: Bearer secret-value",
+        evidence=RepositoryEvidence(target_diff="patch", tracked_diff="patch"),
+        execution_exit_code=0,
+    )
+
+    event_text = log_path.read_text(encoding="utf-8")
+    assert "do-not-store" not in event_text
+    assert "secret-value" not in event_text
+    assert "<redacted>" in event_text
+
+
 def _snapshot(content: str, *, existed: bool = True, mode: int = 0o644) -> FileSnapshot:
     return FileSnapshot(TARGET, existed, content.encode(), mode if existed else None)
+
+
+def _initialize_git_target(tmp_path: Path, target_name: str, content: bytes) -> Path:
+    target = tmp_path / target_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", target_name], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+    return target
+
+
+def _bash_executable() -> str | None:
+    located = shutil.which("bash")
+    if located is not None:
+        return located
+    if os.name == "nt":
+        candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/bin/bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+class _LocalPhaseEnvironment:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def communicate(self, command: str, check: str) -> str:
+        process = subprocess.run(
+            shlex.split(command, posix=True),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if check == "raise" and process.returncode:
+            raise RuntimeError(process.stderr)
+        return process.stdout + process.stderr
 
 
 @pytest.mark.parametrize(
@@ -750,6 +1084,7 @@ def test_installed_gate_rolls_back_rejected_edit_transaction(
                 + b"    def test_added(self):\n        self.assertTrue(True)\n"
             )
             step.observation = "edit command completed"
+            step.execution_exit_code = 0
             step.done = False
             return step
 
@@ -800,3 +1135,162 @@ def test_installed_gate_rolls_back_rejected_edit_transaction(
     assert event["executed"] is True
     assert event["accepted"] is False
     assert event["rolled_back"] is True
+    assert event["execution_exit_code"] == 0
+    assert event["target_changed"] is True
+    assert event["postcondition_outcome"] == "rejected"
+    assert event["parsed_executable"] == "printf"
+    assert event["true_write_targets"] == [TARGET]
+
+
+def test_nonzero_single_target_edit_rolls_back_changed_bytes_and_stays_in_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prior = b"def transform(value):\n    return value.strip()\n"
+    target = _initialize_git_target(tmp_path, TARGET, prior)
+    original_calls: list[str] = []
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(get_state=lambda env: {"working_dir": str(tmp_path)})
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            original_calls.append(step.action)
+            target.write_text(
+                "def transform(value):\n    return value.upper()\n", encoding="utf-8"
+            )
+            step.observation = "sed: simulated write followed by failure"
+            step.execution_exit_code = 2
+            step.done = False
+            return step
+
+    sweagent = ModuleType("sweagent")
+    agent = ModuleType("sweagent.agent")
+    agents = ModuleType("sweagent.agent.agents")
+    agents.DefaultAgent = FakeAgent  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sweagent", sweagent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent", agent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent.agents", agents)
+    state_path = tmp_path / "state.json"
+    event_path = tmp_path / "events.jsonl"
+    config = tmp_path / "phase-gate.json"
+    config.write_text(
+        json.dumps(
+            {
+                "initial_phase": "edit",
+                "target": TARGET,
+                "focused_test": TEST,
+                "log_path": str(event_path),
+                "state_path": str(state_path),
+                "snapshot_python": sys.executable,
+                "edit_policy": {
+                    "mode": "modify_existing_source",
+                    "require_existing_content_change": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CGR_PHASE_GATE_CONFIG", str(config))
+    install_sweagent_phase_gate()
+    action = "sed -i 's/value.strip()/value.upper()/' src/module.py"
+
+    result = FakeAgent().handle_action(
+        SimpleNamespace(action=action, observation="", state=None, done=False)
+    )
+
+    assert original_calls == [action]
+    assert target.read_bytes() == prior
+    assert "ACTION EXECUTED BUT DID NOT PRODUCE AN ACCEPTABLE EDIT" in result.observation
+    assert "Execution exit code: 2" in result.observation
+    assert "simulated write followed by failure" in result.observation
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["current_phase"] == "edit"
+    assert state["accepted_target_edit"] is False
+    assert state["last_edit_execution"]["execution_exit_code"] == 2
+    assert state["last_edit_execution"]["target_changed"] is True
+    assert state["last_edit_execution"]["rolled_back"] is True
+    event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["execution_attempted"] is True
+    assert event["execution_exit_code"] == 2
+    assert "command_nonzero_exit" in event["postcondition_failures"]
+
+
+def test_valid_generic_sed_executes_transactionally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bash = _bash_executable()
+    if bash is None:
+        pytest.skip("Bash is required to execute the model-authored sed action.")
+    target = _initialize_git_target(
+        tmp_path, TARGET, b"def transform(value):\n    return value.strip()\n"
+    )
+    original_calls: list[str] = []
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = _LocalPhaseEnvironment(tmp_path)
+            self.tools = SimpleNamespace(get_state=lambda env: {"working_dir": str(tmp_path)})
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            original_calls.append(step.action)
+            process = subprocess.run(
+                [bash, "-lc", step.action],
+                cwd=tmp_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            step.observation = process.stdout + process.stderr
+            step.execution_exit_code = process.returncode
+            step.done = False
+            return step
+
+    sweagent = ModuleType("sweagent")
+    agent = ModuleType("sweagent.agent")
+    agents = ModuleType("sweagent.agent.agents")
+    agents.DefaultAgent = FakeAgent  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sweagent", sweagent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent", agent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent.agents", agents)
+    state_path = tmp_path / "state.json"
+    event_path = tmp_path / "events.jsonl"
+    config = tmp_path / "phase-gate.json"
+    config.write_text(
+        json.dumps(
+            {
+                "initial_phase": "edit",
+                "target": TARGET,
+                "focused_test": TEST,
+                "log_path": str(event_path),
+                "state_path": str(state_path),
+                "snapshot_python": sys.executable,
+                "edit_policy": {
+                    "mode": "modify_existing_source",
+                    "require_existing_content_change": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CGR_PHASE_GATE_CONFIG", str(config))
+    install_sweagent_phase_gate()
+    action = "sed -i 's/value.strip()/value.upper()/' src/module.py"
+
+    FakeAgent().handle_action(
+        SimpleNamespace(action=action, observation="", state=None, done=False)
+    )
+
+    assert original_calls == [action]
+    assert "return value.upper()" in target.read_text(encoding="utf-8")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["current_phase"] == "confirm_edit"
+    assert state["accepted_target_edit"] is True
+    assert state["last_edit_execution"]["execution_exit_code"] == 0
+    assert state["last_edit_execution"]["postcondition_outcome"] == "accepted"
+    event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["execution_attempted"] is True
+    assert event["target_changed"] is True
+    assert event["rollback_status"] == "not_required"
