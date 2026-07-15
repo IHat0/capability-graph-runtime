@@ -755,6 +755,70 @@ def test_selector_uses_inspection_then_later_attempt_for_equal_failures() -> Non
     assert _select_attempt(failures, diagnoses) == 2
 
 
+def test_transaction_rejection_and_incomplete_autosubmission_drive_recovery(
+    tmp_path: Path,
+) -> None:
+    task, _manifest = _load_task(DEFAULT_MANIFEST, "quixbugs.gcd")
+    result = {
+        "classification": "phase_incomplete",
+        "patch_status": "patch",
+        "patch_size": 42,
+        "patch_emitted": True,
+        "patch_phase_authorized": False,
+        "autosubmission_detected": True,
+        "patch_authorization_failures": [
+            "focused_test_not_executed",
+            "workflow_incomplete",
+        ],
+        "termination_reason": "exit_cost",
+        "phase_gate_state": {
+            "current_phase": "edit",
+            "workflow_complete": False,
+            "diagnostic_flags": [
+                "append_only_nonrepair_edit",
+                "test_scaffolding_in_production_source",
+                "edit_postcondition_failed",
+                "edit_rolled_back",
+            ],
+            "last_postcondition_failures": [
+                "append_only_nonrepair_edit",
+                "existing_implementation_unchanged",
+                "test_scaffolding_in_production_source",
+            ],
+            "rollback_count": 1,
+        },
+    }
+
+    diagnosis = diagnose_attempt(None, tmp_path, result, task)
+    correction = build_corrective_message(diagnosis, task)
+
+    assert diagnosis["required_next_phase"] == "edit"
+    assert diagnosis["edit_rollback_count"] == 1
+    assert "phase_incomplete_autosubmission" in diagnosis["failure_types"]
+    assert "budget_exhausted_before_phase_completion" in diagnosis["failure_types"]
+    assert "test_scaffolding_in_production_source" in diagnosis["failure_types"]
+    assert "rolled back" in correction
+    assert "Change the existing production implementation" in correction
+    assert "gcd(a" not in correction
+
+
+def test_unauthorized_patch_cannot_outrank_authorized_candidate() -> None:
+    unauthorized = {
+        "classification": "resolved",
+        "verifier_exit_code": 0,
+        "patch_size": 100,
+        "patch_phase_authorized": False,
+    }
+    authorized = {
+        "classification": "tests_failed",
+        "verifier_exit_code": 1,
+        "patch_size": 10,
+        "patch_phase_authorized": True,
+    }
+
+    assert _select_attempt([unauthorized, authorized]) == 1
+
+
 def test_model_request_count_can_be_derived_from_trajectory(tmp_path: Path) -> None:
     trajectory = tmp_path / "count.traj"
     trajectory.write_text(

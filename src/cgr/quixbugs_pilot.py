@@ -17,8 +17,15 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from cgr.swebench import sandbox_full_cycle as cycle
 from cgr.quixbugs_diagnosis import build_corrective_message, diagnose_attempt
+from cgr.swebench import sandbox_full_cycle as cycle
+from cgr.swebench.phase_gate import (
+    EditPolicy,
+    PatchAuthorization,
+    authorize_phase_patch,
+    build_initial_phase_state,
+    write_phase_state,
+)
 
 
 DEFAULT_MANIFEST = Path("benchmark-manifests/quixbugs-python-pilot-v1.json")
@@ -72,6 +79,8 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             "declared_edit",
             "recovery",
             "phase_gate_realistic",
+            "transactional_failure",
+            "transactional_recovery",
         ),
         default="success",
         help=argparse.SUPPRESS,
@@ -103,6 +112,7 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
     server_thread: threading.Thread | None = None
     phase_config_path: Path | None = None
     phase_log_path: Path | None = None
+    phase_state_path: Path | None = None
     started = time.perf_counter()
     result: dict[str, Any] = {
         "task_id": args.task_id,
@@ -187,11 +197,12 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         overlay_path = attempt / "sweagent-config.yaml"
         overlay_path.write_text(_quixbugs_overlay(agent_python), encoding="utf-8")
         if args.required_phase:
-            phase_config_path, phase_log_path = _write_phase_gate_config(
+            phase_config_path, phase_log_path, phase_state_path = _write_phase_gate_config(
                 attempt,
                 initial_phase=args.required_phase,
                 target=str(task["source_file"]),
                 focused_test=str(task["test_file"]),
+                snapshot_python=agent_python,
             )
         adapter_command = _adapter_command(
             sweagent_python,
@@ -199,7 +210,9 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
             problem_path,
             overlay_path,
             deployment_type,
-            max_calls=10 if args.deterministic_profile == "phase_gate_realistic" else 8,
+            max_calls=_deterministic_max_calls(args.deterministic_profile)
+            if args.deterministic_model
+            else 8,
         )
         (attempt / "adapter-command.json").write_text(
             json.dumps(adapter_command, indent=2), encoding="utf-8"
@@ -230,6 +243,9 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                     if phase_config_path
                     else None,
                     "phase_gate_event_log_path": str(phase_log_path) if phase_log_path else None,
+                    "phase_gate_state_path": str(phase_state_path)
+                    if phase_state_path
+                    else None,
                     "attempt_timeout_seconds": args.attempt_timeout_seconds,
                 },
                 indent=2,
@@ -257,6 +273,22 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
         prediction = cycle._optional_artifact(attempt, "*.pred")
         submitted_patch = cycle._optional_artifact(attempt, "*.patch")
         termination = cycle._trajectory_exit_status(trajectory) if trajectory else None
+        phase_state = _load_phase_gate_state(phase_state_path)
+        if phase_state is not None:
+            assert phase_state_path is not None
+            phase_state["terminal_reason"] = termination
+            write_phase_state(phase_state_path, phase_state)
+        phase_authorization = (
+            authorize_phase_patch(phase_state, diff)
+            if phase_config_path is not None
+            else PatchAuthorization(bool(diff.strip()), (), None)
+        )
+        patch_emitted = bool(diff.strip())
+        autosubmission_detected = bool(
+            patch_emitted
+            and phase_state is not None
+            and not phase_state.get("submission_authorized")
+        )
         model_requests = (
             cycle._jsonl_count(interaction_path)
             if interaction_path and interaction_path.is_file()
@@ -290,6 +322,12 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 stderr=adapter.stderr,
                 phase_config=phase_config_path,
             )
+        classification = _phase_aware_classification(
+            classification,
+            gate_enabled=phase_config_path is not None,
+            patch_emitted=patch_emitted,
+            authorization=phase_authorization,
+        )
         if verifier is not None:
             _write_process_artifacts(attempt, "verifier", verifier_command, verifier)
         else:
@@ -342,6 +380,22 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 if phase_config_path
                 else None,
                 "phase_gate_event_log_path": str(phase_log_path) if phase_log_path else None,
+                "phase_gate_state_path": str(phase_state_path)
+                if phase_state_path
+                else None,
+                "phase_gate_state": phase_state,
+                "phase_at_termination": phase_state.get("current_phase")
+                if phase_state
+                else None,
+                "workflow_complete": bool(phase_state and phase_state.get("workflow_complete")),
+                "patch_emitted": patch_emitted,
+                "patch_phase_authorized": phase_authorization.authorized,
+                "patch_authorization_failures": list(phase_authorization.failures),
+                "final_patch_fingerprint": phase_authorization.fingerprint,
+                "autosubmission_detected": autosubmission_detected,
+                "autosubmission_rejected": bool(
+                    autosubmission_detected and not phase_authorization.authorized
+                ),
                 "adapter_result": adapter_result,
                 "adapter_error": adapter_error,
                 "adapter_stdout_path": str(attempt / "adapter.stdout.log"),
@@ -378,6 +432,9 @@ def quixbugs_pilot_main(argv: list[str] | None = None) -> int:
                 if phase_config_path
                 else None,
                 "phase_gate_event_log_path": str(phase_log_path) if phase_log_path else None,
+                "phase_gate_state_path": str(phase_state_path)
+                if phase_state_path
+                else None,
                 "elapsed_seconds": time.perf_counter() - started,
             }
         )
@@ -549,7 +606,12 @@ def _run_cgr(args: argparse.Namespace, max_attempts: int) -> int:
             }
         )
         patch_path = _result_path(selected.get("submitted_patch_path"))
-        if patch_path is not None and patch_path.is_file() and patch_path.stat().st_size:
+        if (
+            selected.get("patch_phase_authorized")
+            and patch_path is not None
+            and patch_path.is_file()
+            and patch_path.stat().st_size
+        ):
             parent_patch = run / "selected.patch"
             shutil.copyfile(patch_path, parent_patch)
             result["final_patch_path"] = str(parent_patch)
@@ -658,23 +720,40 @@ def _select_attempt(
 ) -> int:
     evidence = diagnoses or [None] * len(results)
 
-    def score(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int, int, int, int, int]:
+    def score(
+        item: tuple[int, dict[str, Any]],
+    ) -> tuple[int, int, int, int, int, int, int, int]:
         index, result = item
         diagnosis = evidence[index] or {}
+        authorized = int(bool(result.get("patch_phase_authorized", True)))
         verified = int(
+            authorized
+            and
             result.get("classification") == "resolved"
             and result.get("verifier_exit_code") == 0
         )
-        patch = int(bool(result.get("patch_size")))
+        patch = int(authorized and bool(result.get("patch_size")))
         test_passed = int(
             bool(diagnosis.get("test_passed") or result.get("verifier_exit_code") == 0)
         )
         test_failed = int(bool(diagnosis.get("test_failed")))
         changed = int(bool(diagnosis.get("tracked_change_observed") or result.get("patch_size")))
         inspected = int(bool(diagnosis.get("inspected_source_paths")))
-        return verified, patch, test_passed, test_failed, changed, inspected, index
+        return authorized, verified, patch, test_passed, test_failed, changed, inspected, index
 
     return max(enumerate(results), key=score)[0]
+
+
+def _phase_aware_classification(
+    classification: str,
+    *,
+    gate_enabled: bool,
+    patch_emitted: bool,
+    authorization: PatchAuthorization,
+) -> str:
+    if gate_enabled and patch_emitted and not authorization.authorized:
+        return "phase_incomplete"
+    return classification
 
 
 def _selection_rationale(
@@ -682,6 +761,10 @@ def _selection_rationale(
 ) -> list[str]:
     evidence = diagnosis or {}
     rationale = []
+    if result.get("patch_phase_authorized"):
+        rationale.append("phase_workflow_authorized")
+    elif result.get("patch_size"):
+        rationale.append("unauthorized_patch_excluded")
     if result.get("classification") == "resolved" and result.get("verifier_exit_code") == 0:
         rationale.append("verifier_passed")
     if result.get("patch_size"):
@@ -848,11 +931,26 @@ def _write_phase_gate_config(
     initial_phase: str,
     target: str,
     focused_test: str,
-) -> tuple[Path, Path]:
+    snapshot_python: str = "python",
+) -> tuple[Path, Path, Path]:
     attempt = attempt.resolve(strict=True)
     config_path = attempt / "phase-gate-config.json"
     log_path = attempt / "phase-gate-events.jsonl"
+    state_path = attempt / "phase-gate-state.json"
+    edit_policy = EditPolicy(
+        mode="modify_existing_source",
+        prohibit_test_scaffolding=True,
+        require_existing_content_change=True,
+    )
     try:
+        write_phase_state(
+            state_path,
+            build_initial_phase_state(
+                initial_phase=initial_phase,
+                target=target,
+                edit_policy=edit_policy,
+            ),
+        )
         config_path.write_text(
             json.dumps(
                 {
@@ -861,6 +959,15 @@ def _write_phase_gate_config(
                     "target": target,
                     "focused_test": focused_test,
                     "log_path": str(log_path),
+                    "state_path": str(state_path),
+                    "snapshot_python": snapshot_python,
+                    "edit_policy": {
+                        "mode": edit_policy.mode,
+                        "prohibit_test_scaffolding": edit_policy.prohibit_test_scaffolding,
+                        "require_existing_content_change": (
+                            edit_policy.require_existing_content_change
+                        ),
+                    },
                 },
                 indent=2,
             ),
@@ -872,7 +979,7 @@ def _write_phase_gate_config(
             f"Phase-gate artifacts could not be created in {attempt}."
         ) from exc
     _assert_phase_gate_config(config_path, {"CGR_PHASE_GATE_CONFIG": str(config_path)})
-    return config_path, log_path
+    return config_path, log_path, state_path
 
 
 def _assert_phase_gate_config(
@@ -900,7 +1007,16 @@ def _assert_phase_gate_config(
         ) from exc
     if not isinstance(payload, dict):
         raise PhaseGateBootstrapError("Phase-gate configuration must be a JSON object.")
-    required = {"schema_version", "initial_phase", "target", "focused_test", "log_path"}
+    required = {
+        "schema_version",
+        "initial_phase",
+        "target",
+        "focused_test",
+        "log_path",
+        "state_path",
+        "edit_policy",
+        "snapshot_python",
+    }
     missing = sorted(required.difference(payload))
     if missing:
         raise PhaseGateBootstrapError(
@@ -913,6 +1029,34 @@ def _assert_phase_gate_config(
         raise PhaseGateBootstrapError(
             "Phase-gate event log must use an absolute path in the attempt directory."
         )
+    state_path = Path(str(payload["state_path"]))
+    if not state_path.is_absolute() or state_path.parent != config_path.parent:
+        raise PhaseGateBootstrapError(
+            "Phase-gate state must use an absolute path in the attempt directory."
+        )
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PhaseGateBootstrapError("Phase-gate state is missing or invalid.") from exc
+    if not isinstance(state, dict) or state.get("target") != payload["target"]:
+        raise PhaseGateBootstrapError("Phase-gate state does not match the configuration.")
+    policy = payload["edit_policy"]
+    if not isinstance(policy, dict) or policy.get("mode") != "modify_existing_source":
+        raise PhaseGateBootstrapError("Phase-gate edit policy is missing or unsupported.")
+    if not isinstance(payload["snapshot_python"], str) or not payload["snapshot_python"].strip():
+        raise PhaseGateBootstrapError("Phase-gate snapshot interpreter is missing.")
+    return payload
+
+
+def _load_phase_gate_state(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PhaseGateBootstrapError("Phase-gate state could not be loaded after the run.") from exc
+    if not isinstance(payload, dict):
+        raise PhaseGateBootstrapError("Phase-gate state must be a JSON object.")
     return payload
 
 
@@ -1061,6 +1205,30 @@ def _deterministic_actions(
             f"git diff -- {shlex_quote(source)}",
             f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
         ]
+    if profile in {"transactional_failure", "transactional_recovery"}:
+        rejected_prefix = [
+            f"git add {shlex_quote(source)} && git commit -m 'premature commit'",
+            f"cat {shlex_quote(source)}",
+            f"git add {shlex_quote(source)} && git commit -m 'still premature'",
+            "printf 'temporary test' > test_gcd.py",
+            (
+                f"cat >> {shlex_quote(source)} <<'CGR_EOF'\n\nimport unittest\n"
+                "class TestInjected(unittest.TestCase):\n"
+                "    def test_injected(self):\n        self.assertTrue(True)\n"
+                "CGR_EOF"
+            ),
+        ]
+        if profile == "transactional_failure":
+            return rejected_prefix
+        return [
+            *rejected_prefix,
+            f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
+            f"sed -n '1,30p' {shlex_quote(source)}",
+            f"git diff -- {shlex_quote(source)}",
+            str(task["agent_verifier_command"]),
+            f"git diff -- {shlex_quote(source)}",
+            f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\n'",
+        ]
     return [
         f"sed -n '1,100p' {shlex_quote(source)} && sed -n '1,120p' {shlex_quote(test)}",
         f"sed -i 's/return gcd(a % b, b)/return gcd(b, a % b)/' {shlex_quote(source)}",
@@ -1068,6 +1236,14 @@ def _deterministic_actions(
         f"git diff -- {shlex_quote(source)}",
         f"git diff --binary HEAD -- > {shlex_quote(submission)} && printf '<<SWE_AGENT_SUBMISSION>>\\n'",
     ]
+
+
+def _deterministic_max_calls(profile: str) -> int:
+    return {
+        "phase_gate_realistic": 10,
+        "transactional_failure": 6,
+        "transactional_recovery": 12,
+    }.get(profile, 8)
 
 
 def _deterministic_discussions(profile: str) -> list[str] | None:

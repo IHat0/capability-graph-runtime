@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -8,12 +11,18 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from cgr.swebench.phase_gate import (
+    EditPolicy,
+    FileSnapshot,
     PhaseGate,
     RepositoryEvidence,
     _normalize_observation_text,
     _probe_repository,
+    _restore_snapshot,
+    authorize_phase_patch,
     classify_candidate_action,
+    evaluate_edit,
     install_sweagent_phase_gate,
+    patch_fingerprint,
 )
 
 
@@ -318,3 +327,232 @@ def test_repository_probe_normalizes_swerex_observation_objects() -> None:
     assert evidence == RepositoryEvidence(
         target_diff="target patch", tracked_diff="tracked patch"
     )
+
+
+def _snapshot(content: str, *, existed: bool = True, mode: int = 0o644) -> FileSnapshot:
+    return FileSnapshot(TARGET, existed, content.encode(), mode if existed else None)
+
+
+@pytest.mark.parametrize(
+    ("after", "failure"),
+    [
+        (
+            "def add(a, b):\n    return a - b\n\nimport unittest\n"
+            "class TestAdd(unittest.TestCase):\n    def test_add(self):\n"
+            "        self.assertEqual(add(2, 3), 5)\n",
+            "test_scaffolding_in_production_source",
+        ),
+        (
+            "def add(a, b):\n    return a - b\n\nHELPER = 1\n",
+            "append_only_nonrepair_edit",
+        ),
+        (
+            "# explanation\ndef add(a, b):\n    return a - b\n",
+            "existing_implementation_unchanged",
+        ),
+    ],
+)
+def test_modify_existing_policy_rejects_nonrepair_edits(after: str, failure: str) -> None:
+    result = evaluate_edit(
+        _snapshot("def add(a, b):\n    return a - b\n"),
+        _snapshot(after),
+        target=TARGET,
+        policy=EditPolicy(
+            mode="modify_existing_source",
+            prohibit_test_scaffolding=True,
+            require_existing_content_change=True,
+        ),
+    )
+
+    assert not result.accepted
+    assert failure in result.failures
+
+
+def test_focused_existing_implementation_edit_is_accepted() -> None:
+    result = evaluate_edit(
+        _snapshot("def add(a, b):\n    return a - b\n"),
+        _snapshot("def add(a, b):\n    return a + b\n"),
+        target=TARGET,
+        policy=EditPolicy(
+            mode="modify_existing_source",
+            prohibit_test_scaffolding=True,
+            require_existing_content_change=True,
+        ),
+    )
+
+    assert result.accepted
+    assert result.evidence.existing_lines_modified
+    assert result.evidence.executable_content_changed
+
+
+def test_rejected_followup_edit_preserves_prior_accepted_candidate() -> None:
+    evidence = RepositoryEvidence(target_diff="focused patch", tracked_diff="focused patch")
+    gate = PhaseGate(phase="edit", target=TARGET, focused_test=TEST)
+    first = gate.decide("sed -i 's/a/b/' src/module.py", RepositoryEvidence())
+    gate.record_execution(first, observation="", evidence=evidence, accepted=True)
+    assert gate.phase == "confirm_edit"
+
+    followup = gate.decide("printf scaffold >> src/module.py", evidence)
+    gate.record_execution(
+        followup,
+        observation="rejected and restored",
+        evidence=evidence,
+        accepted=False,
+        rolled_back=True,
+        postcondition_failures=("append_only_nonrepair_edit",),
+    )
+
+    assert gate.phase == "confirm_edit"
+    assert gate.state["accepted_target_edit"] is True
+    assert gate.state["accepted_patch_fingerprint"] == patch_fingerprint("focused patch")
+
+
+def test_snapshot_restore_preserves_exact_prior_bytes_and_mode(tmp_path: Path) -> None:
+    target = tmp_path / "module.py"
+    prior = b"def value():\r\n    return 1\r\n"
+    target.write_bytes(b"destructive replacement\n")
+
+    class LocalEnvironment:
+        def communicate(self, command: str, check: str) -> str:
+            argv = shlex.split(command, posix=True)
+            process = subprocess.run(
+                [sys.executable, *argv[1:]],
+                cwd=tmp_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if check == "raise" and process.returncode:
+                raise RuntimeError(process.stderr)
+            return process.stdout
+
+    snapshot = FileSnapshot("module.py", True, prior, 0o600)
+    _restore_snapshot(SimpleNamespace(_env=LocalEnvironment()), snapshot)
+
+    assert target.read_bytes() == prior
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_phase_state_and_patch_fingerprint_fail_closed(tmp_path: Path) -> None:
+    state_path = tmp_path / "phase-gate-state.json"
+    gate = PhaseGate(
+        phase="test",
+        target=TARGET,
+        focused_test=TEST,
+        state_path=state_path,
+    )
+    gate.state.update(
+        {
+            "accepted_target_edit": True,
+            "target_diff_inspected": True,
+            "focused_test_executed": True,
+            "focused_test_passed": True,
+            "final_diff_inspected": True,
+            "submission_authorized": True,
+            "workflow_complete": True,
+        }
+    )
+    patch = "diff --git a/src/module.py b/src/module.py\n+changed\n"
+    gate.state["accepted_patch_fingerprint"] = patch_fingerprint(patch)
+    gate._persist_state()
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert authorize_phase_patch(persisted, patch).authorized
+    changed = authorize_phase_patch(persisted, patch + "+later\n")
+    assert not changed.authorized
+    assert "final_patch_fingerprint_mismatch" in changed.failures
+
+
+def test_installed_gate_rolls_back_rejected_edit_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / TARGET
+    target.parent.mkdir(parents=True)
+    prior = b"def add(a, b):\r\n    return a - b\r\n"
+    target.write_bytes(prior)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", TARGET], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+    original_calls: list[str] = []
+
+    class LocalEnvironment:
+        def communicate(self, command: str, check: str) -> str:
+            process = subprocess.run(
+                shlex.split(command, posix=True),
+                cwd=tmp_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if check == "raise" and process.returncode:
+                raise RuntimeError(process.stderr)
+            return process.stdout
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self._env = LocalEnvironment()
+            self.tools = SimpleNamespace(get_state=lambda env: {"working_dir": str(tmp_path)})
+
+        def handle_action(self, step: SimpleNamespace) -> SimpleNamespace:
+            original_calls.append(step.action)
+            target.write_bytes(
+                target.read_bytes()
+                + b"\nimport unittest\nclass TestInjected(unittest.TestCase):\n"
+                + b"    def test_added(self):\n        self.assertTrue(True)\n"
+            )
+            step.observation = "edit command completed"
+            step.done = False
+            return step
+
+    sweagent = ModuleType("sweagent")
+    agent = ModuleType("sweagent.agent")
+    agents = ModuleType("sweagent.agent.agents")
+    agents.DefaultAgent = FakeAgent  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sweagent", sweagent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent", agent)
+    monkeypatch.setitem(sys.modules, "sweagent.agent.agents", agents)
+    state_path = tmp_path / "state.json"
+    event_path = tmp_path / "events.jsonl"
+    config = tmp_path / "phase-gate.json"
+    config.write_text(
+        json.dumps(
+            {
+                "initial_phase": "edit",
+                "target": TARGET,
+                "focused_test": TEST,
+                "log_path": str(event_path),
+                "state_path": str(state_path),
+                "snapshot_python": sys.executable,
+                "edit_policy": {
+                    "mode": "modify_existing_source",
+                    "prohibit_test_scaffolding": True,
+                    "require_existing_content_change": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CGR_PHASE_GATE_CONFIG", str(config))
+    install_sweagent_phase_gate()
+
+    step = SimpleNamespace(
+        action=f"printf scaffold >> {TARGET}", observation="", state=None, done=False
+    )
+    result = FakeAgent().handle_action(step)
+
+    assert original_calls == [step.action]
+    assert target.read_bytes() == prior
+    assert "rejected and rolled back" in result.observation
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["current_phase"] == "edit"
+    assert state["rollback_count"] == 1
+    assert "test_scaffolding_in_production_source" in state["last_postcondition_failures"]
+    event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["executed"] is True
+    assert event["accepted"] is False
+    assert event["rolled_back"] is True

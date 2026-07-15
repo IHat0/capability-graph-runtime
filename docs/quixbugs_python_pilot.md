@@ -84,6 +84,31 @@ module, missing executable, or pre-start permission failure is an environment
 failure, not an executed test. Selection credits tests only after recognizable
 pytest pass or failure output.
 
+## Transactional Phase Gate
+
+Phase-gated repair attempts snapshot the required production target immediately
+before each allowed edit action. The command still runs through pristine
+SWE-agent. CGR then compares the resulting bytes with the snapshot and rejects
+append-only changes, unchanged existing implementations, test scaffolding in a
+production target, and comment, whitespace, or executable no-ops. A rejected
+edit is restored to its exact pre-action bytes and file mode, so an earlier
+accepted edit is not lost.
+
+The gate writes `phase-gate-events.jsonl` and atomically replaces
+`phase-gate-state.json` after every decision. A submitted patch is authorized
+only after target confirmation, a successful focused verifier, final-diff
+inspection, and submission complete, and only when the final tracked diff has
+the recorded fingerprint. This policy is evidence-based and contains no
+task-specific repair implementation.
+
+The action wrapper can govern only actions that pass through SWE-agent's normal
+`DefaultAgent.handle_action` method. SWE-agent may perform automatic submission
+from its outer error or budget handling after that method returns. CGR does not
+alter that upstream behavior or discard its artifact; it treats the durable
+phase state as authoritative. An automatic patch emitted before phase
+completion is retained, classified `phase_incomplete`, and excluded from CGR
+selection even if an outer verifier happens to pass.
+
 ## External Model Run
 
 Set the existing provider variables and omit `--deterministic-model`:

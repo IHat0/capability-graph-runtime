@@ -236,6 +236,27 @@ def diagnose_attempt(
         attempt_result.get("classification") == "budget_exhausted"
         or (isinstance(termination, str) and re.search(r"cost|call|budget", termination, re.I))
     )
+    phase_state = attempt_result.get("phase_gate_state")
+    if not isinstance(phase_state, dict):
+        phase_state = {}
+    phase_flags = [
+        str(item)
+        for item in phase_state.get("diagnostic_flags", [])
+        if isinstance(item, str)
+    ]
+    authorization_failures = [
+        str(item)
+        for item in attempt_result.get("patch_authorization_failures", [])
+        if isinstance(item, str)
+    ]
+    phase_incomplete = bool(
+        attempt_result.get("classification") == "phase_incomplete"
+        or (
+            attempt_result.get("patch_emitted")
+            and not attempt_result.get("patch_phase_authorized")
+        )
+    )
+    phase_at_termination = phase_state.get("current_phase")
     diagnosis: dict[str, Any] = {
         "failure_types": [],
         "repeated_actions": sorted(repeated_actions, key=lambda item: item["first_step"]),
@@ -313,6 +334,19 @@ def diagnose_attempt(
         "attempt_classification": attempt_result.get("classification"),
         "trajectory_steps": len(steps),
         "budget_exhausted": budget_exhausted,
+        "phase_gate_state": phase_state or None,
+        "phase_at_termination": phase_at_termination,
+        "phase_workflow_complete": bool(phase_state.get("workflow_complete")),
+        "phase_diagnostic_flags": phase_flags,
+        "edit_postcondition_failures": list(
+            phase_state.get("last_postcondition_failures", [])
+        ),
+        "edit_rollback_count": int(phase_state.get("rollback_count", 0) or 0),
+        "patch_phase_authorized": bool(attempt_result.get("patch_phase_authorized")),
+        "patch_authorization_failures": authorization_failures,
+        "phase_incomplete_autosubmission": bool(
+            phase_incomplete and attempt_result.get("autosubmission_detected")
+        ),
         "required_actions": {
             "inspect_target": bool(inspected_source_paths),
             "edit_target": target_changed,
@@ -323,11 +357,9 @@ def diagnose_attempt(
                 and attempt_result.get("patch_size")
             ),
         },
-        "required_next_phase": (
-            "edit"
-            if repeated_tests or no_op_edits or declared_edit_not_executed
-            else None
-        ),
+        "required_next_phase": phase_at_termination
+        if phase_incomplete and isinstance(phase_at_termination, str)
+        else ("edit" if repeated_tests or no_op_edits or declared_edit_not_executed else None),
         "phase_exit_condition": (
             {"target": target, "requires_nonempty_diff": True}
             if repeated_tests or no_op_edits or declared_edit_not_executed
@@ -383,6 +415,13 @@ def diagnose_attempt(
         failure_types.append("wrong_file_edit")
     if reasoning_action_mismatch:
         failure_types.append("possible_reasoning_action_mismatch")
+    for flag in phase_flags:
+        if flag not in failure_types:
+            failure_types.append(flag)
+    if phase_incomplete and attempt_result.get("autosubmission_detected"):
+        failure_types.append("phase_incomplete_autosubmission")
+    if budget_exhausted and phase_state and not phase_state.get("workflow_complete"):
+        failure_types.append("budget_exhausted_before_phase_completion")
     if budget_exhausted:
         failure_types.append("budget_exhausted")
     if attempt_result.get("classification") == "model_failure":
@@ -419,6 +458,42 @@ def build_corrective_message(diagnosis: dict[str, Any], task: dict[str, Any]) ->
     traceback_evidence = diagnosis.get("source_evidence") or []
     no_op_edits = diagnosis.get("no_op_edits") or []
     declared_edits = diagnosis.get("declared_edit_not_executed") or []
+    postcondition_failures = diagnosis.get("edit_postcondition_failures") or []
+    if postcondition_failures:
+        labels = {
+            "append_only_nonrepair_edit": "the change only appended content",
+            "existing_implementation_unchanged": (
+                "the existing implementation was left unchanged"
+            ),
+            "test_scaffolding_in_production_source": (
+                "test scaffolding was added to the production source"
+            ),
+            "comment_only_change": "only comments changed",
+            "whitespace_only_change": "only whitespace changed",
+            "executable_content_unchanged": "executable source behavior was unchanged",
+        }
+        observations = [labels[item] for item in postcondition_failures if item in labels]
+        return "\n".join(
+            [
+                "## CGR corrective evidence",
+                "",
+                "Previous attempt outcome:",
+                *(f"- {item}." for item in observations),
+                "- The rejected edit was rolled back to its exact pre-action state.",
+                "- Any emitted patch is unauthorized until the phase workflow completes.",
+                "",
+                f"Immediate required phase: {diagnosis.get('required_next_phase') or 'edit'}",
+                "",
+                f"1. Inspect the current contents of {source}.",
+                "2. Change the existing production implementation with one focused edit.",
+                "3. Do not add tests or unrelated source content to the production file.",
+                f"4. Confirm the target and inspect `git diff -- {source}`.",
+                f"5. Run the focused verifier once: `{verifier}`.",
+                "6. Inspect the final diff and submit only after the verifier passes.",
+                "- Do not commit, push, modify remotes, or configure Git identity.",
+                "",
+            ]
+        )
     if declared_edits:
         return "\n".join(
             [

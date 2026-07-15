@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from cgr import quixbugs_pilot as pilot
+from cgr.swebench.phase_gate import PatchAuthorization
 
 
 def _git(root: Path, *args: str) -> str:
@@ -138,7 +139,7 @@ def test_agent_failures_are_classified(
 def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: Path) -> None:
     attempt = tmp_path / "attempt-001"
     attempt.mkdir()
-    config, event_log = pilot._write_phase_gate_config(
+    config, event_log, state_path = pilot._write_phase_gate_config(
         attempt,
         initial_phase="edit",
         target="src/module.py",
@@ -165,8 +166,52 @@ def test_phase_gate_config_is_absolute_persistent_and_child_readable(tmp_path: P
     assert process.stdout.strip() == "edit:edit"
     assert config.is_absolute() and config.is_file()
     assert event_log.is_absolute() and event_log.is_file()
+    assert state_path.is_absolute() and state_path.is_file()
     assert pilot._assert_phase_gate_config(config, environment) is not None
-    assert json.loads(config.read_text(encoding="utf-8"))["schema_version"] == 1
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["state_path"] == str(state_path)
+    assert payload["edit_policy"] == {
+        "mode": "modify_existing_source",
+        "prohibit_test_scaffolding": True,
+        "require_existing_content_change": True,
+    }
+    assert json.loads(state_path.read_text(encoding="utf-8"))["current_phase"] == "edit"
+
+
+def test_unauthorized_autosubmission_is_retained_but_phase_incomplete() -> None:
+    classification = pilot._phase_aware_classification(
+        "resolved",
+        gate_enabled=True,
+        patch_emitted=True,
+        authorization=PatchAuthorization(
+            False, ("workflow_incomplete",), "candidate-fingerprint"
+        ),
+    )
+
+    assert classification == "phase_incomplete"
+
+
+def test_transactional_deterministic_profiles_reject_then_recover(tmp_path: Path) -> None:
+    task, _manifest = pilot._load_task(pilot.DEFAULT_MANIFEST, "quixbugs.gcd")
+    failure = pilot._deterministic_actions(
+        task, Path(sys.executable), tmp_path, profile="transactional_failure"
+    )
+    recovery = pilot._deterministic_actions(
+        task, Path(sys.executable), tmp_path, profile="transactional_recovery"
+    )
+
+    assert len(failure) == 5
+    assert "git commit" in failure[0]
+    assert failure[1] == "cat python_programs/gcd.py"
+    assert "test_gcd.py" in failure[3]
+    assert "import unittest" in failure[4]
+    assert recovery[:5] == failure
+    assert "sed -i" in recovery[5]
+    assert "pytest" in recovery[8]
+    assert "SWE_AGENT_SUBMISSION" in recovery[-1]
+    assert pilot._deterministic_max_calls("transactional_failure") == 6
+    assert pilot._deterministic_max_calls("transactional_recovery") == 12
 
 
 def test_missing_phase_gate_config_fails_closed(tmp_path: Path) -> None:
