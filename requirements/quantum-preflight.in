@@ -1,0 +1,8 @@
+# Direct scientific runtime dependencies. Keep synchronized with
+# benchmark-manifests/quantum-preflight/lih-ground-state-v1.json.
+# qiskit 2.5.0 has no Python 3.12 distribution. See resolver evidence.
+qiskit==2.3.1
+qiskit-nature==0.8.0
+qiskit-algorithms==0.4.0
+qiskit-aer==0.17.1
+pyscf==2.13.1

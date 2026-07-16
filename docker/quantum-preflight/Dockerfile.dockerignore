@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+*.pem
+*.key
+**/__pycache__
+.venv*
+.sandbox-*
+.quixbugs-src
+benchmark-results
+quantum-preflight-results

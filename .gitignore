@@ -11,5 +11,6 @@ __pycache__/
 .sandbox-sweagent-venv/
 .quixbugs-src/
 benchmark-results/
+quantum-preflight-results/
 dist/
 build/

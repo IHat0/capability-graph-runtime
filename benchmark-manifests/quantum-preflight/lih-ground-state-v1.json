@@ -1,0 +1,84 @@
+{
+  "manifest_schema": "cgr.quantum-preflight-manifest/1.0.0",
+  "expected_experiment_sha256": "964dc311d2da8c5b7a018476078f819dc46cb206a1fb9a3d16bf66537edc736e",
+  "experiment": {
+    "experiment_identifier": "lih-ground-state-v1",
+    "schema_version": {"major": 1, "minor": 0, "patch": 0},
+    "parent_experiment": {
+      "experiment_identifier": "lih-ground-state-scientific-objective-v1",
+      "schema_version": {"major": 1, "minor": 0, "patch": 0},
+      "original_objective": "Determine the molecular ground-state total energy of declared LiH in the trusted local quantum preflight.",
+      "normalized_objective": "Compute and independently verify the LiH molecular ground-state total energy for the declared geometry and model.",
+      "scientific_domain": "quantum_chemistry",
+      "input_artifacts": [],
+      "assumptions": [],
+      "constraints": ["cpu_only", "local_execution", "network_disabled", "no_ibm_runtime"],
+      "requested_outputs": ["exact_ground_state_result", "quantum_preflight_receipt", "vqe_ground_state_result"],
+      "execution_policy": {
+        "execution_allowed": true,
+        "require_all_blocking_assumptions_approved": true,
+        "permitted_runtimes": ["quantum_preflight_linux"],
+        "parameters": {"maximum_duration_seconds": 180}
+      },
+      "provenance": {
+        "producer": "pulsate_labs",
+        "producer_version": {"major": 1, "minor": 0, "patch": 0},
+        "execution_identifier": null,
+        "source": "cgr"
+      }
+    },
+    "objective_type": "molecular_ground_state",
+    "requested_observable": "total_energy_hartree",
+    "molecular_system": {
+      "atoms": [
+        {"atom_identifier": "li-1", "element": "Li", "coordinates": [0.0, 0.0, 0.0]},
+        {"atom_identifier": "h-1", "element": "H", "coordinates": [0.0, 0.0, 1.6]}
+      ],
+      "coordinate_unit": "angstrom",
+      "molecular_charge": 0,
+      "spin_multiplicity": 1,
+      "declared_bond_distance": 1.6,
+      "structure_artifact_identifier": "molecular_structure"
+    },
+    "electronic_structure": {
+      "basis_set": "sto-3g",
+      "reference_method": "restricted_hartree_fock",
+      "driver_identifier": "pyscf",
+      "frozen_core": true,
+      "active_electron_count": 2,
+      "active_spatial_orbital_count": 2,
+      "active_orbital_indices": [1, 2],
+      "hamiltonian_representation": "second_quantized"
+    },
+    "quantum_model": {
+      "mapper": "jordan_wigner",
+      "ansatz": "uccsd",
+      "initial_state": "hartree_fock",
+      "optimizer": "slsqp",
+      "optimizer_settings": {"maxiter": 200, "ftol": 1e-9, "disp": false},
+      "initial_point_policy": "all_zeros",
+      "maximum_iterations": 200,
+      "convergence_threshold": 1e-9,
+      "random_seed": 1701,
+      "simulator_type": "statevector_estimator"
+    },
+    "verification_policy": {
+      "exact_solver": "numpy_minimum_eigensolver",
+      "required_energy_fields": ["electronic_energy_hartree", "total_energy_hartree"],
+      "energy_difference_tolerance_hartree": 1e-5,
+      "hermiticity_tolerance": 1e-10,
+      "particle_number_tolerance": 1e-6,
+      "required_artifact_lineage": true
+    },
+    "execution_policy": {
+      "runtime_identifier": "quantum_preflight_linux",
+      "maximum_duration_seconds": 180,
+      "maximum_memory_mib": 4096,
+      "maximum_processes": 256,
+      "maximum_result_bytes": 10485760,
+      "maximum_log_bytes": 1048576,
+      "network_disabled": true,
+      "cpu_limit": 2.0
+    }
+  }
+}

@@ -1,0 +1,24 @@
+Resolution target: CPython 3.12, manylinux_2_17_x86_64, binary wheels only
+Resolution date: 2026-07-17
+
+Preferred command result:
+
+ERROR: Could not find a version that satisfies the requirement qiskit==2.5.0
+(available compatible versions ended at 2.3.1)
+ERROR: No matching distribution found for qiskit==2.5.0
+
+`pip index versions qiskit` showed 2.5.0 exists, which proves the incompatibility
+is the required CPython 3.12 target rather than a missing project release.
+
+Smallest adjustment: qiskit==2.3.1. All other preferred direct pins remain
+unchanged. A subsequent Python 3.12/manylinux resolver run succeeded with the
+fully pinned dependency graph in quantum-preflight.lock.
+
+Pinned API inspection also found that qiskit-nature 0.8.0's
+ActiveSpaceTransformer explicit-list validation compares
+`num_spatial_orbitals` directly to the list instead of its length. CGR does not
+patch or modify the package. It independently derives the transformer's
+closed-shell default indices, requires them to equal the declared `[1, 2]`,
+records the resolution policy, then invokes the transformer without the broken
+optional argument. `test_qiskit_nature_080_active_space_compatibility` locks
+this fail-closed workaround.
