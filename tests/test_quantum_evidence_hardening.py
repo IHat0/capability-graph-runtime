@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import warnings
 from copy import deepcopy
@@ -86,7 +88,7 @@ def _artifact(
     *,
     duration: float = 1.0,
     identity: ScientificResultIdentity | None = None,
-    execution_metadata: dict[str, str] | None = None,
+    execution_metadata: dict[str, str | int | float | bool | None] | None = None,
 ) -> ScientificResultArtifact:
     identity = identity or _identity()
     return ScientificResultArtifact(
@@ -313,10 +315,132 @@ def test_quantum_scripts_enforce_isolation_entrypoints_and_permission_probe() ->
     for source in (acceptance, integration):
         assert "--network none" in source and "--read-only" in source
         assert "--cap-drop ALL" in source and "--pids-limit" in source
+        assert "--cpus 2" in source and "--memory 4g" in source
+        assert "--security-opt no-new-privileges" in source
         assert "/var/run/docker.sock" not in source and "AWS_SECRET" not in source and "IBM_QUANTUM" not in source
     assert "--entrypoint python" in acceptance and "--entrypoint python" in integration
     assert "CGR_QUANTUM_INTEGRATION=1" in integration and "CGR_QUANTUM_IMAGE_ID" in integration
+    assert (
+        "tests/test_quantum_preflight_integration.py::"
+        "test_real_lih_reference_mutation_and_determinism"
+    ) in integration
+    assert "-m quantum_integration" not in integration
+    assert "-m pytest -q -s -rs -p no:cacheprovider" in integration
+    assert "--tmpfs /tmp:rw,nosuid,nodev,size=1g,mode=1777" in integration
     assert ".cgr-write-probe" in acceptance and "sudo chown -R 10001:10001" in acceptance
+
+
+def _bash_executable() -> str:
+    discovered = shutil.which("bash")
+    if discovered:
+        return discovered
+    windows_git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+    if windows_git_bash.is_file():
+        return str(windows_git_bash)
+    pytest.skip("Bash is unavailable for integration-wrapper behavior tests.")
+
+
+def _run_mocked_integration_wrapper(
+    tmp_path: Path,
+    *,
+    docker_output: str,
+    docker_status: int,
+    tee_status: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    script = ROOT / "scripts/run-quantum-preflight-integration.sh"
+    log = tmp_path / "host-logs" / "integration.log"
+    harness = r'''
+docker() {
+  if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+    printf 'sha256:mock-image-id\n'
+    return 0
+  fi
+  if [[ "$1" == "run" ]]; then
+    printf '%b\n' "$FAKE_DOCKER_OUTPUT"
+    return "$FAKE_DOCKER_STATUS"
+  fi
+  return 99
+}
+if [[ "$FAKE_TEE_STATUS" -ne 0 ]]; then
+  tee() {
+    command cat
+    return "$FAKE_TEE_STATUS"
+  }
+fi
+source "$1" "$2"
+'''
+    environment = {
+        **os.environ,
+        "FAKE_DOCKER_OUTPUT": docker_output,
+        "FAKE_DOCKER_STATUS": str(docker_status),
+        "FAKE_TEE_STATUS": str(tee_status),
+    }
+    return subprocess.run(
+        [
+            _bash_executable(),
+            "-c",
+            harness,
+            "quantum-integration-test",
+            script.as_posix(),
+            log.as_posix(),
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.quantum_unit
+@pytest.mark.parametrize(
+    ("docker_output", "docker_status", "expected_status"),
+    [
+        ("collection failed", 2, 2),
+        ("1 skipped in 0.01s", 0, 4),
+        ("841 deselected in 0.01s", 0, 4),
+    ],
+)
+def test_integration_wrapper_rejects_failure_skip_and_zero_pass(
+    tmp_path: Path,
+    docker_output: str,
+    docker_status: int,
+    expected_status: int,
+) -> None:
+    completed = _run_mocked_integration_wrapper(
+        tmp_path,
+        docker_output=docker_output,
+        docker_status=docker_status,
+    )
+    assert completed.returncode == expected_status
+    assert "OFFICIAL QUANTUM INTEGRATION PASSED" not in completed.stdout
+    assert f"integration_exit={docker_status}" in completed.stdout
+
+
+@pytest.mark.quantum_unit
+def test_integration_wrapper_reports_success_only_after_exact_test_passes(tmp_path: Path) -> None:
+    completed = _run_mocked_integration_wrapper(
+        tmp_path,
+        docker_output="1 passed in 5.76s",
+        docker_status=0,
+    )
+    assert completed.returncode == 0
+    assert "integration_exit=0" in completed.stdout
+    assert "log_path=" in completed.stdout
+    assert completed.stdout.rstrip().endswith("OFFICIAL QUANTUM INTEGRATION PASSED")
+
+
+@pytest.mark.quantum_unit
+def test_integration_wrapper_never_masks_tee_failure_as_success(tmp_path: Path) -> None:
+    completed = _run_mocked_integration_wrapper(
+        tmp_path,
+        docker_output="1 passed in 5.76s",
+        docker_status=0,
+        tee_status=9,
+    )
+    assert completed.returncode == 9
+    assert "Integration logging failed with exit code 9" in completed.stderr
+    assert "OFFICIAL QUANTUM INTEGRATION PASSED" not in completed.stdout
 
 
 @pytest.mark.quantum_unit
