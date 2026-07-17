@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.metadata
 import json
@@ -53,6 +54,18 @@ def first_numeric(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def prepare_execution_experiment(
+    mode: str,
+    public_experiment: dict[str, Any],
+) -> dict[str, Any]:
+    """Return candidate-owned inputs without changing the public task document."""
+    execution_experiment = copy.deepcopy(public_experiment)
+    if mode == "wrong-bond-distance":
+        execution_experiment["molecular_system"]["atoms"][1]["coordinates"][2] = 1.7
+        execution_experiment["molecular_system"]["declared_bond_distance"] = 1.7
+    return execution_experiment
 
 
 def construct(experiment: dict[str, Any]) -> tuple[dict[str, Any], Any, Any, Any]:
@@ -262,12 +275,9 @@ def solve(
     }
 
 
-def mutate(mode: str, payloads: dict[str, Any]) -> dict[str, Any]:
+def mutate_post_execution(mode: str, payloads: dict[str, Any]) -> dict[str, Any]:
     result = payloads["candidate_result"]
-    if mode == "wrong-bond-distance":
-        payloads["molecular_structure"]["atoms"][1]["coordinates"][2] = 1.7
-        payloads["molecular_structure"]["declared_bond_distance"] = 1.7
-    elif mode == "angstrom-bohr-confusion":
+    if mode == "angstrom-bohr-confusion":
         payloads["molecular_structure"]["coordinate_unit"] = "bohr"
     elif mode == "wrong-charge":
         payloads["molecular_structure"]["molecular_charge"] = 1
@@ -301,17 +311,20 @@ def emit(
     mode: str,
     candidate_identifier: str,
     input_sha: str,
-    experiment: dict[str, Any],
+    public_experiment: dict[str, Any],
     output: Path,
 ) -> None:
     if mode == "bare-fabricated-energy":
-        summary = summary_document(candidate_identifier, input_sha, experiment, {}, [])
+        summary = summary_document(
+            candidate_identifier, input_sha, public_experiment, {}, []
+        )
         summary["claimed_energies"] = {"total_energy_hartree": 0.0}
         write_json(output / "candidate-summary.json", summary)
         return
-    payloads, problem, mapper, ansatz = construct(experiment)
-    solve(experiment, payloads, problem, mapper, ansatz)
-    mutate(mode, payloads)
+    execution_experiment = prepare_execution_experiment(mode, public_experiment)
+    payloads, problem, mapper, ansatz = construct(execution_experiment)
+    solve(execution_experiment, payloads, problem, mapper, ansatz)
+    mutate_post_execution(mode, payloads)
     paths = {
         "molecular_structure": "molecular-structure.json",
         "electronic_problem": "electronic-problem.json",
@@ -335,7 +348,7 @@ def emit(
             }
         )
     summary = summary_document(
-        candidate_identifier, input_sha, experiment, payloads, claims
+        candidate_identifier, input_sha, public_experiment, payloads, claims
     )
     if mode == "forged-content-hash":
         summary["artifacts"][0]["content_sha256"] = "f" * 64
@@ -349,7 +362,7 @@ def emit(
 def summary_document(
     candidate_identifier: str,
     input_sha: str,
-    experiment: dict[str, Any],
+    public_experiment: dict[str, Any],
     payloads: dict[str, Any],
     claims: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -377,10 +390,10 @@ def summary_document(
         "claimed_workflow": "lih_statevector_vqe",
         "artifacts": claims,
         "lineage": lineage,
-        "claimed_molecular_specification": experiment["molecular_system"],
-        "claimed_active_space": experiment["electronic_structure"],
+        "claimed_molecular_specification": public_experiment["molecular_system"],
+        "claimed_active_space": public_experiment["electronic_structure"],
         "claimed_mapper": payloads.get("qubit_hamiltonian", {}).get(
-            "mapper", experiment["quantum_model"]["mapper"]
+            "mapper", public_experiment["quantum_model"]["mapper"]
         ),
         "claimed_solver": "statevector_vqe",
         "claimed_energies": {

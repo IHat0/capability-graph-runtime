@@ -217,6 +217,39 @@ def test_valid_candidate_is_authorized_with_recomputed_receipt(tmp_path: Path) -
     assert receipt.receipt_content_sha256 == receipt.fingerprint
 
 
+def test_self_consistent_wrong_bond_distance_is_a_structure_mismatch(
+    tmp_path: Path,
+) -> None:
+    _, payloads, trusted = _fixture()
+    payloads["molecular_structure"]["atoms"][1]["coordinates"][2] = 1.7
+    payloads["molecular_structure"]["declared_bond_distance"] = 1.7
+    payloads["electronic_problem"]["execution_geometry_bond_distance"] = 1.7
+    payloads["active_space"]["electronic_problem_sha256"] = sha256_fingerprint(
+        payloads["electronic_problem"]
+    )
+    payloads["fermionic_hamiltonian"]["terms"] = [
+        {"label": "+_1 -_1", "coefficient": 1.7}
+    ]
+    payloads["qubit_hamiltonian"]["terms"] = [{"label": "IZ", "coefficient": 1.7}]
+    qubit_sha256 = sha256_fingerprint(payloads["qubit_hamiltonian"])
+    payloads["candidate_result"]["hamiltonian_sha256"] = qubit_sha256
+    payloads["ansatz_manifest"]["active_space_sha256"] = sha256_fingerprint(
+        payloads["active_space"]
+    )
+    payloads["ansatz_manifest"]["hamiltonian_sha256"] = qubit_sha256
+
+    receipt = _adjudicate(tmp_path, payloads, trusted)
+
+    codes = {item.code for item in receipt.findings}
+    assert receipt.authorized is False
+    assert receipt.primary_failure_code == "candidate_structure_mismatch"
+    assert "candidate_structure_mismatch" in codes
+    assert "candidate_protocol_invalid" not in codes
+    assert "candidate_lineage_mismatch" not in codes
+    assert receipt.recomputed_scientific_result_sha256 is not None
+    assert receipt.receipt_content_sha256 == receipt.fingerprint
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
