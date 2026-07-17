@@ -32,6 +32,7 @@ cgr-sandbox-full-cycle = "cgr.swebench.sandbox_full_cycle:sandbox_full_cycle_mai
 cgr-quixbugs-pilot = "cgr.quixbugs_pilot:quixbugs_pilot_main"
 cgr-quantum-preflight-reference = "cgr.quantum_preflight.cli:main"
 cgr-quantum-preflight-acceptance = "cgr.quantum_preflight.acceptance:main"
+cgr-quantum-candidate-benchmark = "cgr.quantum_candidate.cli:main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]

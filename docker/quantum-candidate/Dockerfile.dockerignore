@@ -1,0 +1,6 @@
+**
+!requirements/
+!requirements/quantum-preflight.lock
+!docker/
+!docker/quantum-candidate/
+!docker/quantum-candidate/Dockerfile
