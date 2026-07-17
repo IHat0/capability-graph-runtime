@@ -126,10 +126,6 @@ def validate_and_apply_patch(
             "mode_shortcut",
         )
         _require(
-            "candidate_identifier" not in edit.old_text + edit.new_text,
-            "candidate_identity_edit",
-        )
-        _require(
             not any(
                 token in lowered
                 for token in (
@@ -157,6 +153,10 @@ def validate_and_apply_patch(
         output_manifest = create_source_manifest(
             destination_root, source_manifest.source_identifier
         )
+        candidate_identifier_retained = _candidate_identifier_retained(
+            source_root, destination_root
+        )
+        _require(candidate_identifier_retained, "candidate_identity_edit")
         _require(
             output_manifest.source_manifest_sha256
             != source_manifest.source_manifest_sha256,
@@ -189,7 +189,7 @@ def validate_and_apply_patch(
         source_provenance="fresh-copy-plus-structured-edits",
         unchanged_file_ratio=_unchanged_file_ratio(source_manifest, output_manifest),
         control_source_match=False,
-        candidate_identifier_retained=True,
+        candidate_identifier_retained=candidate_identifier_retained,
     )
     return validation, output_manifest
 
@@ -216,6 +216,24 @@ def _unchanged_file_ratio(before: SourceManifest, after: SourceManifest) -> floa
         1 for path in paths if before_hashes.get(path) == after_hashes.get(path)
     )
     return unchanged / len(paths)
+
+
+def _candidate_identifier_retained(before: Path, after: Path) -> bool:
+    path = Path("repair-config.json")
+    if not (before / path).is_file() and not (after / path).is_file():
+        return True
+    try:
+        import json
+
+        before_value = json.loads((before / path).read_text(encoding="utf-8"))
+        after_value = json.loads((after / path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    identifier = before_value.get("candidate_identifier")
+    return (
+        isinstance(identifier, str)
+        and after_value.get("candidate_identifier") == identifier
+    )
 
 
 def _require(condition: bool, code: str) -> None:

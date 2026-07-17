@@ -8,11 +8,13 @@ __pycache__/
 .venv/
 .venv-swebench-eval/
 .sandbox-sweagent-src/
+.swe-agent-src/
 .sandbox-sweagent-venv/
 .quixbugs-src/
 benchmark-results/
 quantum-preflight-results/
 quantum-candidate-repair/
 quantum-repair-benchmark/
+quantum-model-repair/
 dist/
 build/

@@ -148,7 +148,7 @@ class QuantumRepairPolicy(CanonicalModel):
     maximum_files_changed: int = Field(default=8, ge=1, le=8)
     maximum_patch_bytes: int = Field(default=64 * 1024, ge=1, le=64 * 1024)
     maximum_changed_lines: int = Field(default=300, ge=1, le=300)
-    maximum_provider_seconds: int = Field(default=30, ge=1, le=120)
+    maximum_provider_seconds: int = Field(default=30, ge=1, le=3600)
     maximum_total_seconds: int = Field(default=600, ge=1, le=3600)
     allowed_file_types: tuple[str, ...] = (".json", ".py", ".txt")
     prohibited_paths: tuple[str, ...] = (

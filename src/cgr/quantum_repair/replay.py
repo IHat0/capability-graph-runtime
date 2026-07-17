@@ -150,6 +150,7 @@ def verify_repair_run(run_directory: Path) -> dict[str, Any]:
                     )
         elif attempt.patch_sha256 is not None:
             raise ValueError("Repair patch exists without a directive.")
+        _verify_provider_invocations(attempt_directory, attempt)
         previous_identifier = attempt.attempt_identifier
     final_reference = receipt.attempts[-1]
     if (
@@ -184,3 +185,79 @@ def verify_repair_run(run_directory: Path) -> dict[str, Any]:
         "repair_run_content_sha256": receipt.repair_run_content_sha256,
         "replay_verified": True,
     }
+
+
+def _verify_provider_invocations(
+    attempt_directory: Path, attempt: QuantumRepairAttempt
+) -> None:
+    root = attempt_directory / "provider-invocations"
+    if not root.exists():
+        return
+    from .model_provider.contracts import (
+        AgentDescriptor,
+        ModelEndpointDescriptor,
+        ModelRepairPrompt,
+        ProviderInvocationRequest,
+        ProviderInvocationResult,
+        ProviderTrajectoryManifest,
+    )
+    from .model_provider.telemetry import verify_provider_telemetry
+
+    directories = sorted(path for path in root.glob("invocation-*") if path.is_dir())
+    expected = [f"invocation-{index:03d}" for index in range(len(directories))]
+    if [path.name for path in directories] != expected:
+        raise ValueError("Provider invocations were inserted, deleted, or reordered.")
+    completed = 0
+    for directory in directories:
+        state = read_json(directory / "invocation-state.json")
+        if state.get("schema_version") != "cgr.quantum-repair-provider-state/1.0.0":
+            raise ValueError("Provider invocation state schema is unsupported.")
+        status = state.get("status")
+        request_path = directory / "provider-request.json"
+        request = None
+        if request_path.is_file():
+            request = ProviderInvocationRequest.model_validate(read_json(request_path))
+            if (
+                request.directive_sha256 != attempt.directive_sha256
+                or request.input_source_manifest_sha256
+                != attempt.input_source_manifest_sha256
+            ):
+                raise ValueError("Provider request was cross-linked.")
+            endpoint = ModelEndpointDescriptor.model_validate(
+                read_json(directory / "model-endpoint.json")
+            )
+            agent = AgentDescriptor.model_validate(
+                read_json(directory / "agent-descriptor.json")
+            )
+            prompt = ModelRepairPrompt.model_validate(
+                read_json(directory / "model-prompt.json")
+            )
+            if (
+                request.model_endpoint_descriptor_sha256 != endpoint.descriptor_sha256
+                or request.agent_descriptor_sha256 != agent.descriptor_sha256
+                or request.prompt_sha256 != prompt.prompt_sha256
+            ):
+                raise ValueError("Provider descriptors or prompt were substituted.")
+        if status == "completed":
+            if request is None:
+                raise ValueError("Completed provider invocation has no request.")
+            completed += 1
+            result = ProviderInvocationResult.model_validate(
+                read_json(directory / "provider-result.json")
+            )
+            trajectory = ProviderTrajectoryManifest.model_validate(
+                read_json(directory / "trajectory-manifest.json")
+            )
+            proposed = QuantumRepairPatch.model_validate(
+                read_json(directory / "proposed-patch.json")
+            )
+            if (
+                result.request_sha256 != request.request_content_sha256
+                or result.trajectory_identity != trajectory.complete_trajectory_sha256
+                or result.proposed_patch_identity != proposed.patch_sha256
+                or proposed.patch_sha256 != attempt.patch_sha256
+            ):
+                raise ValueError("Completed provider evidence was cross-linked.")
+        verify_provider_telemetry(directory / "provider-events.jsonl")
+    if completed > 1:
+        raise ValueError("More than one provider invocation completed for an attempt.")

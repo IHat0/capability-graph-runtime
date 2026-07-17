@@ -1,0 +1,33 @@
+{
+  "schema_version": "cgr.quantum-repair-model-acceptance/1.0.0",
+  "benchmark_identifier": "lih-sweagent-qwen-acceptance-v1",
+  "repair_benchmark_manifest": "lih-candidate-repair-benchmark-v1.json",
+  "repair_benchmark_manifest_sha256": "3d43b62563fdf80d50f7bf2020aa41db29e699dfa153bfe2e86a4df707b8ec8f",
+  "modes": ["baseline", "cgr"],
+  "maximum_attempts": 3,
+  "minimum_cgr_broken_authorized": 8,
+  "minimum_absolute_improvement": 2,
+  "cases": [
+    "valid-control",
+    "syntax-error",
+    "import-error",
+    "runtime-error",
+    "malformed-output",
+    "wrong-bond-distance",
+    "wrong-active-space",
+    "wrong-mapper",
+    "electronic-energy-as-total",
+    "forged-content-hash",
+    "network-attempt",
+    "syntax-then-structure"
+  ],
+  "repeatability_cases": [
+    "valid-control",
+    "syntax-error",
+    "malformed-output",
+    "wrong-bond-distance",
+    "wrong-mapper",
+    "syntax-then-structure"
+  ],
+  "repeatability_runs": 2
+}
