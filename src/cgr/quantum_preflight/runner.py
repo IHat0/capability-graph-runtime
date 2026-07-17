@@ -9,7 +9,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from cgr.science import ArtifactLineageEdge, ArtifactLineageGraph, ArtifactReference
+from cgr.science import (
+    ArtifactLineageEdge,
+    ArtifactLineageGraph,
+    ArtifactReference,
+    sha256_fingerprint,
+)
 
 from .artifacts import SCHEMA_VERSION, artifact_document, artifact_reference, write_json_atomic
 from .contracts import ManifestEnvelope
@@ -22,7 +27,15 @@ from .errors import (
 )
 from .receipt import assemble_receipt
 from .reference import prepare_problem, run_exact, run_vqe
+from .identities import (
+    AuthorizedScientificOutcome,
+    ScientificResultArtifact,
+    ScientificResultIdentity,
+    verifier_outcome_identities,
+)
 from .verification import blocking_findings, verify_execution
+from .warnings import CapturedWarning, capture_warnings, warning_evidence
+from .results import EnergyResult, VQEResult
 
 _FILENAMES = {
     "experiment": "experiment.json",
@@ -37,6 +50,7 @@ _FILENAMES = {
     "vqe_result": "vqe-result.json",
     "optimization_trace": "optimization-trace.json",
     "ansatz_manifest": "ansatz-manifest.json",
+    "compatibility_warnings": "compatibility-warnings.json",
     "verification_report": "verification-report.json",
     "lineage": "lineage.json",
     "receipt": "receipt.json",
@@ -54,6 +68,7 @@ _ARTIFACT_TYPES = {
     "vqe_result": "vqe_ground_state_result",
     "optimization_trace": "optimization_trace",
     "ansatz_manifest": "circuit_ansatz_manifest",
+    "compatibility_warnings": "compatibility_warnings",
     "verification_report": "verification_report",
     "lineage": "artifact_lineage",
     "receipt": "quantum_preflight_receipt",
@@ -83,6 +98,7 @@ def run_trusted_reference(
             summary = _execute(
                 manifest,
                 temporary,
+                execution_identifier=run_id,
                 lock_path=lock_path,
                 image_identifier=image_identifier,
                 maximum_bytes=maximum_bytes,
@@ -112,11 +128,13 @@ def _execute(
     manifest: ManifestEnvelope,
     directory: Path,
     *,
+    execution_identifier: str,
     lock_path: Path,
     image_identifier: str,
     maximum_bytes: int,
 ) -> dict[str, Any]:
     experiment = manifest.experiment
+    captured_warnings: list[CapturedWarning] = []
     payloads: dict[str, Any] = {
         "experiment": experiment.model_dump(mode="json"),
         "environment": environment_manifest(lock_path, image_identifier=image_identifier),
@@ -130,7 +148,9 @@ def _execute(
         parents=(references["experiment"].pointer,),
         maximum_bytes=maximum_bytes,
     )
-    prepared = prepare_problem(experiment)
+    with capture_warnings("problem_construction") as phase_warnings:
+        prepared = prepare_problem(experiment)
+    captured_warnings.extend(phase_warnings)
     payloads.update(prepared.payloads)
     construction_order = (
         ("molecular_structure", (references["experiment"].pointer,)),
@@ -153,12 +173,14 @@ def _execute(
 
     # VQE executes before the exact solver exists. The function signature has
     # no reference-energy argument, enforcing optimizer/reference separation.
-    vqe, trace, ansatz = run_vqe(
-        prepared,
-        experiment,
-        hamiltonian_sha256=references["qubit_hamiltonian"].content_sha256,
-        environment_sha256=references["environment"].content_sha256,
-    )
+    with capture_warnings("vqe_execution") as phase_warnings:
+        vqe, trace, ansatz = run_vqe(
+            prepared,
+            experiment,
+            hamiltonian_sha256=references["qubit_hamiltonian"].content_sha256,
+            environment_sha256=references["environment"].content_sha256,
+        )
+    captured_warnings.extend(phase_warnings)
     payloads["optimization_trace"] = trace
     references["optimization_trace"] = _record(
         directory,
@@ -175,7 +197,16 @@ def _execute(
         parents=(references["active_space"].pointer, references["qubit_hamiltonian"].pointer),
         maximum_bytes=maximum_bytes,
     )
-    payloads["vqe_result"] = vqe.model_dump(mode="json")
+    vqe_identity = _scientific_result_identity(
+        "vqe_ground_state", vqe, experiment, payloads, references
+    )
+    vqe_artifact = ScientificResultArtifact(
+        scientific_identity=vqe_identity,
+        scientific_result_sha256=vqe_identity.fingerprint,
+        execution_result=vqe,
+        execution_metadata={"execution_identifier": execution_identifier},
+    )
+    payloads["vqe_result"] = vqe_artifact.model_dump(mode="json")
     references["vqe_result"] = _record(
         directory,
         "vqe_result",
@@ -187,17 +218,37 @@ def _execute(
         ),
         maximum_bytes=maximum_bytes,
     )
-    exact = run_exact(
-        prepared,
-        hamiltonian_sha256=references["qubit_hamiltonian"].content_sha256,
-        environment_sha256=references["environment"].content_sha256,
+    with capture_warnings("exact_execution") as phase_warnings:
+        exact = run_exact(
+            prepared,
+            hamiltonian_sha256=references["qubit_hamiltonian"].content_sha256,
+            environment_sha256=references["environment"].content_sha256,
+        )
+    captured_warnings.extend(phase_warnings)
+    exact_identity = _scientific_result_identity(
+        "exact_ground_state", exact, experiment, payloads, references
     )
-    payloads["exact_result"] = exact.model_dump(mode="json")
+    exact_artifact = ScientificResultArtifact(
+        scientific_identity=exact_identity,
+        scientific_result_sha256=exact_identity.fingerprint,
+        execution_result=exact,
+        execution_metadata={"execution_identifier": execution_identifier},
+    )
+    payloads["exact_result"] = exact_artifact.model_dump(mode="json")
     references["exact_result"] = _record(
         directory,
         "exact_result",
         payloads["exact_result"],
         parents=(references["qubit_hamiltonian"].pointer, references["environment"].pointer),
+        maximum_bytes=maximum_bytes,
+    )
+    compatibility = warning_evidence(captured_warnings)
+    payloads["compatibility_warnings"] = compatibility.model_dump(mode="json")
+    references["compatibility_warnings"] = _record(
+        directory,
+        "compatibility_warnings",
+        payloads["compatibility_warnings"],
+        parents=(references["environment"].pointer,),
         maximum_bytes=maximum_bytes,
     )
     lineage = _lineage(references)
@@ -226,11 +277,38 @@ def _execute(
         parents=tuple(reference.pointer for reference in references.values()),
         maximum_bytes=maximum_bytes,
     )
+    agreement = payloads["numerical_agreement"]
+    outcome = AuthorizedScientificOutcome(
+        experiment_sha256=experiment.fingerprint,
+        molecular_structure_sha256=references["molecular_structure"].content_sha256,
+        electronic_problem_sha256=references["electronic_problem"].content_sha256,
+        active_space_sha256=references["active_space"].content_sha256,
+        fermionic_hamiltonian_sha256=references["fermionic_hamiltonian"].content_sha256,
+        qubit_hamiltonian_sha256=references["qubit_hamiltonian"].content_sha256,
+        exact_scientific_result_sha256=exact_identity.fingerprint,
+        vqe_scientific_result_sha256=vqe_identity.fingerprint,
+        exact_total_energy=exact.total_energy_hartree,
+        vqe_total_energy=vqe.total_energy_hartree,
+        absolute_difference=agreement["absolute_difference_hartree"],
+        tolerance=agreement["tolerance_hartree"],
+        comparison_passed=agreement["passed"],
+        verification_policy_sha256=experiment.verification_policy.fingerprint,
+        verifier_outcomes=verifier_outcome_identities(results),
+        authorization_decision=not blocking_findings(results),
+        environment_compatibility_sha256=payloads["environment"][
+            "environment_compatibility_sha256"
+        ],
+        compatibility_warnings_sha256=compatibility.fingerprint,
+        compatibility_status=compatibility.status,
+    )
     receipt = assemble_receipt(
+        execution_identifier=execution_identifier,
         experiment=references["experiment"].pointer,
         artifacts=tuple(reference.pointer for reference in references.values()),
         verification_results=results,
         lineage=references["lineage"].pointer,
+        compatibility_warnings=references["compatibility_warnings"].pointer,
+        scientific_outcome=outcome,
         execution_completed=True,
     )
     payloads["receipt"] = receipt.model_dump(mode="json")
@@ -249,12 +327,29 @@ def _execute(
     summary = {
         "experiment_identifier": experiment.experiment_identifier,
         "experiment_sha256": references["experiment"].content_sha256,
+        "experiment_fingerprint": experiment.fingerprint,
         "structure_sha256": references["molecular_structure"].content_sha256,
         "qcschema_sha256": references["qcschema"].content_sha256,
+        "electronic_problem_sha256": references["electronic_problem"].content_sha256,
+        "active_space_sha256": references["active_space"].content_sha256,
         "fermionic_hamiltonian_sha256": references["fermionic_hamiltonian"].content_sha256,
         "qubit_hamiltonian_sha256": references["qubit_hamiltonian"].content_sha256,
         "exact_result_sha256": references["exact_result"].content_sha256,
         "vqe_result_sha256": references["vqe_result"].content_sha256,
+        "exact_scientific_result_sha256": exact_identity.fingerprint,
+        "vqe_scientific_result_sha256": vqe_identity.fingerprint,
+        "scientific_outcome_sha256": outcome.fingerprint,
+        "environment_compatibility_sha256": payloads["environment"][
+            "environment_compatibility_sha256"
+        ],
+        "network_disabled": payloads["environment"]["network_disabled"],
+        "compatibility_warnings_sha256": compatibility.fingerprint,
+        "compatibility_status": compatibility.status,
+        "initial_point_sha256": vqe.initial_point_sha256,
+        "optimized_parameters_sha256": vqe.optimized_parameters_sha256,
+        "optimization_trace_scientific_sha256": references[
+            "optimization_trace"
+        ].content_sha256,
         "receipt_sha256": references["receipt"].content_sha256,
         "exact_total_energy_hartree": exact.total_energy_hartree,
         "vqe_total_energy_hartree": vqe.total_energy_hartree,
@@ -268,6 +363,77 @@ def _execute(
     if not receipt.authorized:
         raise QuantumVerificationError("Trusted execution completed but was not authorized.")
     return summary
+
+
+def _scientific_result_identity(
+    result_kind: str,
+    result: EnergyResult,
+    experiment: Any,
+    payloads: dict[str, Any],
+    references: dict[str, ArtifactReference],
+) -> ScientificResultIdentity:
+    vqe_result = result if isinstance(result, VQEResult) else None
+    if vqe_result is not None:
+        solver_configuration = experiment.quantum_model.model_dump(mode="json")
+    else:
+        solver_configuration = {
+            "exact_solver": experiment.verification_policy.exact_solver,
+            "particle_sector_filtering_policy": "default_particle_sector_filter",
+        }
+    return ScientificResultIdentity(
+        result_kind=result_kind,
+        experiment_sha256=experiment.fingerprint,
+        molecular_structure_sha256=references["molecular_structure"].content_sha256,
+        electronic_problem_sha256=references["electronic_problem"].content_sha256,
+        active_space_sha256=references["active_space"].content_sha256,
+        fermionic_hamiltonian_sha256=references["fermionic_hamiltonian"].content_sha256,
+        qubit_hamiltonian_sha256=references["qubit_hamiltonian"].content_sha256,
+        solver_identifier=result.solver_identifier,
+        solver_version=result.solver_version,
+        solver_configuration_sha256=sha256_fingerprint(solver_configuration),
+        environment_compatibility_sha256=payloads["environment"][
+            "environment_compatibility_sha256"
+        ],
+        electronic_energy=result.electronic_energy_hartree,
+        nuclear_repulsion_energy=result.nuclear_repulsion_energy_hartree,
+        total_energy=result.total_energy_hartree,
+        particle_count=result.particle_count,
+        number_of_spatial_orbitals=result.number_of_spatial_orbitals,
+        number_of_spin_orbitals=result.number_of_spin_orbitals,
+        number_of_qubits=result.number_of_qubits,
+        converged=vqe_result.converged if vqe_result is not None else result.completed,
+        auxiliary_scientific_values={"raw_eigenvalue_hartree": result.raw_eigenvalue_hartree},
+        particle_sector_filtering_policy=(
+            None if vqe_result is not None else "default_particle_sector_filter"
+        ),
+        estimator_type=(
+            experiment.quantum_model.simulator_type if vqe_result is not None else None
+        ),
+        initial_point_sha256=(
+            vqe_result.initial_point_sha256 if vqe_result is not None else None
+        ),
+        optimized_parameters_sha256=(
+            vqe_result.optimized_parameters_sha256 if vqe_result is not None else None
+        ),
+        optimization_trace_sha256=(
+            references["optimization_trace"].content_sha256
+            if vqe_result is not None
+            else None
+        ),
+        ansatz_sha256=(
+            references["ansatz_manifest"].content_sha256
+            if vqe_result is not None
+            else None
+        ),
+        ansatz_identifier=(
+            vqe_result.ansatz_identifier if vqe_result is not None else None
+        ),
+        initial_state_identifier=(
+            vqe_result.initial_state_identifier if vqe_result is not None else None
+        ),
+        mapper_identifier=experiment.quantum_model.mapper,
+        verification_policy_sha256=experiment.verification_policy.fingerprint,
+    )
 
 
 def _record(

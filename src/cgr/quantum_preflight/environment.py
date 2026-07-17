@@ -6,11 +6,13 @@ import hashlib
 import importlib.metadata
 import os
 import platform
+import re
 import socket
 import sys
 from pathlib import Path
 from typing import Any
 
+from .identities import EnvironmentCompatibilityIdentity
 from .errors import QuantumDependencyError
 
 DIRECT_VERSIONS = {
@@ -82,7 +84,7 @@ def environment_manifest(lock_path: Path, *, image_identifier: str) -> dict[str,
     }
     lock_hash = hashlib.sha256(lock_path.read_bytes()).hexdigest()
     credential_names_present = sorted(_CREDENTIAL_NAMES.intersection(os.environ.keys()))
-    return {
+    manifest = {
         "schema_version": "cgr.quantum-environment/1.0.0",
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
@@ -99,6 +101,41 @@ def environment_manifest(lock_path: Path, *, image_identifier: str) -> dict[str,
         "blas_information": _blas_information(),
         "python_major_minor": f"{sys.version_info.major}.{sys.version_info.minor}",
     }
+    compatibility = environment_compatibility_identity(manifest)
+    manifest["compatibility_identity"] = compatibility.model_dump(mode="json")
+    manifest["environment_compatibility_sha256"] = compatibility.fingerprint
+    return manifest
+
+
+def environment_compatibility_identity(
+    environment: dict[str, Any],
+) -> EnvironmentCompatibilityIdentity:
+    """Project stable compatibility fields from complete environment evidence."""
+    direct = environment.get("direct_package_versions", {})
+    transitive = environment.get("transitive_package_versions", {})
+    blas = environment.get("blas_information", {})
+    limits = environment.get("thread_limits", {})
+    if not all(isinstance(value, dict) for value in (direct, transitive, blas, limits)):
+        raise ValueError("Environment compatibility fields must be mappings.")
+    return EnvironmentCompatibilityIdentity(
+        python_version=str(environment["python_version"]),
+        python_implementation=_stable_identifier(environment["python_implementation"]),
+        os_family=_stable_identifier(environment["os"]),
+        architecture=_stable_identifier(environment["architecture"]),
+        direct_package_versions={str(key): str(value) for key, value in direct.items()},
+        transitive_package_versions={str(key): str(value) for key, value in transitive.items()},
+        dependency_lock_sha256=str(environment["dependency_lock_sha256"]),
+        container_image_identifier=str(environment["container_image_identifier"]),
+        blas_information={str(key): str(value) for key, value in blas.items()},
+        thread_limits={str(key): str(value) for key, value in limits.items()},
+        deterministic_seed_policy=_stable_identifier(environment["deterministic_seed_policy"]),
+        network_disabled=bool(environment["network_disabled"]),
+    )
+
+
+def _stable_identifier(value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9._:/-]+", "_", str(value).strip().lower()).strip("_")
+    return normalized or "unknown"
 
 
 def _blas_information() -> dict[str, Any]:

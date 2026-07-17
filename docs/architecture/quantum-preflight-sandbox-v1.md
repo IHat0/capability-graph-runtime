@@ -143,3 +143,30 @@ docker run --rm --network none --read-only --tmpfs /tmp --entrypoint python \
 CLI exits are: `0` authorized, `2` manifest/specification, `3` execution,
 `4` scientific verification, `5` artifact/lineage integrity, `6`
 dependency/environment, and `7` timeout.
+
+## Hardened identities and acceptance
+
+Artifact `content_sha256` continues to cover complete run bytes, including
+duration. The v2 result wrapper separately exposes a recomputed
+`scientific_result_sha256`; the v2 receipt exposes both exact and VQE result
+identities plus `scientific_outcome_sha256`. Thus repeat result, lineage, and
+receipt hashes may differ while their scientific identities match. Runtime
+warnings are retained as deterministic compatibility evidence, with current
+Qiskit deprecations and SciPy efficiency notices non-blocking. See
+`quantum-evidence-identity-v1.md` for the projections and cross-link rules.
+
+Run the durable two-repeat plus 1.7 angstrom mutation acceptance package:
+
+```bash
+mkdir -p "$HOME/cgr-evidence/quantum-preflight"
+sudo chown -R 10001:10001 "$HOME/cgr-evidence/quantum-preflight"
+./scripts/run-lih-quantum-preflight-acceptance.sh \
+  "$HOME/cgr-evidence/quantum-preflight"
+./scripts/run-quantum-preflight-integration.sh \
+  "$HOME/cgr-evidence/quantum-preflight/integration.log"
+```
+
+The acceptance CLI exits are: `0` passed, `2` manifest/specification, `3`
+trusted execution, `4` scientific verification, `5` repeat determinism, `6`
+mutation sensitivity, `7` evidence integrity, `8` environment/dependency, `9`
+timeout, and `10` output persistence.

@@ -31,6 +31,7 @@ cgr-swebench-swe-agent-adapter = "cgr.swebench.swe_agent_adapter:adapter_main"
 cgr-sandbox-full-cycle = "cgr.swebench.sandbox_full_cycle:sandbox_full_cycle_main"
 cgr-quixbugs-pilot = "cgr.quixbugs_pilot:quixbugs_pilot_main"
 cgr-quantum-preflight-reference = "cgr.quantum_preflight.cli:main"
+cgr-quantum-preflight-acceptance = "cgr.quantum_preflight.acceptance:main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]

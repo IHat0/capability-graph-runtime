@@ -18,9 +18,11 @@ from cgr.science import (
 )
 
 from .contracts import QuantumChemistryExperiment
-from .environment import DIRECT_VERSIONS
+from .environment import DIRECT_VERSIONS, environment_compatibility_identity
+from .identities import ScientificResultArtifact, inspect_result_artifact
 from .operators import encode_float
 from .results import EnergyResult, VQEResult
+from .warnings import CompatibilityWarningEvidence
 
 VERIFIER_VERSION = CapabilityVersion(major=1, minor=0, patch=0)
 
@@ -86,6 +88,11 @@ def verify_execution(
         lambda: _verify_agreement(experiment, subject, payloads),
         lambda: _verify_lineage(subject, references, lineage),
         lambda: _verify_environment(subject, payloads["environment"]),
+        lambda: _verify_compatibility(
+            subject,
+            payloads["compatibility_warnings"],
+            references["compatibility_warnings"].pointer,
+        ),
     )
     return tuple(verifier() for verifier in verifiers)
 
@@ -205,8 +212,14 @@ def _verify_exact(
     value: EnergyResult | dict[str, Any],
     references: dict[str, ArtifactReference],
 ) -> ScientificVerificationResult:
-    exact = value if isinstance(value, EnergyResult) else EnergyResult.model_validate(value)
     findings: list[VerificationFinding] = []
+    exact_artifact = _hardened_result(value, "exact", findings)
+    if exact_artifact is None:
+        return _result("quantum.exact_result", subject, findings)
+    exact = exact_artifact.execution_result
+    if not isinstance(exact, EnergyResult) or isinstance(exact, VQEResult):
+        findings.append(_finding("exact.result_kind_mismatch", "Exact result payload has the wrong type."))
+        return _result("quantum.exact_result", subject, findings)
     if not exact.completed:
         findings.append(_finding("exact.incomplete", "Exact solver did not complete."))
     if exact.hamiltonian_sha256 != references["qubit_hamiltonian"].content_sha256:
@@ -224,8 +237,13 @@ def _verify_vqe(
     payloads: dict[str, Any],
     references: dict[str, ArtifactReference],
 ) -> ScientificVerificationResult:
-    vqe = VQEResult.model_validate(payloads["vqe_result"])
     findings: list[VerificationFinding] = []
+    vqe_artifact = _hardened_result(payloads["vqe_result"], "vqe", findings)
+    if vqe_artifact is None or not isinstance(vqe_artifact.execution_result, VQEResult):
+        if vqe_artifact is not None:
+            findings.append(_finding("vqe.result_kind_mismatch", "VQE result payload has the wrong type."))
+        return _result("quantum.vqe_result", subject, findings)
+    vqe = vqe_artifact.execution_result
     if not vqe.completed or not vqe.converged:
         findings.append(_finding("vqe.incomplete", "VQE did not complete and converge."))
     if vqe.hamiltonian_sha256 != references["qubit_hamiltonian"].content_sha256:
@@ -244,8 +262,16 @@ def _verify_agreement(
     subject: ArtifactPointer,
     payloads: dict[str, Any],
 ) -> ScientificVerificationResult:
-    exact = EnergyResult.model_validate(payloads["exact_result"])
-    vqe = VQEResult.model_validate(payloads["vqe_result"])
+    findings: list[VerificationFinding] = []
+    exact_artifact = _hardened_result(payloads["exact_result"], "exact", findings)
+    vqe_artifact = _hardened_result(payloads["vqe_result"], "vqe", findings)
+    if exact_artifact is None or vqe_artifact is None:
+        return _result("quantum.numerical_agreement", subject, findings)
+    exact = exact_artifact.execution_result
+    vqe = vqe_artifact.execution_result
+    if isinstance(exact, VQEResult) or not isinstance(vqe, VQEResult):
+        findings.append(_finding("agreement.result_kind_mismatch", "Agreement result kinds are invalid."))
+        return _result("quantum.numerical_agreement", subject, findings)
     difference = abs(vqe.total_energy_hartree - exact.total_energy_hartree)
     payloads["numerical_agreement"] = {
         "exact_total_energy_hex": encode_float(exact.total_energy_hartree),
@@ -255,7 +281,6 @@ def _verify_agreement(
         "units": "hartree",
         "passed": difference <= experiment.verification_policy.energy_difference_tolerance_hartree,
     }
-    findings: list[VerificationFinding] = []
     if difference > experiment.verification_policy.energy_difference_tolerance_hartree:
         findings.append(_finding("agreement.energy_tolerance_exceeded", "VQE total energy differs from the exact reference beyond tolerance.", expected=experiment.verification_policy.energy_difference_tolerance_hartree, observed=difference))
     return _result("quantum.numerical_agreement", subject, findings)
@@ -320,7 +345,70 @@ def _verify_environment(
     limits = environment.get("thread_limits", {})
     if any(value != "1" for name, value in limits.items() if name != "PYTHONHASHSEED") or limits.get("PYTHONHASHSEED") != "0":
         findings.append(_finding("environment.thread_policy_mismatch", "Deterministic thread policy is incomplete."))
+    try:
+        compatibility = environment_compatibility_identity(environment)
+    except (TypeError, ValueError) as exc:
+        findings.append(_finding("environment.compatibility_identity_invalid", str(exc)))
+    else:
+        if environment.get("environment_compatibility_sha256") != compatibility.fingerprint:
+            findings.append(
+                _finding(
+                    "environment.compatibility_identity_mismatch",
+                    "Environment compatibility identity was not recomputed correctly.",
+                    expected=compatibility.fingerprint,
+                    observed=environment.get("environment_compatibility_sha256"),
+                )
+            )
     return _result("quantum.environment", subject, findings)
+
+
+def _verify_compatibility(
+    subject: ArtifactPointer,
+    value: dict[str, Any],
+    evidence: ArtifactPointer,
+) -> ScientificVerificationResult:
+    warnings = CompatibilityWarningEvidence.model_validate(value)
+    findings = [
+        _finding(
+            f"compatibility.{item.code}",
+            item.normalized_message,
+            observed=item.dependency_version,
+        )
+        for item in warnings.warnings
+        if item.blocking
+    ]
+    return _result("quantum.compatibility", subject, findings, (evidence,))
+
+
+def _hardened_result(
+    value: EnergyResult | dict[str, Any],
+    label: str,
+    findings: list[VerificationFinding],
+) -> ScientificResultArtifact | None:
+    if isinstance(value, EnergyResult):
+        findings.append(
+            _finding(
+                f"{label}.legacy_result",
+                "Legacy flat result lacks a recomputable scientific-result identity.",
+            )
+        )
+        return None
+    try:
+        inspection = inspect_result_artifact(value)
+    except (TypeError, ValueError) as exc:
+        findings.append(
+            _finding(f"{label}.scientific_identity_invalid", str(exc))
+        )
+        return None
+    if not inspection.hardened or inspection.artifact is None:
+        findings.append(
+            _finding(
+                f"{label}.legacy_result",
+                inspection.reason or "Legacy result is not authorized by the hardened verifier.",
+            )
+        )
+        return None
+    return inspection.artifact
 
 
 def blocking_findings(results: tuple[ScientificVerificationResult, ...]) -> tuple[VerificationFinding, ...]:

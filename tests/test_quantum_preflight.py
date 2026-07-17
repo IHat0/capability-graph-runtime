@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from cgr.quantum_preflight.artifacts import artifact_reference, verify_artifact_bytes, write_json_atomic
-from cgr.quantum_preflight.environment import require_dependencies
+from cgr.quantum_preflight.environment import environment_compatibility_identity, require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError, QuantumIntegrityError, QuantumManifestError
 from cgr.quantum_preflight.manifests import load_manifest, with_bond_distance
 from cgr.quantum_preflight.operators import (
@@ -19,11 +19,23 @@ from cgr.quantum_preflight.operators import (
     serialize_fermionic_operator,
     serialize_qubit_operator,
 )
-from cgr.quantum_preflight.receipt import QuantumPreflightReceipt, assemble_receipt
+from cgr.quantum_preflight.identities import (
+    AuthorizedScientificOutcome,
+    ScientificResultArtifact,
+    ScientificResultIdentity,
+    verifier_outcome_identities,
+)
+from cgr.quantum_preflight.receipt import (
+    QuantumPreflightReceipt,
+    assemble_receipt,
+    inspect_receipt,
+    verify_receipt_identities,
+)
 from cgr.quantum_preflight.reference import resolve_active_orbitals
-from cgr.quantum_preflight.runner import _ARTIFACT_TYPES
+from cgr.quantum_preflight.runner import _ARTIFACT_TYPES, _scientific_result_identity
 from cgr.quantum_preflight.results import EnergyResult, VQEResult
 from cgr.quantum_preflight.verification import blocking_findings, verify_execution
+from cgr.quantum_preflight.warnings import CompatibilityWarning, CompatibilityWarningEvidence
 from cgr.science import ArtifactLineageEdge, ArtifactLineageGraph
 from cgr.quantum_preflight.artifacts import SCHEMA_VERSION
 
@@ -212,7 +224,10 @@ def _synthetic_evidence(manifest):
             "total_electron_count": 4,
         },
         "environment": {
+            "python_version": "3.12.11",
+            "python_implementation": "CPython",
             "os": "linux",
+            "architecture": "x86_64",
             "python_major_minor": "3.12",
             "network_disabled": True,
             "credential_variable_names_present": [],
@@ -220,12 +235,15 @@ def _synthetic_evidence(manifest):
                 "qiskit": "2.3.1", "qiskit-nature": "0.8.0",
                 "qiskit-algorithms": "0.4.0", "qiskit-aer": "0.17.1", "pyscf": "2.13.1",
             },
+            "transitive_package_versions": {"numpy": "2.0.0", "scipy": "1.14.0"},
             "dependency_lock_sha256": "a" * 64,
             "container_image_identifier": "sha256:test",
             "thread_limits": {
                 "PYTHONHASHSEED": "0", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
                 "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
             },
+            "deterministic_seed_policy": "algorithm_globals.random_seed=manifest.random_seed",
+            "blas_information": {"name": "openblas", "version": "0.3"},
         },
         "qcschema": {"schema_name": "qcschema"},
         "electronic_problem": {
@@ -241,16 +259,22 @@ def _synthetic_evidence(manifest):
         "qubit_hamiltonian": serialize_qubit_operator({"II": 1}, number_of_qubits=2, mapper="jordan_wigner"),
         "hamiltonian_metrics": {"maximum_antihermitian_coefficient": 0.0, "qubit_sha256": None},
         "optimization_trace": [{"evaluation": 1}],
+        "ansatz_manifest": {"ansatz": "uccsd"},
+        "compatibility_warnings": CompatibilityWarningEvidence(status="clean").model_dump(mode="json"),
     }
+    compatibility = environment_compatibility_identity(payloads["environment"])
+    payloads["environment"]["compatibility_identity"] = compatibility.model_dump(mode="json")
+    payloads["environment"]["environment_compatibility_sha256"] = compatibility.fingerprint
     refs = {}
-    for name in ("experiment", "environment", "molecular_structure", "qcschema", "electronic_problem", "active_space", "fermionic_hamiltonian", "qubit_hamiltonian"):
-        refs[name] = artifact_reference(name, name, payloads[name], filename=f"{name}.json")
+    for name in ("experiment", "environment", "molecular_structure", "qcschema", "electronic_problem", "active_space", "fermionic_hamiltonian", "qubit_hamiltonian", "optimization_trace", "ansatz_manifest", "compatibility_warnings"):
+        refs[name] = artifact_reference(name, _ARTIFACT_TYPES.get(name, name), payloads[name], filename=f"{name}.json")
     payloads["hamiltonian_metrics"]["qubit_sha256"] = refs["qubit_hamiltonian"].content_sha256
     exact = EnergyResult(
         solver_identifier="exact", solver_version="1.0", hamiltonian_sha256=refs["qubit_hamiltonian"].content_sha256,
         environment_sha256=refs["environment"].content_sha256, electronic_energy_hartree=1.0,
         nuclear_repulsion_energy_hartree=1.0, total_energy_hartree=2.0, raw_eigenvalue_hartree=1.0,
         particle_count=2.0, particle_sector_filter_applied=True,
+        number_of_spatial_orbitals=2, number_of_spin_orbitals=4, number_of_qubits=2,
         completed=True, duration_seconds=1.0,
     )
     vqe = VQEResult(
@@ -258,14 +282,29 @@ def _synthetic_evidence(manifest):
         environment_sha256=refs["environment"].content_sha256, electronic_energy_hartree=1.000001,
         nuclear_repulsion_energy_hartree=1.0, total_energy_hartree=2.000001, raw_eigenvalue_hartree=1.000001,
         particle_count=2.0, completed=True, duration_seconds=1.0, optimizer_identifier="slsqp",
+        number_of_spatial_orbitals=2, number_of_spin_orbitals=4, number_of_qubits=2,
         optimizer_status="completed", optimizer_evaluations=1, initial_point_sha256="0" * 64,
         optimized_parameters_sha256="1" * 64, ansatz_identifier="uccsd",
         initial_state_identifier="hartree_fock", converged=True,
     )
-    payloads["exact_result"] = exact.model_dump(mode="json")
-    payloads["vqe_result"] = vqe.model_dump(mode="json")
-    refs["exact_result"] = artifact_reference("exact_result", "exact_result", payloads["exact_result"], filename="exact.json")
-    refs["vqe_result"] = artifact_reference("vqe_result", "vqe_result", payloads["vqe_result"], filename="vqe.json")
+    exact_identity = _scientific_result_identity(
+        "exact_ground_state", exact, experiment, payloads, refs
+    )
+    vqe_identity = _scientific_result_identity(
+        "vqe_ground_state", vqe, experiment, payloads, refs
+    )
+    payloads["exact_result"] = ScientificResultArtifact(
+        scientific_identity=exact_identity,
+        scientific_result_sha256=exact_identity.fingerprint,
+        execution_result=exact,
+    ).model_dump(mode="json")
+    payloads["vqe_result"] = ScientificResultArtifact(
+        scientific_identity=vqe_identity,
+        scientific_result_sha256=vqe_identity.fingerprint,
+        execution_result=vqe,
+    ).model_dump(mode="json")
+    refs["exact_result"] = artifact_reference("exact_result", _ARTIFACT_TYPES["exact_result"], payloads["exact_result"], filename="exact.json")
+    refs["vqe_result"] = artifact_reference("vqe_result", _ARTIFACT_TYPES["vqe_result"], payloads["vqe_result"], filename="vqe.json")
     links = (
         ("experiment", "molecular_structure"), ("molecular_structure", "qcschema"),
         ("qcschema", "electronic_problem"), ("electronic_problem", "active_space"),
@@ -280,6 +319,43 @@ def _synthetic_evidence(manifest):
     return payloads, refs, lineage
 
 
+def _synthetic_outcome(manifest, payloads, refs, results):
+    exact = payloads["exact_result"]
+    vqe = payloads["vqe_result"]
+    agreement = payloads["numerical_agreement"]
+    warnings = CompatibilityWarningEvidence.model_validate(payloads["compatibility_warnings"])
+    return AuthorizedScientificOutcome(
+        experiment_sha256=manifest.experiment.fingerprint,
+        molecular_structure_sha256=refs["molecular_structure"].content_sha256,
+        electronic_problem_sha256=refs["electronic_problem"].content_sha256,
+        active_space_sha256=refs["active_space"].content_sha256,
+        fermionic_hamiltonian_sha256=refs["fermionic_hamiltonian"].content_sha256,
+        qubit_hamiltonian_sha256=refs["qubit_hamiltonian"].content_sha256,
+        exact_scientific_result_sha256=exact["scientific_result_sha256"],
+        vqe_scientific_result_sha256=vqe["scientific_result_sha256"],
+        exact_total_energy=exact["execution_result"]["total_energy_hartree"],
+        vqe_total_energy=vqe["execution_result"]["total_energy_hartree"],
+        absolute_difference=agreement["absolute_difference_hartree"],
+        tolerance=agreement["tolerance_hartree"],
+        comparison_passed=agreement["passed"],
+        verification_policy_sha256=manifest.experiment.verification_policy.fingerprint,
+        verifier_outcomes=verifier_outcome_identities(results),
+        authorization_decision=not blocking_findings(results),
+        environment_compatibility_sha256=payloads["environment"]["environment_compatibility_sha256"],
+        compatibility_warnings_sha256=warnings.fingerprint,
+        compatibility_status=warnings.status,
+    )
+
+
+def _mutate_vqe_energy(payloads, refs, graph) -> None:
+    del refs, graph
+    artifact = payloads["vqe_result"]
+    artifact["execution_result"].update(total_energy_hartree=3.0, electronic_energy_hartree=2.0)
+    artifact["scientific_identity"].update(total_energy=3.0, electronic_energy=2.0)
+    identity = ScientificResultIdentity.model_validate(artifact["scientific_identity"])
+    artifact["scientific_result_sha256"] = identity.fingerprint
+
+
 @pytest.mark.quantum_unit
 def test_complete_synthetic_evidence_authorizes(manifest) -> None:
     payloads, refs, lineage = _synthetic_evidence(manifest)
@@ -287,13 +363,109 @@ def test_complete_synthetic_evidence_authorizes(manifest) -> None:
     assert not blocking_findings(results)
     lineage_ref = artifact_reference("lineage", "lineage", lineage.model_dump(mode="json"), filename="lineage.json")
     receipt = assemble_receipt(
+        execution_identifier="run-001",
         experiment=refs["experiment"].pointer,
         artifacts=tuple(ref.pointer for ref in refs.values()),
         verification_results=results,
         lineage=lineage_ref.pointer,
+        compatibility_warnings=refs["compatibility_warnings"].pointer,
+        scientific_outcome=_synthetic_outcome(manifest, payloads, refs, results),
         execution_completed=True,
     )
     assert receipt.authorized
+
+
+@pytest.mark.quantum_unit
+def test_run_identifier_changes_receipt_content_not_scientific_outcome(manifest) -> None:
+    payloads, refs, lineage = _synthetic_evidence(manifest)
+    results = verify_execution(manifest.experiment, refs, payloads, lineage)
+    lineage_ref = artifact_reference("lineage", "lineage", lineage.model_dump(mode="json"), filename="lineage.json")
+    outcome = _synthetic_outcome(manifest, payloads, refs, results)
+    receipts = [
+        assemble_receipt(
+            execution_identifier=run_id,
+            experiment=refs["experiment"].pointer,
+            artifacts=tuple(ref.pointer for ref in refs.values()),
+            verification_results=results,
+            lineage=lineage_ref.pointer,
+            compatibility_warnings=refs["compatibility_warnings"].pointer,
+            scientific_outcome=outcome,
+            execution_completed=True,
+        )
+        for run_id in ("run-001", "run-002")
+    ]
+    receipt_refs = [
+        artifact_reference("receipt", "receipt", item.model_dump(mode="json"), filename="receipt.json")
+        for item in receipts
+    ]
+    assert receipts[0].scientific_outcome_sha256 == receipts[1].scientific_outcome_sha256
+    assert receipt_refs[0].content_sha256 != receipt_refs[1].content_sha256
+
+
+@pytest.mark.quantum_unit
+def test_legacy_receipt_is_inspectable_but_cannot_be_hardened() -> None:
+    inspected = inspect_receipt({"schema_version": "cgr.quantum-preflight-receipt/1.0.0"})
+    assert inspected.legacy and not inspected.hardened
+
+
+@pytest.mark.quantum_unit
+def test_receipt_identity_recomputation_rejects_full_pointer_substitution(manifest) -> None:
+    payloads, refs, lineage = _synthetic_evidence(manifest)
+    results = verify_execution(manifest.experiment, refs, payloads, lineage)
+    lineage_ref = artifact_reference("lineage", "lineage", lineage.model_dump(mode="json"), filename="lineage.json")
+    outcome = _synthetic_outcome(manifest, payloads, refs, results)
+    receipt = assemble_receipt(
+        execution_identifier="run-001",
+        experiment=refs["experiment"].pointer,
+        artifacts=tuple(ref.pointer for ref in refs.values()),
+        verification_results=results,
+        lineage=lineage_ref.pointer,
+        compatibility_warnings=refs["compatibility_warnings"].pointer,
+        scientific_outcome=outcome,
+        execution_completed=True,
+    )
+    arguments = {
+        "receipt": receipt,
+        "exact_result": payloads["exact_result"],
+        "vqe_result": payloads["vqe_result"],
+        "exact_result_pointer": refs["exact_result"].pointer,
+        "vqe_result_pointer": refs["vqe_result"].pointer,
+        "expected_outcome": outcome,
+    }
+    assert not verify_receipt_identities(**arguments)
+    arguments["exact_result_pointer"] = refs["exact_result"].pointer.model_copy(
+        update={"content_sha256": "f" * 64}
+    )
+    failures = verify_receipt_identities(**arguments)
+    assert "receipt.run_specific_artifact_substitution" in failures
+    assert "receipt.exact_result_content_mismatch" in failures
+
+
+@pytest.mark.quantum_unit
+def test_future_blocking_compatibility_warning_prevents_authorization(manifest) -> None:
+    payloads, refs, lineage = _synthetic_evidence(manifest)
+    payloads["compatibility_warnings"] = CompatibilityWarningEvidence(
+        warnings=(
+            CompatibilityWarning(
+                code="dependency_runtime_warning",
+                category="RuntimeWarning",
+                origin_module="unknown",
+                normalized_message="future incompatible runtime behavior",
+                count=1,
+                severity="error",
+                blocking=True,
+                suggested_action="review_dependency_runtime_warning",
+                dependency_name="unknown",
+                dependency_version="unknown",
+                first_observed_phase="vqe_execution",
+            ),
+        ),
+        status="blocking",
+    ).model_dump(mode="json")
+    results = verify_execution(manifest.experiment, refs, payloads, lineage)
+    assert blocking_findings(results)
+    outcome = _synthetic_outcome(manifest, payloads, refs, results)
+    assert outcome.authorization_decision is False
 
 
 @pytest.mark.quantum_unit
@@ -303,7 +475,7 @@ def test_complete_synthetic_evidence_authorizes(manifest) -> None:
         (lambda payload, refs, graph: payload["qubit_hamiltonian"].update(mapper="parity"), "hamiltonian.mapper_mismatch"),
         (lambda payload, refs, graph: payload["hamiltonian_metrics"].update(maximum_antihermitian_coefficient=1.0), "hamiltonian.non_hermitian"),
         (lambda payload, refs, graph: payload.update(optimization_trace=[]), "vqe.optimization_trace_missing"),
-        (lambda payload, refs, graph: payload["vqe_result"].update(total_energy_hartree=3.0, electronic_energy_hartree=2.0), "agreement.energy_tolerance_exceeded"),
+        (_mutate_vqe_energy, "agreement.energy_tolerance_exceeded"),
         (lambda payload, refs, graph: graph.edges.__class__, "lineage.required_edge_missing"),
     ],
 )
@@ -321,17 +493,26 @@ def test_negative_evidence_fails_for_intended_reason(manifest, mutation, finding
 @pytest.mark.quantum_unit
 def test_wrong_result_hamiltonian_and_receipt_fail_closed(manifest) -> None:
     payloads, refs, lineage = _synthetic_evidence(manifest)
-    payloads["exact_result"]["hamiltonian_sha256"] = "f" * 64
+    clean_results = verify_execution(manifest.experiment, refs, payloads, lineage)
+    clean_outcome = _synthetic_outcome(manifest, payloads, refs, clean_results)
+    payloads["exact_result"]["execution_result"]["hamiltonian_sha256"] = "f" * 64
     results = verify_execution(manifest.experiment, refs, payloads, lineage)
-    assert "exact.hamiltonian_mismatch" in {finding.code for result in results for finding in result.findings}
+    assert "exact.scientific_identity_invalid" in {finding.code for result in results for finding in result.findings}
     lineage_ref = artifact_reference("lineage", "lineage", lineage.model_dump(mode="json"), filename="lineage.json")
     with pytest.raises(ValidationError, match="authorization"):
         QuantumPreflightReceipt(
-            schema_version="cgr.quantum-preflight-receipt/1.0.0",
+            schema_version="cgr.quantum-preflight-receipt/2.0.0",
+            execution_identifier="run-001",
             experiment=refs["experiment"].pointer,
             artifacts=tuple(ref.pointer for ref in refs.values()),
             verification_results=results,
             lineage=lineage_ref.pointer,
+            compatibility_warnings=refs["compatibility_warnings"].pointer,
+            compatibility_status="clean",
+            exact_scientific_result_sha256=payloads["exact_result"]["scientific_result_sha256"],
+            vqe_scientific_result_sha256=payloads["vqe_result"]["scientific_result_sha256"],
+            scientific_outcome=clean_outcome,
+            scientific_outcome_sha256=clean_outcome.fingerprint,
             execution_completed=True,
             scientific_verification_passed=False,
             artifact_lineage_passed=True,

@@ -228,6 +228,9 @@ def run_exact(
         hamiltonian_sha256=hamiltonian_sha256,
         environment_sha256=environment_sha256,
         duration_seconds=duration,
+        number_of_spatial_orbitals=int(prepared.active_problem.num_spatial_orbitals),
+        number_of_spin_orbitals=int(prepared.active_problem.num_spin_orbitals),
+        number_of_qubits=int(prepared.qubit_operator.num_qubits),
         particle_sector_filter_applied=True,
     )
 
@@ -293,6 +296,9 @@ def run_vqe(
         hamiltonian_sha256=hamiltonian_sha256,
         environment_sha256=environment_sha256,
         duration_seconds=duration,
+        number_of_spatial_orbitals=int(problem.num_spatial_orbitals),
+        number_of_spin_orbitals=int(problem.num_spin_orbitals),
+        number_of_qubits=int(prepared.qubit_operator.num_qubits),
         optimizer_identifier=quantum.optimizer,
         optimizer_status="completed" if status is None else f"status_{status}",
         optimizer_evaluations=max(evaluations, len(trace), 1),

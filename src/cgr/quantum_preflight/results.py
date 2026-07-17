@@ -21,6 +21,9 @@ class EnergyResult(CanonicalModel):
     total_energy_hartree: float
     raw_eigenvalue_hartree: float
     particle_count: float | None = None
+    number_of_spatial_orbitals: int = Field(gt=0)
+    number_of_spin_orbitals: int = Field(gt=0)
+    number_of_qubits: int = Field(gt=0)
     particle_sector_filter_applied: bool | None = None
     completed: bool
     duration_seconds: float = Field(ge=0)
