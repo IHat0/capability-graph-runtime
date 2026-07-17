@@ -12,5 +12,7 @@ __pycache__/
 .quixbugs-src/
 benchmark-results/
 quantum-preflight-results/
+quantum-candidate-repair/
+quantum-repair-benchmark/
 dist/
 build/

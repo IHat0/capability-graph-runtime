@@ -33,6 +33,9 @@ cgr-quixbugs-pilot = "cgr.quixbugs_pilot:quixbugs_pilot_main"
 cgr-quantum-preflight-reference = "cgr.quantum_preflight.cli:main"
 cgr-quantum-preflight-acceptance = "cgr.quantum_preflight.acceptance:main"
 cgr-quantum-candidate-benchmark = "cgr.quantum_candidate.cli:main"
+cgr-quantum-candidate-repair = "cgr.quantum_repair.cli:repair_main"
+cgr-quantum-candidate-repair-benchmark = "cgr.quantum_repair.cli:benchmark_main"
+cgr-quantum-candidate-repair-verify = "cgr.quantum_repair.cli:verify_main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 
 [project.optional-dependencies]
