@@ -182,6 +182,7 @@ def provider_check_main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         from .model_provider.agent import (
+            tool_control_proxy_policy_descriptor,
             tool_network_policy_descriptor,
             verify_pristine_sweagent,
         )
@@ -190,6 +191,7 @@ def provider_check_main(argv: list[str] | None = None) -> int:
         from .model_provider.tool_sandbox import (
             inspect_tool_image,
             run_offline_tool_preflight,
+            verify_control_proxy_lifecycle_evidence,
         )
         from .persistence import write_evidence
 
@@ -216,10 +218,18 @@ def provider_check_main(argv: list[str] | None = None) -> int:
         health = run_offline_tool_preflight(
             config, image=tool_image, lifecycle_root=args.evidence_root / "private"
         )
+        verify_control_proxy_lifecycle_evidence(
+            args.evidence_root / "private" / "tool-control-proxy-lifecycle.json",
+            health.tool_control_proxy_lifecycle_artifact_sha256,
+        )
         write_evidence(args.evidence_root / "tool-image-descriptor.json", tool_image)
         write_evidence(
             args.evidence_root / "tool-network-policy.json",
             tool_network_policy_descriptor(config),
+        )
+        write_evidence(
+            args.evidence_root / "tool-control-proxy-policy.json",
+            tool_control_proxy_policy_descriptor(config),
         )
         write_evidence(args.evidence_root / "provider-preflight.json", health)
         if health.startup_result != "passed":
@@ -259,10 +269,14 @@ def tool_check_main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         from .model_provider.config import load_provider_config
-        from .model_provider.agent import tool_network_policy_descriptor
+        from .model_provider.agent import (
+            tool_control_proxy_policy_descriptor,
+            tool_network_policy_descriptor,
+        )
         from .model_provider.tool_sandbox import (
             inspect_tool_image,
             run_offline_tool_preflight,
+            verify_control_proxy_lifecycle_evidence,
         )
         from .persistence import write_evidence
 
@@ -271,11 +285,19 @@ def tool_check_main(argv: list[str] | None = None) -> int:
         health = run_offline_tool_preflight(
             config, image=image, lifecycle_root=args.evidence_root / "private"
         )
+        verify_control_proxy_lifecycle_evidence(
+            args.evidence_root / "private" / "tool-control-proxy-lifecycle.json",
+            health.tool_control_proxy_lifecycle_artifact_sha256,
+        )
         args.evidence_root.mkdir(parents=True, exist_ok=True)
         write_evidence(args.evidence_root / "tool-image-descriptor.json", image)
         write_evidence(
             args.evidence_root / "tool-network-policy.json",
             tool_network_policy_descriptor(config),
+        )
+        write_evidence(
+            args.evidence_root / "tool-control-proxy-policy.json",
+            tool_control_proxy_policy_descriptor(config),
         )
         write_evidence(args.evidence_root / "provider-preflight.json", health)
         result = {

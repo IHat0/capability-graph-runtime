@@ -239,6 +239,9 @@ def _verify_provider_invocations(
             network_policy_sha256 = _verify_provider_network_policy(
                 directory, agent.tool_network_policy_descriptor_sha256
             )
+            proxy_policy_sha256 = _verify_provider_proxy_policy(
+                directory, agent.tool_control_proxy_policy_descriptor_sha256
+            )
             prompt = ModelRepairPrompt.model_validate(
                 read_json(directory / "model-prompt.json")
             )
@@ -253,6 +256,11 @@ def _verify_provider_invocations(
                         or agent.tool_image_descriptor_sha256
                         != tool_image.descriptor_sha256
                     )
+                )
+                or (
+                    agent.tool_control_proxy_policy_descriptor_sha256 is not None
+                    and agent.tool_control_proxy_policy_descriptor_sha256
+                    != proxy_policy_sha256
                 )
                 or (
                     agent.tool_network_policy_descriptor_sha256 is not None
@@ -277,6 +285,8 @@ def _verify_provider_invocations(
             proposed = QuantumRepairPatch.model_validate(
                 read_json(directory / "proposed-patch.json")
             )
+            if proxy_policy_sha256 is not None:
+                _verify_provider_proxy_lifecycle(directory, proxy_policy_sha256)
             if (
                 result.request_sha256 != request.request_content_sha256
                 or result.trajectory_identity != trajectory.complete_trajectory_sha256
@@ -304,3 +314,38 @@ def _verify_provider_network_policy(
     if descriptor.descriptor_sha256 != expected_sha256:
         raise ValueError("Provider tool network policy evidence was substituted.")
     return descriptor.descriptor_sha256
+
+
+def _verify_provider_proxy_policy(
+    directory: Path, expected_sha256: str | None
+) -> str | None:
+    if expected_sha256 is None:
+        return None
+    from .model_provider.contracts import ToolControlProxyPolicyDescriptor
+
+    path = directory / "tool-control-proxy-policy.json"
+    if not path.is_file():
+        raise ValueError("Provider tool control proxy policy evidence is missing.")
+    descriptor = ToolControlProxyPolicyDescriptor.model_validate(read_json(path))
+    if descriptor.descriptor_sha256 != expected_sha256:
+        raise ValueError("Provider tool control proxy policy evidence was substituted.")
+    return descriptor.descriptor_sha256
+
+
+def _verify_provider_proxy_lifecycle(
+    directory: Path, expected_policy_sha256: str | None
+) -> None:
+    from .model_provider.contracts import ToolControlProxyLifecycleArtifact
+
+    path = directory / "tool-control-proxy-lifecycle.json"
+    if not path.is_file():
+        raise ValueError("Provider tool control proxy lifecycle evidence is missing.")
+    lifecycle = ToolControlProxyLifecycleArtifact.model_validate(read_json(path))
+    if (
+        expected_policy_sha256 is None
+        or lifecycle.proxy_policy_descriptor_sha256 != expected_policy_sha256
+        or lifecycle.startup_result != "passed"
+        or lifecycle.readiness_result != "passed"
+        or not lifecycle.cleanup_passed
+    ):
+        raise ValueError("Provider tool control proxy lifecycle evidence is invalid.")

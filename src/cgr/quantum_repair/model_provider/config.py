@@ -47,6 +47,11 @@ class SWEAgentProviderConfig(BaseModel):
     tool_control_container_port: Literal[8000] = 8000
     tool_public_port_exposure: Literal[False] = False
     tool_model_endpoint_access: Literal[False] = False
+    tool_control_proxy_type: Literal["provider_owned_tcp"] = "provider_owned_tcp"
+    tool_control_proxy_bind_address: Literal["127.0.0.1"] = "127.0.0.1"
+    tool_control_proxy_destination_port: Literal[8000] = 8000
+    tool_control_proxy_public_exposure: Literal[False] = False
+    tool_control_proxy_external_destination: Literal[False] = False
     required_swerex_version: Literal["1.4.0"] = "1.4.0"
     tool_startup_timeout_seconds: int = Field(default=180, gt=0, le=600)
     tool_container_pull_policy: Literal["never"] = "never"

@@ -9,6 +9,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from cgr.science import sha256_fingerprint
+
 from ..contracts import (
     ProviderCapability,
     QuantumRepairDirective,
@@ -21,6 +23,7 @@ from .agent import (
     build_official_command,
     child_environment,
     provider_overlay,
+    tool_control_proxy_policy_descriptor,
     tool_network_policy_descriptor,
     verify_pristine_sweagent,
 )
@@ -30,9 +33,11 @@ from .contracts import (
     ProviderBudget,
     ProviderInvocationRequest,
     ProviderInvocationResult,
+    ToolControlProxyLifecycleArtifact,
     seal_contract,
 )
 from .endpoint import verify_model_endpoint
+from .control_proxy import LoopbackControlProxy, select_loopback_port
 from .extraction import extract_official_patch, redact_trajectory
 from .process import run_bounded_process
 from .prompting import build_model_prompt, render_problem_statement
@@ -189,6 +194,10 @@ class SWEAgentOpenAICompatibleRepairProvider:
         api_key = invocation_config.api_key(self.environment)
         secrets = (api_key, str(directory.resolve()), str(source_root.resolve()))
         control_network: OwnedControlNetwork | None = None
+        control_proxy: LoopbackControlProxy | None = None
+        control_endpoint: Any | None = None
+        control_port = 0
+        proxy_started = 0.0
         try:
             endpoint = verify_model_endpoint(
                 base_url=invocation_config.base_url,
@@ -209,15 +218,20 @@ class SWEAgentOpenAICompatibleRepairProvider:
             control_network = OwnedControlNetwork.create(
                 private / "tool-network-state.json"
             )
+            control_port = select_loopback_port()
             overlay = provider_overlay(
                 invocation_config,
                 control_network_name=control_network.name,
                 network_ownership_nonce=control_network.ownership_nonce,
+                control_port=control_port,
             )
             agent = verify_pristine_sweagent(
-                invocation_config, tool_image_descriptor=tool_image
+                invocation_config,
+                overlay=overlay,
+                tool_image_descriptor=tool_image,
             )
             network_policy = tool_network_policy_descriptor(invocation_config)
+            proxy_policy = tool_control_proxy_policy_descriptor(invocation_config)
             prompt = build_model_prompt(
                 directive=directive,
                 source_root=source_root,
@@ -233,6 +247,7 @@ class SWEAgentOpenAICompatibleRepairProvider:
             write_evidence(directory / "agent-descriptor.json", agent)
             write_evidence(directory / "tool-image-descriptor.json", tool_image)
             write_evidence(directory / "tool-network-policy.json", network_policy)
+            write_evidence(directory / "tool-control-proxy-policy.json", proxy_policy)
             write_evidence(directory / "model-prompt.json", prompt)
             request_values = {
                 "provider_invocation_identifier": identifier,
@@ -285,12 +300,40 @@ class SWEAgentOpenAICompatibleRepairProvider:
             control_channel_observed = False
 
             def heartbeat() -> None:
-                nonlocal control_channel_observed, last_heartbeat
-                if not control_channel_observed:
-                    control_channel_observed = (
-                        control_network is not None
-                        and control_network.inspect_active_container() is not None
+                nonlocal control_channel_observed, control_endpoint
+                nonlocal control_proxy, last_heartbeat, proxy_started
+                if control_network is None:
+                    raise ToolSandboxError(
+                        "tool_control_proxy_destination_invalid",
+                        "The owned tool network disappeared during startup.",
                     )
+                observed = control_network.discover_owned_container(tool_image.image_id)
+                if control_proxy is None and observed is not None:
+                    try:
+                        control_network.verify_direct_control(observed)
+                    except ToolSandboxError as exc:
+                        if exc.code == "tool_runtime_control_channel_unreachable":
+                            observed = None
+                        else:
+                            raise
+                    if observed is None:
+                        pass
+                    else:
+                        control_endpoint = observed
+                        control_proxy = LoopbackControlProxy(
+                            source_port=control_port,
+                            endpoint=observed.proxy_endpoint(control_network),
+                        )
+                        control_proxy.start()
+                        proxy_started = time.monotonic()
+                        control_channel_observed = True
+                elif control_proxy is not None:
+                    if observed != control_endpoint:
+                        raise ToolSandboxError(
+                            "tool_control_proxy_destination_invalid",
+                            "The supervised tool container destination changed.",
+                        )
+                    control_proxy.assert_healthy()
                 now = time.monotonic()
                 if now - last_heartbeat >= invocation_config.heartbeat_seconds:
                     store.heartbeat()
@@ -351,6 +394,17 @@ class SWEAgentOpenAICompatibleRepairProvider:
                     "tool_runtime_control_channel_unreachable",
                     "The official SWE-ReX control channel was not observed.",
                 )
+            assert control_proxy is not None
+            _release_control_proxy(
+                control_proxy,
+                directory,
+                proxy_policy.descriptor_sha256,
+                control_endpoint,
+                control_network.identifier_sha256,
+                control_port,
+                proxy_started,
+            )
+            control_proxy = None
             _release_control_network(control_network)
             control_network = None
             patch, prediction_sha, prediction_path = extract_official_patch(
@@ -398,7 +452,9 @@ class SWEAgentOpenAICompatibleRepairProvider:
                 tool_call_count=trajectory.tool_call_count,
             )
             after = verify_pristine_sweagent(
-                invocation_config, tool_image_descriptor=tool_image
+                invocation_config,
+                overlay=overlay,
+                tool_image_descriptor=tool_image,
             )
             if after.descriptor_sha256 != agent.descriptor_sha256:
                 raise ValueError("SWE-agent source identity changed during invocation.")
@@ -435,6 +491,38 @@ class SWEAgentOpenAICompatibleRepairProvider:
             return patch
         except Exception as exc:
             failure = exc
+            if control_proxy is not None:
+                try:
+                    _release_control_proxy(
+                        control_proxy,
+                        directory,
+                        tool_control_proxy_policy_descriptor(
+                            invocation_config
+                        ).descriptor_sha256,
+                        control_endpoint,
+                        control_network.identifier_sha256
+                        if control_network is not None
+                        else "0" * 64,
+                        control_port,
+                        proxy_started,
+                        failure_classification=getattr(
+                            failure, "code", type(failure).__name__
+                        ),
+                    )
+                    control_proxy = None
+                except ToolSandboxError as cleanup_error:
+                    failure = cleanup_error
+            lifecycle_path = directory / "tool-control-proxy-lifecycle.json"
+            if control_network is not None and not lifecycle_path.is_file():
+                _write_failed_proxy_lifecycle(
+                    directory,
+                    invocation_config,
+                    control_endpoint,
+                    control_network.identifier_sha256,
+                    control_port,
+                    proxy_started,
+                    getattr(failure, "code", type(failure).__name__),
+                )
             if control_network is not None:
                 try:
                     _release_control_network(control_network)
@@ -459,6 +547,103 @@ def _release_control_network(network: OwnedControlNetwork) -> None:
             "tool_network_cleanup_failure",
             "The invocation tool control network could not be removed.",
         )
+
+
+def _release_control_proxy(
+    proxy: LoopbackControlProxy,
+    directory: Path,
+    policy_sha256: str,
+    endpoint: Any,
+    network_identity_sha256: str,
+    source_port: int,
+    started: float,
+    *,
+    failure_classification: str | None = None,
+) -> None:
+    try:
+        cleanup = proxy.stop()
+    except Exception as exc:
+        raise ToolSandboxError(
+            "tool_control_proxy_cleanup_failure",
+            "The invocation control proxy could not be removed.",
+        ) from exc
+    if not cleanup or endpoint is None:
+        raise ToolSandboxError(
+            "tool_control_proxy_cleanup_failure",
+            "The invocation control proxy cleanup evidence is incomplete.",
+        )
+    values = {
+        "proxy_policy_descriptor_sha256": policy_sha256,
+        "proxy_bind_identity_sha256": sha256_fingerprint(
+            {"address": "127.0.0.1", "port": source_port}
+        ),
+        "proxy_bind_address": "127.0.0.1",
+        "proxy_source_port": source_port,
+        "proxy_destination_container_identity": endpoint.container_identity,
+        "proxy_destination_image_identity": endpoint.image_identity,
+        "proxy_destination_internal_ip_identity": sha256_fingerprint(
+            {"internal_ipv4": endpoint.internal_ipv4}
+        ),
+        "proxy_destination_network_identity_sha256": network_identity_sha256,
+        "startup_result": "failed" if failure_classification else "passed",
+        "readiness_result": "passed",
+        "cleanup_passed": True,
+        "runtime_seconds": max(0.0, time.monotonic() - started),
+        "failure_classification": failure_classification,
+    }
+    lifecycle = seal_contract(
+        ToolControlProxyLifecycleArtifact,
+        values,
+        "lifecycle_artifact_sha256",
+    )
+    write_evidence(directory / "tool-control-proxy-lifecycle.json", lifecycle)
+
+
+def _write_failed_proxy_lifecycle(
+    directory: Path,
+    config: SWEAgentProviderConfig,
+    endpoint: Any | None,
+    network_identity_sha256: str,
+    source_port: int,
+    started: float,
+    failure_classification: str,
+) -> None:
+    policy = tool_control_proxy_policy_descriptor(config)
+    values = {
+        "proxy_policy_descriptor_sha256": policy.descriptor_sha256,
+        "proxy_bind_identity_sha256": sha256_fingerprint(
+            {"address": "127.0.0.1", "port": source_port}
+        ),
+        "proxy_bind_address": "127.0.0.1",
+        "proxy_source_port": source_port,
+        "proxy_destination_container_identity": (
+            endpoint.container_identity if endpoint is not None else "unavailable"
+        ),
+        "proxy_destination_image_identity": (
+            endpoint.image_identity
+            if endpoint is not None
+            else config.tool_container_image
+        ),
+        "proxy_destination_internal_ip_identity": sha256_fingerprint(
+            {
+                "internal_ipv4": (
+                    endpoint.internal_ipv4 if endpoint is not None else "unavailable"
+                )
+            }
+        ),
+        "proxy_destination_network_identity_sha256": network_identity_sha256,
+        "startup_result": "failed",
+        "readiness_result": "not_reached",
+        "cleanup_passed": True,
+        "runtime_seconds": max(0.0, time.monotonic() - started) if started else 0.0,
+        "failure_classification": failure_classification,
+    }
+    lifecycle = seal_contract(
+        ToolControlProxyLifecycleArtifact,
+        values,
+        "lifecycle_artifact_sha256",
+    )
+    write_evidence(directory / "tool-control-proxy-lifecycle.json", lifecycle)
 
 
 def _result(

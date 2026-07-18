@@ -16,6 +16,8 @@ from .benchmark_provider import materialize_benchmark_source
 from .contracts import QuantumRepairPolicy
 from .model_acceptance import load_model_acceptance_manifest
 from .model_provider.agent import (
+    repository_commit,
+    tool_control_proxy_policy_descriptor,
     tool_network_policy_descriptor,
     verify_pristine_sweagent,
 )
@@ -25,6 +27,7 @@ from .model_provider.provider import SWEAgentOpenAICompatibleRepairProvider
 from .model_provider.tool_sandbox import (
     inspect_tool_image,
     run_offline_tool_preflight,
+    verify_control_proxy_lifecycle_evidence,
 )
 from .orchestrator import run_repair
 from .persistence import read_json, write_evidence
@@ -63,10 +66,18 @@ def run_provider_smoke(
         image=tool_image,
         lifecycle_root=directory / "private-preflight",
     )
+    verify_control_proxy_lifecycle_evidence(
+        directory / "private-preflight" / "tool-control-proxy-lifecycle.json",
+        health.tool_control_proxy_lifecycle_artifact_sha256,
+    )
     write_evidence(directory / "tool-image-descriptor.json", tool_image)
     write_evidence(
         directory / "tool-network-policy.json",
         tool_network_policy_descriptor(provider_config),
+    )
+    write_evidence(
+        directory / "tool-control-proxy-policy.json",
+        tool_control_proxy_policy_descriptor(provider_config),
     )
     write_evidence(directory / "provider-preflight.json", health)
     if health.startup_result != "passed":
@@ -147,6 +158,10 @@ def run_provider_smoke(
         and health.network_internal
         and health.control_bind_address == "127.0.0.1"
         and not health.public_port_exposure_observed
+        and not health.docker_published_host_port_observed
+        and health.direct_internal_control_reachable
+        and health.proxy_readiness_passed
+        and health.proxy_cleanup_passed
         and not health.direct_external_ip_reachable
         and not health.external_hostname_reachable
         and not health.pypi_reachable
@@ -170,11 +185,18 @@ def run_provider_smoke(
             "tool_network_policy_descriptor_sha256": (
                 health.tool_network_policy_descriptor_sha256
             ),
+            "tool_control_proxy_policy_descriptor_sha256": (
+                health.tool_control_proxy_policy_descriptor_sha256
+            ),
+            "tool_control_proxy_lifecycle_artifact_sha256": (
+                health.tool_control_proxy_lifecycle_artifact_sha256
+            ),
             "endpoint_descriptor_sha256": endpoint.descriptor_sha256,
             "agent_descriptor_sha256": agent.descriptor_sha256,
             "provider_configuration_sha256": sha256_fingerprint(
                 provider_config.model_dump(mode="json")
             ),
+            "cgr_commit": repository_commit(Path(__file__).parents[3]),
             "tool_control_network_type": health.control_network_type,
             "trusted_evidence_exposure": 0,
             "candidate_model_endpoint_access": 0,
@@ -184,7 +206,7 @@ def run_provider_smoke(
 
 def _write_report(directory: Path, values: dict[str, Any]) -> dict[str, Any]:
     payload = {
-        "schema_version": "cgr.quantum-repair-provider-smoke/1.1.0",
+        "schema_version": "cgr.quantum-repair-provider-smoke/1.2.0",
         **values,
     }
     payload["report_sha256"] = sha256_fingerprint(payload)

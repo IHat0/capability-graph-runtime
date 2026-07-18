@@ -17,6 +17,7 @@ from .contracts import (
     AgentDescriptor,
     ModelEndpointDescriptor,
     ToolSandboxImageDescriptor,
+    ToolControlProxyPolicyDescriptor,
     ToolNetworkPolicyDescriptor,
     seal_contract,
 )
@@ -43,11 +44,14 @@ def provider_overlay(
     *,
     control_network_name: str = TOOL_NETWORK_NAME_PLACEHOLDER,
     network_ownership_nonce: str = TOOL_NETWORK_NONCE_PLACEHOLDER,
+    control_port: int = 49152,
 ) -> str:
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", control_network_name):
         raise ValueError("Tool control network name is unsafe.")
     if not re.fullmatch(r"[0-9a-f]{32}", network_ownership_nonce):
         raise ValueError("Tool control network ownership nonce is malformed.")
+    if not 1 <= control_port <= 65535:
+        raise ValueError("SWE-ReX control port is invalid.")
     arguments = (
         f"--network={control_network_name}",
         f"--label={TOOL_NETWORK_OWNERSHIP_LABEL}={network_ownership_nonce}",
@@ -58,6 +62,7 @@ def provider_overlay(
   deployment:
     type: docker
     image: {json.dumps(config.tool_container_image)}
+    port: {control_port}
     pull: never
     startup_timeout: {config.tool_startup_timeout_seconds}
     python_standalone_dir: null
@@ -110,6 +115,20 @@ def tool_network_policy_descriptor(
     return seal_contract(ToolNetworkPolicyDescriptor, values, "descriptor_sha256")
 
 
+def tool_control_proxy_policy_descriptor(
+    config: SWEAgentProviderConfig,
+) -> ToolControlProxyPolicyDescriptor:
+    values = {
+        "proxy_type": config.tool_control_proxy_type,
+        "proxy_bind_address": config.tool_control_proxy_bind_address,
+        "proxy_destination_port": config.tool_control_proxy_destination_port,
+        "proxy_public_exposure": config.tool_control_proxy_public_exposure,
+        "proxy_external_destination": config.tool_control_proxy_external_destination,
+        "invocation_scoped_ownership": True,
+    }
+    return seal_contract(ToolControlProxyPolicyDescriptor, values, "descriptor_sha256")
+
+
 def verify_pristine_sweagent(
     config: SWEAgentProviderConfig,
     overlay: str | None = None,
@@ -139,6 +158,7 @@ def verify_pristine_sweagent(
 
     image = tool_image_descriptor or inspect_tool_image(config)
     network_policy = tool_network_policy_descriptor(config)
+    proxy_policy = tool_control_proxy_policy_descriptor(config)
     tool_identity = {
         "image": config.tool_container_image,
         "pull": config.tool_container_pull_policy,
@@ -148,6 +168,7 @@ def verify_pristine_sweagent(
         "host_home_mounted": False,
         "tool_image_descriptor_sha256": image.descriptor_sha256,
         "tool_network_policy_descriptor_sha256": network_policy.descriptor_sha256,
+        "tool_control_proxy_policy_descriptor_sha256": proxy_policy.descriptor_sha256,
     }
     values = {
         "pristine_source_commit": commit,
@@ -159,6 +180,7 @@ def verify_pristine_sweagent(
         "executable_identity_sha256": executable_sha,
         "tool_image_descriptor_sha256": image.descriptor_sha256,
         "tool_network_policy_descriptor_sha256": network_policy.descriptor_sha256,
+        "tool_control_proxy_policy_descriptor_sha256": proxy_policy.descriptor_sha256,
     }
     return seal_contract(AgentDescriptor, values, "descriptor_sha256")
 
@@ -257,6 +279,13 @@ def resolve_executable(value: str) -> Path:
             raise ValueError("Official SWE-agent executable is unavailable.")
         discovered = str(candidate)
     return Path(discovered).resolve(strict=True)
+
+
+def repository_commit(root: Path) -> str:
+    commit = _git(root.resolve(strict=True), "rev-parse", "HEAD").strip()
+    if len(commit) != 40 or any(item not in "0123456789abcdef" for item in commit):
+        raise ValueError("CGR repository commit identity is malformed.")
+    return commit
 
 
 def _git(root: Path, *arguments: str) -> str:

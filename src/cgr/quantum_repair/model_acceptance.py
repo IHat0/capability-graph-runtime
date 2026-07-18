@@ -23,6 +23,8 @@ from .model_provider.config import SWEAgentProviderConfig
 from .model_provider.contracts import ProviderInvocationRequest
 from .model_provider.contracts import ToolSandboxHealthArtifact
 from .model_provider.agent import (
+    repository_commit,
+    tool_control_proxy_policy_descriptor,
     tool_network_policy_descriptor,
     verify_pristine_sweagent,
 )
@@ -32,6 +34,7 @@ from .model_provider.tool_sandbox import (
     failed_tool_health,
     inspect_tool_image,
     run_offline_tool_preflight,
+    verify_control_proxy_lifecycle_evidence,
 )
 from .orchestrator import run_repair
 from .persistence import create_source_manifest, read_json, write_evidence
@@ -137,7 +140,16 @@ def run_model_acceptance(
             directory / "tool-network-policy.json",
             tool_network_policy_descriptor(provider_config),
         )
+        write_evidence(
+            directory / "tool-control-proxy-policy.json",
+            tool_control_proxy_policy_descriptor(provider_config),
+        )
         write_evidence(directory / "provider-preflight.json", health)
+        if preflight_runner is None:
+            verify_control_proxy_lifecycle_evidence(
+                directory / "private-preflight" / "tool-control-proxy-lifecycle.json",
+                health.tool_control_proxy_lifecycle_artifact_sha256,
+            )
     except Exception as exc:
         write_evidence(
             directory / "provider-preflight.json",
@@ -206,6 +218,9 @@ def run_model_acceptance(
                 provider_config=provider_config,
                 tool_image_sha256=tool_image.descriptor_sha256,
                 network_policy_sha256=health.tool_network_policy_descriptor_sha256,
+                proxy_policy_sha256=(
+                    health.tool_control_proxy_policy_descriptor_sha256
+                ),
                 endpoint_sha256=endpoint.descriptor_sha256,
                 agent_sha256=agent.descriptor_sha256,
             )
@@ -553,6 +568,12 @@ def _summarize(
                         "tool_control_network_not_internal",
                         "tool_control_port_publicly_exposed",
                         "tool_runtime_control_channel_unreachable",
+                        "tool_control_proxy_startup_failure",
+                        "tool_control_proxy_bind_failure",
+                        "tool_control_proxy_foreign_listener",
+                        "tool_control_proxy_destination_invalid",
+                        "tool_control_proxy_terminated",
+                        "tool_control_proxy_cleanup_failure",
                         "tool_external_egress_detected",
                         "tool_model_endpoint_access_detected",
                         "tool_container_cleanup_failure",
@@ -633,6 +654,12 @@ def _preflight_failure_summary(
                 "tool_control_network_not_internal",
                 "tool_control_port_publicly_exposed",
                 "tool_runtime_control_channel_unreachable",
+                "tool_control_proxy_startup_failure",
+                "tool_control_proxy_bind_failure",
+                "tool_control_proxy_foreign_listener",
+                "tool_control_proxy_destination_invalid",
+                "tool_control_proxy_terminated",
+                "tool_control_proxy_cleanup_failure",
                 "tool_external_egress_detected",
                 "tool_model_endpoint_access_detected",
                 "tool_container_cleanup_failure",
@@ -660,6 +687,7 @@ def _verify_smoke_report(
     provider_config: SWEAgentProviderConfig,
     tool_image_sha256: str,
     network_policy_sha256: str,
+    proxy_policy_sha256: str,
     endpoint_sha256: str,
     agent_sha256: str,
 ) -> None:
@@ -671,11 +699,13 @@ def _verify_smoke_report(
         "provider_smoke_passed": True,
         "tool_image_descriptor_sha256": tool_image_sha256,
         "tool_network_policy_descriptor_sha256": network_policy_sha256,
+        "tool_control_proxy_policy_descriptor_sha256": proxy_policy_sha256,
         "endpoint_descriptor_sha256": endpoint_sha256,
         "agent_descriptor_sha256": agent_sha256,
         "provider_configuration_sha256": sha256_fingerprint(
             provider_config.model_dump(mode="json")
         ),
+        "cgr_commit": repository_commit(Path(__file__).parents[3]),
     }
     if any(report.get(name) != value for name, value in expected.items()):
         raise ValueError("Provider smoke does not match acceptance infrastructure.")

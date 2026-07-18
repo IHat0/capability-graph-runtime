@@ -13,9 +13,12 @@ ENDPOINT_SCHEMA = "cgr.quantum-repair-model-endpoint/1.0.0"
 AGENT_SCHEMA = "cgr.quantum-repair-agent-descriptor/1.0.0"
 AGENT_SCHEMA_V1_1 = "cgr.quantum-repair-agent-descriptor/1.1.0"
 AGENT_SCHEMA_V1_2 = "cgr.quantum-repair-agent-descriptor/1.2.0"
+AGENT_SCHEMA_V1_3 = "cgr.quantum-repair-agent-descriptor/1.3.0"
 TOOL_IMAGE_SCHEMA = "cgr.quantum-sweagent-tool-image/1.1.0"
 TOOL_NETWORK_POLICY_SCHEMA = "cgr.quantum-sweagent-tool-network-policy/1.0.0"
-TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.1.0"
+TOOL_PROXY_POLICY_SCHEMA = "cgr.quantum-swerex-control-proxy-policy/1.0.0"
+TOOL_PROXY_LIFECYCLE_SCHEMA = "cgr.quantum-swerex-control-proxy-lifecycle/1.0.0"
+TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.2.0"
 BUDGET_SCHEMA = "cgr.quantum-repair-provider-budget/1.0.0"
 PROMPT_SCHEMA = "cgr.quantum-repair-model-prompt/1.0.0"
 REQUEST_SCHEMA = "cgr.quantum-repair-provider-request/1.0.0"
@@ -100,7 +103,7 @@ class ModelEndpointDescriptor(CanonicalModel):
 
 
 class AgentDescriptor(CanonicalModel):
-    schema_version: str = AGENT_SCHEMA_V1_2
+    schema_version: str = AGENT_SCHEMA_V1_3
     agent_type: Literal["pristine-sweagent"] = "pristine-sweagent"
     pristine_source_commit: str
     source_tree_clean: bool
@@ -111,12 +114,18 @@ class AgentDescriptor(CanonicalModel):
     executable_identity_sha256: str
     tool_image_descriptor_sha256: str | None = None
     tool_network_policy_descriptor_sha256: str | None = None
+    tool_control_proxy_policy_descriptor_sha256: str | None = None
     descriptor_sha256: str
 
     @field_validator("schema_version")
     @classmethod
     def valid_schema(cls, value: str) -> str:
-        if value not in {AGENT_SCHEMA, AGENT_SCHEMA_V1_1, AGENT_SCHEMA_V1_2}:
+        if value not in {
+            AGENT_SCHEMA,
+            AGENT_SCHEMA_V1_1,
+            AGENT_SCHEMA_V1_2,
+            AGENT_SCHEMA_V1_3,
+        }:
             raise ValueError("Unsupported agent descriptor schema.")
         return value
 
@@ -133,6 +142,7 @@ class AgentDescriptor(CanonicalModel):
         "executable_identity_sha256",
         "tool_image_descriptor_sha256",
         "tool_network_policy_descriptor_sha256",
+        "tool_control_proxy_policy_descriptor_sha256",
         "descriptor_sha256",
     )
     @classmethod
@@ -149,15 +159,21 @@ class AgentDescriptor(CanonicalModel):
         if not self.source_tree_clean:
             raise ValueError("SWE-agent source must be pristine.")
         if (
-            self.schema_version in {AGENT_SCHEMA_V1_1, AGENT_SCHEMA_V1_2}
+            self.schema_version
+            in {AGENT_SCHEMA_V1_1, AGENT_SCHEMA_V1_2, AGENT_SCHEMA_V1_3}
             and self.tool_image_descriptor_sha256 is None
         ):
             raise ValueError("Agent descriptor requires an immutable tool image.")
         if (
-            self.schema_version == AGENT_SCHEMA_V1_2
+            self.schema_version in {AGENT_SCHEMA_V1_2, AGENT_SCHEMA_V1_3}
             and self.tool_network_policy_descriptor_sha256 is None
         ):
             raise ValueError("Agent descriptor requires a tool network policy.")
+        if (
+            self.schema_version == AGENT_SCHEMA_V1_3
+            and self.tool_control_proxy_policy_descriptor_sha256 is None
+        ):
+            raise ValueError("Agent descriptor requires a control proxy policy.")
         if self.descriptor_sha256 != self.fingerprint:
             raise ValueError("Agent descriptor hash was not recomputed.")
         return self
@@ -246,10 +262,96 @@ class ToolNetworkPolicyDescriptor(CanonicalModel):
         return self
 
 
+class ToolControlProxyPolicyDescriptor(CanonicalModel):
+    schema_version: str = TOOL_PROXY_POLICY_SCHEMA
+    proxy_type: Literal["provider_owned_tcp"] = "provider_owned_tcp"
+    proxy_bind_address: Literal["127.0.0.1"] = "127.0.0.1"
+    proxy_destination_port: Literal[8000] = 8000
+    proxy_public_exposure: Literal[False] = False
+    proxy_external_destination: Literal[False] = False
+    invocation_scoped_ownership: Literal[True] = True
+    descriptor_sha256: str
+
+    @field_validator("schema_version")
+    @classmethod
+    def valid_schema(cls, value: str) -> str:
+        if value != TOOL_PROXY_POLICY_SCHEMA:
+            raise ValueError("Unsupported tool control proxy policy schema.")
+        return value
+
+    @field_validator("descriptor_sha256")
+    @classmethod
+    def digest(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    def canonical_identity(self) -> Any:
+        value = self.model_dump(mode="json")
+        value.pop("descriptor_sha256", None)
+        return value
+
+    @model_validator(mode="after")
+    def verified(self) -> Self:
+        if self.descriptor_sha256 != self.fingerprint:
+            raise ValueError("Tool control proxy policy hash was not recomputed.")
+        return self
+
+
+class ToolControlProxyLifecycleArtifact(CanonicalModel):
+    schema_version: str = TOOL_PROXY_LIFECYCLE_SCHEMA
+    proxy_policy_descriptor_sha256: str
+    proxy_type: Literal["provider_owned_tcp"] = "provider_owned_tcp"
+    proxy_bind_identity_sha256: str
+    proxy_bind_address: Literal["127.0.0.1"] = "127.0.0.1"
+    proxy_source_port: int = Field(ge=0, le=65535)
+    proxy_destination_container_identity: str
+    proxy_destination_image_identity: str
+    proxy_destination_internal_ip_identity: str
+    proxy_destination_network_identity_sha256: str
+    proxy_destination_port: Literal[8000] = 8000
+    proxy_public_exposure: Literal[False] = False
+    proxy_external_destination: Literal[False] = False
+    startup_result: Literal["passed", "failed"]
+    readiness_result: Literal["passed", "failed", "not_reached"]
+    cleanup_passed: bool
+    runtime_seconds: float = Field(ge=0)
+    failure_classification: str | None
+    lifecycle_artifact_sha256: str
+
+    @field_validator(
+        "proxy_policy_descriptor_sha256",
+        "proxy_bind_identity_sha256",
+        "proxy_destination_internal_ip_identity",
+        "proxy_destination_network_identity_sha256",
+        "lifecycle_artifact_sha256",
+    )
+    @classmethod
+    def digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    def canonical_identity(self) -> Any:
+        value = self.model_dump(mode="json")
+        value.pop("lifecycle_artifact_sha256", None)
+        return value
+
+    @model_validator(mode="after")
+    def verified(self) -> Self:
+        if self.startup_result == "passed" and (
+            self.proxy_source_port == 0
+            or self.readiness_result != "passed"
+            or not self.cleanup_passed
+        ):
+            raise ValueError("Passing proxy lifecycle evidence is incomplete.")
+        if self.lifecycle_artifact_sha256 != self.fingerprint:
+            raise ValueError("Tool control proxy lifecycle hash was not recomputed.")
+        return self
+
+
 class ToolSandboxHealthArtifact(CanonicalModel):
     schema_version: str = TOOL_HEALTH_SCHEMA
     tool_image_descriptor_sha256: str
     tool_network_policy_descriptor_sha256: str
+    tool_control_proxy_policy_descriptor_sha256: str
+    tool_control_proxy_lifecycle_artifact_sha256: str
     deployment_identity_sha256: str
     control_network_type: Literal["docker_internal"]
     network_identifier_sha256: str
@@ -258,6 +360,10 @@ class ToolSandboxHealthArtifact(CanonicalModel):
     control_bind_address: Literal["127.0.0.1"]
     allocated_control_port: int = Field(ge=0, le=65535)
     public_port_exposure_observed: bool
+    docker_published_host_port_observed: bool
+    direct_internal_control_reachable: bool
+    proxy_readiness_passed: bool
+    proxy_cleanup_passed: bool
     direct_external_ip_reachable: bool
     external_hostname_reachable: bool
     pypi_reachable: bool
@@ -285,6 +391,8 @@ class ToolSandboxHealthArtifact(CanonicalModel):
     @field_validator(
         "tool_image_descriptor_sha256",
         "tool_network_policy_descriptor_sha256",
+        "tool_control_proxy_policy_descriptor_sha256",
+        "tool_control_proxy_lifecycle_artifact_sha256",
         "deployment_identity_sha256",
         "network_identifier_sha256",
         "health_artifact_sha256",
@@ -316,6 +424,10 @@ class ToolSandboxHealthArtifact(CanonicalModel):
             or not self.network_internal
             or self.allocated_control_port == 0
             or self.public_port_exposure_observed
+            or self.docker_published_host_port_observed
+            or not self.direct_internal_control_reachable
+            or not self.proxy_readiness_passed
+            or not self.proxy_cleanup_passed
             or self.direct_external_ip_reachable
             or self.external_hostname_reachable
             or self.pypi_reachable
