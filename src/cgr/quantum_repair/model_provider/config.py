@@ -21,7 +21,7 @@ class SWEAgentProviderConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: str = "cgr.quantum-repair-sweagent-provider-config/1.1.0"
+    schema_version: str = "cgr.quantum-repair-sweagent-provider-config/1.2.0"
     provider_type: Literal["sweagent-openai-compatible"] = "sweagent-openai-compatible"
     base_url: str = DEFAULT_BASE_URL
     model_identifier: str = DEFAULT_MODEL
@@ -35,10 +35,18 @@ class SWEAgentProviderConfig(BaseModel):
     sweagent_version: str = "1.1.0"
     tool_container_image_repository: str = "cgr-quantum-sweagent-tool"
     tool_container_image: str = "sha256:" + "0" * 64
-    tool_image_build_schema_version: str = "cgr.quantum-sweagent-tool-image-build/1.0.0"
+    tool_image_build_schema_version: Literal[
+        "cgr.quantum-sweagent-tool-image-build/1.1.0"
+    ] = "cgr.quantum-sweagent-tool-image-build/1.1.0"
     tool_image_build_input_sha256: str = "0" * 64
     tool_image_offline_bootstrap: Literal[True] = True
-    tool_container_network_policy: Literal["none"] = "none"
+    tool_external_egress_disabled: Literal[True] = True
+    tool_control_network_type: Literal["docker_internal"] = "docker_internal"
+    tool_control_network_driver: Literal["bridge"] = "bridge"
+    tool_control_bind_address: Literal["127.0.0.1"] = "127.0.0.1"
+    tool_control_container_port: Literal[8000] = 8000
+    tool_public_port_exposure: Literal[False] = False
+    tool_model_endpoint_access: Literal[False] = False
     required_swerex_version: Literal["1.4.0"] = "1.4.0"
     tool_startup_timeout_seconds: int = Field(default=180, gt=0, le=600)
     tool_container_pull_policy: Literal["never"] = "never"
@@ -50,7 +58,7 @@ class SWEAgentProviderConfig(BaseModel):
     @field_validator("schema_version")
     @classmethod
     def valid_schema(cls, value: str) -> str:
-        if value != "cgr.quantum-repair-sweagent-provider-config/1.1.0":
+        if value != "cgr.quantum-repair-sweagent-provider-config/1.2.0":
             raise ValueError("Unsupported SWE-agent provider configuration schema.")
         return value
 

@@ -5,12 +5,14 @@ ARG BUILD_INPUT_SHA256
 ARG SWEAGENT_COMMIT
 ARG SWEREX_VERSION
 
-LABEL org.cgr.tool-sandbox.schema="cgr.quantum-sweagent-tool-image/1.0.0" \
+LABEL org.cgr.tool-sandbox.schema="cgr.quantum-sweagent-tool-image/1.1.0" \
       org.cgr.tool-sandbox.build-input-sha256="${BUILD_INPUT_SHA256}" \
       org.cgr.tool-sandbox.sweagent-commit="${SWEAGENT_COMMIT}" \
       org.cgr.tool-sandbox.swerex-version="${SWEREX_VERSION}" \
       org.cgr.tool-sandbox.offline-bootstrap="true" \
-      org.cgr.tool-sandbox.network-policy="none"
+      org.cgr.tool-sandbox.external-egress-disabled="true" \
+      org.cgr.tool-sandbox.control-network="docker-internal" \
+      org.cgr.tool-sandbox.control-bind-address="127.0.0.1"
 
 COPY requirements.lock /opt/cgr-tool-image/requirements.lock
 RUN python3 -m pip install --no-cache-dir --disable-pip-version-check \

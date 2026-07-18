@@ -76,6 +76,7 @@ def run_bounded_process(
     for reader in readers:
         reader.start()
     timed_out = False
+    heartbeat_error: Exception | None = None
     while process.poll() is None:
         elapsed = time.monotonic() - started
         if output_exceeded.is_set():
@@ -85,7 +86,12 @@ def run_bounded_process(
             timed_out = True
             _terminate_process_group(process)
             break
-        heartbeat()
+        try:
+            heartbeat()
+        except Exception as exc:
+            heartbeat_error = exc
+            _terminate_process_group(process)
+            break
         time.sleep(min(heartbeat_seconds, 0.25))
     if process.poll() is None:
         _terminate_process_group(process)
@@ -96,6 +102,8 @@ def run_bounded_process(
         raise ValueError("SWE-agent output streams did not close after termination.")
     if output_exceeded.is_set():
         raise ValueError("SWE-agent process output exceeded its byte budget.")
+    if heartbeat_error is not None:
+        raise heartbeat_error
     stdout_raw = bytes(stdout_buffer)
     stderr_raw = bytes(stderr_buffer)
     stdout = sanitize_text(stdout_raw.decode("utf-8", errors="replace"), secrets)

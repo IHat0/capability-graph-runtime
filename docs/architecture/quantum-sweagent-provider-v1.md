@@ -161,8 +161,8 @@ model call. Pinned SWE-agent enters `SWEEnv._init_deployment()`, calls
 `DockerDeployment.start()` from SWE-ReX 1.4.0, and obtains its container command from
 `DockerDeployment._get_swerex_start_cmd()`. When `swerex-remote` is absent, that
 official command falls back to `python3 -m pip install pipx`, `pipx ensurepath`, and
-`pipx run swe-rex`. With the required Docker network mode `none`, PyPI is correctly
-unreachable and the container terminates. The previously selected
+`pipx run swe-rex`. With the original Docker network mode `none`, PyPI was correctly
+unreachable and the container terminated. The previously selected
 `tools/edit_anthropic/install.sh` would subsequently have run two additional pip
 installs, so merely adding `pipx` would not have made the lifecycle offline-ready.
 
@@ -170,8 +170,8 @@ The supported correction follows upstream's documented custom-image approach. Th
 dedicated image in `docker/quantum-sweagent-tool` installs the exact SWE-ReX 1.4.0
 runtime and its `swerex-remote` entry point at image build time. Build-time dependency
 retrieval is a separately controlled boundary. Runtime creation uses the exact image
-ID, pull policy `never`, and network mode `none`; no runtime dependency download is
-permitted. The provider uses only official tool bundles whose startup scripts do not
+ID and pull policy `never`; no runtime dependency download is permitted. The provider
+uses only official tool bundles whose startup scripts do not
 install packages (`registry`, `search`, `windowed`, and `review_on_submit_m`) plus
 SWE-agent's supported Bash tool for edits. No upstream file or action is modified.
 
@@ -182,23 +182,45 @@ containing the resulting exact `sha256:` image ID. Runtime validation compares t
 local image ID and all labels with the versioned `ToolSandboxImageDescriptor`; a tag
 is only a build-time convenience and is never authoritative.
 
-Provider health now starts the real SWE-ReX `DockerDeployment` with the production
-image, Docker arguments, timeout, removal policy, and environment path. It waits for
-the official ready state, executes a harmless shell command, modifies a disposable
-file, checks credential and Docker-socket absence, confirms that the model endpoint
-is unreachable inside the tool environment, stops the deployment, and persists a
-self-hashed health artifact. It also records whether infrastructure package-install
-behavior was observed. Startup failures are classified as
-`offline_dependency_missing`, `tool_container_terminated_during_startup`, or the
-general `tool_sandbox_bootstrap_failure` without publishing private stderr.
+The next EC2 preflight proved that the preinstalled runtime starts, but also exposed
+that literal `--network=none` cannot carry SWE-ReX's required host-to-container TCP
+control channel. Pinned `DockerDeployment.start()` always publishes its selected host
+port to container port 8000. Its supported `docker_args` field can select a custom
+network, but the pinned configuration has no host-bind-address field and emits
+`-p <port>:8000` itself.
+
+The narrow lifecycle adapter therefore creates a unique user-defined bridge with
+`docker network create --internal` and the bridge driver option
+`com.docker.network.bridge.host_binding_ipv4=127.0.0.1`. It passes the owned network
+name and an ownership label through official `DockerDeploymentConfig.docker_args`.
+Docker's network option makes upstream's unqualified port publication loopback-only.
+The provider does not subclass, patch, or rewrite SWE-ReX and does not intercept agent
+actions. Docker inspection must show `Internal=true`, the expected ownership nonce,
+exactly one container network, and one `127.0.0.1` control binding. The default bridge,
+host network, public bindings, extra networks, and substituted resources are rejected.
+
+Provider health waits for the official ready state, runs a harmless shell command,
+modifies a disposable file, and proves that direct external IP, external hostname,
+PyPI, Qwen, credentials, and the Docker socket remain unavailable. Its self-hashed
+health artifact binds the image, versioned network policy, sanitized network identity,
+ownership nonce, allocated port, probes, and separate container/network cleanup
+results. Failures distinguish control-network creation or policy defects, public port
+exposure, unreachable runtime control, detected egress/model access, and container or
+network cleanup failures from dependency bootstrap failures.
+
+Network state is persisted privately before SWE-agent starts. Normal completion,
+timeout, interruption, and failure all remove labeled containers and then the network.
+Retry recovery reads that state and removes a resource only when its exact Docker ID,
+schema label, and ownership nonce agree. Foreign or substituted networks and
+containers are never removed; they instead cause a fail-closed cleanup classification.
 
 Comparative acceptance performs this preflight before materializing any baseline or
 CGR case. Failure creates a completed fail-closed preflight report with zero cases and
 zero model tokens. A separate `syntax-error` smoke then uses the real provider-neutral
 controller, candidate sandbox, patch policy, agent, endpoint, and image. It must show
 positive model calls and tokens plus replayable official evidence. The full run
-accepts the smoke only when its self-hash and provider, endpoint, agent, and image
-identities exactly match the current configuration.
+accepts the smoke only when its self-hash and provider, endpoint, agent, image, and
+network-policy identities exactly match the current configuration.
 
 Operator order is therefore: build the image, run the offline tool check, run complete
 provider health, run the one-case provider smoke, and only then run comparative

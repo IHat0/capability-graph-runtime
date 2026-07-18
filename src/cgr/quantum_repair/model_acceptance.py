@@ -22,7 +22,10 @@ from .contracts import QuantumRepairPolicy
 from .model_provider.config import SWEAgentProviderConfig
 from .model_provider.contracts import ProviderInvocationRequest
 from .model_provider.contracts import ToolSandboxHealthArtifact
-from .model_provider.agent import verify_pristine_sweagent
+from .model_provider.agent import (
+    tool_network_policy_descriptor,
+    verify_pristine_sweagent,
+)
 from .model_provider.endpoint import verify_model_endpoint
 from .model_provider.provider import SWEAgentOpenAICompatibleRepairProvider
 from .model_provider.tool_sandbox import (
@@ -123,9 +126,17 @@ def run_model_acceptance(
         health = (
             preflight_runner(provider_config)
             if preflight_runner is not None
-            else run_offline_tool_preflight(provider_config, image=tool_image)
+            else run_offline_tool_preflight(
+                provider_config,
+                image=tool_image,
+                lifecycle_root=directory / "private-preflight",
+            )
         )
         write_evidence(directory / "tool-image-descriptor.json", tool_image)
+        write_evidence(
+            directory / "tool-network-policy.json",
+            tool_network_policy_descriptor(provider_config),
+        )
         write_evidence(directory / "provider-preflight.json", health)
     except Exception as exc:
         write_evidence(
@@ -194,6 +205,7 @@ def run_model_acceptance(
                 smoke_report_path,
                 provider_config=provider_config,
                 tool_image_sha256=tool_image.descriptor_sha256,
+                network_policy_sha256=health.tool_network_policy_descriptor_sha256,
                 endpoint_sha256=endpoint.descriptor_sha256,
                 agent_sha256=agent.descriptor_sha256,
             )
@@ -537,6 +549,14 @@ def _summarize(
                         "tool_sandbox_bootstrap_failure",
                         "offline_dependency_missing",
                         "tool_container_terminated_during_startup",
+                        "tool_control_network_creation_failure",
+                        "tool_control_network_not_internal",
+                        "tool_control_port_publicly_exposed",
+                        "tool_runtime_control_channel_unreachable",
+                        "tool_external_egress_detected",
+                        "tool_model_endpoint_access_detected",
+                        "tool_container_cleanup_failure",
+                        "tool_network_cleanup_failure",
                     }
                     for code in item.get("provider_failure_codes", [])
                 )
@@ -609,6 +629,14 @@ def _preflight_failure_summary(
                 "tool_sandbox_bootstrap_failure",
                 "offline_dependency_missing",
                 "tool_container_terminated_during_startup",
+                "tool_control_network_creation_failure",
+                "tool_control_network_not_internal",
+                "tool_control_port_publicly_exposed",
+                "tool_runtime_control_channel_unreachable",
+                "tool_external_egress_detected",
+                "tool_model_endpoint_access_detected",
+                "tool_container_cleanup_failure",
+                "tool_network_cleanup_failure",
             }
         ),
         "model_transport_failures": int(
@@ -631,6 +659,7 @@ def _verify_smoke_report(
     *,
     provider_config: SWEAgentProviderConfig,
     tool_image_sha256: str,
+    network_policy_sha256: str,
     endpoint_sha256: str,
     agent_sha256: str,
 ) -> None:
@@ -641,6 +670,7 @@ def _verify_smoke_report(
     expected = {
         "provider_smoke_passed": True,
         "tool_image_descriptor_sha256": tool_image_sha256,
+        "tool_network_policy_descriptor_sha256": network_policy_sha256,
         "endpoint_descriptor_sha256": endpoint_sha256,
         "agent_descriptor_sha256": agent_sha256,
         "provider_configuration_sha256": sha256_fingerprint(

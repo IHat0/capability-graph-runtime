@@ -236,6 +236,9 @@ def _verify_provider_invocations(
                 if tool_image_path.is_file()
                 else None
             )
+            network_policy_sha256 = _verify_provider_network_policy(
+                directory, agent.tool_network_policy_descriptor_sha256
+            )
             prompt = ModelRepairPrompt.model_validate(
                 read_json(directory / "model-prompt.json")
             )
@@ -249,6 +252,14 @@ def _verify_provider_invocations(
                         tool_image is None
                         or agent.tool_image_descriptor_sha256
                         != tool_image.descriptor_sha256
+                    )
+                )
+                or (
+                    agent.tool_network_policy_descriptor_sha256 is not None
+                    and (
+                        network_policy_sha256 is None
+                        or agent.tool_network_policy_descriptor_sha256
+                        != network_policy_sha256
                     )
                 )
             ):
@@ -277,3 +288,19 @@ def _verify_provider_invocations(
         verify_provider_telemetry(directory / "provider-events.jsonl")
     if completed > 1:
         raise ValueError("More than one provider invocation completed for an attempt.")
+
+
+def _verify_provider_network_policy(
+    directory: Path, expected_sha256: str | None
+) -> str | None:
+    if expected_sha256 is None:
+        return None
+    from .model_provider.contracts import ToolNetworkPolicyDescriptor
+
+    path = directory / "tool-network-policy.json"
+    if not path.is_file():
+        raise ValueError("Provider tool network policy evidence is missing.")
+    descriptor = ToolNetworkPolicyDescriptor.model_validate(read_json(path))
+    if descriptor.descriptor_sha256 != expected_sha256:
+        raise ValueError("Provider tool network policy evidence was substituted.")
+    return descriptor.descriptor_sha256

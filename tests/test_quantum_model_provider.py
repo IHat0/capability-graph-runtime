@@ -30,6 +30,7 @@ from cgr.quantum_repair.model_provider.agent import (
     build_official_command,
     child_environment,
     provider_overlay,
+    tool_network_policy_descriptor,
     verify_pristine_sweagent,
 )
 from cgr.quantum_repair.model_provider.config import (
@@ -71,10 +72,12 @@ from cgr.quantum_repair.model_provider.redaction import (
     sanitize_text,
 )
 from cgr.quantum_repair.model_provider.tool_sandbox import (
+    OwnedControlNetwork,
     ToolSandboxError,
     classify_bootstrap_failure,
     infrastructure_install_attempt_observed,
     inspect_tool_image,
+    recover_owned_control_network,
     run_offline_tool_preflight,
 )
 from cgr.quantum_repair.patches import (
@@ -83,6 +86,7 @@ from cgr.quantum_repair.patches import (
     validate_and_apply_patch,
 )
 from cgr.quantum_repair.persistence import create_source_manifest
+from cgr.quantum_repair.replay import _verify_provider_network_policy
 from cgr.science import ArtifactPointer, sha256_fingerprint
 
 ROOT = Path(__file__).parents[1]
@@ -100,16 +104,129 @@ def _tool_image_descriptor() -> ToolSandboxImageDescriptor:
         {
             "image_repository": "cgr-quantum-sweagent-tool",
             "image_id": "sha256:" + "a" * 64,
-            "build_schema_version": "cgr.quantum-sweagent-tool-image-build/1.0.0",
+            "build_schema_version": "cgr.quantum-sweagent-tool-image-build/1.1.0",
             "build_input_sha256": "b" * 64,
             "offline_bootstrap": True,
-            "network_policy": "none",
+            "network_policy": "docker-internal-loopback-control",
             "required_sweagent_commit": REQUIRED_SWEAGENT_COMMIT,
             "swerex_version": "1.4.0",
             "runtime_identity": "c" * 64,
         },
         "descriptor_sha256",
     )
+
+
+class _FakeControlNetwork:
+    name = "cgr-swerex-test-network"
+    ownership_nonce = "d" * 32
+    identifier_sha256 = "e" * 64
+    docker_args = (
+        "--network=cgr-swerex-test-network",
+        "--label=org.cgr.swerex-control.owner-nonce=" + "d" * 32,
+        "--cpus=2",
+    )
+
+    def inspect_running_container(self, container_name: str | None) -> int:
+        assert container_name == "owned-tool-container"
+        return 49152
+
+    def cleanup(self) -> tuple[bool, bool]:
+        return True, True
+
+
+def _fake_control_network(_state_path: Path) -> _FakeControlNetwork:
+    return _FakeControlNetwork()
+
+
+class _DockerNetworkRunner:
+    def __init__(
+        self,
+        *,
+        internal: bool = True,
+        bind_address: str = "127.0.0.1",
+        container_bind_address: str = "127.0.0.1",
+        foreign_container: bool = False,
+        extra_network: str | None = None,
+    ) -> None:
+        self.internal = internal
+        self.bind_address = bind_address
+        self.container_bind_address = container_bind_address
+        self.foreign_container = foreign_container
+        self.extra_network = extra_network
+        self.network_exists = False
+        self.container_exists = False
+        self.name = ""
+        self.nonce = ""
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command: list[str], **_kwargs: Any) -> Any:
+        self.commands.append(command)
+        arguments = command[1:]
+        if arguments[:2] == ["network", "create"]:
+            self.name = arguments[-1]
+            self.nonce = next(
+                item.rsplit("=", 1)[-1]
+                for item in arguments
+                if item.startswith("org.cgr.swerex-control.owner-nonce=")
+            )
+            self.network_exists = True
+            return SimpleNamespace(returncode=0, stdout="network-id\n", stderr="")
+        if arguments[:2] == ["network", "inspect"]:
+            if not self.network_exists:
+                return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+            containers = {"container-id": {}} if self.container_exists else {}
+            payload = {
+                "Id": "network-id",
+                "Name": self.name,
+                "Driver": "bridge",
+                "Internal": self.internal,
+                "Options": {
+                    "com.docker.network.bridge.host_binding_ipv4": self.bind_address
+                },
+                "Labels": {
+                    "org.cgr.swerex-control.schema": (
+                        "cgr.quantum-swerex-control-network/1.0.0"
+                    ),
+                    "org.cgr.swerex-control.owner-nonce": self.nonce,
+                },
+                "Containers": containers,
+            }
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps([payload]), stderr=""
+            )
+        if arguments[:2] == ["container", "inspect"]:
+            if not self.container_exists:
+                return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+            networks = {self.name: {}}
+            if self.extra_network is not None:
+                networks[self.extra_network] = {}
+            label = "foreign" if self.foreign_container else self.nonce
+            payload = {
+                "Config": {"Labels": {"org.cgr.swerex-control.owner-nonce": label}},
+                "NetworkSettings": {
+                    "Networks": networks,
+                    "Ports": {
+                        "8000/tcp": [
+                            {
+                                "HostIp": self.container_bind_address,
+                                "HostPort": "49152",
+                            }
+                        ]
+                    },
+                },
+            }
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps([payload]), stderr=""
+            )
+        if arguments[:3] == ["container", "rm", "--force"]:
+            self.container_exists = False
+            return SimpleNamespace(returncode=0, stdout="container-id\n", stderr="")
+        if arguments[:2] == ["network", "rm"]:
+            if self.container_exists:
+                return SimpleNamespace(returncode=1, stdout="", stderr="in use")
+            self.network_exists = False
+            return SimpleNamespace(returncode=0, stdout=self.name + "\n", stderr="")
+        raise AssertionError(f"Unexpected Docker command: {command}")
 
 
 def _receipt(code: str) -> CandidateAdjudicationReceipt:
@@ -292,7 +409,8 @@ def test_agent_descriptor_verifies_real_pristine_checkout() -> None:
         descriptor.tool_image_descriptor_sha256
         == _tool_image_descriptor().descriptor_sha256
     )
-    assert "--network=none" in TOOL_DOCKER_ARGS
+    assert "--network=cgr-swerex-invocation-network" in TOOL_DOCKER_ARGS
+    assert descriptor.tool_network_policy_descriptor_sha256 is not None
 
 
 def test_agent_wrong_commit_dirty_tree_and_missing_executable_fail(
@@ -356,7 +474,8 @@ def test_official_command_uses_env_key_reference_and_isolated_docker_policy(
     assert environment["CGR_REPAIR_MODEL_API_KEY"] == "provider-secret"
     assert not any(name.startswith(("AWS_", "IBM_", "GITHUB_")) for name in environment)
     overlay_text = provider_overlay(config)
-    assert "--network=none" in overlay_text
+    assert "--network=cgr-swerex-invocation-network" in overlay_text
+    assert "owner-nonce=" in overlay_text
     assert "edit_anthropic" not in overlay_text
     assert "pip install" not in overlay_text
 
@@ -366,6 +485,30 @@ def test_tool_image_requires_immutable_identity() -> None:
         SWEAgentProviderConfig(tool_container_image="python:3.12")
     with pytest.raises(ValidationError, match="exact sha256"):
         SWEAgentProviderConfig(tool_container_image="cgr-sweagent-tool:latest")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"tool_control_bind_address": "0.0.0.0"},
+        {"tool_control_bind_address": "::"},
+        {"tool_control_network_type": "bridge"},
+        {"tool_control_network_type": "host"},
+        {"tool_external_egress_disabled": False},
+        {"tool_public_port_exposure": True},
+        {"tool_model_endpoint_access": True},
+        {
+            "tool_image_build_schema_version": (
+                "cgr.quantum-sweagent-tool-image-build/1.0.0"
+            )
+        },
+    ],
+)
+def test_provider_contract_rejects_unsafe_control_network_policy(
+    override: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        SWEAgentProviderConfig.model_validate(override)
 
 
 def test_tool_image_identity_and_build_labels_are_verified(
@@ -379,12 +522,14 @@ def test_tool_image_identity_and_build_labels_are_verified(
         tool_image_build_input_sha256="b" * 64,
     )
     labels = {
-        "org.cgr.tool-sandbox.schema": "cgr.quantum-sweagent-tool-image/1.0.0",
+        "org.cgr.tool-sandbox.schema": "cgr.quantum-sweagent-tool-image/1.1.0",
         "org.cgr.tool-sandbox.build-input-sha256": "b" * 64,
         "org.cgr.tool-sandbox.sweagent-commit": REQUIRED_SWEAGENT_COMMIT,
         "org.cgr.tool-sandbox.swerex-version": "1.4.0",
         "org.cgr.tool-sandbox.offline-bootstrap": "true",
-        "org.cgr.tool-sandbox.network-policy": "none",
+        "org.cgr.tool-sandbox.external-egress-disabled": "true",
+        "org.cgr.tool-sandbox.control-network": "docker-internal",
+        "org.cgr.tool-sandbox.control-bind-address": "127.0.0.1",
     }
     monkeypatch.setattr(tool_module.shutil, "which", lambda _name: "docker")
 
@@ -396,7 +541,7 @@ def test_tool_image_identity_and_build_labels_are_verified(
 
     descriptor = inspect_tool_image(config, runner=runner)
     assert descriptor.image_id == image_id
-    assert descriptor.network_policy == "none"
+    assert descriptor.network_policy == "docker-internal-loopback-control"
 
     def mismatch(*_args: Any, **_kwargs: Any) -> Any:
         return SimpleNamespace(
@@ -410,6 +555,110 @@ def test_tool_image_identity_and_build_labels_are_verified(
         inspect_tool_image(config, runner=mismatch)
 
 
+def test_owned_internal_network_creation_and_loopback_control_binding(
+    tmp_path: Path,
+) -> None:
+    runner = _DockerNetworkRunner()
+    network = OwnedControlNetwork.create(
+        tmp_path / "network-state.json", runner=runner, docker="docker"
+    )
+    create = runner.commands[0]
+    assert "--internal" in create
+    assert "com.docker.network.bridge.host_binding_ipv4=127.0.0.1" in create
+    assert network.docker_args[0] == f"--network={network.name}"
+    assert all(
+        value not in {"--network=bridge", "--network=host"}
+        for value in network.docker_args
+    )
+    runner.container_exists = True
+    assert network.inspect_running_container("container-id") == 49152
+    container_cleanup, network_cleanup = network.cleanup()
+    assert container_cleanup is True and network_cleanup is True
+    assert runner.container_exists is False and runner.network_exists is False
+
+
+@pytest.mark.parametrize(
+    ("internal", "bind_address", "classification"),
+    [
+        (False, "127.0.0.1", "tool_control_network_not_internal"),
+        (True, "0.0.0.0", "tool_control_port_publicly_exposed"),
+        (True, "::", "tool_control_port_publicly_exposed"),
+    ],
+)
+def test_non_internal_or_public_control_network_is_rejected(
+    tmp_path: Path,
+    internal: bool,
+    bind_address: str,
+    classification: str,
+) -> None:
+    runner = _DockerNetworkRunner(internal=internal, bind_address=bind_address)
+    with pytest.raises(ToolSandboxError) as raised:
+        OwnedControlNetwork.create(
+            tmp_path / "network-state.json", runner=runner, docker="docker"
+        )
+    assert raised.value.code == classification
+    assert runner.network_exists is False
+
+
+@pytest.mark.parametrize(
+    ("bind_address", "extra_network", "classification"),
+    [
+        ("0.0.0.0", None, "tool_control_port_publicly_exposed"),
+        ("::", None, "tool_control_port_publicly_exposed"),
+        ("127.0.0.1", "bridge", "tool_control_network_not_internal"),
+        ("127.0.0.1", "host", "tool_control_network_not_internal"),
+    ],
+)
+def test_public_binding_default_bridge_and_host_network_are_rejected(
+    tmp_path: Path,
+    bind_address: str,
+    extra_network: str | None,
+    classification: str,
+) -> None:
+    runner = _DockerNetworkRunner(
+        container_bind_address=bind_address, extra_network=extra_network
+    )
+    network = OwnedControlNetwork.create(
+        tmp_path / "network-state.json", runner=runner, docker="docker"
+    )
+    runner.container_exists = True
+    with pytest.raises(ToolSandboxError) as raised:
+        network.inspect_running_container("container-id")
+    assert raised.value.code == classification
+    network.cleanup()
+
+
+def test_foreign_container_and_substituted_network_are_never_removed(
+    tmp_path: Path,
+) -> None:
+    runner = _DockerNetworkRunner(foreign_container=True)
+    network = OwnedControlNetwork.create(
+        tmp_path / "network-state.json", runner=runner, docker="docker"
+    )
+    runner.container_exists = True
+    container_cleanup, network_cleanup = network.cleanup()
+    assert container_cleanup is False and network_cleanup is False
+    assert runner.container_exists is True and runner.network_exists is True
+
+    runner.container_exists = False
+    runner.nonce = "f" * 32
+    assert network.cleanup() == (True, False)
+    assert runner.network_exists is True
+
+
+def test_interrupted_owned_network_recovery_removes_only_matching_resources(
+    tmp_path: Path,
+) -> None:
+    runner = _DockerNetworkRunner()
+    state_path = tmp_path / "network-state.json"
+    network = OwnedControlNetwork.create(state_path, runner=runner, docker="docker")
+    runner.container_exists = True
+    recover_owned_control_network(state_path, runner=runner, docker="docker")
+    assert not state_path.exists()
+    assert runner.container_exists is False and runner.network_exists is False
+    assert network.ownership_nonce
+
+
 def test_exact_offline_deployment_preflight_and_cleanup() -> None:
     class Runtime:
         async def upload(self, _request: Any) -> None:
@@ -418,7 +667,13 @@ def test_exact_offline_deployment_preflight_and_cleanup() -> None:
         async def execute(self, command: Any) -> Any:
             if command.command == "env":
                 return SimpleNamespace(stdout="PATH=/usr/bin", exit_code=0)
-            if "docker.sock" in command.command or "connect_ex" in command.command:
+            if (
+                "docker.sock" in command.command
+                or "1.1.1.1" in command.command
+                or "example.com" in command.command
+                or "pypi.org" in command.command
+                or "/models" in command.command
+            ):
                 return SimpleNamespace(stdout="", exit_code=1)
             return SimpleNamespace(stdout="ok", exit_code=0)
 
@@ -426,6 +681,7 @@ def test_exact_offline_deployment_preflight_and_cleanup() -> None:
         def __init__(self) -> None:
             self.runtime = Runtime()
             self.stopped = False
+            self.container_name = "owned-tool-container"
 
         async def start(self) -> None:
             return None
@@ -439,9 +695,10 @@ def test_exact_offline_deployment_preflight_and_cleanup() -> None:
         image=_tool_image_descriptor(),
         deployment_factory=lambda values: (
             deployment
-            if "--network=none" in values["docker_args"]
-            else pytest.fail("network isolation missing")
+            if "--network=cgr-swerex-test-network" in values["docker_args"]
+            else pytest.fail("internal control network missing")
         ),
+        control_network_factory=_fake_control_network,
     )
     assert health.startup_result == "passed"
     assert health.cleanup_passed is True
@@ -449,6 +706,10 @@ def test_exact_offline_deployment_preflight_and_cleanup() -> None:
     assert health.credential_forwarding_observed is False
     assert health.docker_socket_forwarded is False
     assert health.model_endpoint_reachable is False
+    assert health.network_internal is True
+    assert health.control_bind_address == "127.0.0.1"
+    assert health.allocated_control_port == 49152
+    assert health.network_cleanup_passed is True
 
 
 def test_offline_dependency_and_container_startup_failures_are_precise() -> None:
@@ -469,6 +730,7 @@ def test_offline_dependency_and_container_startup_failures_are_precise() -> None
         SWEAgentProviderConfig(),
         image=_tool_image_descriptor(),
         deployment_factory=lambda _values: deployment,
+        control_network_factory=_fake_control_network,
     )
     assert health.startup_result == "failed"
     assert health.failure_classification == "offline_dependency_missing"
@@ -477,6 +739,87 @@ def test_offline_dependency_and_container_startup_failures_are_precise() -> None
     assert classify_bootstrap_failure("Container process terminated") == (
         "tool_container_terminated_during_startup"
     )
+    assert classify_bootstrap_failure("Runtime did not start within timeout") == (
+        "tool_runtime_control_channel_unreachable"
+    )
+
+
+@pytest.mark.parametrize(
+    ("successful_probe", "classification"),
+    [
+        ("1.1.1.1", "tool_external_egress_detected"),
+        ("example.com", "tool_external_egress_detected"),
+        ("pypi.org", "tool_external_egress_detected"),
+        ("/models", "tool_model_endpoint_access_detected"),
+    ],
+)
+def test_external_egress_and_model_endpoint_access_fail_preflight(
+    successful_probe: str, classification: str
+) -> None:
+    class Runtime:
+        async def upload(self, _request: Any) -> None:
+            return None
+
+        async def execute(self, command: Any) -> Any:
+            if command.command == "env":
+                return SimpleNamespace(stdout="PATH=/usr/bin", exit_code=0)
+            probes = ("docker.sock", "1.1.1.1", "example.com", "pypi.org", "/models")
+            if any(probe in command.command for probe in probes):
+                return SimpleNamespace(
+                    stdout="", exit_code=0 if successful_probe in command.command else 1
+                )
+            return SimpleNamespace(stdout="ok", exit_code=0)
+
+    class Deployment:
+        runtime = Runtime()
+        container_name = "owned-tool-container"
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    health = run_offline_tool_preflight(
+        SWEAgentProviderConfig(),
+        image=_tool_image_descriptor(),
+        deployment_factory=lambda _values: Deployment(),
+        control_network_factory=_fake_control_network,
+    )
+    assert health.startup_result == "failed"
+    assert health.failure_classification == classification
+
+
+@pytest.mark.parametrize(
+    ("cleanup", "classification"),
+    [
+        ((False, False), "tool_container_cleanup_failure"),
+        ((True, False), "tool_network_cleanup_failure"),
+    ],
+)
+def test_cleanup_failures_are_precisely_classified(
+    cleanup: tuple[bool, bool], classification: str
+) -> None:
+    class Network(_FakeControlNetwork):
+        def cleanup(self) -> tuple[bool, bool]:
+            return cleanup
+
+    class FailedDeployment:
+        runtime = None
+
+        async def start(self) -> None:
+            raise TimeoutError("runtime did not start within timeout")
+
+        async def stop(self) -> None:
+            return None
+
+    health = run_offline_tool_preflight(
+        SWEAgentProviderConfig(),
+        image=_tool_image_descriptor(),
+        deployment_factory=lambda _values: FailedDeployment(),
+        control_network_factory=lambda _path: Network(),
+    )
+    assert health.failure_classification == classification
 
 
 @pytest.mark.parametrize(
@@ -793,6 +1136,20 @@ def test_process_timeout_and_output_redaction(tmp_path: Path) -> None:
             heartbeat_seconds=1,
             heartbeat=lambda: None,
         )
+    with pytest.raises(ToolSandboxError) as raised:
+        run_bounded_process(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=tmp_path,
+            environment={},
+            timeout_seconds=10,
+            maximum_output_bytes=1024,
+            secrets=(),
+            heartbeat_seconds=1,
+            heartbeat=lambda: (_ for _ in ()).throw(
+                ToolSandboxError("tool_control_port_publicly_exposed", "unsafe binding")
+            ),
+        )
+    assert raised.value.code == "tool_control_port_publicly_exposed"
 
 
 def test_telemetry_can_append_retry_without_reordering(tmp_path: Path) -> None:
@@ -909,9 +1266,10 @@ def test_preflight_failure_aborts_acceptance_before_cases(tmp_path: Path) -> Non
 def test_smoke_gate_requires_positive_real_model_usage(tmp_path: Path) -> None:
     config = SWEAgentProviderConfig()
     values = {
-        "schema_version": "cgr.quantum-repair-provider-smoke/1.0.0",
+        "schema_version": "cgr.quantum-repair-provider-smoke/1.1.0",
         "provider_smoke_passed": True,
         "tool_image_descriptor_sha256": "a" * 64,
+        "tool_network_policy_descriptor_sha256": "d" * 64,
         "endpoint_descriptor_sha256": "b" * 64,
         "agent_descriptor_sha256": "c" * 64,
         "provider_configuration_sha256": sha256_fingerprint(
@@ -928,9 +1286,54 @@ def test_smoke_gate_requires_positive_real_model_usage(tmp_path: Path) -> None:
             path,
             provider_config=config,
             tool_image_sha256="a" * 64,
+            network_policy_sha256="d" * 64,
             endpoint_sha256="b" * 64,
             agent_sha256="c" * 64,
         )
+
+
+def test_smoke_gate_rejects_network_policy_mismatch(tmp_path: Path) -> None:
+    config = SWEAgentProviderConfig()
+    values = {
+        "schema_version": "cgr.quantum-repair-provider-smoke/1.1.0",
+        "provider_smoke_passed": True,
+        "tool_image_descriptor_sha256": "a" * 64,
+        "tool_network_policy_descriptor_sha256": "e" * 64,
+        "endpoint_descriptor_sha256": "b" * 64,
+        "agent_descriptor_sha256": "c" * 64,
+        "provider_configuration_sha256": sha256_fingerprint(
+            config.model_dump(mode="json")
+        ),
+        "model_request_count": 1,
+        "total_model_tokens": 2,
+    }
+    values["report_sha256"] = sha256_fingerprint(values)
+    path = tmp_path / "smoke.json"
+    path.write_text(json.dumps(values), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        _verify_smoke_report(
+            path,
+            provider_config=config,
+            tool_image_sha256="a" * 64,
+            network_policy_sha256="d" * 64,
+            endpoint_sha256="b" * 64,
+            agent_sha256="c" * 64,
+        )
+
+
+def test_replay_requires_exact_network_policy_evidence(tmp_path: Path) -> None:
+    policy = tool_network_policy_descriptor(SWEAgentProviderConfig())
+    path = tmp_path / "tool-network-policy.json"
+    path.write_text(json.dumps(policy.model_dump(mode="json")), encoding="utf-8")
+    assert (
+        _verify_provider_network_policy(tmp_path, policy.descriptor_sha256)
+        == policy.descriptor_sha256
+    )
+    with pytest.raises(ValueError, match="substituted"):
+        _verify_provider_network_policy(tmp_path, "f" * 64)
+    path.unlink()
+    with pytest.raises(ValueError, match="missing"):
+        _verify_provider_network_policy(tmp_path, policy.descriptor_sha256)
 
 
 def test_verification_scripts_require_suitable_python_and_no_false_success() -> None:
@@ -1045,5 +1448,11 @@ def test_real_offline_tool_deployment_when_docker_is_available() -> None:
     config = load_provider_config(Path(config_path))
     health = run_offline_tool_preflight(config)
     assert health.startup_result == "passed"
-    assert health.network_mode == "none"
+    assert health.control_network_type == "docker_internal"
+    assert health.network_internal is True
+    assert health.control_bind_address == "127.0.0.1"
+    assert health.public_port_exposure_observed is False
+    assert health.direct_external_ip_reachable is False
+    assert health.external_hostname_reachable is False
+    assert health.pypi_reachable is False
     assert health.infrastructure_package_install_attempt_observed is False

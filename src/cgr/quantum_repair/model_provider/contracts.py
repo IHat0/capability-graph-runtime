@@ -12,8 +12,10 @@ from cgr.science.canonical import validate_identifier, validate_sha256
 ENDPOINT_SCHEMA = "cgr.quantum-repair-model-endpoint/1.0.0"
 AGENT_SCHEMA = "cgr.quantum-repair-agent-descriptor/1.0.0"
 AGENT_SCHEMA_V1_1 = "cgr.quantum-repair-agent-descriptor/1.1.0"
-TOOL_IMAGE_SCHEMA = "cgr.quantum-sweagent-tool-image/1.0.0"
-TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.0.0"
+AGENT_SCHEMA_V1_2 = "cgr.quantum-repair-agent-descriptor/1.2.0"
+TOOL_IMAGE_SCHEMA = "cgr.quantum-sweagent-tool-image/1.1.0"
+TOOL_NETWORK_POLICY_SCHEMA = "cgr.quantum-sweagent-tool-network-policy/1.0.0"
+TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.1.0"
 BUDGET_SCHEMA = "cgr.quantum-repair-provider-budget/1.0.0"
 PROMPT_SCHEMA = "cgr.quantum-repair-model-prompt/1.0.0"
 REQUEST_SCHEMA = "cgr.quantum-repair-provider-request/1.0.0"
@@ -98,7 +100,7 @@ class ModelEndpointDescriptor(CanonicalModel):
 
 
 class AgentDescriptor(CanonicalModel):
-    schema_version: str = AGENT_SCHEMA_V1_1
+    schema_version: str = AGENT_SCHEMA_V1_2
     agent_type: Literal["pristine-sweagent"] = "pristine-sweagent"
     pristine_source_commit: str
     source_tree_clean: bool
@@ -108,12 +110,13 @@ class AgentDescriptor(CanonicalModel):
     patch_output_mechanism: Literal["official-trajectory-prediction"]
     executable_identity_sha256: str
     tool_image_descriptor_sha256: str | None = None
+    tool_network_policy_descriptor_sha256: str | None = None
     descriptor_sha256: str
 
     @field_validator("schema_version")
     @classmethod
     def valid_schema(cls, value: str) -> str:
-        if value not in {AGENT_SCHEMA, AGENT_SCHEMA_V1_1}:
+        if value not in {AGENT_SCHEMA, AGENT_SCHEMA_V1_1, AGENT_SCHEMA_V1_2}:
             raise ValueError("Unsupported agent descriptor schema.")
         return value
 
@@ -129,6 +132,7 @@ class AgentDescriptor(CanonicalModel):
         "tool_environment_sha256",
         "executable_identity_sha256",
         "tool_image_descriptor_sha256",
+        "tool_network_policy_descriptor_sha256",
         "descriptor_sha256",
     )
     @classmethod
@@ -145,10 +149,15 @@ class AgentDescriptor(CanonicalModel):
         if not self.source_tree_clean:
             raise ValueError("SWE-agent source must be pristine.")
         if (
-            self.schema_version == AGENT_SCHEMA_V1_1
+            self.schema_version in {AGENT_SCHEMA_V1_1, AGENT_SCHEMA_V1_2}
             and self.tool_image_descriptor_sha256 is None
         ):
             raise ValueError("Agent descriptor requires an immutable tool image.")
+        if (
+            self.schema_version == AGENT_SCHEMA_V1_2
+            and self.tool_network_policy_descriptor_sha256 is None
+        ):
+            raise ValueError("Agent descriptor requires a tool network policy.")
         if self.descriptor_sha256 != self.fingerprint:
             raise ValueError("Agent descriptor hash was not recomputed.")
         return self
@@ -161,7 +170,9 @@ class ToolSandboxImageDescriptor(CanonicalModel):
     build_schema_version: str
     build_input_sha256: str
     offline_bootstrap: Literal[True] = True
-    network_policy: Literal["none"] = "none"
+    network_policy: Literal["docker-internal-loopback-control"] = (
+        "docker-internal-loopback-control"
+    )
     required_sweagent_commit: str
     swerex_version: str
     runtime_identity: str
@@ -199,15 +210,63 @@ class ToolSandboxImageDescriptor(CanonicalModel):
         return self
 
 
+class ToolNetworkPolicyDescriptor(CanonicalModel):
+    schema_version: str = TOOL_NETWORK_POLICY_SCHEMA
+    external_egress_disabled: Literal[True] = True
+    control_network_type: Literal["docker_internal"] = "docker_internal"
+    control_network_driver: Literal["bridge"] = "bridge"
+    control_bind_address: Literal["127.0.0.1"] = "127.0.0.1"
+    control_container_port: Literal[8000] = 8000
+    public_port_exposure: Literal[False] = False
+    model_endpoint_access: Literal[False] = False
+    invocation_scoped_ownership: Literal[True] = True
+    descriptor_sha256: str
+
+    @field_validator("schema_version")
+    @classmethod
+    def valid_schema(cls, value: str) -> str:
+        if value != TOOL_NETWORK_POLICY_SCHEMA:
+            raise ValueError("Unsupported tool network policy schema.")
+        return value
+
+    @field_validator("descriptor_sha256")
+    @classmethod
+    def digest(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    def canonical_identity(self) -> Any:
+        value = self.model_dump(mode="json")
+        value.pop("descriptor_sha256", None)
+        return value
+
+    @model_validator(mode="after")
+    def verified(self) -> Self:
+        if self.descriptor_sha256 != self.fingerprint:
+            raise ValueError("Tool network policy hash was not recomputed.")
+        return self
+
+
 class ToolSandboxHealthArtifact(CanonicalModel):
     schema_version: str = TOOL_HEALTH_SCHEMA
     tool_image_descriptor_sha256: str
+    tool_network_policy_descriptor_sha256: str
     deployment_identity_sha256: str
-    network_mode: Literal["none"]
+    control_network_type: Literal["docker_internal"]
+    network_identifier_sha256: str
+    network_ownership_nonce: str
+    network_internal: bool
+    control_bind_address: Literal["127.0.0.1"]
+    allocated_control_port: int = Field(ge=0, le=65535)
+    public_port_exposure_observed: bool
+    direct_external_ip_reachable: bool
+    external_hostname_reachable: bool
+    pypi_reachable: bool
     startup_result: Literal["passed", "failed"]
     shell_smoke_passed: bool
     workspace_write_passed: bool
     cleanup_passed: bool
+    container_cleanup_passed: bool
+    network_cleanup_passed: bool
     credential_forwarding_observed: bool
     docker_socket_forwarded: bool
     model_endpoint_reachable: bool
@@ -225,12 +284,21 @@ class ToolSandboxHealthArtifact(CanonicalModel):
 
     @field_validator(
         "tool_image_descriptor_sha256",
+        "tool_network_policy_descriptor_sha256",
         "deployment_identity_sha256",
+        "network_identifier_sha256",
         "health_artifact_sha256",
     )
     @classmethod
     def digests(cls, value: str) -> str:
         return validate_sha256(value)
+
+    @field_validator("network_ownership_nonce")
+    @classmethod
+    def ownership_nonce(cls, value: str) -> str:
+        if len(value) != 32 or any(item not in "0123456789abcdef" for item in value):
+            raise ValueError("Tool network ownership nonce is malformed.")
+        return value
 
     def canonical_identity(self) -> Any:
         value = self.model_dump(mode="json")
@@ -243,6 +311,14 @@ class ToolSandboxHealthArtifact(CanonicalModel):
             not self.shell_smoke_passed
             or not self.workspace_write_passed
             or not self.cleanup_passed
+            or not self.container_cleanup_passed
+            or not self.network_cleanup_passed
+            or not self.network_internal
+            or self.allocated_control_port == 0
+            or self.public_port_exposure_observed
+            or self.direct_external_ip_reachable
+            or self.external_hostname_reachable
+            or self.pypi_reachable
             or self.credential_forwarding_observed
             or self.docker_socket_forwarded
             or self.model_endpoint_reachable

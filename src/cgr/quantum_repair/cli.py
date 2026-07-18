@@ -181,7 +181,10 @@ def provider_check_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-root", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        from .model_provider.agent import TOOL_DOCKER_ARGS, verify_pristine_sweagent
+        from .model_provider.agent import (
+            tool_network_policy_descriptor,
+            verify_pristine_sweagent,
+        )
         from .model_provider.config import load_provider_config
         from .model_provider.endpoint import verify_model_endpoint
         from .model_provider.tool_sandbox import (
@@ -210,8 +213,14 @@ def provider_check_main(argv: list[str] | None = None) -> int:
         probe = args.evidence_root / ".cgr-provider-write-probe"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-        health = run_offline_tool_preflight(config, image=tool_image)
+        health = run_offline_tool_preflight(
+            config, image=tool_image, lifecycle_root=args.evidence_root / "private"
+        )
         write_evidence(args.evidence_root / "tool-image-descriptor.json", tool_image)
+        write_evidence(
+            args.evidence_root / "tool-network-policy.json",
+            tool_network_policy_descriptor(config),
+        )
         write_evidence(args.evidence_root / "provider-preflight.json", health)
         if health.startup_result != "passed":
             raise ValueError(
@@ -229,7 +238,9 @@ def provider_check_main(argv: list[str] | None = None) -> int:
             "offline_bootstrap_passed": True,
             "sweagent_commit": agent.pristine_source_commit,
             "sweagent_clean": agent.source_tree_clean,
-            "tool_network_disabled": "--network=none" in TOOL_DOCKER_ARGS,
+            "tool_external_egress_disabled": config.tool_external_egress_disabled,
+            "tool_control_network_type": health.control_network_type,
+            "tool_control_bind_address": health.control_bind_address,
             "docker_socket_forwarded": False,
             "credential_forwarding": False,
         }
@@ -248,6 +259,7 @@ def tool_check_main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         from .model_provider.config import load_provider_config
+        from .model_provider.agent import tool_network_policy_descriptor
         from .model_provider.tool_sandbox import (
             inspect_tool_image,
             run_offline_tool_preflight,
@@ -256,16 +268,23 @@ def tool_check_main(argv: list[str] | None = None) -> int:
 
         config = load_provider_config(args.provider_config)
         image = inspect_tool_image(config)
-        health = run_offline_tool_preflight(config, image=image)
+        health = run_offline_tool_preflight(
+            config, image=image, lifecycle_root=args.evidence_root / "private"
+        )
         args.evidence_root.mkdir(parents=True, exist_ok=True)
         write_evidence(args.evidence_root / "tool-image-descriptor.json", image)
+        write_evidence(
+            args.evidence_root / "tool-network-policy.json",
+            tool_network_policy_descriptor(config),
+        )
         write_evidence(args.evidence_root / "provider-preflight.json", health)
         result = {
             "tool_sandbox_preflight_passed": health.startup_result == "passed",
             "tool_image_id": image.image_id,
             "tool_image_descriptor_sha256": image.descriptor_sha256,
             "health_artifact_sha256": health.health_artifact_sha256,
-            "network_mode": health.network_mode,
+            "control_network_type": health.control_network_type,
+            "control_bind_address": health.control_bind_address,
             "failure_classification": health.failure_classification,
         }
     except Exception as exc:

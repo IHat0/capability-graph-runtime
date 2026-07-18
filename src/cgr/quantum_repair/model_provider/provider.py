@@ -21,6 +21,7 @@ from .agent import (
     build_official_command,
     child_environment,
     provider_overlay,
+    tool_network_policy_descriptor,
     verify_pristine_sweagent,
 )
 from .config import SWEAgentProviderConfig
@@ -39,9 +40,11 @@ from .recovery import InvocationStateStore, recover_attempt_invocations
 from .telemetry import ProviderTelemetryLog
 from .tool_sandbox import (
     ToolSandboxError,
+    OwnedControlNetwork,
     classify_bootstrap_failure,
     infrastructure_install_attempt_observed,
     inspect_tool_image,
+    recover_stale_control_networks,
 )
 
 
@@ -109,6 +112,7 @@ class SWEAgentOpenAICompatibleRepairProvider:
         source_manifest: SourceManifest,
     ) -> QuantumRepairPatch:
         invocation_root = source_root.parent / "provider-invocations"
+        recover_stale_control_networks(invocation_root)
         recovered, sequence, _ = recover_attempt_invocations(
             invocation_root,
             directive_sha256=directive.directive_sha256,
@@ -184,6 +188,7 @@ class SWEAgentOpenAICompatibleRepairProvider:
         started = time.monotonic()
         api_key = invocation_config.api_key(self.environment)
         secrets = (api_key, str(directory.resolve()), str(source_root.resolve()))
+        control_network: OwnedControlNetwork | None = None
         try:
             endpoint = verify_model_endpoint(
                 base_url=invocation_config.base_url,
@@ -198,11 +203,21 @@ class SWEAgentOpenAICompatibleRepairProvider:
                 "verified",
                 model_identifier=endpoint.observed_model_identifier,
             )
-            overlay = provider_overlay(invocation_config)
             tool_image = inspect_tool_image(invocation_config)
-            agent = verify_pristine_sweagent(
-                invocation_config, overlay, tool_image_descriptor=tool_image
+            private = directory / "private"
+            private.mkdir(exist_ok=True)
+            control_network = OwnedControlNetwork.create(
+                private / "tool-network-state.json"
             )
+            overlay = provider_overlay(
+                invocation_config,
+                control_network_name=control_network.name,
+                network_ownership_nonce=control_network.ownership_nonce,
+            )
+            agent = verify_pristine_sweagent(
+                invocation_config, tool_image_descriptor=tool_image
+            )
+            network_policy = tool_network_policy_descriptor(invocation_config)
             prompt = build_model_prompt(
                 directive=directive,
                 source_root=source_root,
@@ -217,6 +232,7 @@ class SWEAgentOpenAICompatibleRepairProvider:
             write_evidence(directory / "model-endpoint.json", endpoint)
             write_evidence(directory / "agent-descriptor.json", agent)
             write_evidence(directory / "tool-image-descriptor.json", tool_image)
+            write_evidence(directory / "tool-network-policy.json", network_policy)
             write_evidence(directory / "model-prompt.json", prompt)
             request_values = {
                 "provider_invocation_identifier": identifier,
@@ -237,7 +253,6 @@ class SWEAgentOpenAICompatibleRepairProvider:
                 ProviderInvocationRequest, request_values, "request_content_sha256"
             )
             store.persist_request(request)
-            private = directory / "private"
             workspace = private / "agent-workspace"
             copy_source_tree(source_root, workspace)
             _initialize_repository(workspace)
@@ -267,9 +282,15 @@ class SWEAgentOpenAICompatibleRepairProvider:
             )
             store.transition("running")
             last_heartbeat = 0.0
+            control_channel_observed = False
 
             def heartbeat() -> None:
-                nonlocal last_heartbeat
+                nonlocal control_channel_observed, last_heartbeat
+                if not control_channel_observed:
+                    control_channel_observed = (
+                        control_network is not None
+                        and control_network.inspect_active_container() is not None
+                    )
                 now = time.monotonic()
                 if now - last_heartbeat >= invocation_config.heartbeat_seconds:
                     store.heartbeat()
@@ -325,6 +346,13 @@ class SWEAgentOpenAICompatibleRepairProvider:
                         and infrastructure_install_attempt_observed(process.stderr)
                     ),
                 )
+            if not control_channel_observed:
+                raise ToolSandboxError(
+                    "tool_runtime_control_channel_unreachable",
+                    "The official SWE-ReX control channel was not observed.",
+                )
+            _release_control_network(control_network)
+            control_network = None
             patch, prediction_sha, prediction_path = extract_official_patch(
                 output_directory=output_directory,
                 source_root=source_root,
@@ -370,7 +398,7 @@ class SWEAgentOpenAICompatibleRepairProvider:
                 tool_call_count=trajectory.tool_call_count,
             )
             after = verify_pristine_sweagent(
-                invocation_config, overlay, tool_image_descriptor=tool_image
+                invocation_config, tool_image_descriptor=tool_image
             )
             if after.descriptor_sha256 != agent.descriptor_sha256:
                 raise ValueError("SWE-agent source identity changed during invocation.")
@@ -406,11 +434,31 @@ class SWEAgentOpenAICompatibleRepairProvider:
             self.elapsed_seconds += result.elapsed_seconds
             return patch
         except Exception as exc:
+            failure = exc
+            if control_network is not None:
+                try:
+                    _release_control_network(control_network)
+                except ToolSandboxError as cleanup_error:
+                    failure = cleanup_error
             self.elapsed_seconds += time.monotonic() - started
             if self.crash_injector is not None:
                 raise
-            _persist_failure(store, telemetry, exc, started)
-            raise
+            _persist_failure(store, telemetry, failure, started)
+            raise failure
+
+
+def _release_control_network(network: OwnedControlNetwork) -> None:
+    container_cleanup, network_cleanup = network.cleanup()
+    if not container_cleanup:
+        raise ToolSandboxError(
+            "tool_container_cleanup_failure",
+            "The invocation tool container could not be removed.",
+        )
+    if not network_cleanup:
+        raise ToolSandboxError(
+            "tool_network_cleanup_failure",
+            "The invocation tool control network could not be removed.",
+        )
 
 
 def _result(

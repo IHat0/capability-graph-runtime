@@ -1,5 +1,5 @@
 {
-  "schema_version": "cgr.quantum-sweagent-tool-image-build/1.0.0",
+  "schema_version": "cgr.quantum-sweagent-tool-image-build/1.1.0",
   "base_image_policy": "caller-supplied-immutable-repository-digest",
   "dockerfile": "Dockerfile",
   "requirements_lock": "requirements.lock",
@@ -7,6 +7,9 @@
   "required_sweagent_commit": "0f3acafacabc0def8cc76b4e48acb4b6cf302cb9",
   "required_swerex_version": "1.4.0",
   "offline_bootstrap": true,
-  "runtime_network_policy": "none",
+  "runtime_external_egress": "disabled",
+  "runtime_control_network": "invocation-scoped-docker-internal",
+  "runtime_control_bind_address": "127.0.0.1",
+  "runtime_public_port_exposure": false,
   "runtime_package_installation": "prohibited"
 }

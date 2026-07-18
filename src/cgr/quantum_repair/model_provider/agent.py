@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,21 +17,43 @@ from .contracts import (
     AgentDescriptor,
     ModelEndpointDescriptor,
     ToolSandboxImageDescriptor,
+    ToolNetworkPolicyDescriptor,
     seal_contract,
 )
 
-TOOL_DOCKER_ARGS = (
-    "--network=none",
+TOOL_NETWORK_NAME_PLACEHOLDER = "cgr-swerex-invocation-network"
+TOOL_NETWORK_NONCE_PLACEHOLDER = "0" * 32
+TOOL_NETWORK_OWNERSHIP_LABEL = "org.cgr.swerex-control.owner-nonce"
+TOOL_DOCKER_RESOURCE_ARGS = (
     "--cpus=2",
     "--memory=2g",
     "--pids-limit=128",
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
 )
+TOOL_DOCKER_ARGS = (
+    f"--network={TOOL_NETWORK_NAME_PLACEHOLDER}",
+    f"--label={TOOL_NETWORK_OWNERSHIP_LABEL}={TOOL_NETWORK_NONCE_PLACEHOLDER}",
+    *TOOL_DOCKER_RESOURCE_ARGS,
+)
 
 
-def provider_overlay(config: SWEAgentProviderConfig) -> str:
-    docker_args = "\n".join(f"      - {json.dumps(item)}" for item in TOOL_DOCKER_ARGS)
+def provider_overlay(
+    config: SWEAgentProviderConfig,
+    *,
+    control_network_name: str = TOOL_NETWORK_NAME_PLACEHOLDER,
+    network_ownership_nonce: str = TOOL_NETWORK_NONCE_PLACEHOLDER,
+) -> str:
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", control_network_name):
+        raise ValueError("Tool control network name is unsafe.")
+    if not re.fullmatch(r"[0-9a-f]{32}", network_ownership_nonce):
+        raise ValueError("Tool control network ownership nonce is malformed.")
+    arguments = (
+        f"--network={control_network_name}",
+        f"--label={TOOL_NETWORK_OWNERSHIP_LABEL}={network_ownership_nonce}",
+        *TOOL_DOCKER_RESOURCE_ARGS,
+    )
+    docker_args = "\n".join(f"      - {json.dumps(item)}" for item in arguments)
     return f"""env:
   deployment:
     type: docker
@@ -71,6 +94,22 @@ agent:
 """
 
 
+def tool_network_policy_descriptor(
+    config: SWEAgentProviderConfig,
+) -> ToolNetworkPolicyDescriptor:
+    values = {
+        "external_egress_disabled": config.tool_external_egress_disabled,
+        "control_network_type": config.tool_control_network_type,
+        "control_network_driver": config.tool_control_network_driver,
+        "control_bind_address": config.tool_control_bind_address,
+        "control_container_port": config.tool_control_container_port,
+        "public_port_exposure": config.tool_public_port_exposure,
+        "model_endpoint_access": config.tool_model_endpoint_access,
+        "invocation_scoped_ownership": True,
+    }
+    return seal_contract(ToolNetworkPolicyDescriptor, values, "descriptor_sha256")
+
+
 def verify_pristine_sweagent(
     config: SWEAgentProviderConfig,
     overlay: str | None = None,
@@ -99,6 +138,7 @@ def verify_pristine_sweagent(
     from .tool_sandbox import inspect_tool_image
 
     image = tool_image_descriptor or inspect_tool_image(config)
+    network_policy = tool_network_policy_descriptor(config)
     tool_identity = {
         "image": config.tool_container_image,
         "pull": config.tool_container_pull_policy,
@@ -107,6 +147,7 @@ def verify_pristine_sweagent(
         "docker_socket_mounted": False,
         "host_home_mounted": False,
         "tool_image_descriptor_sha256": image.descriptor_sha256,
+        "tool_network_policy_descriptor_sha256": network_policy.descriptor_sha256,
     }
     values = {
         "pristine_source_commit": commit,
@@ -117,6 +158,7 @@ def verify_pristine_sweagent(
         "patch_output_mechanism": "official-trajectory-prediction",
         "executable_identity_sha256": executable_sha,
         "tool_image_descriptor_sha256": image.descriptor_sha256,
+        "tool_network_policy_descriptor_sha256": network_policy.descriptor_sha256,
     }
     return seal_contract(AgentDescriptor, values, "descriptor_sha256")
 
