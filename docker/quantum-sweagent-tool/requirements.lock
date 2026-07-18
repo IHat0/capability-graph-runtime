@@ -1,0 +1,12 @@
+# Exact top-level runtime inputs for the pinned SWE-ReX bootstrap.
+# Transitive resolution is captured by Docker image ID and the build provenance file.
+pipx==1.7.1
+swe-rex==1.4.0
+fastapi==0.139.0
+uvicorn==0.51.0
+requests==2.34.2
+pydantic==2.13.4
+pexpect==4.9.0
+bashlex==0.18
+python-multipart==0.0.32
+rich==15.0.0

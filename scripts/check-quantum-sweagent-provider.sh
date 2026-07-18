@@ -2,11 +2,14 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-provider_config="${1:-$repo_root/benchmark-manifests/quantum-repair/sweagent-qwen-provider-v1.json}"
+provider_config="${1:?usage: check-quantum-sweagent-provider.sh PROVIDER_CONFIG [EVIDENCE_ROOT]}"
 evidence_root="${2:-$HOME/cgr-evidence/quantum-model-repair/provider-health}"
-host_python="${CGR_HOST_PYTHON:-python3}"
+cgr_python="${CGR_PYTHON:?Set CGR_PYTHON to the project Python executable.}"
 : "${CGR_REPAIR_MODEL_API_KEY:?Set CGR_REPAIR_MODEL_API_KEY without printing it.}"
 export CGR_SWE_AGENT_SOURCE="$repo_root/.swe-agent-src"
+PYTHONPATH="$repo_root/src" "$cgr_python" -c 'import pydantic, cgr' || {
+  echo "CGR_PYTHON cannot import required project dependencies." >&2; exit 2;
+}
 
 test "$(git -C "$repo_root/.swe-agent-src" rev-parse HEAD)" = \
   "0f3acafacabc0def8cc76b4e48acb4b6cf302cb9"
@@ -19,7 +22,7 @@ test -w "$evidence_root"
 log="$evidence_root/provider-health.log"
 
 set +e
-PYTHONPATH="$repo_root/src" "$host_python" -m cgr.quantum_repair.cli provider-check \
+PYTHONPATH="$repo_root/src" "$cgr_python" -m cgr.quantum_repair.cli provider-check \
   --provider sweagent-openai-compatible \
   --provider-config "$provider_config" \
   --evidence-root "$evidence_root" 2>&1 | tee "$log"

@@ -11,6 +11,9 @@ from cgr.science.canonical import validate_identifier, validate_sha256
 
 ENDPOINT_SCHEMA = "cgr.quantum-repair-model-endpoint/1.0.0"
 AGENT_SCHEMA = "cgr.quantum-repair-agent-descriptor/1.0.0"
+AGENT_SCHEMA_V1_1 = "cgr.quantum-repair-agent-descriptor/1.1.0"
+TOOL_IMAGE_SCHEMA = "cgr.quantum-sweagent-tool-image/1.0.0"
+TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.0.0"
 BUDGET_SCHEMA = "cgr.quantum-repair-provider-budget/1.0.0"
 PROMPT_SCHEMA = "cgr.quantum-repair-model-prompt/1.0.0"
 REQUEST_SCHEMA = "cgr.quantum-repair-provider-request/1.0.0"
@@ -95,7 +98,7 @@ class ModelEndpointDescriptor(CanonicalModel):
 
 
 class AgentDescriptor(CanonicalModel):
-    schema_version: str = AGENT_SCHEMA
+    schema_version: str = AGENT_SCHEMA_V1_1
     agent_type: Literal["pristine-sweagent"] = "pristine-sweagent"
     pristine_source_commit: str
     source_tree_clean: bool
@@ -104,12 +107,13 @@ class AgentDescriptor(CanonicalModel):
     agent_version: str
     patch_output_mechanism: Literal["official-trajectory-prediction"]
     executable_identity_sha256: str
+    tool_image_descriptor_sha256: str | None = None
     descriptor_sha256: str
 
     @field_validator("schema_version")
     @classmethod
     def valid_schema(cls, value: str) -> str:
-        if value != AGENT_SCHEMA:
+        if value not in {AGENT_SCHEMA, AGENT_SCHEMA_V1_1}:
             raise ValueError("Unsupported agent descriptor schema.")
         return value
 
@@ -124,8 +128,61 @@ class AgentDescriptor(CanonicalModel):
         "configuration_sha256",
         "tool_environment_sha256",
         "executable_identity_sha256",
+        "tool_image_descriptor_sha256",
         "descriptor_sha256",
     )
+    @classmethod
+    def digests(cls, value: str | None) -> str | None:
+        return validate_sha256(value) if value is not None else None
+
+    def canonical_identity(self) -> Any:
+        value = self.model_dump(mode="json")
+        value.pop("descriptor_sha256", None)
+        return value
+
+    @model_validator(mode="after")
+    def verified(self) -> Self:
+        if not self.source_tree_clean:
+            raise ValueError("SWE-agent source must be pristine.")
+        if (
+            self.schema_version == AGENT_SCHEMA_V1_1
+            and self.tool_image_descriptor_sha256 is None
+        ):
+            raise ValueError("Agent descriptor requires an immutable tool image.")
+        if self.descriptor_sha256 != self.fingerprint:
+            raise ValueError("Agent descriptor hash was not recomputed.")
+        return self
+
+
+class ToolSandboxImageDescriptor(CanonicalModel):
+    schema_version: str = TOOL_IMAGE_SCHEMA
+    image_repository: str
+    image_id: str
+    build_schema_version: str
+    build_input_sha256: str
+    offline_bootstrap: Literal[True] = True
+    network_policy: Literal["none"] = "none"
+    required_sweagent_commit: str
+    swerex_version: str
+    runtime_identity: str
+    descriptor_sha256: str
+
+    @field_validator("schema_version")
+    @classmethod
+    def valid_schema(cls, value: str) -> str:
+        if value != TOOL_IMAGE_SCHEMA:
+            raise ValueError("Unsupported tool image descriptor schema.")
+        return value
+
+    @field_validator("image_id")
+    @classmethod
+    def immutable_image(cls, value: str) -> str:
+        if not value.startswith("sha256:") or len(value) != 71:
+            raise ValueError("Tool image must use an exact sha256 image ID.")
+        validate_sha256(value.removeprefix("sha256:"))
+        return value
+
+    @field_validator("build_input_sha256", "runtime_identity", "descriptor_sha256")
     @classmethod
     def digests(cls, value: str) -> str:
         return validate_sha256(value)
@@ -137,10 +194,63 @@ class AgentDescriptor(CanonicalModel):
 
     @model_validator(mode="after")
     def verified(self) -> Self:
-        if not self.source_tree_clean:
-            raise ValueError("SWE-agent source must be pristine.")
         if self.descriptor_sha256 != self.fingerprint:
-            raise ValueError("Agent descriptor hash was not recomputed.")
+            raise ValueError("Tool image descriptor hash was not recomputed.")
+        return self
+
+
+class ToolSandboxHealthArtifact(CanonicalModel):
+    schema_version: str = TOOL_HEALTH_SCHEMA
+    tool_image_descriptor_sha256: str
+    deployment_identity_sha256: str
+    network_mode: Literal["none"]
+    startup_result: Literal["passed", "failed"]
+    shell_smoke_passed: bool
+    workspace_write_passed: bool
+    cleanup_passed: bool
+    credential_forwarding_observed: bool
+    docker_socket_forwarded: bool
+    model_endpoint_reachable: bool
+    infrastructure_package_install_attempt_observed: bool
+    runtime_seconds: float = Field(ge=0)
+    failure_classification: str | None
+    health_artifact_sha256: str
+
+    @field_validator("schema_version")
+    @classmethod
+    def valid_schema(cls, value: str) -> str:
+        if value != TOOL_HEALTH_SCHEMA:
+            raise ValueError("Unsupported tool sandbox health schema.")
+        return value
+
+    @field_validator(
+        "tool_image_descriptor_sha256",
+        "deployment_identity_sha256",
+        "health_artifact_sha256",
+    )
+    @classmethod
+    def digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    def canonical_identity(self) -> Any:
+        value = self.model_dump(mode="json")
+        value.pop("health_artifact_sha256", None)
+        return value
+
+    @model_validator(mode="after")
+    def verified(self) -> Self:
+        if self.startup_result == "passed" and (
+            not self.shell_smoke_passed
+            or not self.workspace_write_passed
+            or not self.cleanup_passed
+            or self.credential_forwarding_observed
+            or self.docker_socket_forwarded
+            or self.model_endpoint_reachable
+            or self.infrastructure_package_install_attempt_observed
+        ):
+            raise ValueError("Passing tool health evidence violates isolation policy.")
+        if self.health_artifact_sha256 != self.fingerprint:
+            raise ValueError("Tool health artifact hash was not recomputed.")
         return self
 
 
@@ -371,6 +481,7 @@ class ProviderInvocationResult(CanonicalModel):
     total_tokens: int = Field(ge=0)
     tool_call_count: int = Field(ge=0)
     tool_output_bytes: int = Field(ge=0)
+    infrastructure_package_install_attempt_observed: bool = False
     trajectory_identity: str | None
     prediction_identity: str | None
     proposed_patch_identity: str | None

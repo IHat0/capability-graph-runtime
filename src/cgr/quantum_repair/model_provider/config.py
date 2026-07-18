@@ -21,7 +21,7 @@ class SWEAgentProviderConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: str = "cgr.quantum-repair-sweagent-provider-config/1.0.0"
+    schema_version: str = "cgr.quantum-repair-sweagent-provider-config/1.1.0"
     provider_type: Literal["sweagent-openai-compatible"] = "sweagent-openai-compatible"
     base_url: str = DEFAULT_BASE_URL
     model_identifier: str = DEFAULT_MODEL
@@ -33,7 +33,14 @@ class SWEAgentProviderConfig(BaseModel):
     sweagent_executable: str = "sweagent"
     required_sweagent_commit: str = REQUIRED_SWEAGENT_COMMIT
     sweagent_version: str = "1.1.0"
-    tool_container_image: str = "python:3.12"
+    tool_container_image_repository: str = "cgr-quantum-sweagent-tool"
+    tool_container_image: str = "sha256:" + "0" * 64
+    tool_image_build_schema_version: str = "cgr.quantum-sweagent-tool-image-build/1.0.0"
+    tool_image_build_input_sha256: str = "0" * 64
+    tool_image_offline_bootstrap: Literal[True] = True
+    tool_container_network_policy: Literal["none"] = "none"
+    required_swerex_version: Literal["1.4.0"] = "1.4.0"
+    tool_startup_timeout_seconds: int = Field(default=180, gt=0, le=600)
     tool_container_pull_policy: Literal["never"] = "never"
     guidance_mode: Literal["baseline", "cgr"] = "cgr"
     source_context_maximum_bytes: int = Field(default=96 * 1024, gt=0, le=512 * 1024)
@@ -43,8 +50,26 @@ class SWEAgentProviderConfig(BaseModel):
     @field_validator("schema_version")
     @classmethod
     def valid_schema(cls, value: str) -> str:
-        if value != "cgr.quantum-repair-sweagent-provider-config/1.0.0":
+        if value != "cgr.quantum-repair-sweagent-provider-config/1.1.0":
             raise ValueError("Unsupported SWE-agent provider configuration schema.")
+        return value
+
+    @field_validator("tool_container_image")
+    @classmethod
+    def immutable_tool_image(cls, value: str) -> str:
+        if not value.startswith("sha256:") or len(value) != 71:
+            raise ValueError("Tool container image must be an exact sha256 image ID.")
+        if any(character not in "0123456789abcdef" for character in value[7:]):
+            raise ValueError("Tool container image ID is malformed.")
+        return value
+
+    @field_validator("tool_image_build_input_sha256")
+    @classmethod
+    def build_input_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError("Tool image build-input identity is malformed.")
         return value
 
     @field_validator("api_key_environment_variable")
@@ -93,6 +118,10 @@ def load_provider_config(
         "request_timeout_seconds": values.get("CGR_REPAIR_MODEL_TIMEOUT_SECONDS"),
         "sweagent_source": values.get("CGR_SWE_AGENT_SOURCE"),
         "sweagent_executable": values.get("CGR_SWE_AGENT_EXECUTABLE"),
+        "tool_container_image": values.get("CGR_SWEAGENT_TOOL_IMAGE"),
+        "tool_image_build_input_sha256": values.get(
+            "CGR_SWEAGENT_TOOL_BUILD_INPUT_SHA256"
+        ),
     }
     for key, value in overrides.items():
         if value not in (None, ""):

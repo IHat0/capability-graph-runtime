@@ -12,7 +12,12 @@ from pathlib import Path
 from cgr.science import sha256_fingerprint
 
 from .config import SWEAgentProviderConfig
-from .contracts import AgentDescriptor, ModelEndpointDescriptor, seal_contract
+from .contracts import (
+    AgentDescriptor,
+    ModelEndpointDescriptor,
+    ToolSandboxImageDescriptor,
+    seal_contract,
+)
 
 TOOL_DOCKER_ARGS = (
     "--network=none",
@@ -31,6 +36,9 @@ def provider_overlay(config: SWEAgentProviderConfig) -> str:
     type: docker
     image: {json.dumps(config.tool_container_image)}
     pull: never
+    startup_timeout: {config.tool_startup_timeout_seconds}
+    python_standalone_dir: null
+    remove_container: true
     docker_args:
 {docker_args}
   post_startup_commands:
@@ -54,7 +62,8 @@ agent:
   tools:
     bundles:
       - path: tools/registry
-      - path: tools/edit_anthropic
+      - path: tools/search
+      - path: tools/windowed
       - path: tools/review_on_submit_m
     enable_bash_tool: true
     parse_function:
@@ -63,7 +72,9 @@ agent:
 
 
 def verify_pristine_sweagent(
-    config: SWEAgentProviderConfig, overlay: str | None = None
+    config: SWEAgentProviderConfig,
+    overlay: str | None = None,
+    tool_image_descriptor: ToolSandboxImageDescriptor | None = None,
 ) -> AgentDescriptor:
     source = config.sweagent_source.resolve(strict=True)
     executable = resolve_executable(config.sweagent_executable)
@@ -85,6 +96,9 @@ def verify_pristine_sweagent(
         (source / "config/default.yaml").read_bytes() + overlay_value.encode("utf-8")
     ).hexdigest()
     executable_sha = hashlib.sha256(executable.read_bytes()).hexdigest()
+    from .tool_sandbox import inspect_tool_image
+
+    image = tool_image_descriptor or inspect_tool_image(config)
     tool_identity = {
         "image": config.tool_container_image,
         "pull": config.tool_container_pull_policy,
@@ -92,6 +106,7 @@ def verify_pristine_sweagent(
         "credential_forwarding": False,
         "docker_socket_mounted": False,
         "host_home_mounted": False,
+        "tool_image_descriptor_sha256": image.descriptor_sha256,
     }
     values = {
         "pristine_source_commit": commit,
@@ -101,6 +116,7 @@ def verify_pristine_sweagent(
         "agent_version": config.sweagent_version,
         "patch_output_mechanism": "official-trajectory-prediction",
         "executable_identity_sha256": executable_sha,
+        "tool_image_descriptor_sha256": image.descriptor_sha256,
     }
     return seal_contract(AgentDescriptor, values, "descriptor_sha256")
 

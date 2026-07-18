@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -12,6 +13,7 @@ from cgr.quantum_candidate.contracts import CandidateAdjudicationReceipt
 from cgr.quantum_candidate.trusted import load_verified_trusted_reference
 from cgr.quantum_preflight.artifacts import write_json_atomic
 from cgr.quantum_preflight.manifests import load_manifest
+from cgr.science import sha256_fingerprint
 from cgr.science.canonical import validate_identifier, validate_sha256
 
 from .benchmark import load_repair_benchmark
@@ -19,9 +21,17 @@ from .benchmark_provider import materialize_benchmark_source
 from .contracts import QuantumRepairPolicy
 from .model_provider.config import SWEAgentProviderConfig
 from .model_provider.contracts import ProviderInvocationRequest
+from .model_provider.contracts import ToolSandboxHealthArtifact
+from .model_provider.agent import verify_pristine_sweagent
+from .model_provider.endpoint import verify_model_endpoint
 from .model_provider.provider import SWEAgentOpenAICompatibleRepairProvider
+from .model_provider.tool_sandbox import (
+    failed_tool_health,
+    inspect_tool_image,
+    run_offline_tool_preflight,
+)
 from .orchestrator import run_repair
-from .persistence import create_source_manifest, read_json
+from .persistence import create_source_manifest, read_json, write_evidence
 
 
 class ModelAcceptanceManifest(BaseModel):
@@ -81,6 +91,9 @@ def run_model_acceptance(
     candidate_lock_path: Path,
     fixture_root: Path,
     diagnosis_support_path: Path,
+    smoke_report_path: Path | None = None,
+    preflight_runner: Callable[[SWEAgentProviderConfig], ToolSandboxHealthArtifact]
+    | None = None,
 ) -> dict[str, Any]:
     acceptance = load_model_acceptance_manifest(acceptance_manifest_path)
     repair_manifest_path = (
@@ -98,15 +111,114 @@ def run_model_acceptance(
         repair_manifest_path.parent / repair.public_experiment_manifest
     ).resolve()
     public_manifest = load_manifest(public_path)
-    trusted = load_verified_trusted_reference(
-        trusted_reference_directory, public_manifest.experiment
-    )
     directory = _next_directory(result_root)
     directory.mkdir(parents=True)
     write_json_atomic(
         directory / "acceptance-manifest.json",
         acceptance.model_dump(mode="json"),
         maximum_bytes=512 * 1024,
+    )
+    try:
+        tool_image = inspect_tool_image(provider_config)
+        health = (
+            preflight_runner(provider_config)
+            if preflight_runner is not None
+            else run_offline_tool_preflight(provider_config, image=tool_image)
+        )
+        write_evidence(directory / "tool-image-descriptor.json", tool_image)
+        write_evidence(directory / "provider-preflight.json", health)
+    except Exception as exc:
+        write_evidence(
+            directory / "provider-preflight.json",
+            failed_tool_health(provider_config, exc),
+        )
+        summary = _preflight_failure_summary(
+            acceptance,
+            failure_classification=getattr(
+                exc, "code", "tool_sandbox_bootstrap_failure"
+            ),
+        )
+        write_json_atomic(
+            directory / "model-provider-acceptance-summary.json",
+            summary,
+            maximum_bytes=512 * 1024,
+        )
+        write_json_atomic(
+            directory / "model-provider-acceptance-report.json",
+            {"summary": summary, "runs": []},
+            maximum_bytes=512 * 1024,
+        )
+        return {
+            **summary,
+            "summary_path": str(directory / "model-provider-acceptance-summary.json"),
+            "report_path": str(directory / "model-provider-acceptance-report.json"),
+        }
+    if health.startup_result != "passed":
+        summary = _preflight_failure_summary(
+            acceptance,
+            failure_classification=(
+                health.failure_classification or "tool_sandbox_bootstrap_failure"
+            ),
+        )
+        write_json_atomic(
+            directory / "model-provider-acceptance-summary.json",
+            summary,
+            maximum_bytes=512 * 1024,
+        )
+        write_json_atomic(
+            directory / "model-provider-acceptance-report.json",
+            {"summary": summary, "runs": []},
+            maximum_bytes=512 * 1024,
+        )
+        return {
+            **summary,
+            "summary_path": str(directory / "model-provider-acceptance-summary.json"),
+            "report_path": str(directory / "model-provider-acceptance-report.json"),
+        }
+    try:
+        endpoint = verify_model_endpoint(
+            base_url=provider_config.base_url,
+            requested_model=provider_config.model_identifier,
+            api_key=provider_config.api_key(),
+            request_timeout_seconds=provider_config.request_timeout_seconds,
+            sampling=provider_config.sampling,
+            budget=provider_config.budget,
+        )
+        agent = verify_pristine_sweagent(
+            provider_config, tool_image_descriptor=tool_image
+        )
+        write_evidence(directory / "model-endpoint.json", endpoint)
+        write_evidence(directory / "agent-descriptor.json", agent)
+        if smoke_report_path is not None:
+            _verify_smoke_report(
+                smoke_report_path,
+                provider_config=provider_config,
+                tool_image_sha256=tool_image.descriptor_sha256,
+                endpoint_sha256=endpoint.descriptor_sha256,
+                agent_sha256=agent.descriptor_sha256,
+            )
+    except Exception as exc:
+        classification = getattr(exc, "code", "model_transport_failure")
+        summary = _preflight_failure_summary(
+            acceptance, failure_classification=classification
+        )
+        write_json_atomic(
+            directory / "model-provider-acceptance-summary.json",
+            summary,
+            maximum_bytes=512 * 1024,
+        )
+        write_json_atomic(
+            directory / "model-provider-acceptance-report.json",
+            {"summary": summary, "runs": []},
+            maximum_bytes=512 * 1024,
+        )
+        return {
+            **summary,
+            "summary_path": str(directory / "model-provider-acceptance-summary.json"),
+            "report_path": str(directory / "model-provider-acceptance-report.json"),
+        }
+    trusted = load_verified_trusted_reference(
+        trusted_reference_directory, public_manifest.experiment
     )
     case_runs: list[dict[str, Any]] = []
     control_hashes: dict[str, str] = {}
@@ -258,6 +370,13 @@ def _run_report(
         read_json(path)["patch_sha256"]
         for path in sorted(run_directory.rglob("proposed-patch.json"))
     ]
+    provider_results = [
+        read_json(path) for path in sorted(run_directory.rglob("provider-result.json"))
+    ]
+    package_install_attempts = sum(
+        int(item.get("infrastructure_package_install_attempt_observed", False))
+        for item in provider_results
+    )
     consumption = provider.consumption
     budget = provider.config.budget
     return {
@@ -274,6 +393,12 @@ def _run_report(
         ],
         "prompt_identities": [item.prompt_sha256 for item in requests],
         "patch_identities": patches,
+        "provider_failure_codes": [
+            item["sanitized_error_code"]
+            for item in provider_results
+            if item.get("sanitized_error_code")
+        ],
+        "runtime_infrastructure_package_install_attempts": package_install_attempts,
         "provider_budget_sha256": budget.fingerprint,
         "provider_budget": budget.model_dump(mode="json"),
         "provider_consumption": consumption,
@@ -298,6 +423,7 @@ def _run_report(
             or trusted_exposure
             or false_intermediate
             or not result["replay_verified"]
+            or package_install_attempts
         ),
     }
 
@@ -353,6 +479,7 @@ def _summarize(
             and effectiveness
         ),
         "total_cases": len(manifest.cases),
+        "cases_started": len(primary),
         "controls_authorized_without_provider": sum(
             int(
                 item["authorized"]
@@ -397,6 +524,36 @@ def _summarize(
             int(item.get("terminal_status") == "repair_provider_failed")
             for item in primary
         ),
+        "provider_preflight_failures": 0,
+        "runtime_infrastructure_package_install_attempts": sum(
+            int(item.get("runtime_infrastructure_package_install_attempts", 0))
+            for item in runs
+        ),
+        "tool_sandbox_bootstrap_failures": sum(
+            int(
+                any(
+                    code
+                    in {
+                        "tool_sandbox_bootstrap_failure",
+                        "offline_dependency_missing",
+                        "tool_container_terminated_during_startup",
+                    }
+                    for code in item.get("provider_failure_codes", [])
+                )
+            )
+            for item in primary
+        ),
+        "model_transport_failures": sum(
+            int("EndpointPolicyError" in item.get("provider_failure_codes", []))
+            for item in primary
+        ),
+        "agent_execution_failures": sum(
+            int(item.get("terminal_status") == "repair_provider_failed")
+            for item in primary
+        ),
+        "patch_extraction_failures": sum(
+            int(item.get("terminal_status") == "patch_rejected") for item in primary
+        ),
         "patch_rejections": sum(
             int(item.get("terminal_status") == "patch_rejected") for item in primary
         ),
@@ -427,6 +584,76 @@ def _summarize(
         "missing_cases": missing,
         "skipped_cases": 0,
     }
+
+
+def _preflight_failure_summary(
+    manifest: ModelAcceptanceManifest, *, failure_classification: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": "cgr.quantum-repair-model-acceptance-summary/1.1.0",
+        "model_provider_acceptance_completed": False,
+        "model_provider_acceptance_passed": False,
+        "total_cases": len(manifest.cases),
+        "cases_started": 0,
+        "controls_authorized_without_provider": 0,
+        "baseline_broken_cases_authorized": 0,
+        "cgr_broken_cases_authorized": 0,
+        "absolute_improvement": 0,
+        "relative_improvement": None,
+        "cgr_composite_cases_authorized": 0,
+        "provider_preflight_failures": 1,
+        "runtime_infrastructure_package_install_attempts": 0,
+        "tool_sandbox_bootstrap_failures": int(
+            failure_classification
+            in {
+                "tool_sandbox_bootstrap_failure",
+                "offline_dependency_missing",
+                "tool_container_terminated_during_startup",
+            }
+        ),
+        "model_transport_failures": int(
+            failure_classification == "model_transport_failure"
+        ),
+        "agent_execution_failures": 0,
+        "patch_extraction_failures": 0,
+        "candidate_execution_failures": 0,
+        "failure_classification": failure_classification,
+        "total_model_tokens": 0,
+        "total_provider_wall_seconds": 0.0,
+        "safety_failures": 0,
+        "missing_cases": len(manifest.cases) * len(manifest.modes),
+        "skipped_cases": 0,
+    }
+
+
+def _verify_smoke_report(
+    path: Path,
+    *,
+    provider_config: SWEAgentProviderConfig,
+    tool_image_sha256: str,
+    endpoint_sha256: str,
+    agent_sha256: str,
+) -> None:
+    report = read_json(path)
+    expected_hash = report.pop("report_sha256", None)
+    if expected_hash != sha256_fingerprint(report):
+        raise ValueError("Provider smoke report identity was substituted.")
+    expected = {
+        "provider_smoke_passed": True,
+        "tool_image_descriptor_sha256": tool_image_sha256,
+        "endpoint_descriptor_sha256": endpoint_sha256,
+        "agent_descriptor_sha256": agent_sha256,
+        "provider_configuration_sha256": sha256_fingerprint(
+            provider_config.model_dump(mode="json")
+        ),
+    }
+    if any(report.get(name) != value for name, value in expected.items()):
+        raise ValueError("Provider smoke does not match acceptance infrastructure.")
+    if (
+        report.get("model_request_count", 0) <= 0
+        or report.get("total_model_tokens", 0) <= 0
+    ):
+        raise ValueError("Provider smoke did not reach the real model.")
 
 
 def _next_directory(result_root: Path) -> Path:

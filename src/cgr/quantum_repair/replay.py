@@ -200,6 +200,7 @@ def _verify_provider_invocations(
         ProviderInvocationRequest,
         ProviderInvocationResult,
         ProviderTrajectoryManifest,
+        ToolSandboxImageDescriptor,
     )
     from .model_provider.telemetry import verify_provider_telemetry
 
@@ -229,6 +230,12 @@ def _verify_provider_invocations(
             agent = AgentDescriptor.model_validate(
                 read_json(directory / "agent-descriptor.json")
             )
+            tool_image_path = directory / "tool-image-descriptor.json"
+            tool_image = (
+                ToolSandboxImageDescriptor.model_validate(read_json(tool_image_path))
+                if tool_image_path.is_file()
+                else None
+            )
             prompt = ModelRepairPrompt.model_validate(
                 read_json(directory / "model-prompt.json")
             )
@@ -236,6 +243,14 @@ def _verify_provider_invocations(
                 request.model_endpoint_descriptor_sha256 != endpoint.descriptor_sha256
                 or request.agent_descriptor_sha256 != agent.descriptor_sha256
                 or request.prompt_sha256 != prompt.prompt_sha256
+                or (
+                    agent.tool_image_descriptor_sha256 is not None
+                    and (
+                        tool_image is None
+                        or agent.tool_image_descriptor_sha256
+                        != tool_image.descriptor_sha256
+                    )
+                )
             ):
                 raise ValueError("Provider descriptors or prompt were substituted.")
         if status == "completed":
@@ -256,6 +271,7 @@ def _verify_provider_invocations(
                 or result.trajectory_identity != trajectory.complete_trajectory_sha256
                 or result.proposed_patch_identity != proposed.patch_sha256
                 or proposed.patch_sha256 != attempt.patch_sha256
+                or result.infrastructure_package_install_attempt_observed
             ):
                 raise ValueError("Completed provider evidence was cross-linked.")
         verify_provider_telemetry(directory / "provider-events.jsonl")

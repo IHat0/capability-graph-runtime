@@ -37,6 +37,12 @@ from .process import run_bounded_process
 from .prompting import build_model_prompt, render_problem_statement
 from .recovery import InvocationStateStore, recover_attempt_invocations
 from .telemetry import ProviderTelemetryLog
+from .tool_sandbox import (
+    ToolSandboxError,
+    classify_bootstrap_failure,
+    infrastructure_install_attempt_observed,
+    inspect_tool_image,
+)
 
 
 class SWEAgentOpenAICompatibleRepairProvider:
@@ -193,7 +199,10 @@ class SWEAgentOpenAICompatibleRepairProvider:
                 model_identifier=endpoint.observed_model_identifier,
             )
             overlay = provider_overlay(invocation_config)
-            agent = verify_pristine_sweagent(invocation_config, overlay)
+            tool_image = inspect_tool_image(invocation_config)
+            agent = verify_pristine_sweagent(
+                invocation_config, overlay, tool_image_descriptor=tool_image
+            )
             prompt = build_model_prompt(
                 directive=directive,
                 source_root=source_root,
@@ -207,6 +216,7 @@ class SWEAgentOpenAICompatibleRepairProvider:
             )
             write_evidence(directory / "model-endpoint.json", endpoint)
             write_evidence(directory / "agent-descriptor.json", agent)
+            write_evidence(directory / "tool-image-descriptor.json", tool_image)
             write_evidence(directory / "model-prompt.json", prompt)
             request_values = {
                 "provider_invocation_identifier": identifier,
@@ -297,7 +307,24 @@ class SWEAgentOpenAICompatibleRepairProvider:
             if process.timed_out:
                 raise TimeoutError("Official SWE-agent exceeded its wall-time budget.")
             if process.exit_code != 0:
-                raise RuntimeError("Official SWE-agent exited unsuccessfully.")
+                model_artifacts_exist = any(
+                    path.suffix.lower() in {".traj", ".pred"}
+                    for path in output_directory.rglob("*")
+                    if path.is_file()
+                )
+                classification = (
+                    "agent_execution_failure"
+                    if model_artifacts_exist
+                    else classify_bootstrap_failure(process.stderr)
+                )
+                raise ToolSandboxError(
+                    classification,
+                    "Official SWE-agent deployment failed safely.",
+                    package_install_attempt=(
+                        not model_artifacts_exist
+                        and infrastructure_install_attempt_observed(process.stderr)
+                    ),
+                )
             patch, prediction_sha, prediction_path = extract_official_patch(
                 output_directory=output_directory,
                 source_root=source_root,
@@ -342,7 +369,9 @@ class SWEAgentOpenAICompatibleRepairProvider:
                 output_tokens=trajectory.output_tokens,
                 tool_call_count=trajectory.tool_call_count,
             )
-            after = verify_pristine_sweagent(invocation_config, overlay)
+            after = verify_pristine_sweagent(
+                invocation_config, overlay, tool_image_descriptor=tool_image
+            )
             if after.descriptor_sha256 != agent.descriptor_sha256:
                 raise ValueError("SWE-agent source identity changed during invocation.")
             completed = time.monotonic()
@@ -397,6 +426,7 @@ def _result(
     patch_sha: str | None = None,
     error_code: str | None = None,
     error_detail: str | None = None,
+    package_install_attempt: bool = False,
 ) -> ProviderInvocationResult:
     input_tokens = trajectory.input_tokens if trajectory is not None else 0
     output_tokens = trajectory.output_tokens if trajectory is not None else 0
@@ -420,6 +450,7 @@ def _result(
             if trajectory is not None
             else 0
         ),
+        "infrastructure_package_install_attempt_observed": package_install_attempt,
         "trajectory_identity": (
             trajectory.complete_trajectory_sha256 if trajectory is not None else None
         ),
@@ -458,8 +489,13 @@ def _persist_failure(
             started=started,
             completed=completed,
             exit_status=None,
-            error_code=type(error).__name__,
+            error_code=getattr(error, "code", type(error).__name__),
             error_detail=f"Provider invocation failed safely at state {status}.",
+            package_install_attempt=getattr(
+                error,
+                "package_install_attempt",
+                infrastructure_install_attempt_observed(str(error)),
+            ),
         )
         store.persist_result(result)
     store.transition(target)

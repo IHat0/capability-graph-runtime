@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -185,6 +184,11 @@ def provider_check_main(argv: list[str] | None = None) -> int:
         from .model_provider.agent import TOOL_DOCKER_ARGS, verify_pristine_sweagent
         from .model_provider.config import load_provider_config
         from .model_provider.endpoint import verify_model_endpoint
+        from .model_provider.tool_sandbox import (
+            inspect_tool_image,
+            run_offline_tool_preflight,
+        )
+        from .persistence import write_evidence
 
         config = load_provider_config(args.provider_config)
         api_key = config.api_key()
@@ -196,29 +200,33 @@ def provider_check_main(argv: list[str] | None = None) -> int:
             sampling=config.sampling,
             budget=config.budget,
         )
-        agent = verify_pristine_sweagent(config)
+        tool_image = inspect_tool_image(config)
+        agent = verify_pristine_sweagent(config, tool_image_descriptor=tool_image)
         docker = shutil.which("docker")
         git = shutil.which("git")
         if docker is None or git is None:
             raise ValueError("Provider requires Docker and Git executables.")
-        image = subprocess.run(
-            [docker, "image", "inspect", config.tool_container_image],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if image.returncode:
-            raise ValueError("Configured agent tool image is unavailable locally.")
         args.evidence_root.mkdir(parents=True, exist_ok=True)
         probe = args.evidence_root / ".cgr-provider-write-probe"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
+        health = run_offline_tool_preflight(config, image=tool_image)
+        write_evidence(args.evidence_root / "tool-image-descriptor.json", tool_image)
+        write_evidence(args.evidence_root / "provider-preflight.json", health)
+        if health.startup_result != "passed":
+            raise ValueError(
+                "Tool sandbox preflight failed: " + str(health.failure_classification)
+            )
         result = {
             "provider_healthy": True,
             "model_endpoint_descriptor_sha256": endpoint.descriptor_sha256,
             "observed_model_identifier": endpoint.observed_model_identifier,
             "observed_context_length": endpoint.observed_context_length,
             "agent_descriptor_sha256": agent.descriptor_sha256,
+            "tool_image_descriptor_sha256": tool_image.descriptor_sha256,
+            "tool_image_id": tool_image.image_id,
+            "provider_preflight_sha256": health.health_artifact_sha256,
+            "offline_bootstrap_passed": True,
             "sweagent_commit": agent.pristine_source_commit,
             "sweagent_clean": agent.source_tree_clean,
             "tool_network_disabled": "--network=none" in TOOL_DOCKER_ARGS,
@@ -229,6 +237,41 @@ def provider_check_main(argv: list[str] | None = None) -> int:
         return _error(EXIT_PROVIDER, exc)
     print(json.dumps(result, sort_keys=True))
     return 0
+
+
+def tool_check_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Exercise the exact offline SWE-ReX tool deployment."
+    )
+    parser.add_argument("--provider-config", type=Path, required=True)
+    parser.add_argument("--evidence-root", type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        from .model_provider.config import load_provider_config
+        from .model_provider.tool_sandbox import (
+            inspect_tool_image,
+            run_offline_tool_preflight,
+        )
+        from .persistence import write_evidence
+
+        config = load_provider_config(args.provider_config)
+        image = inspect_tool_image(config)
+        health = run_offline_tool_preflight(config, image=image)
+        args.evidence_root.mkdir(parents=True, exist_ok=True)
+        write_evidence(args.evidence_root / "tool-image-descriptor.json", image)
+        write_evidence(args.evidence_root / "provider-preflight.json", health)
+        result = {
+            "tool_sandbox_preflight_passed": health.startup_result == "passed",
+            "tool_image_id": image.image_id,
+            "tool_image_descriptor_sha256": image.descriptor_sha256,
+            "health_artifact_sha256": health.health_artifact_sha256,
+            "network_mode": health.network_mode,
+            "failure_classification": health.failure_classification,
+        }
+    except Exception as exc:
+        return _error(EXIT_PROVIDER, exc)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["tool_sandbox_preflight_passed"] else EXIT_PROVIDER
 
 
 def model_acceptance_main(argv: list[str] | None = None) -> int:
@@ -243,6 +286,7 @@ def model_acceptance_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidate-lock", type=Path, required=True)
     parser.add_argument("--fixture-root", type=Path, required=True)
     parser.add_argument("--diagnosis-support", type=Path, required=True)
+    parser.add_argument("--smoke-report", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         from .model_acceptance import run_model_acceptance
@@ -257,11 +301,45 @@ def model_acceptance_main(argv: list[str] | None = None) -> int:
             candidate_lock_path=args.candidate_lock,
             fixture_root=args.fixture_root,
             diagnosis_support_path=args.diagnosis_support,
+            smoke_report_path=args.smoke_report,
         )
     except Exception as exc:
         return _error(EXIT_BENCHMARK, exc)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["model_provider_acceptance_passed"] else EXIT_BENCHMARK
+
+
+def provider_smoke_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run the real one-case SWE-agent/Qwen provider smoke gate."
+    )
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--provider-config", type=Path, required=True)
+    parser.add_argument("--trusted-reference", type=Path, required=True)
+    parser.add_argument("--result-root", type=Path, required=True)
+    parser.add_argument("--candidate-image", required=True)
+    parser.add_argument("--candidate-lock", type=Path, required=True)
+    parser.add_argument("--fixture-root", type=Path, required=True)
+    parser.add_argument("--diagnosis-support", type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        from .model_provider.config import load_provider_config
+        from .model_smoke import run_provider_smoke
+
+        result = run_provider_smoke(
+            acceptance_manifest_path=args.manifest,
+            provider_config=load_provider_config(args.provider_config),
+            trusted_reference_directory=args.trusted_reference,
+            result_root=args.result_root,
+            candidate_image_identifier=args.candidate_image,
+            candidate_lock_path=args.candidate_lock,
+            fixture_root=args.fixture_root,
+            diagnosis_support_path=args.diagnosis_support,
+        )
+    except Exception as exc:
+        return _error(EXIT_PROVIDER, exc)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["provider_smoke_passed"] else EXIT_PROVIDER
 
 
 def _classify_exception(exc: Exception) -> int:
@@ -302,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         "benchmark": benchmark_main,
         "verify": verify_main,
         "provider-check": provider_check_main,
+        "tool-check": tool_check_main,
+        "provider-smoke": provider_smoke_main,
         "model-acceptance": model_acceptance_main,
     }
     selected = dispatch.get(command)

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,7 +21,9 @@ from cgr.quantum_repair.contracts import QuantumRepairPolicy, StructuredEdit
 from cgr.quantum_repair.directives import create_directive
 from cgr.quantum_repair.model_acceptance import (
     _summarize,
+    _verify_smoke_report,
     load_model_acceptance_manifest,
+    run_model_acceptance,
 )
 from cgr.quantum_repair.model_provider.agent import (
     TOOL_DOCKER_ARGS,
@@ -38,6 +44,7 @@ from cgr.quantum_repair.model_provider.contracts import (
     ProviderBudget,
     ProviderInvocationRequest,
     SamplingParameters,
+    ToolSandboxImageDescriptor,
     seal_contract,
 )
 from cgr.quantum_repair.model_provider.endpoint import (
@@ -63,6 +70,13 @@ from cgr.quantum_repair.model_provider.redaction import (
     assert_prompt_safe,
     sanitize_text,
 )
+from cgr.quantum_repair.model_provider.tool_sandbox import (
+    ToolSandboxError,
+    classify_bootstrap_failure,
+    infrastructure_install_attempt_observed,
+    inspect_tool_image,
+    run_offline_tool_preflight,
+)
 from cgr.quantum_repair.patches import (
     RepairPatchRejected,
     create_patch,
@@ -78,6 +92,24 @@ ACCEPTANCE = (
 )
 SWE_SOURCE = ROOT / ".sandbox-sweagent-src"
 SWE_EXECUTABLE = ROOT / ".sandbox-sweagent-venv/Scripts/sweagent.exe"
+
+
+def _tool_image_descriptor() -> ToolSandboxImageDescriptor:
+    return seal_contract(
+        ToolSandboxImageDescriptor,
+        {
+            "image_repository": "cgr-quantum-sweagent-tool",
+            "image_id": "sha256:" + "a" * 64,
+            "build_schema_version": "cgr.quantum-sweagent-tool-image-build/1.0.0",
+            "build_input_sha256": "b" * 64,
+            "offline_bootstrap": True,
+            "network_policy": "none",
+            "required_sweagent_commit": REQUIRED_SWEAGENT_COMMIT,
+            "swerex_version": "1.4.0",
+            "runtime_identity": "c" * 64,
+        },
+        "descriptor_sha256",
+    )
 
 
 def _receipt(code: str) -> CandidateAdjudicationReceipt:
@@ -250,10 +282,16 @@ def test_agent_descriptor_verifies_real_pristine_checkout() -> None:
     config = SWEAgentProviderConfig(
         sweagent_source=SWE_SOURCE, sweagent_executable=str(SWE_EXECUTABLE)
     )
-    descriptor = verify_pristine_sweagent(config)
+    descriptor = verify_pristine_sweagent(
+        config, tool_image_descriptor=_tool_image_descriptor()
+    )
     assert descriptor.pristine_source_commit == REQUIRED_SWEAGENT_COMMIT
     assert descriptor.source_tree_clean is True
     assert descriptor.descriptor_sha256 == descriptor.fingerprint
+    assert (
+        descriptor.tool_image_descriptor_sha256
+        == _tool_image_descriptor().descriptor_sha256
+    )
     assert "--network=none" in TOOL_DOCKER_ARGS
 
 
@@ -317,6 +355,145 @@ def test_official_command_uses_env_key_reference_and_isolated_docker_policy(
     environment = child_environment(config, tmp_path / "home", "provider-secret")
     assert environment["CGR_REPAIR_MODEL_API_KEY"] == "provider-secret"
     assert not any(name.startswith(("AWS_", "IBM_", "GITHUB_")) for name in environment)
+    overlay_text = provider_overlay(config)
+    assert "--network=none" in overlay_text
+    assert "edit_anthropic" not in overlay_text
+    assert "pip install" not in overlay_text
+
+
+def test_tool_image_requires_immutable_identity() -> None:
+    with pytest.raises(ValidationError, match="exact sha256"):
+        SWEAgentProviderConfig(tool_container_image="python:3.12")
+    with pytest.raises(ValidationError, match="exact sha256"):
+        SWEAgentProviderConfig(tool_container_image="cgr-sweagent-tool:latest")
+
+
+def test_tool_image_identity_and_build_labels_are_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cgr.quantum_repair.model_provider.tool_sandbox as tool_module
+
+    image_id = "sha256:" + "a" * 64
+    config = SWEAgentProviderConfig(
+        tool_container_image=image_id,
+        tool_image_build_input_sha256="b" * 64,
+    )
+    labels = {
+        "org.cgr.tool-sandbox.schema": "cgr.quantum-sweagent-tool-image/1.0.0",
+        "org.cgr.tool-sandbox.build-input-sha256": "b" * 64,
+        "org.cgr.tool-sandbox.sweagent-commit": REQUIRED_SWEAGENT_COMMIT,
+        "org.cgr.tool-sandbox.swerex-version": "1.4.0",
+        "org.cgr.tool-sandbox.offline-bootstrap": "true",
+        "org.cgr.tool-sandbox.network-policy": "none",
+    }
+    monkeypatch.setattr(tool_module.shutil, "which", lambda _name: "docker")
+
+    def runner(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([{"Id": image_id, "Config": {"Labels": labels}}]),
+        )
+
+    descriptor = inspect_tool_image(config, runner=runner)
+    assert descriptor.image_id == image_id
+    assert descriptor.network_policy == "none"
+
+    def mismatch(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [{"Id": "sha256:" + "f" * 64, "Config": {"Labels": labels}}]
+            ),
+        )
+
+    with pytest.raises(ToolSandboxError, match="substituted"):
+        inspect_tool_image(config, runner=mismatch)
+
+
+def test_exact_offline_deployment_preflight_and_cleanup() -> None:
+    class Runtime:
+        async def upload(self, _request: Any) -> None:
+            return None
+
+        async def execute(self, command: Any) -> Any:
+            if command.command == "env":
+                return SimpleNamespace(stdout="PATH=/usr/bin", exit_code=0)
+            if "docker.sock" in command.command or "connect_ex" in command.command:
+                return SimpleNamespace(stdout="", exit_code=1)
+            return SimpleNamespace(stdout="ok", exit_code=0)
+
+    class Deployment:
+        def __init__(self) -> None:
+            self.runtime = Runtime()
+            self.stopped = False
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    deployment = Deployment()
+    health = run_offline_tool_preflight(
+        SWEAgentProviderConfig(),
+        image=_tool_image_descriptor(),
+        deployment_factory=lambda values: (
+            deployment
+            if "--network=none" in values["docker_args"]
+            else pytest.fail("network isolation missing")
+        ),
+    )
+    assert health.startup_result == "passed"
+    assert health.cleanup_passed is True
+    assert deployment.stopped is True
+    assert health.credential_forwarding_observed is False
+    assert health.docker_socket_forwarded is False
+    assert health.model_endpoint_reachable is False
+
+
+def test_offline_dependency_and_container_startup_failures_are_precise() -> None:
+    class FailedDeployment:
+        runtime = None
+        stopped = False
+
+        async def start(self) -> None:
+            raise RuntimeError(
+                "Container process terminated: /simple/pipx/ temporary name resolution"
+            )
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    deployment = FailedDeployment()
+    health = run_offline_tool_preflight(
+        SWEAgentProviderConfig(),
+        image=_tool_image_descriptor(),
+        deployment_factory=lambda _values: deployment,
+    )
+    assert health.startup_result == "failed"
+    assert health.failure_classification == "offline_dependency_missing"
+    assert health.infrastructure_package_install_attempt_observed is True
+    assert health.cleanup_passed is True
+    assert classify_bootstrap_failure("Container process terminated") == (
+        "tool_container_terminated_during_startup"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install x",
+        "pipx install x",
+        "apt-get install x",
+        "apt install x",
+        "apk add x",
+        "dnf install x",
+        "yum install x",
+        "conda install x",
+    ],
+)
+def test_runtime_infrastructure_install_attempt_detection(command: str) -> None:
+    assert infrastructure_install_attempt_observed(command) is True
 
 
 @pytest.mark.parametrize("mode", ["baseline", "cgr"])
@@ -709,6 +886,92 @@ def test_acceptance_manifest_is_reviewed_twelve_case_parity_set() -> None:
     assert manifest.minimum_absolute_improvement == 2
 
 
+def test_preflight_failure_aborts_acceptance_before_cases(tmp_path: Path) -> None:
+    result = run_model_acceptance(
+        acceptance_manifest_path=ACCEPTANCE,
+        provider_config=SWEAgentProviderConfig(),
+        trusted_reference_directory=tmp_path / "missing-trusted-reference",
+        result_root=tmp_path / "results",
+        candidate_image_identifier="sha256:" + "d" * 64,
+        candidate_lock_path=ROOT / "requirements/quantum-preflight.lock",
+        fixture_root=ROOT / "benchmark-fixtures/quantum-repair-v1",
+        diagnosis_support_path=(
+            ROOT
+            / "benchmark-fixtures/quantum-candidate-v1/_support/standalone_candidate.py"
+        ),
+    )
+    assert result["model_provider_acceptance_completed"] is False
+    assert result["provider_preflight_failures"] == 1
+    assert result["cases_started"] == 0
+    assert result["total_model_tokens"] == 0
+
+
+def test_smoke_gate_requires_positive_real_model_usage(tmp_path: Path) -> None:
+    config = SWEAgentProviderConfig()
+    values = {
+        "schema_version": "cgr.quantum-repair-provider-smoke/1.0.0",
+        "provider_smoke_passed": True,
+        "tool_image_descriptor_sha256": "a" * 64,
+        "endpoint_descriptor_sha256": "b" * 64,
+        "agent_descriptor_sha256": "c" * 64,
+        "provider_configuration_sha256": sha256_fingerprint(
+            config.model_dump(mode="json")
+        ),
+        "model_request_count": 0,
+        "total_model_tokens": 0,
+    }
+    values["report_sha256"] = sha256_fingerprint(values)
+    path = tmp_path / "smoke.json"
+    path.write_text(json.dumps(values), encoding="utf-8")
+    with pytest.raises(ValueError, match="did not reach"):
+        _verify_smoke_report(
+            path,
+            provider_config=config,
+            tool_image_sha256="a" * 64,
+            endpoint_sha256="b" * 64,
+            agent_sha256="c" * 64,
+        )
+
+
+def test_verification_scripts_require_suitable_python_and_no_false_success() -> None:
+    for name in (
+        "check-quantum-sweagent-provider.sh",
+        "check-quantum-sweagent-tool-image.sh",
+        "run-quantum-sweagent-qwen-provider-smoke.sh",
+        "run-quantum-sweagent-qwen-acceptance.sh",
+        "verify-quantum-sweagent-qwen-acceptance.sh",
+    ):
+        source = (ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert "CGR_PYTHON:?" in source
+        assert "import pydantic, cgr" in source
+    verifier = (ROOT / "scripts/verify-quantum-sweagent-qwen-acceptance.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "set -euo pipefail" in verifier
+    assert "verified_acceptance_summary" in verifier
+    bash = shutil.which("bash")
+    if bash is None and Path("C:/Program Files/Git/bin/bash.exe").is_file():
+        bash = "C:/Program Files/Git/bin/bash.exe"
+    if bash is None:
+        pytest.skip("Bash is unavailable for verifier environment test.")
+    environment = dict(os.environ)
+    environment.pop("CGR_PYTHON", None)
+    process = subprocess.run(
+        [
+            bash,
+            str(ROOT / "scripts/verify-quantum-sweagent-qwen-acceptance.sh"),
+            str(ROOT / "missing-acceptance"),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert process.returncode != 0
+    assert "CGR_PYTHON" in process.stderr
+    assert "verified_acceptance_summary" not in process.stdout
+
+
 def test_acceptance_repeatability_contradiction_fails_gate() -> None:
     manifest = load_model_acceptance_manifest(ACCEPTANCE)
     runs: list[dict[str, Any]] = []
@@ -745,3 +1008,42 @@ def test_sanitizer_never_logs_api_keys_or_authorization_headers() -> None:
     )
     assert "abc" not in value
     assert value.count("[REDACTED]") >= 3
+
+
+def test_provider_contains_no_benchmark_specific_repair_logic() -> None:
+    provider_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "src/cgr/quantum_repair/model_provider").glob("*.py")
+    )
+    for case_identifier in (
+        "syntax-then-structure",
+        "wrong-bond-distance",
+        "wrong-active-space",
+        "wrong-mapper",
+        "electronic-energy-as-total",
+        "forged-content-hash",
+    ):
+        assert case_identifier not in provider_source
+    assert "ReviewedBenchmarkRepairProvider" not in provider_source
+
+
+@pytest.mark.quantum_container
+def test_real_offline_tool_deployment_when_docker_is_available() -> None:
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("Docker is genuinely unavailable.")
+    daemon = subprocess.run(
+        [docker, "info"], capture_output=True, text=True, check=False
+    )
+    if daemon.returncode != 0:
+        pytest.skip("Docker daemon is genuinely unavailable.")
+    config_path = os.environ.get("CGR_OFFLINE_PROVIDER_CONFIG")
+    if not config_path:
+        pytest.fail(
+            "Docker is available; set CGR_OFFLINE_PROVIDER_CONFIG to the generated immutable configuration."
+        )
+    config = load_provider_config(Path(config_path))
+    health = run_offline_tool_preflight(config)
+    assert health.startup_result == "passed"
+    assert health.network_mode == "none"
+    assert health.infrastructure_package_install_attempt_observed is False

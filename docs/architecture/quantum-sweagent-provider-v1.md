@@ -153,3 +153,55 @@ Model quality on the twelve cases remains an EC2 acceptance result, not a proper
 inferred from mocks. The component is therefore production-oriented and fail-closed,
 but the complete platform is not described as production-ready. Rung 8B will execute
 and tune repeated full thirty-case comparisons without changing the trust boundary.
+
+## Offline-ready tool image and bootstrap correction
+
+The first EC2 provider acceptance exposed a systemic bootstrap failure before any
+model call. Pinned SWE-agent enters `SWEEnv._init_deployment()`, calls
+`DockerDeployment.start()` from SWE-ReX 1.4.0, and obtains its container command from
+`DockerDeployment._get_swerex_start_cmd()`. When `swerex-remote` is absent, that
+official command falls back to `python3 -m pip install pipx`, `pipx ensurepath`, and
+`pipx run swe-rex`. With the required Docker network mode `none`, PyPI is correctly
+unreachable and the container terminates. The previously selected
+`tools/edit_anthropic/install.sh` would subsequently have run two additional pip
+installs, so merely adding `pipx` would not have made the lifecycle offline-ready.
+
+The supported correction follows upstream's documented custom-image approach. The
+dedicated image in `docker/quantum-sweagent-tool` installs the exact SWE-ReX 1.4.0
+runtime and its `swerex-remote` entry point at image build time. Build-time dependency
+retrieval is a separately controlled boundary. Runtime creation uses the exact image
+ID, pull policy `never`, and network mode `none`; no runtime dependency download is
+permitted. The provider uses only official tool bundles whose startup scripts do not
+install packages (`registry`, `search`, `windowed`, and `review_on_submit_m`) plus
+SWE-agent's supported Bash tool for edits. No upstream file or action is modified.
+
+The build requires a caller-supplied base image by immutable repository digest. It
+hashes that identity together with the Dockerfile, requirements lock, and build
+contract, labels the result, records provenance, and produces a provider configuration
+containing the resulting exact `sha256:` image ID. Runtime validation compares the
+local image ID and all labels with the versioned `ToolSandboxImageDescriptor`; a tag
+is only a build-time convenience and is never authoritative.
+
+Provider health now starts the real SWE-ReX `DockerDeployment` with the production
+image, Docker arguments, timeout, removal policy, and environment path. It waits for
+the official ready state, executes a harmless shell command, modifies a disposable
+file, checks credential and Docker-socket absence, confirms that the model endpoint
+is unreachable inside the tool environment, stops the deployment, and persists a
+self-hashed health artifact. It also records whether infrastructure package-install
+behavior was observed. Startup failures are classified as
+`offline_dependency_missing`, `tool_container_terminated_during_startup`, or the
+general `tool_sandbox_bootstrap_failure` without publishing private stderr.
+
+Comparative acceptance performs this preflight before materializing any baseline or
+CGR case. Failure creates a completed fail-closed preflight report with zero cases and
+zero model tokens. A separate `syntax-error` smoke then uses the real provider-neutral
+controller, candidate sandbox, patch policy, agent, endpoint, and image. It must show
+positive model calls and tokens plus replayable official evidence. The full run
+accepts the smoke only when its self-hash and provider, endpoint, agent, and image
+identities exactly match the current configuration.
+
+Operator order is therefore: build the image, run the offline tool check, run complete
+provider health, run the one-case provider smoke, and only then run comparative
+acceptance. All scripts require an explicit `CGR_PYTHON` that imports CGR and Pydantic;
+they cannot fall back to an unsuitable system interpreter or print verification
+success after an import or replay failure.
