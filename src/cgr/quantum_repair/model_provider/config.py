@@ -16,6 +16,14 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 
 
+class ToolTemplateVariables(BaseModel):
+    """Allow-listed pristine SWE-agent command-document template values."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    WINDOW: int = Field(default=100, strict=True, ge=1, le=1_000)
+
+
 class SWEAgentProviderConfig(BaseModel):
     """Runtime configuration; API-key values are referenced, never stored here."""
 
@@ -33,6 +41,9 @@ class SWEAgentProviderConfig(BaseModel):
     sweagent_executable: str = "sweagent"
     required_sweagent_commit: str = REQUIRED_SWEAGENT_COMMIT
     sweagent_version: str = "1.1.0"
+    tool_template_variables: ToolTemplateVariables = Field(
+        default_factory=ToolTemplateVariables
+    )
     tool_container_image_repository: str = "cgr-quantum-sweagent-tool"
     tool_container_image: str = "sha256:" + "0" * 64
     tool_image_build_schema_version: Literal[

@@ -19,7 +19,12 @@ from .contracts import (
     ToolSandboxImageDescriptor,
     ToolControlProxyPolicyDescriptor,
     ToolNetworkPolicyDescriptor,
+    ToolTemplateValidationArtifact,
     seal_contract,
+)
+from .tool_templates import (
+    PROVIDER_TOOL_BUNDLES,
+    validate_tool_template_configuration,
 )
 
 TOOL_NETWORK_NAME_PLACEHOLDER = "cgr-swerex-invocation-network"
@@ -58,6 +63,7 @@ def provider_overlay(
         *TOOL_DOCKER_RESOURCE_ARGS,
     )
     docker_args = "\n".join(f"      - {json.dumps(item)}" for item in arguments)
+    tool_bundles = "\n".join(f"      - path: {item}" for item in PROVIDER_TOOL_BUNDLES)
     return f"""env:
   deployment:
     type: docker
@@ -88,11 +94,10 @@ agent:
     next_step_no_output_template: |-
       Your command completed without output. Continue the bounded source repair.
   tools:
+    env_variables:
+      WINDOW: {config.tool_template_variables.WINDOW}
     bundles:
-      - path: tools/registry
-      - path: tools/search
-      - path: tools/windowed
-      - path: tools/review_on_submit_m
+{tool_bundles}
     enable_bash_tool: true
     parse_function:
       type: function_calling
@@ -134,22 +139,10 @@ def verify_pristine_sweagent(
     overlay: str | None = None,
     tool_image_descriptor: ToolSandboxImageDescriptor | None = None,
 ) -> AgentDescriptor:
-    source = config.sweagent_source.resolve(strict=True)
     executable = resolve_executable(config.sweagent_executable)
-    if (
-        not (source / "config/default.yaml").is_file()
-        or not (source / "sweagent/__init__.py").is_file()
-    ):
-        raise ValueError("Configured SWE-agent source is incomplete.")
-    commit = _git(source, "rev-parse", "HEAD").strip()
-    status = _git(source, "status", "--porcelain=v1", "--untracked-files=all")
-    if commit != config.required_sweagent_commit:
-        raise ValueError("Pristine SWE-agent commit does not match the reviewed pin.")
-    if status.strip():
-        raise ValueError(
-            "Pristine SWE-agent working tree is dirty or has untracked files."
-        )
+    source, commit = _verify_pristine_source(config)
     overlay_value = provider_overlay(config) if overlay is None else overlay
+    tool_template_validation = validate_pristine_tool_templates(config)
     configuration_sha = hashlib.sha256(
         (source / "config/default.yaml").read_bytes() + overlay_value.encode("utf-8")
     ).hexdigest()
@@ -169,6 +162,7 @@ def verify_pristine_sweagent(
         "tool_image_descriptor_sha256": image.descriptor_sha256,
         "tool_network_policy_descriptor_sha256": network_policy.descriptor_sha256,
         "tool_control_proxy_policy_descriptor_sha256": proxy_policy.descriptor_sha256,
+        "tool_template_validation_sha256": (tool_template_validation.validation_sha256),
     }
     values = {
         "pristine_source_commit": commit,
@@ -181,8 +175,40 @@ def verify_pristine_sweagent(
         "tool_image_descriptor_sha256": image.descriptor_sha256,
         "tool_network_policy_descriptor_sha256": network_policy.descriptor_sha256,
         "tool_control_proxy_policy_descriptor_sha256": proxy_policy.descriptor_sha256,
+        "tool_template_validation_sha256": (tool_template_validation.validation_sha256),
     }
     return seal_contract(AgentDescriptor, values, "descriptor_sha256")
+
+
+def validate_pristine_tool_templates(
+    config: SWEAgentProviderConfig,
+) -> ToolTemplateValidationArtifact:
+    """Validate command-doc values only after the upstream checkout is pinned."""
+    source, commit = _verify_pristine_source(config)
+    return validate_tool_template_configuration(
+        source=source,
+        pristine_source_commit=commit,
+        configured_variables=config.tool_template_variables.model_dump(mode="python"),
+        bundles=PROVIDER_TOOL_BUNDLES,
+    )
+
+
+def _verify_pristine_source(config: SWEAgentProviderConfig) -> tuple[Path, str]:
+    source = config.sweagent_source.resolve(strict=True)
+    if (
+        not (source / "config/default.yaml").is_file()
+        or not (source / "sweagent/__init__.py").is_file()
+    ):
+        raise ValueError("Configured SWE-agent source is incomplete.")
+    commit = _git(source, "rev-parse", "HEAD").strip()
+    status = _git(source, "status", "--porcelain=v1", "--untracked-files=all")
+    if commit != config.required_sweagent_commit:
+        raise ValueError("Pristine SWE-agent commit does not match the reviewed pin.")
+    if status.strip():
+        raise ValueError(
+            "Pristine SWE-agent working tree is dirty or has untracked files."
+        )
+    return source, commit
 
 
 def build_official_command(

@@ -25,6 +25,9 @@
   "sweagent_executable": "sweagent",
   "required_sweagent_commit": "0f3acafacabc0def8cc76b4e48acb4b6cf302cb9",
   "sweagent_version": "1.1.0",
+  "tool_template_variables": {
+    "WINDOW": 100
+  },
   "tool_container_image_repository": "cgr-quantum-sweagent-tool",
   "tool_container_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "tool_image_build_schema_version": "cgr.quantum-sweagent-tool-image-build/1.1.0",

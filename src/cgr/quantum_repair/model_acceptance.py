@@ -26,6 +26,7 @@ from .model_provider.agent import (
     repository_commit,
     tool_control_proxy_policy_descriptor,
     tool_network_policy_descriptor,
+    validate_pristine_tool_templates,
     verify_pristine_sweagent,
 )
 from .model_provider.endpoint import verify_model_endpoint
@@ -199,6 +200,8 @@ def run_model_acceptance(
             "report_path": str(directory / "model-provider-acceptance-report.json"),
         }
     try:
+        template_validation = validate_pristine_tool_templates(provider_config)
+        write_evidence(directory / "tool-template-validation.json", template_validation)
         endpoint = verify_model_endpoint(
             base_url=provider_config.base_url,
             requested_model=provider_config.model_identifier,
@@ -223,6 +226,7 @@ def run_model_acceptance(
                 ),
                 endpoint_sha256=endpoint.descriptor_sha256,
                 agent_sha256=agent.descriptor_sha256,
+                template_validation_sha256=(template_validation.validation_sha256),
             )
     except Exception as exc:
         classification = getattr(exc, "code", "model_transport_failure")
@@ -344,7 +348,10 @@ def run_model_acceptance(
                     report,
                     maximum_bytes=2 * 1024 * 1024,
                 )
-    summary = _summarize(acceptance, case_runs)
+    summary = {
+        **_summarize(acceptance, case_runs),
+        "tool_template_validation_sha256": (template_validation.validation_sha256),
+    }
     write_json_atomic(
         directory / "model-provider-acceptance-summary.json",
         summary,
@@ -419,6 +426,9 @@ def _run_report(
             item.request_content_sha256 for item in requests
         ],
         "prompt_identities": [item.prompt_sha256 for item in requests],
+        "tool_template_validation_identities": [
+            item.tool_template_validation_sha256 for item in requests
+        ],
         "patch_identities": patches,
         "provider_failure_codes": [
             item["sanitized_error_code"]
@@ -581,6 +591,8 @@ def _summarize(
                         "tool_model_endpoint_access_detected",
                         "tool_container_cleanup_failure",
                         "tool_network_cleanup_failure",
+                        "tool_configuration_template_missing_variable",
+                        "sweagent_tool_template_configuration_failure",
                     }
                     for code in item.get("provider_failure_codes", [])
                 )
@@ -670,6 +682,8 @@ def _preflight_failure_summary(
                 "tool_model_endpoint_access_detected",
                 "tool_container_cleanup_failure",
                 "tool_network_cleanup_failure",
+                "tool_configuration_template_missing_variable",
+                "sweagent_tool_template_configuration_failure",
             }
         ),
         "model_transport_failures": int(
@@ -696,6 +710,7 @@ def _verify_smoke_report(
     proxy_policy_sha256: str,
     endpoint_sha256: str,
     agent_sha256: str,
+    template_validation_sha256: str,
 ) -> None:
     report = read_json(path)
     expected_hash = report.pop("report_sha256", None)
@@ -708,6 +723,7 @@ def _verify_smoke_report(
         "tool_control_proxy_policy_descriptor_sha256": proxy_policy_sha256,
         "endpoint_descriptor_sha256": endpoint_sha256,
         "agent_descriptor_sha256": agent_sha256,
+        "tool_template_validation_sha256": template_validation_sha256,
         "provider_configuration_sha256": sha256_fingerprint(
             provider_config.model_dump(mode="json")
         ),

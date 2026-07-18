@@ -1054,6 +1054,8 @@ async def _probe_succeeds(runtime: Any, command: str, command_type: Any) -> bool
 
 def classify_bootstrap_failure(value: str) -> str:
     lowered = value.lower()
+    if "keyerror: 'window'" in lowered or 'keyerror: "window"' in lowered:
+        return "tool_configuration_template_missing_variable"
     if _INSTALL_ATTEMPT.search(value) and (
         "name resolution" in lowered
         or "could not find a version" in lowered

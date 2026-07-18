@@ -19,6 +19,7 @@ from .model_provider.agent import (
     repository_commit,
     tool_control_proxy_policy_descriptor,
     tool_network_policy_descriptor,
+    validate_pristine_tool_templates,
     verify_pristine_sweagent,
 )
 from .model_provider.config import SWEAgentProviderConfig
@@ -90,6 +91,24 @@ def run_provider_smoke(
                 "total_model_tokens": 0,
             },
         )
+    try:
+        template_validation = validate_pristine_tool_templates(provider_config)
+    except Exception as exc:
+        return _write_report(
+            directory,
+            {
+                "provider_smoke_passed": False,
+                "failure_classification": getattr(
+                    exc,
+                    "code",
+                    "sweagent_tool_template_configuration_failure",
+                ),
+                "model_request_count": 0,
+                "total_model_tokens": 0,
+                "trusted_evidence_exposure": 0,
+            },
+        )
+    write_evidence(directory / "tool-template-validation.json", template_validation)
     endpoint = verify_model_endpoint(
         base_url=provider_config.base_url,
         requested_model=provider_config.model_identifier,
@@ -193,6 +212,7 @@ def run_provider_smoke(
             ),
             "endpoint_descriptor_sha256": endpoint.descriptor_sha256,
             "agent_descriptor_sha256": agent.descriptor_sha256,
+            "tool_template_validation_sha256": (template_validation.validation_sha256),
             "provider_configuration_sha256": sha256_fingerprint(
                 provider_config.model_dump(mode="json")
             ),

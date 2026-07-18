@@ -25,6 +25,7 @@ from .agent import (
     provider_overlay,
     tool_control_proxy_policy_descriptor,
     tool_network_policy_descriptor,
+    validate_pristine_tool_templates,
     verify_pristine_sweagent,
 )
 from .config import SWEAgentProviderConfig
@@ -199,6 +200,10 @@ class SWEAgentOpenAICompatibleRepairProvider:
         control_port = 0
         proxy_started = 0.0
         try:
+            template_validation = validate_pristine_tool_templates(invocation_config)
+            write_evidence(
+                directory / "tool-template-validation.json", template_validation
+            )
             endpoint = verify_model_endpoint(
                 base_url=invocation_config.base_url,
                 requested_model=invocation_config.model_identifier,
@@ -260,6 +265,9 @@ class SWEAgentOpenAICompatibleRepairProvider:
                 "provider_capability_sha256": self.capability.fingerprint,
                 "model_endpoint_descriptor_sha256": endpoint.descriptor_sha256,
                 "agent_descriptor_sha256": agent.descriptor_sha256,
+                "tool_template_validation_sha256": (
+                    template_validation.validation_sha256
+                ),
                 "prompt_sha256": prompt.prompt_sha256,
                 "budget": invocation_config.budget,
                 "allowed_paths": directive.allowed_edit_paths,

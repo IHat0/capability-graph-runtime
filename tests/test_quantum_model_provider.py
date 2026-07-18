@@ -1687,6 +1687,7 @@ def test_budget_hard_caps_unknown_schemas_and_request_tampering() -> None:
         "provider_capability_sha256": "d" * 64,
         "model_endpoint_descriptor_sha256": "e" * 64,
         "agent_descriptor_sha256": "f" * 64,
+        "tool_template_validation_sha256": "2" * 64,
         "prompt_sha256": "1" * 64,
         "budget": ProviderBudget(),
         "allowed_paths": ("main.py",),
@@ -1762,6 +1763,7 @@ def test_smoke_gate_requires_positive_real_model_usage(tmp_path: Path) -> None:
         "tool_control_proxy_policy_descriptor_sha256": "e" * 64,
         "endpoint_descriptor_sha256": "b" * 64,
         "agent_descriptor_sha256": "c" * 64,
+        "tool_template_validation_sha256": "2" * 64,
         "provider_configuration_sha256": sha256_fingerprint(
             config.model_dump(mode="json")
         ),
@@ -1781,6 +1783,7 @@ def test_smoke_gate_requires_positive_real_model_usage(tmp_path: Path) -> None:
             proxy_policy_sha256="e" * 64,
             endpoint_sha256="b" * 64,
             agent_sha256="c" * 64,
+            template_validation_sha256="2" * 64,
         )
 
 
@@ -1794,6 +1797,7 @@ def test_smoke_gate_rejects_network_policy_mismatch(tmp_path: Path) -> None:
         "tool_control_proxy_policy_descriptor_sha256": "f" * 64,
         "endpoint_descriptor_sha256": "b" * 64,
         "agent_descriptor_sha256": "c" * 64,
+        "tool_template_validation_sha256": "2" * 64,
         "provider_configuration_sha256": sha256_fingerprint(
             config.model_dump(mode="json")
         ),
@@ -1813,6 +1817,7 @@ def test_smoke_gate_rejects_network_policy_mismatch(tmp_path: Path) -> None:
             proxy_policy_sha256="f" * 64,
             endpoint_sha256="b" * 64,
             agent_sha256="c" * 64,
+            template_validation_sha256="2" * 64,
         )
 
 

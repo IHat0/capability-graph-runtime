@@ -230,6 +230,15 @@ def _verify_provider_invocations(
             agent = AgentDescriptor.model_validate(
                 read_json(directory / "agent-descriptor.json")
             )
+            template_validation_sha256 = None
+            if (
+                request.tool_template_validation_sha256 is not None
+                or agent.tool_template_validation_sha256 is not None
+            ):
+                template_validation_sha256 = _verify_provider_tool_templates(
+                    directory,
+                    request.tool_template_validation_sha256,
+                )
             tool_image_path = directory / "tool-image-descriptor.json"
             tool_image = (
                 ToolSandboxImageDescriptor.model_validate(read_json(tool_image_path))
@@ -248,6 +257,8 @@ def _verify_provider_invocations(
             if (
                 request.model_endpoint_descriptor_sha256 != endpoint.descriptor_sha256
                 or request.agent_descriptor_sha256 != agent.descriptor_sha256
+                or request.tool_template_validation_sha256 != template_validation_sha256
+                or agent.tool_template_validation_sha256 != template_validation_sha256
                 or request.prompt_sha256 != prompt.prompt_sha256
                 or (
                     agent.tool_image_descriptor_sha256 is not None
@@ -314,6 +325,22 @@ def _verify_provider_network_policy(
     if descriptor.descriptor_sha256 != expected_sha256:
         raise ValueError("Provider tool network policy evidence was substituted.")
     return descriptor.descriptor_sha256
+
+
+def _verify_provider_tool_templates(
+    directory: Path, expected_sha256: str | None
+) -> str:
+    from .model_provider.contracts import ToolTemplateValidationArtifact
+
+    if expected_sha256 is None:
+        raise ValueError("Provider tool-template validation identity is missing.")
+    path = directory / "tool-template-validation.json"
+    if not path.is_file():
+        raise ValueError("Provider tool-template validation evidence is missing.")
+    artifact = ToolTemplateValidationArtifact.model_validate(read_json(path))
+    if artifact.validation_sha256 != expected_sha256:
+        raise ValueError("Provider tool-template values were substituted.")
+    return artifact.validation_sha256
 
 
 def _verify_provider_proxy_policy(

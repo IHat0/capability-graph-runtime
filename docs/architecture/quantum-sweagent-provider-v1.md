@@ -214,6 +214,32 @@ Retry recovery reads that state and removes a resource only when its exact Docke
 schema label, and ownership nonce agree. Foreign or substituted networks and
 containers are never removed; they instead cause a fail-closed cleanup classification.
 
+### Windowed-tool command-document configuration
+
+Pinned SWE-agent 1.1.0 declares `scroll_up` and `scroll_down` in
+`tools/windowed/config.yaml` with docstrings containing the exact `{WINDOW}` field.
+`ToolConfig.model_post_init()` passes `agent.tools.env_variables` to
+`generate_command_docs()`, which formats those docstrings. Upstream's official
+windowed configurations and `tools/windowed/install.sh` use the default value 100;
+upstream converts the runtime value to an integer but declares no narrower range.
+The repair provider therefore retains `tools/windowed` and supplies the deterministic
+value `WINDOW: 100` through the supported `agent.tools.env_variables` field. Retaining
+the bundle preserves its bounded file navigation commands; removing it would narrow
+the provider workflow without addressing the supported upstream configuration.
+
+Before SWE-agent launch, CGR resolves each configured bundle beneath the pristine
+pinned `tools` root, hashes its `config.yaml`, extracts command-doc placeholder names
+without formatting their values, and checks them against the allow-listed schema.
+`WINDOW` must be an actual integer from 1 through 1000; missing values are classified
+as `tool_configuration_template_missing_variable`, while unknown placeholders and
+malformed or unbounded values fail as
+`sweagent_tool_template_configuration_failure`. The sanitized, self-hashed validation
+artifact contains only bundle identities, hashes, required names, and validated
+allow-listed values, with zero model requests, tokens, and trusted-evidence exposure.
+Its identity is cross-linked by the overlay-derived agent configuration, agent
+descriptor, provider request, smoke evidence, acceptance evidence, and replay checks.
+No Docker image input changes because this is an agent configuration value.
+
 Comparative acceptance performs this preflight before materializing any baseline or
 CGR case. Failure creates a completed fail-closed preflight report with zero cases and
 zero model tokens. A separate `syntax-error` smoke then uses the real provider-neutral

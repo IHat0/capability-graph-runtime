@@ -14,6 +14,8 @@ AGENT_SCHEMA = "cgr.quantum-repair-agent-descriptor/1.0.0"
 AGENT_SCHEMA_V1_1 = "cgr.quantum-repair-agent-descriptor/1.1.0"
 AGENT_SCHEMA_V1_2 = "cgr.quantum-repair-agent-descriptor/1.2.0"
 AGENT_SCHEMA_V1_3 = "cgr.quantum-repair-agent-descriptor/1.3.0"
+AGENT_SCHEMA_V1_4 = "cgr.quantum-repair-agent-descriptor/1.4.0"
+TOOL_TEMPLATE_VALIDATION_SCHEMA = "cgr.quantum-sweagent-tool-template-validation/1.0.0"
 TOOL_IMAGE_SCHEMA = "cgr.quantum-sweagent-tool-image/1.1.0"
 TOOL_NETWORK_POLICY_SCHEMA = "cgr.quantum-sweagent-tool-network-policy/1.0.0"
 TOOL_PROXY_POLICY_SCHEMA = "cgr.quantum-swerex-control-proxy-policy/1.0.0"
@@ -22,6 +24,7 @@ TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.3.0"
 BUDGET_SCHEMA = "cgr.quantum-repair-provider-budget/1.0.0"
 PROMPT_SCHEMA = "cgr.quantum-repair-model-prompt/1.0.0"
 REQUEST_SCHEMA = "cgr.quantum-repair-provider-request/1.0.0"
+REQUEST_SCHEMA_V1_1 = "cgr.quantum-repair-provider-request/1.1.0"
 RESULT_SCHEMA = "cgr.quantum-repair-provider-result/1.0.0"
 TRAJECTORY_SCHEMA = "cgr.quantum-repair-provider-trajectory/1.0.0"
 TELEMETRY_SCHEMA = "cgr.quantum-repair-provider-event/1.0.0"
@@ -103,7 +106,7 @@ class ModelEndpointDescriptor(CanonicalModel):
 
 
 class AgentDescriptor(CanonicalModel):
-    schema_version: str = AGENT_SCHEMA_V1_3
+    schema_version: str = AGENT_SCHEMA_V1_4
     agent_type: Literal["pristine-sweagent"] = "pristine-sweagent"
     pristine_source_commit: str
     source_tree_clean: bool
@@ -115,6 +118,7 @@ class AgentDescriptor(CanonicalModel):
     tool_image_descriptor_sha256: str | None = None
     tool_network_policy_descriptor_sha256: str | None = None
     tool_control_proxy_policy_descriptor_sha256: str | None = None
+    tool_template_validation_sha256: str | None = None
     descriptor_sha256: str
 
     @field_validator("schema_version")
@@ -125,6 +129,7 @@ class AgentDescriptor(CanonicalModel):
             AGENT_SCHEMA_V1_1,
             AGENT_SCHEMA_V1_2,
             AGENT_SCHEMA_V1_3,
+            AGENT_SCHEMA_V1_4,
         }:
             raise ValueError("Unsupported agent descriptor schema.")
         return value
@@ -143,6 +148,7 @@ class AgentDescriptor(CanonicalModel):
         "tool_image_descriptor_sha256",
         "tool_network_policy_descriptor_sha256",
         "tool_control_proxy_policy_descriptor_sha256",
+        "tool_template_validation_sha256",
         "descriptor_sha256",
     )
     @classmethod
@@ -152,6 +158,8 @@ class AgentDescriptor(CanonicalModel):
     def canonical_identity(self) -> Any:
         value = self.model_dump(mode="json")
         value.pop("descriptor_sha256", None)
+        if self.schema_version != AGENT_SCHEMA_V1_4:
+            value.pop("tool_template_validation_sha256", None)
         return value
 
     @model_validator(mode="after")
@@ -160,22 +168,87 @@ class AgentDescriptor(CanonicalModel):
             raise ValueError("SWE-agent source must be pristine.")
         if (
             self.schema_version
-            in {AGENT_SCHEMA_V1_1, AGENT_SCHEMA_V1_2, AGENT_SCHEMA_V1_3}
+            in {
+                AGENT_SCHEMA_V1_1,
+                AGENT_SCHEMA_V1_2,
+                AGENT_SCHEMA_V1_3,
+                AGENT_SCHEMA_V1_4,
+            }
             and self.tool_image_descriptor_sha256 is None
         ):
             raise ValueError("Agent descriptor requires an immutable tool image.")
         if (
-            self.schema_version in {AGENT_SCHEMA_V1_2, AGENT_SCHEMA_V1_3}
+            self.schema_version
+            in {AGENT_SCHEMA_V1_2, AGENT_SCHEMA_V1_3, AGENT_SCHEMA_V1_4}
             and self.tool_network_policy_descriptor_sha256 is None
         ):
             raise ValueError("Agent descriptor requires a tool network policy.")
         if (
-            self.schema_version == AGENT_SCHEMA_V1_3
+            self.schema_version in {AGENT_SCHEMA_V1_3, AGENT_SCHEMA_V1_4}
             and self.tool_control_proxy_policy_descriptor_sha256 is None
         ):
             raise ValueError("Agent descriptor requires a control proxy policy.")
+        if (
+            self.schema_version == AGENT_SCHEMA_V1_4
+            and self.tool_template_validation_sha256 is None
+        ):
+            raise ValueError("Agent descriptor requires tool-template validation.")
         if self.descriptor_sha256 != self.fingerprint:
             raise ValueError("Agent descriptor hash was not recomputed.")
+        return self
+
+
+class ToolTemplateValidationArtifact(CanonicalModel):
+    schema_version: str = TOOL_TEMPLATE_VALIDATION_SCHEMA
+    pristine_source_commit: str
+    configured_bundles: tuple[str, ...]
+    bundle_configuration_sha256: dict[str, str]
+    required_variables: tuple[str, ...]
+    configured_variables: dict[str, int]
+    validation_result: Literal["passed", "failed"]
+    failure_classification: str | None = None
+    model_request_count: Literal[0] = 0
+    total_tokens: Literal[0] = 0
+    trusted_evidence_exposure: Literal[0] = 0
+    validation_sha256: str
+
+    @field_validator("schema_version")
+    @classmethod
+    def valid_schema(cls, value: str) -> str:
+        if value != TOOL_TEMPLATE_VALIDATION_SCHEMA:
+            raise ValueError("Unsupported tool-template validation schema.")
+        return value
+
+    @field_validator("pristine_source_commit")
+    @classmethod
+    def commit(cls, value: str) -> str:
+        if len(value) != 40 or any(item not in "0123456789abcdef" for item in value):
+            raise ValueError("Tool-template source identity is malformed.")
+        return value
+
+    @field_validator("validation_sha256")
+    @classmethod
+    def digest(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    def canonical_identity(self) -> Any:
+        value = self.model_dump(mode="json")
+        value.pop("validation_sha256", None)
+        return value
+
+    @model_validator(mode="after")
+    def verified(self) -> Self:
+        if self.validation_result == "passed":
+            if self.failure_classification not in {None, "none"}:
+                raise ValueError(
+                    "Passing tool-template evidence cannot report failure."
+                )
+            if set(self.required_variables) != set(self.configured_variables):
+                raise ValueError("Tool-template variables are not exactly resolved.")
+        elif not self.failure_classification:
+            raise ValueError("Failed tool-template evidence requires classification.")
+        if self.validation_sha256 != self.fingerprint:
+            raise ValueError("Tool-template validation hash was not recomputed.")
         return self
 
 
@@ -619,7 +692,7 @@ class ModelRepairPrompt(CanonicalModel):
 
 
 class ProviderInvocationRequest(CanonicalModel):
-    schema_version: str = REQUEST_SCHEMA
+    schema_version: str = REQUEST_SCHEMA_V1_1
     provider_invocation_identifier: str
     invocation_sequence: int = Field(ge=0)
     repair_run_identifier: str
@@ -630,6 +703,7 @@ class ProviderInvocationRequest(CanonicalModel):
     provider_capability_sha256: str
     model_endpoint_descriptor_sha256: str
     agent_descriptor_sha256: str
+    tool_template_validation_sha256: str | None = None
     prompt_sha256: str
     budget: ProviderBudget
     allowed_paths: tuple[str, ...]
@@ -638,7 +712,7 @@ class ProviderInvocationRequest(CanonicalModel):
     @field_validator("schema_version")
     @classmethod
     def valid_schema(cls, value: str) -> str:
-        if value != REQUEST_SCHEMA:
+        if value not in {REQUEST_SCHEMA, REQUEST_SCHEMA_V1_1}:
             raise ValueError("Unsupported provider request schema.")
         return value
 
@@ -657,6 +731,7 @@ class ProviderInvocationRequest(CanonicalModel):
         "provider_capability_sha256",
         "model_endpoint_descriptor_sha256",
         "agent_descriptor_sha256",
+        "tool_template_validation_sha256",
         "prompt_sha256",
         "request_content_sha256",
     )
@@ -667,10 +742,17 @@ class ProviderInvocationRequest(CanonicalModel):
     def canonical_identity(self) -> Any:
         value = self.model_dump(mode="json")
         value.pop("request_content_sha256", None)
+        if self.schema_version == REQUEST_SCHEMA:
+            value.pop("tool_template_validation_sha256", None)
         return value
 
     @model_validator(mode="after")
     def verified(self) -> Self:
+        if (
+            self.schema_version == REQUEST_SCHEMA_V1_1
+            and self.tool_template_validation_sha256 is None
+        ):
+            raise ValueError("Provider request requires tool-template validation.")
         if self.request_content_sha256 != self.fingerprint:
             raise ValueError("Provider request hash was not recomputed.")
         return self
