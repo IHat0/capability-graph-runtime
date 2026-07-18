@@ -176,7 +176,7 @@ def run_model_acceptance(
             "summary_path": str(directory / "model-provider-acceptance-summary.json"),
             "report_path": str(directory / "model-provider-acceptance-report.json"),
         }
-    if health.startup_result != "passed":
+    if not health.preflight_passed:
         summary = _preflight_failure_summary(
             acceptance,
             failure_classification=(
@@ -568,12 +568,15 @@ def _summarize(
                         "tool_control_network_not_internal",
                         "tool_control_port_publicly_exposed",
                         "tool_runtime_control_channel_unreachable",
+                        "tool_runtime_shutdown_failure",
+                        "tool_deployment_stop_failure",
                         "tool_control_proxy_startup_failure",
                         "tool_control_proxy_bind_failure",
                         "tool_control_proxy_foreign_listener",
                         "tool_control_proxy_destination_invalid",
                         "tool_control_proxy_terminated",
                         "tool_control_proxy_cleanup_failure",
+                        "tool_control_proxy_premature_shutdown",
                         "tool_external_egress_detected",
                         "tool_model_endpoint_access_detected",
                         "tool_container_cleanup_failure",
@@ -654,12 +657,15 @@ def _preflight_failure_summary(
                 "tool_control_network_not_internal",
                 "tool_control_port_publicly_exposed",
                 "tool_runtime_control_channel_unreachable",
+                "tool_runtime_shutdown_failure",
+                "tool_deployment_stop_failure",
                 "tool_control_proxy_startup_failure",
                 "tool_control_proxy_bind_failure",
                 "tool_control_proxy_foreign_listener",
                 "tool_control_proxy_destination_invalid",
                 "tool_control_proxy_terminated",
                 "tool_control_proxy_cleanup_failure",
+                "tool_control_proxy_premature_shutdown",
                 "tool_external_egress_detected",
                 "tool_model_endpoint_access_detected",
                 "tool_container_cleanup_failure",
@@ -709,6 +715,8 @@ def _verify_smoke_report(
     }
     if any(report.get(name) != value for name, value in expected.items()):
         raise ValueError("Provider smoke does not match acceptance infrastructure.")
+    if report.get("failure_classification") not in {None, "none"}:
+        raise ValueError("Provider smoke cannot pass with a failure classification.")
     if (
         report.get("model_request_count", 0) <= 0
         or report.get("total_model_tokens", 0) <= 0

@@ -232,7 +232,7 @@ def provider_check_main(argv: list[str] | None = None) -> int:
             tool_control_proxy_policy_descriptor(config),
         )
         write_evidence(args.evidence_root / "provider-preflight.json", health)
-        if health.startup_result != "passed":
+        if not health.preflight_passed:
             raise ValueError(
                 "Tool sandbox preflight failed: " + str(health.failure_classification)
             )
@@ -301,7 +301,7 @@ def tool_check_main(argv: list[str] | None = None) -> int:
         )
         write_evidence(args.evidence_root / "provider-preflight.json", health)
         result = {
-            "tool_sandbox_preflight_passed": health.startup_result == "passed",
+            "tool_sandbox_preflight_passed": health.preflight_passed,
             "tool_image_id": image.image_id,
             "tool_image_descriptor_sha256": image.descriptor_sha256,
             "health_artifact_sha256": health.health_artifact_sha256,

@@ -17,8 +17,8 @@ AGENT_SCHEMA_V1_3 = "cgr.quantum-repair-agent-descriptor/1.3.0"
 TOOL_IMAGE_SCHEMA = "cgr.quantum-sweagent-tool-image/1.1.0"
 TOOL_NETWORK_POLICY_SCHEMA = "cgr.quantum-sweagent-tool-network-policy/1.0.0"
 TOOL_PROXY_POLICY_SCHEMA = "cgr.quantum-swerex-control-proxy-policy/1.0.0"
-TOOL_PROXY_LIFECYCLE_SCHEMA = "cgr.quantum-swerex-control-proxy-lifecycle/1.0.0"
-TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.2.0"
+TOOL_PROXY_LIFECYCLE_SCHEMA = "cgr.quantum-swerex-control-proxy-lifecycle/1.1.0"
+TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.3.0"
 BUDGET_SCHEMA = "cgr.quantum-repair-provider-budget/1.0.0"
 PROMPT_SCHEMA = "cgr.quantum-repair-model-prompt/1.0.0"
 REQUEST_SCHEMA = "cgr.quantum-repair-provider-request/1.0.0"
@@ -313,9 +313,24 @@ class ToolControlProxyLifecycleArtifact(CanonicalModel):
     startup_result: Literal["passed", "failed"]
     readiness_result: Literal["passed", "failed", "not_reached"]
     cleanup_passed: bool
+    proxy_cleanup_passed: bool
+    container_cleanup_passed: bool
+    network_cleanup_passed: bool
+    official_deployment_stop_passed: bool
+    fallback_cleanup_required: bool
+    fallback_proxy_cleanup_passed: bool
+    fallback_container_cleanup_passed: bool
+    fallback_network_cleanup_passed: bool
     runtime_seconds: float = Field(ge=0)
     failure_classification: str | None
     lifecycle_artifact_sha256: str
+
+    @field_validator("schema_version")
+    @classmethod
+    def valid_schema(cls, value: str) -> str:
+        if value != TOOL_PROXY_LIFECYCLE_SCHEMA:
+            raise ValueError("Unsupported tool control proxy lifecycle schema.")
+        return value
 
     @field_validator(
         "proxy_policy_descriptor_sha256",
@@ -335,12 +350,37 @@ class ToolControlProxyLifecycleArtifact(CanonicalModel):
 
     @model_validator(mode="after")
     def verified(self) -> Self:
+        if self.cleanup_passed != (
+            self.proxy_cleanup_passed
+            and self.container_cleanup_passed
+            and self.network_cleanup_passed
+        ):
+            raise ValueError("Proxy lifecycle cleanup was not derived consistently.")
+        fallback_values = (
+            self.fallback_proxy_cleanup_passed,
+            self.fallback_container_cleanup_passed,
+            self.fallback_network_cleanup_passed,
+        )
+        if not self.fallback_cleanup_required and any(fallback_values):
+            raise ValueError("Proxy lifecycle records an unrequired fallback cleanup.")
+        if self.fallback_cleanup_required and self.official_deployment_stop_passed:
+            raise ValueError("Proxy lifecycle fallback contradicts official cleanup.")
         if self.startup_result == "passed" and (
             self.proxy_source_port == 0
             or self.readiness_result != "passed"
             or not self.cleanup_passed
+            or not self.official_deployment_stop_passed
+            or self.fallback_cleanup_required
+            or self.failure_classification not in {None, "none"}
         ):
             raise ValueError("Passing proxy lifecycle evidence is incomplete.")
+        if (
+            self.failure_classification not in {None, "none"}
+            and self.startup_result == "passed"
+        ):
+            raise ValueError(
+                "Proxy lifecycle cannot pass with a failure classification."
+            )
         if self.lifecycle_artifact_sha256 != self.fingerprint:
             raise ValueError("Tool control proxy lifecycle hash was not recomputed.")
         return self
@@ -373,6 +413,11 @@ class ToolSandboxHealthArtifact(CanonicalModel):
     cleanup_passed: bool
     container_cleanup_passed: bool
     network_cleanup_passed: bool
+    official_deployment_stop_passed: bool
+    fallback_cleanup_required: bool
+    fallback_proxy_cleanup_passed: bool
+    fallback_container_cleanup_passed: bool
+    fallback_network_cleanup_passed: bool
     credential_forwarding_observed: bool
     docker_socket_forwarded: bool
     model_endpoint_reachable: bool
@@ -415,6 +460,26 @@ class ToolSandboxHealthArtifact(CanonicalModel):
 
     @model_validator(mode="after")
     def verified(self) -> Self:
+        if self.cleanup_passed != (
+            self.proxy_cleanup_passed
+            and self.container_cleanup_passed
+            and self.network_cleanup_passed
+        ):
+            raise ValueError("Aggregate cleanup evidence was not derived consistently.")
+        fallback_values = (
+            self.fallback_proxy_cleanup_passed,
+            self.fallback_container_cleanup_passed,
+            self.fallback_network_cleanup_passed,
+        )
+        if not self.fallback_cleanup_required and any(fallback_values):
+            raise ValueError("Tool health records an unrequired fallback cleanup.")
+        if self.fallback_cleanup_required and self.official_deployment_stop_passed:
+            raise ValueError("Tool health fallback contradicts official cleanup.")
+        if (
+            self.failure_classification not in {None, "none"}
+            and self.startup_result == "passed"
+        ):
+            raise ValueError("Tool health cannot pass with a failure classification.")
         if self.startup_result == "passed" and (
             not self.shell_smoke_passed
             or not self.workspace_write_passed
@@ -428,6 +493,9 @@ class ToolSandboxHealthArtifact(CanonicalModel):
             or not self.direct_internal_control_reachable
             or not self.proxy_readiness_passed
             or not self.proxy_cleanup_passed
+            or not self.official_deployment_stop_passed
+            or self.fallback_cleanup_required
+            or self.failure_classification not in {None, "none"}
             or self.direct_external_ip_reachable
             or self.external_hostname_reachable
             or self.pypi_reachable
@@ -440,6 +508,13 @@ class ToolSandboxHealthArtifact(CanonicalModel):
         if self.health_artifact_sha256 != self.fingerprint:
             raise ValueError("Tool health artifact hash was not recomputed.")
         return self
+
+    @property
+    def preflight_passed(self) -> bool:
+        return self.startup_result == "passed" and self.failure_classification in {
+            None,
+            "none",
+        }
 
 
 class ProviderBudget(CanonicalModel):

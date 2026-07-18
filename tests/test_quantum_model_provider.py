@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ from cgr.quantum_candidate.contracts import CandidateAdjudicationReceipt
 from cgr.quantum_candidate.findings import finding
 from cgr.quantum_preflight.manifests import load_manifest
 from cgr.quantum_repair.contracts import QuantumRepairPolicy, StructuredEdit
+from cgr.quantum_repair.cli import tool_check_main
 from cgr.quantum_repair.directives import create_directive
 from cgr.quantum_repair.model_acceptance import (
     _summarize,
@@ -46,6 +48,7 @@ from cgr.quantum_repair.model_provider.contracts import (
     ProviderBudget,
     ProviderInvocationRequest,
     SamplingParameters,
+    ToolSandboxHealthArtifact,
     ToolSandboxImageDescriptor,
     ToolControlProxyLifecycleArtifact,
     ToolControlProxyPolicyDescriptor,
@@ -80,6 +83,7 @@ from cgr.quantum_repair.model_provider.tool_sandbox import (
     OwnedControlNetwork,
     ToolSandboxError,
     classify_bootstrap_failure,
+    failed_tool_health,
     infrastructure_install_attempt_observed,
     inspect_tool_image,
     recover_owned_control_network,
@@ -155,7 +159,13 @@ class _FakeControlNetwork:
         return self.verify_direct_control(endpoint)
 
     def cleanup(self) -> tuple[bool, bool]:
-        return True, True
+        return self.cleanup_containers(), self.cleanup_network()
+
+    def cleanup_containers(self) -> bool:
+        return True
+
+    def cleanup_network(self) -> bool:
+        return True
 
 
 def _fake_control_network(_state_path: Path) -> _FakeControlNetwork:
@@ -170,7 +180,8 @@ class _FakeProxy:
         return None
 
     def assert_healthy(self) -> None:
-        return None
+        if self.stopped:
+            raise RuntimeError("proxy stopped")
 
     def stop(self) -> bool:
         self.stopped = True
@@ -798,6 +809,14 @@ def test_replay_verifies_proxy_policy_and_lifecycle_cross_links(tmp_path: Path) 
             "startup_result": "passed",
             "readiness_result": "passed",
             "cleanup_passed": True,
+            "proxy_cleanup_passed": True,
+            "container_cleanup_passed": True,
+            "network_cleanup_passed": True,
+            "official_deployment_stop_passed": True,
+            "fallback_cleanup_required": False,
+            "fallback_proxy_cleanup_passed": False,
+            "fallback_container_cleanup_passed": False,
+            "fallback_network_cleanup_passed": False,
             "runtime_seconds": 1.0,
             "failure_classification": None,
         },
@@ -810,6 +829,81 @@ def test_replay_verifies_proxy_policy_and_lifecycle_cross_links(tmp_path: Path) 
     _verify_provider_proxy_lifecycle(tmp_path, observed)
     with pytest.raises(ValueError, match="substituted"):
         _verify_provider_proxy_policy(tmp_path, "f" * 64)
+    contradictory = lifecycle.model_dump(mode="json")
+    contradictory["failure_classification"] = "tool_runtime_shutdown_failure"
+    contradictory.pop("lifecycle_artifact_sha256")
+    provisional = ToolControlProxyLifecycleArtifact.model_construct(
+        **contradictory, lifecycle_artifact_sha256="0" * 64
+    )
+    contradictory["lifecycle_artifact_sha256"] = sha256_fingerprint(
+        provisional.canonical_identity()
+    )
+    (tmp_path / "tool-control-proxy-lifecycle.json").write_text(
+        json.dumps(contradictory), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="incomplete|cannot pass"):
+        _verify_provider_proxy_lifecycle(tmp_path, policy.descriptor_sha256)
+
+
+def test_tool_health_rejects_failure_pass_and_cleanup_contradictions() -> None:
+    failed = failed_tool_health(
+        SWEAgentProviderConfig(),
+        ToolSandboxError("tool_runtime_shutdown_failure", "sanitized"),
+    )
+
+    def validate_changed(**changes: Any) -> None:
+        values = failed.model_dump(mode="json")
+        values.update(changes)
+        values.pop("health_artifact_sha256")
+        provisional = ToolSandboxHealthArtifact.model_construct(
+            **values, health_artifact_sha256="0" * 64
+        )
+        values["health_artifact_sha256"] = sha256_fingerprint(
+            provisional.canonical_identity()
+        )
+        ToolSandboxHealthArtifact.model_validate(values)
+
+    with pytest.raises(ValueError, match="cannot pass"):
+        validate_changed(startup_result="passed")
+    with pytest.raises(ValueError, match="derived consistently"):
+        validate_changed(cleanup_passed=False)
+
+
+def test_tool_check_cli_exits_nonzero_for_every_classified_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cgr.quantum_repair.model_provider.config as config_module
+    import cgr.quantum_repair.model_provider.tool_sandbox as tool_module
+
+    config = SWEAgentProviderConfig()
+    health = failed_tool_health(
+        config, ToolSandboxError("tool_runtime_shutdown_failure", "sanitized")
+    )
+    monkeypatch.setattr(config_module, "load_provider_config", lambda _path: config)
+    monkeypatch.setattr(
+        tool_module, "inspect_tool_image", lambda _config: _tool_image_descriptor()
+    )
+    monkeypatch.setattr(
+        tool_module,
+        "run_offline_tool_preflight",
+        lambda *_args, **_kwargs: health,
+    )
+    monkeypatch.setattr(
+        tool_module,
+        "verify_control_proxy_lifecycle_evidence",
+        lambda *_args, **_kwargs: None,
+    )
+    config_path = tmp_path / "provider-config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    status = tool_check_main(
+        [
+            "--provider-config",
+            str(config_path),
+            "--evidence-root",
+            str(tmp_path / "evidence"),
+        ]
+    )
+    assert status != 0
 
 
 def test_interrupted_owned_network_recovery_removes_only_matching_resources(
@@ -885,11 +979,17 @@ def test_proxy_container_network_cleanup_order_is_stable(
     fail_after_readiness: bool,
 ) -> None:
     events: list[str] = []
+    proxy_holder: list[Proxy] = []
+    deployment_stop_calls = 0
 
     class Network(_FakeControlNetwork):
-        def cleanup(self) -> tuple[bool, bool]:
+        def cleanup_containers(self) -> bool:
+            events.append("container")
+            return True
+
+        def cleanup_network(self) -> bool:
             events.append("network")
-            return True, True
+            return True
 
     class Proxy(_FakeProxy):
         def stop(self) -> bool:
@@ -918,18 +1018,175 @@ def test_proxy_container_network_cleanup_order_is_stable(
             return None
 
         async def stop(self) -> None:
-            events.append("container")
+            nonlocal deployment_stop_calls
+            deployment_stop_calls += 1
+            proxy_holder[0].assert_healthy()
+            events.append("runtime-close")
+            proxy_holder[0].assert_healthy()
+            events.append("deployment-stop")
+
+    def proxy_factory(port: int, endpoint: ControlProxyEndpoint) -> Proxy:
+        proxy = Proxy(port, endpoint)
+        proxy_holder.append(proxy)
+        return proxy
 
     health = run_offline_tool_preflight(
         SWEAgentProviderConfig(),
         image=_tool_image_descriptor(),
         deployment_factory=lambda _values: Deployment(),
         control_network_factory=lambda _path: Network(),
+        proxy_factory=proxy_factory,
+        control_port_selector=lambda: 49152,
+    )
+    assert events == [
+        "runtime-close",
+        "deployment-stop",
+        "container",
+        "proxy",
+        "network",
+    ]
+    assert deployment_stop_calls == 1
+    assert health.startup_result == ("failed" if fail_after_readiness else "passed")
+
+
+def test_runtime_close_refusal_is_fail_closed_after_successful_fallback() -> None:
+    events: list[str] = []
+
+    class Network(_FakeControlNetwork):
+        def cleanup_containers(self) -> bool:
+            events.append("fallback-container")
+            return True
+
+        def cleanup_network(self) -> bool:
+            events.append("fallback-network")
+            return True
+
+    class Proxy(_FakeProxy):
+        def stop(self) -> bool:
+            events.append("fallback-proxy")
+            return super().stop()
+
+    class Runtime:
+        async def upload(self, _request: Any) -> None:
+            return None
+
+        async def execute(self, command: Any) -> Any:
+            if command.command == "env":
+                return SimpleNamespace(stdout="PATH=/usr/bin", exit_code=0)
+            probes = ("docker.sock", "1.1.1.1", "example.com", "pypi.org", "/models")
+            return SimpleNamespace(
+                stdout="ok",
+                exit_code=1 if any(item in command.command for item in probes) else 0,
+            )
+
+    class Deployment:
+        runtime = Runtime()
+        stop_calls = 0
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            events.append("official-stop")
+            raise ConnectionRefusedError(
+                "Cannot connect to host 127.0.0.1:49152 Connection refused"
+            )
+
+    deployment = Deployment()
+    health = run_offline_tool_preflight(
+        SWEAgentProviderConfig(),
+        image=_tool_image_descriptor(),
+        deployment_factory=lambda _values: deployment,
+        control_network_factory=lambda _path: Network(),
         proxy_factory=lambda port, endpoint: Proxy(port, endpoint),
         control_port_selector=lambda: 49152,
     )
-    assert events == ["proxy", "container", "network"]
-    assert health.startup_result == ("failed" if fail_after_readiness else "passed")
+    assert events == [
+        "official-stop",
+        "fallback-container",
+        "fallback-proxy",
+        "fallback-network",
+    ]
+    assert deployment.stop_calls == 1
+    assert health.failure_classification == "tool_runtime_shutdown_failure"
+    assert health.startup_result == "failed"
+    assert health.preflight_passed is False
+    assert health.official_deployment_stop_passed is False
+    assert health.fallback_cleanup_required is True
+    assert health.fallback_proxy_cleanup_passed is True
+    assert health.fallback_container_cleanup_passed is True
+    assert health.fallback_network_cleanup_passed is True
+    assert health.cleanup_passed is True
+
+
+def test_proxy_exit_during_official_stop_is_detected_and_never_passes() -> None:
+    proxy_holder: list[_FakeProxy] = []
+
+    class Runtime:
+        async def upload(self, _request: Any) -> None:
+            return None
+
+        async def execute(self, command: Any) -> Any:
+            if command.command == "env":
+                return SimpleNamespace(stdout="PATH=/usr/bin", exit_code=0)
+            probes = ("docker.sock", "1.1.1.1", "example.com", "pypi.org", "/models")
+            return SimpleNamespace(
+                stdout="ok",
+                exit_code=1 if any(item in command.command for item in probes) else 0,
+            )
+
+    class Deployment:
+        runtime = Runtime()
+        stop_calls = 0
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            proxy_holder[0].stop()
+
+    def proxy_factory(port: int, endpoint: ControlProxyEndpoint) -> _FakeProxy:
+        proxy = _FakeProxy(port, endpoint)
+        proxy_holder.append(proxy)
+        return proxy
+
+    deployment = Deployment()
+    health = run_offline_tool_preflight(
+        SWEAgentProviderConfig(),
+        image=_tool_image_descriptor(),
+        deployment_factory=lambda _values: deployment,
+        control_network_factory=_fake_control_network,
+        proxy_factory=proxy_factory,
+        control_port_selector=lambda: 49152,
+    )
+    assert deployment.stop_calls == 1
+    assert health.failure_classification == "tool_control_proxy_premature_shutdown"
+    assert health.preflight_passed is False
+    assert health.official_deployment_stop_passed is True
+    assert health.proxy_cleanup_passed is True
+
+
+def test_pinned_deployment_stop_is_idempotent_after_runtime_close() -> None:
+    from swerex.deployment.config import DockerDeploymentConfig
+
+    class Runtime:
+        close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    deployment = DockerDeploymentConfig(
+        image="sha256:" + "a" * 64,
+        python_standalone_dir=None,
+        remove_container=True,
+    ).get_deployment()
+    runtime = Runtime()
+    deployment._runtime = runtime
+    asyncio.run(deployment.stop())
+    asyncio.run(deployment.stop())
+    assert runtime.close_calls == 1
 
 
 def test_offline_dependency_and_container_startup_failures_are_precise() -> None:
@@ -1015,18 +1272,21 @@ def test_external_egress_and_model_endpoint_access_fail_preflight(
 
 
 @pytest.mark.parametrize(
-    ("cleanup", "classification"),
+    "cleanup",
     [
-        ((False, False), "tool_container_cleanup_failure"),
-        ((True, False), "tool_network_cleanup_failure"),
+        (False, False),
+        (True, False),
     ],
 )
 def test_cleanup_failures_are_precisely_classified(
-    cleanup: tuple[bool, bool], classification: str
+    cleanup: tuple[bool, bool],
 ) -> None:
     class Network(_FakeControlNetwork):
-        def cleanup(self) -> tuple[bool, bool]:
-            return cleanup
+        def cleanup_containers(self) -> bool:
+            return cleanup[0]
+
+        def cleanup_network(self) -> bool:
+            return cleanup[1]
 
     class FailedDeployment:
         runtime = None
@@ -1045,7 +1305,10 @@ def test_cleanup_failures_are_precisely_classified(
         proxy_factory=_fake_proxy,
         control_port_selector=lambda: 49152,
     )
-    assert health.failure_classification == classification
+    assert health.failure_classification == "tool_runtime_control_channel_unreachable"
+    assert health.container_cleanup_passed is cleanup[0]
+    assert health.network_cleanup_passed is cleanup[1]
+    assert health.startup_result == "failed"
 
 
 @pytest.mark.parametrize(

@@ -80,7 +80,7 @@ def run_provider_smoke(
         tool_control_proxy_policy_descriptor(provider_config),
     )
     write_evidence(directory / "provider-preflight.json", health)
-    if health.startup_result != "passed":
+    if not health.preflight_passed:
         return _write_report(
             directory,
             {

@@ -69,6 +69,27 @@ class OwnedContainerEndpoint:
         )
 
 
+@dataclass(frozen=True)
+class ToolCleanupOutcome:
+    official_deployment_stop_passed: bool
+    fallback_cleanup_required: bool
+    proxy_cleanup_passed: bool
+    container_cleanup_passed: bool
+    network_cleanup_passed: bool
+    fallback_proxy_cleanup_passed: bool
+    fallback_container_cleanup_passed: bool
+    fallback_network_cleanup_passed: bool
+    failure_classification: str | None
+
+    @property
+    def cleanup_passed(self) -> bool:
+        return (
+            self.proxy_cleanup_passed
+            and self.container_cleanup_passed
+            and self.network_cleanup_passed
+        )
+
+
 class ToolSandboxError(RuntimeError):
     def __init__(
         self, code: str, message: str, *, package_install_attempt: bool = False
@@ -402,6 +423,12 @@ class OwnedControlNetwork:
         )
 
     def cleanup(self) -> tuple[bool, bool]:
+        container_cleanup = self.cleanup_containers()
+        network_cleanup = self.cleanup_network() if container_cleanup else False
+        return container_cleanup, network_cleanup
+
+    def cleanup_containers(self) -> bool:
+        """Remove only verified owned containers, leaving the network intact."""
         container_cleanup = True
         try:
             payload = self.inspect_owned()
@@ -417,12 +444,14 @@ class OwnedControlNetwork:
                     self.runner, self.docker, "container", "rm", "--force", container_id
                 )
                 container_cleanup = container_cleanup and removed.returncode == 0
-        network_cleanup = (
-            self._remove_network_if_owned() if container_cleanup else False
-        )
-        if container_cleanup and network_cleanup:
+        return container_cleanup
+
+    def cleanup_network(self) -> bool:
+        """Remove the verified owned network after proxy teardown."""
+        network_cleanup = self._remove_network_if_owned()
+        if network_cleanup:
             self.state_path.unlink(missing_ok=True)
-        return container_cleanup, network_cleanup
+        return network_cleanup
 
     def _inspect_network(self) -> dict[str, Any]:
         process = _docker(self.runner, self.docker, "network", "inspect", self.name)
@@ -585,8 +614,11 @@ def run_offline_tool_preflight(
     network: Any | None = None
     proxy: Any | None = None
     endpoint: OwnedContainerEndpoint | None = None
-    proxy_started = proxy_cleanup = False
+    proxy_cleanup = False
     container_cleanup = network_cleanup = False
+    official_stop = False
+    fallback_required = False
+    fallback_proxy = fallback_container = fallback_network = False
     temporary: tempfile.TemporaryDirectory[str] | None = None
     holder: dict[str, Any] = {}
     if lifecycle_root is None:
@@ -624,7 +656,6 @@ def run_offline_tool_preflight(
         )
         proxy = holder.get("proxy")
         endpoint = holder.get("endpoint")
-        proxy_started = proxy is not None
     except Exception as exc:
         text = str(exc)
         package_attempt = bool(_INSTALL_ATTEMPT.search(text))
@@ -639,37 +670,29 @@ def run_offline_tool_preflight(
     finally:
         proxy = proxy or holder.get("proxy")
         endpoint = endpoint or holder.get("endpoint")
-        proxy_started = proxy is not None
-        if proxy is not None:
-            try:
-                proxy_cleanup = bool(proxy.stop())
-            except Exception:
-                proxy_cleanup = False
-                failure = "tool_control_proxy_cleanup_failure"
-        if deployment is not None:
-            try:
-                asyncio.run(deployment.stop())
-            except Exception:
-                container_cleanup = False
-                failure = "tool_container_cleanup_failure"
-        if network is not None:
-            try:
-                container_cleanup, network_cleanup = network.cleanup()
-            except Exception:
-                container_cleanup = network_cleanup = False
-            if not container_cleanup:
-                failure = "tool_container_cleanup_failure"
-            elif not network_cleanup:
-                failure = "tool_network_cleanup_failure"
-    cleanup = container_cleanup and network_cleanup
-    if proxy_started and not proxy_cleanup:
-        cleanup = False
-    if observations["direct_external_ip"]:
-        failure = "tool_external_egress_detected"
-    elif observations["external_hostname"] or observations["pypi"]:
-        failure = "tool_external_egress_detected"
-    elif observations["model_access"]:
-        failure = "tool_model_endpoint_access_detected"
+        outcome = _shutdown_preflight_lifecycle(
+            deployment=deployment,
+            proxy=proxy,
+            network=network,
+            failure_classification=failure,
+        )
+        official_stop = outcome.official_deployment_stop_passed
+        fallback_required = outcome.fallback_cleanup_required
+        proxy_cleanup = outcome.proxy_cleanup_passed
+        container_cleanup = outcome.container_cleanup_passed
+        network_cleanup = outcome.network_cleanup_passed
+        fallback_proxy = outcome.fallback_proxy_cleanup_passed
+        fallback_container = outcome.fallback_container_cleanup_passed
+        fallback_network = outcome.fallback_network_cleanup_passed
+        failure = outcome.failure_classification
+    cleanup = proxy_cleanup and container_cleanup and network_cleanup
+    if failure in {None, "none"}:
+        if observations["direct_external_ip"]:
+            failure = "tool_external_egress_detected"
+        elif observations["external_hostname"] or observations["pypi"]:
+            failure = "tool_external_egress_detected"
+        elif observations["model_access"]:
+            failure = "tool_model_endpoint_access_detected"
     status = (
         "passed"
         if all(
@@ -688,6 +711,9 @@ def run_offline_tool_preflight(
                 observations["direct_internal_control"],
                 observations["proxy_readiness"],
                 proxy_cleanup,
+                official_stop,
+                not fallback_required,
+                failure in {None, "none"},
             )
         )
         else "failed"
@@ -724,7 +750,15 @@ def run_offline_tool_preflight(
         "readiness_result": (
             "passed" if observations["proxy_readiness"] else "not_reached"
         ),
-        "cleanup_passed": proxy_cleanup if proxy_started else True,
+        "cleanup_passed": cleanup,
+        "proxy_cleanup_passed": proxy_cleanup,
+        "container_cleanup_passed": container_cleanup,
+        "network_cleanup_passed": network_cleanup,
+        "official_deployment_stop_passed": official_stop,
+        "fallback_cleanup_required": fallback_required,
+        "fallback_proxy_cleanup_passed": fallback_proxy,
+        "fallback_container_cleanup_passed": fallback_container,
+        "fallback_network_cleanup_passed": fallback_network,
         "runtime_seconds": time.monotonic() - started,
         "failure_classification": failure,
     }
@@ -762,7 +796,7 @@ def run_offline_tool_preflight(
         "docker_published_host_port_observed": public_exposure,
         "direct_internal_control_reachable": observations["direct_internal_control"],
         "proxy_readiness_passed": observations["proxy_readiness"],
-        "proxy_cleanup_passed": proxy_cleanup if proxy_started else True,
+        "proxy_cleanup_passed": proxy_cleanup,
         "direct_external_ip_reachable": observations["direct_external_ip"],
         "external_hostname_reachable": observations["external_hostname"],
         "pypi_reachable": observations["pypi"],
@@ -772,6 +806,11 @@ def run_offline_tool_preflight(
         "cleanup_passed": cleanup,
         "container_cleanup_passed": container_cleanup,
         "network_cleanup_passed": network_cleanup,
+        "official_deployment_stop_passed": official_stop,
+        "fallback_cleanup_required": fallback_required,
+        "fallback_proxy_cleanup_passed": fallback_proxy,
+        "fallback_container_cleanup_passed": fallback_container,
+        "fallback_network_cleanup_passed": fallback_network,
         "credential_forwarding_observed": observations["credential_forwarding"],
         "docker_socket_forwarded": observations["docker_socket"],
         "model_endpoint_reachable": observations["model_access"],
@@ -783,6 +822,103 @@ def run_offline_tool_preflight(
     if temporary is not None:
         temporary.cleanup()
     return health
+
+
+def _shutdown_preflight_lifecycle(
+    *,
+    deployment: Any | None,
+    proxy: Any | None,
+    network: Any | None,
+    failure_classification: str | None,
+) -> ToolCleanupOutcome:
+    """Keep control available through official stop, then remove owned resources."""
+    failure = failure_classification
+    official_stop = deployment is None
+    fallback_required = False
+
+    if proxy is not None:
+        try:
+            proxy.assert_healthy()
+        except Exception:
+            if failure in {None, "none"}:
+                failure = "tool_control_proxy_premature_shutdown"
+
+    if deployment is not None:
+        try:
+            asyncio.run(deployment.stop())
+            official_stop = True
+        except Exception as exc:
+            fallback_required = True
+            if failure in {None, "none"}:
+                failure = _classify_shutdown_failure(exc)
+
+    if proxy is not None and official_stop:
+        try:
+            proxy.assert_healthy()
+        except Exception:
+            if failure in {None, "none"}:
+                failure = "tool_control_proxy_premature_shutdown"
+
+    container_cleanup = network is None
+    if network is not None:
+        try:
+            container_cleanup = bool(network.cleanup_containers())
+        except Exception:
+            container_cleanup = False
+        if not container_cleanup and failure in {None, "none"}:
+            failure = "tool_container_cleanup_failure"
+
+    proxy_cleanup = proxy is None
+    if proxy is not None:
+        try:
+            proxy_cleanup = bool(proxy.stop())
+        except Exception:
+            proxy_cleanup = False
+        if not proxy_cleanup and failure in {None, "none"}:
+            failure = "tool_control_proxy_cleanup_failure"
+
+    network_cleanup = network is None
+    if network is not None:
+        try:
+            network_cleanup = bool(network.cleanup_network())
+        except Exception:
+            network_cleanup = False
+        if not network_cleanup and failure in {None, "none"}:
+            failure = "tool_network_cleanup_failure"
+
+    return ToolCleanupOutcome(
+        official_deployment_stop_passed=official_stop,
+        fallback_cleanup_required=fallback_required,
+        proxy_cleanup_passed=proxy_cleanup,
+        container_cleanup_passed=container_cleanup,
+        network_cleanup_passed=network_cleanup,
+        fallback_proxy_cleanup_passed=proxy_cleanup if fallback_required else False,
+        fallback_container_cleanup_passed=(
+            container_cleanup if fallback_required else False
+        ),
+        fallback_network_cleanup_passed=(
+            network_cleanup if fallback_required else False
+        ),
+        failure_classification=failure,
+    )
+
+
+def _classify_shutdown_failure(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    lowered = str(error).lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "cannot connect",
+            "connection refused",
+            "clientconnectorerror",
+            "connect call failed",
+        )
+    ):
+        return "tool_runtime_shutdown_failure"
+    return "tool_deployment_stop_failure"
 
 
 async def _exercise_deployment(
@@ -1000,6 +1136,11 @@ def failed_tool_health(
         "cleanup_passed": True,
         "container_cleanup_passed": True,
         "network_cleanup_passed": True,
+        "official_deployment_stop_passed": True,
+        "fallback_cleanup_required": False,
+        "fallback_proxy_cleanup_passed": False,
+        "fallback_container_cleanup_passed": False,
+        "fallback_network_cleanup_passed": False,
         "credential_forwarding_observed": False,
         "docker_socket_forwarded": False,
         "model_endpoint_reachable": False,
