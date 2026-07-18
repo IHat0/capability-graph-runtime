@@ -193,11 +193,36 @@ The narrow lifecycle adapter therefore creates a unique user-defined bridge with
 `docker network create --internal` and the bridge driver option
 `com.docker.network.bridge.host_binding_ipv4=127.0.0.1`. It passes the owned network
 name and an ownership label through official `DockerDeploymentConfig.docker_args`.
-Docker's network option makes upstream's unqualified port publication loopback-only.
-The provider does not subclass, patch, or rewrite SWE-ReX and does not intercept agent
+An internal Docker network intentionally provides no usable published host port, so
+CGR supplies the selected loopback endpoint with an invocation-owned TCP proxy. The
+provider does not subclass, patch, or rewrite SWE-ReX and does not intercept agent
 actions. Docker inspection must show `Internal=true`, the expected ownership nonce,
-exactly one container network, and one `127.0.0.1` control binding. The default bridge,
-host network, public bindings, extra networks, and substituted resources are rejected.
+exactly one container network, and no published container control binding. The default
+bridge, host network, public bindings, extra networks, and substituted resources are
+rejected.
+
+Pinned SWE-ReX 1.4.0 starts its Docker process and immediately constructs a loopback
+`RemoteRuntime`; its readiness loop can therefore issue `GET /is_alive` before CGR
+has discovered the new container. Selecting a free port and closing the selection
+socket left a nondeterministic interval in which that first probe received connection
+refused. The v2 startup handshake instead binds an ephemeral `127.0.0.1` listener
+before official deployment launch, passes that still-owned port to SWE-ReX, and keeps
+the listener gated until Docker inspection verifies the ownership nonce, exact image,
+network identity, sole internal network, absent public binding, and internal IPv4
+destination. Early official health probes can reach the reserved listener but cannot
+reach any unverified destination.
+
+After activation, CGR polls `/is_alive` through the proxy under the original bounded
+startup deadline. Only connection/readiness failures are retried; every poll rechecks
+the immutable container destination. Container exit, identity substitution, missing
+internal IP, public exposure, network-policy changes, proxy failure, and deadline
+expiry fail immediately with layer-specific classifications. The lifecycle contract
+records the reserved port, bind/listener, official activation and first-request times,
+verified destination state, readiness attempts and elapsed time, deadline, terminal
+state, and cleanup results. A passing artifact must prove listener readiness preceded
+both official client activation and the first official control request. The proxy
+remains live until the official child has completed `deployment.stop()` and `/close`;
+cleanup then removes containers, the proxy, and finally the owned network.
 
 Provider health waits for the official ready state, runs a harmless shell command,
 modifies a disposable file, and proves that direct external IP, external hostname,

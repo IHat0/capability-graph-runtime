@@ -4,9 +4,11 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +45,7 @@ from cgr.quantum_repair.model_provider.config import (
     load_provider_config,
 )
 from cgr.quantum_repair.model_provider.contracts import (
+    TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2,
     ModelEndpointDescriptor,
     ModelRepairPrompt,
     ProviderBudget,
@@ -722,15 +725,28 @@ def test_foreign_container_and_substituted_network_are_never_removed(
 
 
 @pytest.mark.parametrize(
-    "runner",
+    ("runner", "classification"),
     [
-        _DockerNetworkRunner(container_image="sha256:" + "f" * 64),
-        _DockerNetworkRunner(foreign_container=True),
-        _DockerNetworkRunner(internal_ip="192.0.2.10"),
+        (
+            _DockerNetworkRunner(container_image="sha256:" + "f" * 64),
+            "tool_container_identity_mismatch",
+        ),
+        (
+            _DockerNetworkRunner(foreign_container=True),
+            "tool_container_identity_mismatch",
+        ),
+        (
+            _DockerNetworkRunner(internal_ip="192.0.2.10"),
+            "tool_control_proxy_destination_invalid",
+        ),
+        (
+            _DockerNetworkRunner(internal_ip=""),
+            "tool_runtime_destination_not_ready",
+        ),
     ],
 )
 def test_proxy_destination_identity_and_owned_subnet_are_enforced(
-    tmp_path: Path, runner: _DockerNetworkRunner
+    tmp_path: Path, runner: _DockerNetworkRunner, classification: str
 ) -> None:
     network = OwnedControlNetwork.create(
         tmp_path / "network-state.json", runner=runner, docker="docker"
@@ -738,7 +754,7 @@ def test_proxy_destination_identity_and_owned_subnet_are_enforced(
     runner.container_exists = True
     with pytest.raises(ToolSandboxError) as raised:
         network.discover_owned_container("sha256:" + "a" * 64)
-    assert raised.value.code == "tool_control_proxy_destination_invalid"
+    assert raised.value.code == classification
     runner.container_exists = False
     network.cleanup()
 
@@ -778,7 +794,7 @@ def test_owned_container_discovery_race_succeeds_and_timeout_is_bounded(
         network.wait_for_owned_container(
             "sha256:" + "a" * 64, timeout_seconds=0.02, poll_seconds=0.005
         )
-    assert raised.value.code == "tool_runtime_control_channel_unreachable"
+    assert raised.value.code == "tool_container_discovery_timeout"
     network.cleanup()
 
 
@@ -867,6 +883,176 @@ def test_tool_health_rejects_failure_pass_and_cleanup_contradictions() -> None:
         validate_changed(startup_result="passed")
     with pytest.raises(ValueError, match="derived consistently"):
         validate_changed(cleanup_passed=False)
+
+
+def test_proxy_handshake_lifecycle_persists_order_and_retry_evidence() -> None:
+    values = {
+        "schema_version": TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2,
+        "proxy_policy_descriptor_sha256": "a" * 64,
+        "proxy_bind_identity_sha256": "b" * 64,
+        "proxy_source_port": 49152,
+        "proxy_destination_container_identity": "owned-container",
+        "proxy_destination_image_identity": "sha256:" + "c" * 64,
+        "proxy_destination_internal_ip_identity": "d" * 64,
+        "proxy_destination_network_identity_sha256": "e" * 64,
+        "startup_result": "passed",
+        "readiness_result": "passed",
+        "cleanup_passed": True,
+        "proxy_cleanup_passed": True,
+        "container_cleanup_passed": True,
+        "network_cleanup_passed": True,
+        "official_deployment_stop_passed": True,
+        "fallback_cleanup_required": False,
+        "fallback_proxy_cleanup_passed": False,
+        "fallback_container_cleanup_passed": False,
+        "fallback_network_cleanup_passed": False,
+        "reserved_source_port": 49152,
+        "container_launch_observed": True,
+        "verified_container_identity": True,
+        "verified_internal_ip": True,
+        "proxy_bind_started_seconds": 0.01,
+        "proxy_listener_ready_seconds": 0.02,
+        "official_client_activation_seconds": 0.03,
+        "first_official_control_request_seconds": 0.04,
+        "destination_ready_seconds": 0.15,
+        "startup_polling_attempts": 4,
+        "startup_polling_elapsed_seconds": 0.11,
+        "startup_deadline_seconds": 30.0,
+        "official_request_before_proxy_readiness": False,
+        "startup_terminal_state": "destination_ready",
+        "runtime_seconds": 0.2,
+        "failure_classification": None,
+    }
+    lifecycle = seal_contract(
+        ToolControlProxyLifecycleArtifact,
+        values,
+        "lifecycle_artifact_sha256",
+    )
+    assert lifecycle.startup_polling_attempts == 4
+    assert lifecycle.startup_polling_elapsed_seconds == 0.11
+    assert (
+        lifecycle.proxy_listener_ready_seconds
+        <= lifecycle.first_official_control_request_seconds
+    )
+
+    contradictory = dict(values)
+    contradictory["proxy_listener_ready_seconds"] = 0.05
+    with pytest.raises(ValidationError, match="handshake evidence is incomplete"):
+        seal_contract(
+            ToolControlProxyLifecycleArtifact,
+            contradictory,
+            "lifecycle_artifact_sha256",
+        )
+
+
+def test_provider_lifecycle_is_written_after_observed_cleanup(tmp_path: Path) -> None:
+    from cgr.quantum_repair.model_provider.provider import _finalize_control_plane
+
+    events: list[str] = []
+    started = time.monotonic() - 1.0
+
+    class Proxy:
+        source_port = 49152
+        bind_started_monotonic = started + 0.01
+        listener_ready_monotonic = started + 0.02
+        first_client_connection_monotonic = started + 0.04
+        destination_ready_monotonic = started + 0.05
+        startup_polling_attempts = 2
+        startup_polling_elapsed_seconds = 0.01
+
+        def stop(self) -> bool:
+            events.append("proxy")
+            return True
+
+    class Network:
+        identifier_sha256 = "d" * 64
+
+        def cleanup_containers(self) -> bool:
+            events.append("container")
+            return True
+
+        def cleanup_network(self) -> bool:
+            events.append("network")
+            return True
+
+    error = _finalize_control_plane(
+        directory=tmp_path,
+        config=SWEAgentProviderConfig(),
+        proxy=Proxy(),  # type: ignore[arg-type]
+        network=Network(),  # type: ignore[arg-type]
+        endpoint=OwnedContainerEndpoint(
+            container_identity="owned-container",
+            image_identity="sha256:" + "a" * 64,
+            internal_ipv4="172.30.0.2",
+        ),
+        source_port=49152,
+        started=started,
+        official_client_activation=started + 0.03,
+        official_deployment_stop_passed=True,
+        failure_classification=None,
+    )
+    lifecycle = ToolControlProxyLifecycleArtifact.model_validate_json(
+        (tmp_path / "tool-control-proxy-lifecycle.json").read_text(encoding="utf-8")
+    )
+    assert error is None
+    assert events == ["container", "proxy", "network"]
+    assert lifecycle.startup_result == "passed"
+    assert lifecycle.cleanup_passed is True
+
+
+def test_provider_partial_cleanup_is_persisted_fail_closed(tmp_path: Path) -> None:
+    from cgr.quantum_repair.model_provider.provider import _finalize_control_plane
+
+    events: list[str] = []
+
+    class Proxy:
+        source_port = 49152
+        bind_started_monotonic = time.monotonic()
+        listener_ready_monotonic = bind_started_monotonic
+        first_client_connection_monotonic = None
+        destination_ready_monotonic = None
+        startup_polling_attempts = 0
+        startup_polling_elapsed_seconds = 0.0
+
+        def stop(self) -> bool:
+            events.append("proxy")
+            return True
+
+    class Network:
+        identifier_sha256 = "d" * 64
+
+        def cleanup_containers(self) -> bool:
+            events.append("container")
+            return False
+
+        def cleanup_network(self) -> bool:
+            events.append("network")
+            return True
+
+    started = time.monotonic()
+    error = _finalize_control_plane(
+        directory=tmp_path,
+        config=SWEAgentProviderConfig(),
+        proxy=Proxy(),  # type: ignore[arg-type]
+        network=Network(),  # type: ignore[arg-type]
+        endpoint=None,
+        source_port=49152,
+        started=started,
+        official_client_activation=started,
+        official_deployment_stop_passed=False,
+        failure_classification="tool_container_discovery_timeout",
+    )
+    lifecycle = ToolControlProxyLifecycleArtifact.model_validate_json(
+        (tmp_path / "tool-control-proxy-lifecycle.json").read_text(encoding="utf-8")
+    )
+    assert error is not None
+    assert error.code == "tool_container_cleanup_failure"
+    assert events == ["container", "proxy"]
+    assert lifecycle.cleanup_passed is False
+    assert lifecycle.proxy_cleanup_passed is True
+    assert lifecycle.container_cleanup_passed is False
+    assert lifecycle.network_cleanup_passed is False
+    assert lifecycle.fallback_cleanup_required is True
 
 
 def test_tool_check_cli_exits_nonzero_for_every_classified_failure(
@@ -972,6 +1158,145 @@ def test_exact_offline_deployment_preflight_and_cleanup() -> None:
     assert health.control_bind_address == "127.0.0.1"
     assert health.allocated_control_port == 49152
     assert health.network_cleanup_passed is True
+
+
+def test_real_proxy_is_prebound_before_official_start_and_survives_stop(
+    tmp_path: Path,
+) -> None:
+    class ReusableServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, *_args: Any) -> None:
+            return None
+
+    server = ReusableServer(("127.0.0.2", 8000), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    endpoint = OwnedContainerEndpoint(
+        container_identity="owned-container",
+        image_identity="sha256:" + "a" * 64,
+        internal_ipv4="127.0.0.2",
+    )
+    events: list[str] = []
+
+    class Network:
+        name = "cgr-swerex-test-network"
+        ownership_nonce = "b" * 32
+        identifier_sha256 = "c" * 64
+        docker_args = ["--network=cgr-swerex-test-network"]
+
+        def wait_for_owned_container(
+            self, _image: str, _timeout: float
+        ) -> OwnedContainerEndpoint:
+            events.append("container-launch")
+            threading.Event().wait(0.05)
+            return endpoint
+
+        def discover_owned_container(self, _image: str) -> OwnedContainerEndpoint:
+            return endpoint
+
+        def verify_direct_control(self, observed: OwnedContainerEndpoint) -> bool:
+            assert observed == endpoint
+            return True
+
+        def cleanup_containers(self) -> bool:
+            events.append("container-cleanup")
+            return True
+
+        def cleanup_network(self) -> bool:
+            events.append("network-cleanup")
+            return True
+
+    class Runtime:
+        async def upload(self, _request: Any) -> None:
+            return None
+
+        async def execute(self, command: Any) -> Any:
+            if command.command == "env":
+                return SimpleNamespace(stdout="PATH=/usr/bin", exit_code=0)
+            probes = ("docker.sock", "1.1.1.1", "example.com", "pypi.org", "/models")
+            return SimpleNamespace(
+                stdout="ok",
+                exit_code=1 if any(item in command.command for item in probes) else 0,
+            )
+
+    class Deployment:
+        runtime = Runtime()
+
+        def __init__(self, port: int) -> None:
+            self.port = port
+
+        def _request(self, method: str, path: str) -> bytes:
+            with socket.create_connection(
+                ("127.0.0.1", self.port), timeout=1
+            ) as client:
+                client.settimeout(1)
+                client.sendall(
+                    f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    "Connection: close\r\n\r\n".encode()
+                )
+                return client.recv(64)
+
+        async def start(self) -> None:
+            events.append("official-start")
+            response = await asyncio.to_thread(self._request, "GET", "/is_alive")
+            assert response.startswith(b"HTTP/")
+            events.append("official-ready")
+
+        async def stop(self) -> None:
+            response = await asyncio.to_thread(self._request, "POST", "/close")
+            assert response.startswith(b"HTTP/")
+            events.append("official-stop")
+
+    deployment_holder: list[Deployment] = []
+
+    def deployment_factory(values: dict[str, Any]) -> Deployment:
+        deployment = Deployment(values["port"])
+        deployment_holder.append(deployment)
+        return deployment
+
+    try:
+        health = run_offline_tool_preflight(
+            SWEAgentProviderConfig(),
+            image=_tool_image_descriptor(),
+            deployment_factory=deployment_factory,
+            control_network_factory=lambda _path: Network(),
+            lifecycle_root=tmp_path,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+    lifecycle = ToolControlProxyLifecycleArtifact.model_validate_json(
+        (tmp_path / "tool-control-proxy-lifecycle.json").read_text(encoding="utf-8")
+    )
+    assert deployment_holder
+    assert health.startup_result == "passed"
+    assert health.allocated_control_port > 0
+    assert lifecycle.schema_version == TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2
+    assert lifecycle.reserved_source_port == health.allocated_control_port
+    assert lifecycle.proxy_listener_ready_seconds is not None
+    assert lifecycle.first_official_control_request_seconds is not None
+    assert (
+        lifecycle.proxy_listener_ready_seconds
+        <= lifecycle.first_official_control_request_seconds
+    )
+    assert lifecycle.startup_polling_attempts >= 1
+    assert events.index("official-start") < events.index("container-launch")
+    assert events.index("official-ready") < events.index("official-stop")
+    assert events[-3:] == ["official-stop", "container-cleanup", "network-cleanup"]
 
 
 @pytest.mark.parametrize("fail_after_readiness", [False, True])

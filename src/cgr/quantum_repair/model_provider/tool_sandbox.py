@@ -33,9 +33,11 @@ from .control_proxy import (
 )
 from .config import SWEAgentProviderConfig
 from .contracts import (
+    TOOL_PROXY_LIFECYCLE_SCHEMA,
     ToolSandboxHealthArtifact,
     ToolSandboxImageDescriptor,
     ToolControlProxyLifecycleArtifact,
+    TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2,
     seal_contract,
 )
 
@@ -292,7 +294,6 @@ class OwnedControlNetwork:
             labels = payload["Config"].get("Labels") or {}
             networks = payload["NetworkSettings"]["Networks"]
             bindings = payload["NetworkSettings"]["Ports"]["8000/tcp"]
-            internal_ipv4 = networks[self.name]["IPAddress"]
             observed_container_identity = payload["Id"]
             observed_image_identity = payload["Image"]
         except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -300,6 +301,18 @@ class OwnedControlNetwork:
                 "tool_control_proxy_destination_invalid",
                 "The SWE-ReX tool container network metadata is malformed.",
             ) from exc
+        try:
+            internal_ipv4 = networks[self.name]["IPAddress"]
+        except (KeyError, TypeError) as exc:
+            raise ToolSandboxError(
+                "tool_runtime_destination_not_ready",
+                "The tool container internal IPv4 address is unavailable.",
+            ) from exc
+        if not internal_ipv4:
+            raise ToolSandboxError(
+                "tool_runtime_destination_not_ready",
+                "The tool container internal IPv4 address is unavailable.",
+            )
         if set(networks) != {self.name}:
             raise ToolSandboxError(
                 "tool_control_proxy_destination_invalid",
@@ -307,17 +320,17 @@ class OwnedControlNetwork:
             )
         if labels.get(TOOL_NETWORK_OWNERSHIP_LABEL) != self.ownership_nonce:
             raise ToolSandboxError(
-                "tool_control_proxy_destination_invalid",
+                "tool_container_identity_mismatch",
                 "The tool container ownership nonce does not match.",
             )
         if observed_container_identity != container_identity:
             raise ToolSandboxError(
-                "tool_control_proxy_destination_invalid",
+                "tool_container_identity_mismatch",
                 "The tool container identity does not match Docker metadata.",
             )
         if observed_image_identity != expected_image_identity:
             raise ToolSandboxError(
-                "tool_control_proxy_destination_invalid",
+                "tool_container_identity_mismatch",
                 "The tool container image identity was substituted.",
             )
         if bindings is not None:
@@ -335,7 +348,7 @@ class OwnedControlNetwork:
             )
         except (ipaddress.AddressValueError, KeyError, TypeError, ValueError) as exc:
             raise ToolSandboxError(
-                "tool_control_proxy_destination_invalid",
+                "tool_runtime_destination_not_ready",
                 "The tool container internal IPv4 address is malformed.",
             ) from exc
         if (
@@ -381,7 +394,7 @@ class OwnedControlNetwork:
                 return endpoint
             time.sleep(poll_seconds)
         raise ToolSandboxError(
-            "tool_runtime_control_channel_unreachable",
+            "tool_container_discovery_timeout",
             "The owned SWE-ReX container was not discovered before timeout.",
         )
 
@@ -418,7 +431,7 @@ class OwnedControlNetwork:
                     raise
             time.sleep(poll_seconds)
         raise ToolSandboxError(
-            "tool_runtime_control_channel_unreachable",
+            "tool_runtime_destination_not_ready",
             "The internal SWE-ReX control endpoint did not become ready.",
         )
 
@@ -631,7 +644,13 @@ def run_offline_tool_preflight(
             if control_network_factory is not None
             else OwnedControlNetwork.create(state_path)
         )
-        control_port = control_port_selector()
+        if proxy_factory is None:
+            proxy = LoopbackControlProxy(source_port=0)
+            proxy.start()
+            holder["proxy"] = proxy
+            control_port = proxy.source_port
+        else:
+            control_port = control_port_selector()
         deployment_values = deployment_configuration(config, network, control_port)
         if deployment_factory is None:
             from swerex.deployment.config import DockerDeploymentConfig
@@ -735,6 +754,11 @@ def run_offline_tool_preflight(
     )
     lifecycle_values = {
         "proxy_policy_descriptor_sha256": proxy_policy.descriptor_sha256,
+        "schema_version": (
+            TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2
+            if getattr(proxy, "listener_ready_monotonic", None) is not None
+            else TOOL_PROXY_LIFECYCLE_SCHEMA
+        ),
         "proxy_bind_identity_sha256": sha256_fingerprint(
             {"address": "127.0.0.1", "port": observations["allocated_port"]}
         ),
@@ -759,6 +783,14 @@ def run_offline_tool_preflight(
         "fallback_proxy_cleanup_passed": fallback_proxy,
         "fallback_container_cleanup_passed": fallback_container,
         "fallback_network_cleanup_passed": fallback_network,
+        **_proxy_startup_evidence(
+            proxy=proxy,
+            endpoint=endpoint,
+            started=started,
+            deadline_seconds=float(config.tool_startup_timeout_seconds),
+            startup_passed=bool(observations["proxy_readiness"]),
+            official_activation=holder.get("official_client_activation"),
+        ),
         "runtime_seconds": time.monotonic() - started,
         "failure_classification": failure,
     }
@@ -932,7 +964,21 @@ async def _exercise_deployment(
 ) -> dict[str, bool | int]:
     from swerex.runtime.abstract import Command, UploadRequest
 
+    holder["official_client_activation"] = time.monotonic()
     start_task = asyncio.create_task(deployment.start())
+    proxy = holder.get("proxy")
+    startup_origin = float(holder["official_client_activation"])
+    startup_deadline = startup_origin + float(config.tool_startup_timeout_seconds)
+
+    def remaining() -> float:
+        value = startup_deadline - time.monotonic()
+        if value <= 0:
+            raise ToolSandboxError(
+                "tool_runtime_destination_not_ready",
+                "The SWE-ReX startup handshake exceeded its bounded deadline.",
+            )
+        return value
+
     discovery_task = asyncio.create_task(
         asyncio.to_thread(
             network.wait_for_owned_container,
@@ -948,21 +994,48 @@ async def _exercise_deployment(
         await start_task
     endpoint = await discovery_task
     holder["endpoint"] = endpoint
-    direct_internal_control = bool(
-        await asyncio.to_thread(
-            network.wait_for_direct_control,
-            endpoint,
-            float(config.tool_startup_timeout_seconds),
+    proxy = holder.get("proxy")
+    if proxy is None:
+        proxy_endpoint = endpoint.proxy_endpoint(network)
+        proxy = (
+            proxy_factory(control_port, proxy_endpoint)
+            if proxy_factory is not None
+            else LoopbackControlProxy(source_port=control_port)
         )
+        proxy.start()
+        holder["proxy"] = proxy
+    if hasattr(proxy, "activate"):
+        proxy.activate(endpoint.proxy_endpoint(network))
+
+    def verify_destination_identity() -> None:
+        observed = network.discover_owned_container(expected_image_identity)
+        if observed is None:
+            raise ToolSandboxError(
+                "tool_container_terminated_during_startup",
+                "The owned SWE-ReX container exited during startup.",
+            )
+        if observed != endpoint:
+            raise ToolSandboxError(
+                "tool_container_identity_mismatch",
+                "The verified SWE-ReX container destination changed.",
+            )
+
+    if hasattr(proxy, "wait_for_first_client"):
+        await asyncio.to_thread(
+            proxy.wait_for_first_client,
+            deadline_seconds=remaining(),
+        )
+    if hasattr(proxy, "wait_until_destination_ready"):
+        await asyncio.to_thread(
+            proxy.wait_until_destination_ready,
+            deadline_seconds=remaining(),
+            readiness_guard=verify_destination_identity,
+        )
+    if hasattr(proxy, "assert_startup_order"):
+        proxy.assert_startup_order()
+    direct_internal_control = bool(
+        await asyncio.to_thread(network.verify_direct_control, endpoint)
     )
-    proxy_endpoint = endpoint.proxy_endpoint(network)
-    proxy = (
-        proxy_factory(control_port, proxy_endpoint)
-        if proxy_factory is not None
-        else LoopbackControlProxy(source_port=control_port, endpoint=proxy_endpoint)
-    )
-    proxy.start()
-    holder["proxy"] = proxy
     await start_task
     proxy.assert_healthy()
     runtime = deployment.runtime
@@ -1042,6 +1115,56 @@ async def _exercise_deployment(
         "allocated_port": control_port,
         "direct_internal_control": direct_internal_control,
         "proxy_readiness": True,
+    }
+
+
+def _proxy_startup_evidence(
+    *,
+    proxy: Any | None,
+    endpoint: OwnedContainerEndpoint | None,
+    started: float,
+    deadline_seconds: float,
+    startup_passed: bool,
+    official_activation: float | None,
+) -> dict[str, Any]:
+    def elapsed(value: float | None) -> float | None:
+        return None if value is None else max(0.0, value - started)
+
+    listener_ready = getattr(proxy, "listener_ready_monotonic", None)
+    first_request = getattr(proxy, "first_client_connection_monotonic", None)
+    destination_ready = getattr(proxy, "destination_ready_monotonic", None)
+    bind_started = getattr(proxy, "bind_started_monotonic", None)
+    source_port = int(getattr(proxy, "source_port", 0) or 0)
+    request_before_ready = bool(
+        first_request is not None
+        and (listener_ready is None or first_request < listener_ready)
+    )
+    terminal = "failed"
+    if destination_ready is not None:
+        terminal = "destination_ready"
+    elif endpoint is not None:
+        terminal = "container_verified"
+    elif listener_ready is not None:
+        terminal = "listener_ready"
+    return {
+        "reserved_source_port": source_port,
+        "container_launch_observed": endpoint is not None,
+        "verified_container_identity": endpoint is not None,
+        "verified_internal_ip": endpoint is not None,
+        "proxy_bind_started_seconds": elapsed(bind_started),
+        "proxy_listener_ready_seconds": elapsed(listener_ready),
+        "destination_ready_seconds": elapsed(destination_ready),
+        "first_official_control_request_seconds": elapsed(first_request),
+        "official_client_activation_seconds": elapsed(official_activation),
+        "startup_polling_attempts": int(
+            getattr(proxy, "startup_polling_attempts", 0) or 0
+        ),
+        "startup_polling_elapsed_seconds": float(
+            getattr(proxy, "startup_polling_elapsed_seconds", 0.0) or 0.0
+        ),
+        "startup_deadline_seconds": deadline_seconds,
+        "official_request_before_proxy_readiness": request_before_ready,
+        "startup_terminal_state": terminal,
     }
 
 

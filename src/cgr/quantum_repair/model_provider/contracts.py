@@ -20,6 +20,7 @@ TOOL_IMAGE_SCHEMA = "cgr.quantum-sweagent-tool-image/1.1.0"
 TOOL_NETWORK_POLICY_SCHEMA = "cgr.quantum-sweagent-tool-network-policy/1.0.0"
 TOOL_PROXY_POLICY_SCHEMA = "cgr.quantum-swerex-control-proxy-policy/1.0.0"
 TOOL_PROXY_LIFECYCLE_SCHEMA = "cgr.quantum-swerex-control-proxy-lifecycle/1.1.0"
+TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2 = "cgr.quantum-swerex-control-proxy-lifecycle/1.2.0"
 TOOL_HEALTH_SCHEMA = "cgr.quantum-sweagent-tool-health/1.3.0"
 BUDGET_SCHEMA = "cgr.quantum-repair-provider-budget/1.0.0"
 PROMPT_SCHEMA = "cgr.quantum-repair-model-prompt/1.0.0"
@@ -394,6 +395,26 @@ class ToolControlProxyLifecycleArtifact(CanonicalModel):
     fallback_proxy_cleanup_passed: bool
     fallback_container_cleanup_passed: bool
     fallback_network_cleanup_passed: bool
+    reserved_source_port: int = Field(default=0, ge=0, le=65535)
+    container_launch_observed: bool = False
+    verified_container_identity: bool = False
+    verified_internal_ip: bool = False
+    proxy_bind_started_seconds: float | None = Field(default=None, ge=0)
+    proxy_listener_ready_seconds: float | None = Field(default=None, ge=0)
+    destination_ready_seconds: float | None = Field(default=None, ge=0)
+    first_official_control_request_seconds: float | None = Field(default=None, ge=0)
+    official_client_activation_seconds: float | None = Field(default=None, ge=0)
+    startup_polling_attempts: int = Field(default=0, ge=0)
+    startup_polling_elapsed_seconds: float = Field(default=0.0, ge=0)
+    startup_deadline_seconds: float = Field(default=0.0, ge=0)
+    official_request_before_proxy_readiness: bool = False
+    startup_terminal_state: Literal[
+        "not_started",
+        "listener_ready",
+        "container_verified",
+        "destination_ready",
+        "failed",
+    ] = "not_started"
     runtime_seconds: float = Field(ge=0)
     failure_classification: str | None
     lifecycle_artifact_sha256: str
@@ -401,7 +422,10 @@ class ToolControlProxyLifecycleArtifact(CanonicalModel):
     @field_validator("schema_version")
     @classmethod
     def valid_schema(cls, value: str) -> str:
-        if value != TOOL_PROXY_LIFECYCLE_SCHEMA:
+        if value not in {
+            TOOL_PROXY_LIFECYCLE_SCHEMA,
+            TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2,
+        }:
             raise ValueError("Unsupported tool control proxy lifecycle schema.")
         return value
 
@@ -419,6 +443,24 @@ class ToolControlProxyLifecycleArtifact(CanonicalModel):
     def canonical_identity(self) -> Any:
         value = self.model_dump(mode="json")
         value.pop("lifecycle_artifact_sha256", None)
+        if self.schema_version == TOOL_PROXY_LIFECYCLE_SCHEMA:
+            for field in (
+                "reserved_source_port",
+                "container_launch_observed",
+                "verified_container_identity",
+                "verified_internal_ip",
+                "proxy_bind_started_seconds",
+                "proxy_listener_ready_seconds",
+                "destination_ready_seconds",
+                "first_official_control_request_seconds",
+                "official_client_activation_seconds",
+                "startup_polling_attempts",
+                "startup_polling_elapsed_seconds",
+                "startup_deadline_seconds",
+                "official_request_before_proxy_readiness",
+                "startup_terminal_state",
+            ):
+                value.pop(field, None)
         return value
 
     @model_validator(mode="after")
@@ -454,6 +496,40 @@ class ToolControlProxyLifecycleArtifact(CanonicalModel):
             raise ValueError(
                 "Proxy lifecycle cannot pass with a failure classification."
             )
+        if self.schema_version == TOOL_PROXY_LIFECYCLE_SCHEMA_V1_2:
+            if (
+                self.startup_result == "passed"
+                and self.official_request_before_proxy_readiness
+            ):
+                raise ValueError("Official control preceded proxy listener readiness.")
+            if self.startup_result == "passed" and (
+                self.reserved_source_port != self.proxy_source_port
+                or not self.container_launch_observed
+                or not self.verified_container_identity
+                or not self.verified_internal_ip
+                or self.proxy_bind_started_seconds is None
+                or self.proxy_listener_ready_seconds is None
+                or self.destination_ready_seconds is None
+                or self.first_official_control_request_seconds is None
+                or self.official_client_activation_seconds is None
+                or self.startup_polling_attempts < 1
+                or self.startup_deadline_seconds <= 0
+                or self.startup_terminal_state != "destination_ready"
+                or self.proxy_bind_started_seconds > self.proxy_listener_ready_seconds
+                or self.proxy_listener_ready_seconds
+                > self.first_official_control_request_seconds
+                or self.proxy_listener_ready_seconds
+                > self.official_client_activation_seconds
+                or self.official_client_activation_seconds
+                > self.first_official_control_request_seconds
+                or self.first_official_control_request_seconds
+                > self.destination_ready_seconds
+                or self.destination_ready_seconds > self.runtime_seconds
+                or self.startup_polling_elapsed_seconds > self.startup_deadline_seconds
+            ):
+                raise ValueError(
+                    "Passing proxy startup-handshake evidence is incomplete."
+                )
         if self.lifecycle_artifact_sha256 != self.fingerprint:
             raise ValueError("Tool control proxy lifecycle hash was not recomputed.")
         return self
