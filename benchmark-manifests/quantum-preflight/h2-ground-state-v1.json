@@ -1,0 +1,135 @@
+{
+  "expected_experiment_sha256": "067315b77f2238911926658df2781ef0c62da90725a3b6a42ff5f08000325d38",
+  "experiment": {
+    "electronic_structure": {
+      "active_electron_count": 2,
+      "active_orbital_indices": [
+        0,
+        1
+      ],
+      "active_spatial_orbital_count": 2,
+      "basis_set": "sto-3g",
+      "driver_identifier": "pyscf",
+      "frozen_core": false,
+      "hamiltonian_representation": "second_quantized",
+      "reference_method": "restricted_hartree_fock"
+    },
+    "execution_policy": {
+      "cpu_limit": 2.0,
+      "maximum_duration_seconds": 180,
+      "maximum_log_bytes": 1048576,
+      "maximum_memory_mib": 4096,
+      "maximum_processes": 256,
+      "maximum_result_bytes": 10485760,
+      "network_disabled": true,
+      "runtime_identifier": "quantum_preflight_linux"
+    },
+    "experiment_identifier": "h2-ground-state-v1",
+    "molecular_system": {
+      "atoms": [
+        {
+          "atom_identifier": "h-1",
+          "coordinates": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "element": "H"
+        },
+        {
+          "atom_identifier": "h-2",
+          "coordinates": [
+            0.0,
+            0.0,
+            0.735
+          ],
+          "element": "H"
+        }
+      ],
+      "coordinate_unit": "angstrom",
+      "declared_bond_distance": 0.735,
+      "molecular_charge": 0,
+      "spin_multiplicity": 1,
+      "structure_artifact_identifier": "molecular_structure"
+    },
+    "objective_type": "molecular_ground_state",
+    "parent_experiment": {
+      "assumptions": [],
+      "constraints": [
+        "cpu_only",
+        "local_execution",
+        "network_disabled",
+        "no_ibm_runtime"
+      ],
+      "execution_policy": {
+        "execution_allowed": true,
+        "parameters": {
+          "maximum_duration_seconds": 180
+        },
+        "permitted_runtimes": [
+          "quantum_preflight_linux"
+        ],
+        "require_all_blocking_assumptions_approved": true
+      },
+      "experiment_identifier": "h2-ground-state-scientific-objective-v1",
+      "input_artifacts": [],
+      "normalized_objective": "Compute and independently verify the H2 molecular ground-state total energy for the declared geometry and model.",
+      "original_objective": "Determine the molecular ground-state total energy of the declared hydrogen molecule in the trusted local quantum preflight.",
+      "provenance": {
+        "execution_identifier": null,
+        "producer": "pulsate_labs",
+        "producer_version": {
+          "major": 1,
+          "minor": 0,
+          "patch": 0
+        },
+        "source": "cgr"
+      },
+      "requested_outputs": [
+        "exact_ground_state_result",
+        "quantum_preflight_receipt",
+        "vqe_ground_state_result"
+      ],
+      "schema_version": {
+        "major": 1,
+        "minor": 0,
+        "patch": 0
+      },
+      "scientific_domain": "quantum_chemistry"
+    },
+    "quantum_model": {
+      "ansatz": "uccsd",
+      "convergence_threshold": 1e-09,
+      "initial_point_policy": "all_zeros",
+      "initial_state": "hartree_fock",
+      "mapper": "jordan_wigner",
+      "maximum_iterations": 200,
+      "optimizer": "slsqp",
+      "optimizer_settings": {
+        "disp": false,
+        "ftol": 1e-09,
+        "maxiter": 200
+      },
+      "random_seed": 1701,
+      "simulator_type": "statevector_estimator"
+    },
+    "requested_observable": "total_energy_hartree",
+    "schema_version": {
+      "major": 1,
+      "minor": 0,
+      "patch": 0
+    },
+    "verification_policy": {
+      "energy_difference_tolerance_hartree": 1e-05,
+      "exact_solver": "numpy_minimum_eigensolver",
+      "hermiticity_tolerance": 1e-10,
+      "particle_number_tolerance": 1e-06,
+      "required_artifact_lineage": true,
+      "required_energy_fields": [
+        "electronic_energy_hartree",
+        "total_energy_hartree"
+      ]
+    }
+  },
+  "manifest_schema": "cgr.quantum-preflight-manifest/1.0.0"
+}
