@@ -3,26 +3,32 @@
 from __future__ import annotations
 
 import math
+import os
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, ConfigDict
 
 from cgr.quantum_preflight.contracts import ManifestEnvelope
 from cgr.quantum_preflight.manifests import load_manifest
+from cgr.quantum_preflight.environment import require_dependencies
+from cgr.quantum_preflight.errors import QuantumDependencyError
+from .runs import (
+    ArtifactUnavailableError,
+    ExistingQuantumPreflightExecutor,
+    IdempotencyConflictError,
+    InvalidIdempotencyKeyError,
+    RunCoordinator,
+    RunNotFoundError,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MANIFEST_ROOT = REPO_ROOT / "benchmark-manifests" / "quantum-preflight"
 
 _PRESET_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,126}$")
-
-app = FastAPI(
-    title="Pulsate Labs API",
-    version="0.1.0",
-    description="Verified small-molecule quantum-science product API.",
-)
-
 
 def _manifest_paths() -> tuple[Path, ...]:
     """Discover every declared quantum-preflight preset."""
@@ -126,36 +132,146 @@ def _declared_scene(manifest: ManifestEnvelope) -> dict[str, Any]:
     }
 
 
-@app.get("/api/v1/health")
-def health() -> dict[str, str]:
-    return {
-        "service": "pulsate-api",
-        "status": "healthy",
-        "version": "0.1.0",
-    }
+class CreateRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preset_identifier: str
+    execution_target: Literal["local_simulator"]
 
 
-@app.get("/api/v1/experiments/presets")
-def list_presets() -> dict[str, Any]:
-    presets = [_preset_summary(path) for path in _manifest_paths()]
-
-    return {
-        "presets": presets,
-        "count": len(presets),
-    }
+def _typed_error(status_code: int, code: str, message: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"code": code, "message": message})
 
 
-@app.get("/api/v1/experiments/presets/{preset_identifier}")
-def read_preset(preset_identifier: str) -> dict[str, Any]:
-    manifest = _load_preset(preset_identifier)
+def _configured_coordinator() -> RunCoordinator:
+    run_root = Path(os.environ.get("PULSATE_RUN_ROOT", str(REPO_ROOT / ".pulsate-runs")))
+    enabled = os.environ.get("PULSATE_EXECUTION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+    lock_path = REPO_ROOT / "requirements" / "quantum-preflight.lock"
 
-    return {
-        "preset_identifier": preset_identifier,
-        "manifest": manifest.model_dump(mode="json"),
-    }
+    def execution_precondition() -> str | None:
+        if not lock_path.is_file():
+            return "The pinned dependency lock is unavailable."
+        try:
+            require_dependencies()
+        except QuantumDependencyError:
+            return "The required pinned quantum dependencies are unavailable."
+        return None
+
+    try:
+        workers = int(os.environ.get("PULSATE_MAX_CONCURRENT_RUNS", "1"))
+    except ValueError:
+        workers = 1
+    executor = ExistingQuantumPreflightExecutor(
+        repository_root=REPO_ROOT,
+        image_identifier=os.environ.get("PULSATE_QUANTUM_IMAGE_IDENTIFIER", "local-uncontainerized"),
+    )
+    return RunCoordinator(
+        run_root=run_root,
+        manifest_resolver=_load_preset,
+        executor=executor,
+        enabled=enabled,
+        max_workers=workers,
+        max_run_seconds=os.environ.get("PULSATE_MAX_RUN_SECONDS", "180"),
+        precondition_check=execution_precondition,
+    )
 
 
-@app.get("/api/v1/experiments/presets/{preset_identifier}/scene")
-def read_preset_scene(preset_identifier: str) -> dict[str, Any]:
-    manifest = _load_preset(preset_identifier)
-    return _declared_scene(manifest)
+def create_app(*, coordinator: RunCoordinator | None = None) -> FastAPI:
+    run_coordinator = coordinator or _configured_coordinator()
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI):
+        run_coordinator.start()
+        try:
+            yield
+        finally:
+            run_coordinator.close()
+
+    application = FastAPI(
+        title="Pulsate Labs API",
+        version="0.2.0",
+        description="Coordinates discovered presets through the verified quantum-preflight workflow.",
+        lifespan=lifespan,
+    )
+    application.state.run_coordinator = run_coordinator
+
+    @application.get("/api/v1/health")
+    def health() -> dict[str, str]:
+        return {
+            "service": "pulsate-api", "status": "healthy", "version": "0.2.0",
+        }
+
+    @application.get("/api/v1/runs/capability")
+    def run_capability() -> dict[str, Any]:
+        return run_coordinator.capability()
+
+    @application.get("/api/v1/experiments/presets")
+    def list_presets() -> dict[str, Any]:
+        presets = [_preset_summary(path) for path in _manifest_paths()]
+        return {"presets": presets, "count": len(presets)}
+
+    @application.get("/api/v1/experiments/presets/{preset_identifier}")
+    def read_preset(preset_identifier: str) -> dict[str, Any]:
+        manifest = _load_preset(preset_identifier)
+        return {"preset_identifier": preset_identifier, "manifest": manifest.model_dump(mode="json")}
+
+    @application.get("/api/v1/experiments/presets/{preset_identifier}/scene")
+    def read_preset_scene(preset_identifier: str) -> dict[str, Any]:
+        return _declared_scene(_load_preset(preset_identifier))
+
+    @application.post("/api/v1/runs", status_code=202)
+    def create_run(
+        request: CreateRunRequest,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        try:
+            state, _created = run_coordinator.create(
+                request.preset_identifier, request.execution_target, idempotency_key
+            )
+            return state
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise _typed_error(404, "preset_not_found", "Experiment preset not found.") from None
+            raise
+        except RunNotFoundError:
+            raise _typed_error(404, "preset_not_found", "Experiment preset not found.") from None
+        except InvalidIdempotencyKeyError as exc:
+            raise _typed_error(400, "invalid_idempotency_key", str(exc)) from None
+        except IdempotencyConflictError as exc:
+            raise _typed_error(409, "idempotency_conflict", str(exc)) from None
+        except RuntimeError as exc:
+            if str(exc) == "execution_unavailable":
+                raise _typed_error(503, "execution_unavailable", "Local quantum execution is not enabled on this backend.") from None
+            raise
+
+    @application.get("/api/v1/runs/{run_identifier}")
+    def read_run(run_identifier: str) -> dict[str, Any]:
+        try:
+            return run_coordinator.get(run_identifier)
+        except (RunNotFoundError, FileNotFoundError):
+            raise _typed_error(404, "run_not_found", "Run not found.") from None
+
+    def read_artifact(run_identifier: str, name: Literal["results", "verification", "receipt"]) -> dict[str, Any]:
+        try:
+            return run_coordinator.artifact(run_identifier, name)
+        except (RunNotFoundError, FileNotFoundError):
+            raise _typed_error(404, "run_not_found", "Run not found.") from None
+        except ArtifactUnavailableError as exc:
+            raise _typed_error(409, f"{name}_unavailable", str(exc)) from None
+
+    @application.get("/api/v1/runs/{run_identifier}/results")
+    def read_results(run_identifier: str) -> dict[str, Any]:
+        return read_artifact(run_identifier, "results")
+
+    @application.get("/api/v1/runs/{run_identifier}/verification")
+    def read_verification(run_identifier: str) -> dict[str, Any]:
+        return read_artifact(run_identifier, "verification")
+
+    @application.get("/api/v1/runs/{run_identifier}/receipt")
+    def read_receipt(run_identifier: str) -> dict[str, Any]:
+        return read_artifact(run_identifier, "receipt")
+
+    return application
+
+
+app = create_app()

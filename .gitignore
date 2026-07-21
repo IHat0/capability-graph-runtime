@@ -16,5 +16,7 @@ quantum-preflight-results/
 quantum-candidate-repair/
 quantum-repair-benchmark/
 quantum-model-repair/
+.pulsate-runs/
 dist/
 build/
+node_modules/

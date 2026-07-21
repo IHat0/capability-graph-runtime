@@ -303,8 +303,14 @@ def _synthetic_evidence(manifest):
         scientific_result_sha256=vqe_identity.fingerprint,
         execution_result=vqe,
     ).model_dump(mode="json")
-    refs["exact_result"] = artifact_reference("exact_result", _ARTIFACT_TYPES["exact_result"], payloads["exact_result"], filename="exact.json")
-    refs["vqe_result"] = artifact_reference("vqe_result", _ARTIFACT_TYPES["vqe_result"], payloads["vqe_result"], filename="vqe.json")
+    refs["exact_result"] = artifact_reference(
+        "exact_result", _ARTIFACT_TYPES["exact_result"], payloads["exact_result"],
+        filename="exact-result.json",
+    )
+    refs["vqe_result"] = artifact_reference(
+        "vqe_result", _ARTIFACT_TYPES["vqe_result"], payloads["vqe_result"],
+        filename="vqe-result.json",
+    )
     links = (
         ("experiment", "molecular_structure"), ("molecular_structure", "qcschema"),
         ("qcschema", "electronic_problem"), ("electronic_problem", "active_space"),
