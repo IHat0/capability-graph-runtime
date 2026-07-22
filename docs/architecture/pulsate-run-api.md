@@ -68,20 +68,27 @@ npm run lint
 npm test -- --run
 ```
 
-On the existing Linux EC2 Docker host, rebuild the trusted image and run the opt-in real HTTP integration exactly as follows:
+## Pinned Linux HTTP integration image
+
+The trusted `cgr-quantum-preflight:1.0.0` scientific base image and
+`requirements/quantum-preflight.lock` remain unchanged. The derived
+`cgr-pulsate-http-integration:1.0.0` image adds the FastAPI, HTTPX, and
+Uvicorn top-level application dependencies and their hash-locked transitive
+dependencies, including Starlette, as defined by
+`requirements/pulsate-http-integration.lock`.
+
+On a Linux Docker host, build both layers, print their immutable image IDs,
+verify the combined package environment, and run the real HTTP integration with:
 
 ```bash
-./scripts/build-quantum-preflight-image.sh
-image_id="$(docker image inspect --format '{{.Id}}' cgr-quantum-preflight:1.0.0)"
-docker run --rm --network none --read-only --cpus 2 --memory 4g --pids-limit 256 \
-  --security-opt no-new-privileges --cap-drop ALL \
-  --tmpfs /tmp:rw,nosuid,nodev,size=1g,mode=1777 \
-  --env PULSATE_RUN_HTTP_INTEGRATION=true \
-  --env PULSATE_EXECUTION_ENABLED=true \
-  --env PULSATE_RUN_ROOT=/tmp/pulsate-runs \
-  --env "PULSATE_QUANTUM_IMAGE_IDENTIFIER=$image_id" \
-  --entrypoint python cgr-quantum-preflight:1.0.0 \
-  -m pytest -q -s -rs -p no:cacheprovider tests/test_pulsate_runs_integration.py
+bash ./scripts/run-pulsate-http-integration.sh
 ```
 
-This command uses the image's pinned packages, disables networking, runs the real existing runner through the HTTP API, and fails unless the run is authorized with readable results, verification, and receipt evidence.
+Runtime networking remains disabled, the filesystem is read-only except for the
+bounded `/tmp` mount, and the container runs as the inherited unprivileged user.
+`PULSATE_QUANTUM_IMAGE_IDENTIFIER` receives the derived image ID because that is
+the actual combined execution environment.
+
+This is a local H2 simulator integration through the existing scientific runner;
+it is not IBM Quantum execution. There is no fixture-energy fallback, Qwen call,
+natural-language compilation, or alternate authorization path.

@@ -1,0 +1,40 @@
+Pulsate HTTP integration dependency resolver evidence
+Generated: 2026-07-21
+Source checkpoint: 7164aebccdf2b404dd6b1eedaddbadc46e055814
+
+Target runtime:
+- Base image: cgr-quantum-preflight:1.0.0
+- CPython: 3.12.11
+- Platform: Linux x86_64
+
+Resolver host:
+- CPython: 3.12.13 (MSC v.1944, AMD64)
+- Platform: Windows-11-10.0.26200-SP0
+- pip: 25.3
+- pip-tools: 7.5.2
+
+Resolver command (from the repository root):
+python -m piptools compile --resolver=backtracking --generate-hashes --strip-extras --no-emit-index-url --no-emit-trusted-host --constraint requirements/quantum-preflight.lock --output-file requirements/pulsate-http-integration.lock requirements/pulsate-http-integration.in
+
+Scientific constraint:
+- requirements/quantum-preflight.lock
+- SHA-256: 2513a1f187309b8aab78e087c3009444aaf5c19a783c54ad61c4ca8d1327605f
+
+The lock was compiled with Python 3.12 on Windows. Python dependency and
+wheel platform markers can differ between Windows and Linux, so host
+resolution alone is not target validation. A separate Linux CPython 3.12
+wheel download succeeded for every locked requirement.
+
+Validation performed:
+- pip download --require-hashes --only-binary=:all: --platform manylinux_2_17_x86_64 --python-version 3.12 --implementation cp --abi cp312 -r requirements/pulsate-http-integration.lock
+- pip install --target <temporary-directory> --require-hashes --only-binary=:all: --platform manylinux_2_17_x86_64 --python-version 3.12 --implementation cp --abi cp312 -r requirements/pulsate-http-integration.lock
+- pip install --require-hashes -r requirements/pulsate-http-integration.lock (Windows resolver host)
+- python -m pip check (Windows-native hash-required installation)
+
+All locked Linux CPython 3.12 distributions downloaded successfully and a
+hash-required Linux-compatible target installation completed. Separately, the
+Windows-native hash-required installation completed and pip check reported no
+broken requirements. Platform-specific binary modules cannot be executed or
+checked as Linux modules on the Windows resolver host. The derived Docker image
+must therefore still build successfully and run its in-image Linux pip check
+and HTTP integration as the final target validation.
