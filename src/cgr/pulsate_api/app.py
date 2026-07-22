@@ -10,12 +10,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cgr.quantum_preflight.contracts import ManifestEnvelope
 from cgr.quantum_preflight.manifests import load_manifest
 from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
+from .experiments import (
+    ExperimentNotFoundError,
+    ExperimentStore,
+    PlannerInputError,
+)
 from .runs import (
     ArtifactUnavailableError,
     ExistingQuantumPreflightExecutor,
@@ -135,15 +140,28 @@ def _declared_scene(manifest: ManifestEnvelope) -> dict[str, Any]:
 class CreateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    preset_identifier: str
+    preset_identifier: str | None = None
+    experiment_identifier: str | None = None
     execution_target: Literal["local_simulator"]
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "CreateRunRequest":
+        if (self.preset_identifier is None) == (self.experiment_identifier is None):
+            raise ValueError("Exactly one experiment_identifier or preset_identifier is required.")
+        return self
+
+
+class PlanExperimentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=4096)
 
 
 def _typed_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
 
 
-def _configured_coordinator() -> RunCoordinator:
+def _configured_coordinator(experiment_store: ExperimentStore) -> RunCoordinator:
     run_root = Path(os.environ.get("PULSATE_RUN_ROOT", str(REPO_ROOT / ".pulsate-runs")))
     enabled = os.environ.get("PULSATE_EXECUTION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
     lock_path = REPO_ROOT / "requirements" / "quantum-preflight.lock"
@@ -168,6 +186,7 @@ def _configured_coordinator() -> RunCoordinator:
     return RunCoordinator(
         run_root=run_root,
         manifest_resolver=_load_preset,
+        experiment_resolver=experiment_store.resolve_for_run,
         executor=executor,
         enabled=enabled,
         max_workers=workers,
@@ -176,16 +195,36 @@ def _configured_coordinator() -> RunCoordinator:
     )
 
 
-def create_app(*, coordinator: RunCoordinator | None = None) -> FastAPI:
-    run_coordinator = coordinator or _configured_coordinator()
+def create_app(
+    *,
+    coordinator: RunCoordinator | None = None,
+    experiment_store: ExperimentStore | None = None,
+) -> FastAPI:
+    if experiment_store is None:
+        if coordinator is not None:
+            experiment_root = coordinator.configured_run_root.parent / "experiments"
+        else:
+            experiment_root = Path(
+                os.environ.get(
+                    "PULSATE_EXPERIMENT_ROOT", str(REPO_ROOT / ".pulsate-experiments")
+                )
+            )
+        experiment_store = ExperimentStore(experiment_root)
+    run_coordinator = coordinator or _configured_coordinator(experiment_store)
+    if run_coordinator.experiment_resolver is None:
+        run_coordinator.experiment_resolver = experiment_store.resolve_for_run
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
-        run_coordinator.start()
+        experiment_store.start()
         try:
-            yield
+            run_coordinator.start()
+            try:
+                yield
+            finally:
+                run_coordinator.close()
         finally:
-            run_coordinator.close()
+            experiment_store.close()
 
     application = FastAPI(
         title="Pulsate Labs API",
@@ -194,6 +233,7 @@ def create_app(*, coordinator: RunCoordinator | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     application.state.run_coordinator = run_coordinator
+    application.state.experiment_store = experiment_store
 
     @application.get("/api/v1/health")
     def health() -> dict[str, str]:
@@ -219,6 +259,20 @@ def create_app(*, coordinator: RunCoordinator | None = None) -> FastAPI:
     def read_preset_scene(preset_identifier: str) -> dict[str, Any]:
         return _declared_scene(_load_preset(preset_identifier))
 
+    @application.post("/api/v1/experiments/plan", status_code=201)
+    def plan_experiment(request: PlanExperimentRequest) -> dict[str, Any]:
+        try:
+            return experiment_store.plan(request.question)
+        except PlannerInputError as exc:
+            raise _typed_error(422, "invalid_experiment_question", str(exc)) from None
+
+    @application.get("/api/v1/experiments/{experiment_identifier}")
+    def read_experiment(experiment_identifier: str) -> dict[str, Any]:
+        try:
+            return experiment_store.get(experiment_identifier)
+        except ExperimentNotFoundError:
+            raise _typed_error(404, "experiment_not_found", "Experiment not found.") from None
+
     @application.post("/api/v1/runs", status_code=202)
     def create_run(
         request: CreateRunRequest,
@@ -226,7 +280,10 @@ def create_app(*, coordinator: RunCoordinator | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         try:
             state, _created = run_coordinator.create(
-                request.preset_identifier, request.execution_target, idempotency_key
+                request.preset_identifier,
+                request.execution_target,
+                idempotency_key,
+                experiment_identifier=request.experiment_identifier,
             )
             return state
         except HTTPException as exc:
@@ -234,7 +291,11 @@ def create_app(*, coordinator: RunCoordinator | None = None) -> FastAPI:
                 raise _typed_error(404, "preset_not_found", "Experiment preset not found.") from None
             raise
         except RunNotFoundError:
-            raise _typed_error(404, "preset_not_found", "Experiment preset not found.") from None
+            code = "experiment_not_found" if request.experiment_identifier else "preset_not_found"
+            message = "Experiment not found." if request.experiment_identifier else "Experiment preset not found."
+            raise _typed_error(404, code, message) from None
+        except ExperimentNotFoundError:
+            raise _typed_error(404, "experiment_not_found", "Experiment not found.") from None
         except InvalidIdempotencyKeyError as exc:
             raise _typed_error(400, "invalid_idempotency_key", str(exc)) from None
         except IdempotencyConflictError as exc:

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { pulsateApi, type WorkspaceApi } from '../api/client'
-import type { HealthResponse, PresetDetailResponse, PresetSummaryResponse } from '../api/types'
+import type { ExperimentPlanResponse, HealthResponse, PresetDetailResponse, PresetSummaryResponse } from '../api/types'
 import { normalizeScene } from '../scene/normalize'
 import type { MolecularScene } from '../scene/types'
 
@@ -24,7 +24,12 @@ export function useExperimentWorkspace(api: WorkspaceApi = pulsateApi) {
   const [presetLoading, setPresetLoading] = useState(false)
   const [errors, setErrors] = useState<WorkspaceError[]>([])
   const [staleSceneMessage, setStaleSceneMessage] = useState<string | null>(null)
+  const [plan, setPlan] = useState<ExperimentPlanResponse | null>(null)
+  const [planning, setPlanning] = useState(false)
+  const [planQuestion, setPlanQuestion] = useState('')
   const requestSequence = useRef(0)
+  const planRequestSequence = useRef(0)
+  const planControllerRef = useRef<AbortController | null>(null)
   const sceneRef = useRef<MolecularScene | null>(null)
   const displayedPresetIdRef = useRef<string | null>(null)
 
@@ -99,7 +104,56 @@ export function useExperimentWorkspace(api: WorkspaceApi = pulsateApi) {
     return () => controller.abort()
   }, [api, selectedPresetId])
 
-  const selectPreset = useCallback((identifier: string) => setSelectedPresetId(identifier), [])
+  const selectPreset = useCallback((identifier: string) => {
+    planRequestSequence.current += 1
+    planControllerRef.current?.abort()
+    planControllerRef.current = null
+    setPlanning(false)
+    setPlan(null)
+    setSelectedPresetId(identifier)
+  }, [])
+
+  useEffect(() => () => {
+    planRequestSequence.current += 1
+    planControllerRef.current?.abort()
+    planControllerRef.current = null
+  }, [])
+
+  const planExperiment = useCallback(async () => {
+    const question = planQuestion.trim()
+    if (!question || planning) return
+    planControllerRef.current?.abort()
+    const controller = new AbortController()
+    planControllerRef.current = controller
+    const sequence = ++planRequestSequence.current
+    setPlanning(true)
+    setErrors((current) => current.filter((error) => error.scope !== 'details' && error.scope !== 'scene'))
+    try {
+      if (!api.planExperiment) throw new Error('Dynamic experiment planning is unavailable.')
+      const nextPlan = await api.planExperiment(question, controller.signal)
+      if (controller.signal.aborted || sequence !== planRequestSequence.current) return
+      setPlan(nextPlan)
+      if (nextPlan.ready_for_execution && nextPlan.molecule) {
+        const normalized = normalizeScene(nextPlan.molecule)
+        requestSequence.current += 1
+        setSelectedPresetId(null)
+        setDisplayedPresetId(nextPlan.experiment_identifier)
+        displayedPresetIdRef.current = nextPlan.experiment_identifier
+        setDetail(null)
+        setScene(normalized)
+        sceneRef.current = normalized
+        setStaleSceneMessage(null)
+      }
+    } catch (error) {
+      if (controller.signal.aborted || sequence !== planRequestSequence.current) return
+      setErrors((current) => [...current, { scope: 'details', message: messageFor(error) }])
+    } finally {
+      if (sequence === planRequestSequence.current) {
+        planControllerRef.current = null
+        setPlanning(false)
+      }
+    }
+  }, [api, planQuestion, planning])
 
   return {
     health,
@@ -112,6 +166,11 @@ export function useExperimentWorkspace(api: WorkspaceApi = pulsateApi) {
     presetLoading,
     errors,
     staleSceneMessage,
+    plan,
+    planning,
+    planQuestion,
+    setPlanQuestion,
+    planExperiment,
     selectPreset,
   }
 }

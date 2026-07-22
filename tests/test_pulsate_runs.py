@@ -70,6 +70,17 @@ class ControlledExecutor:
             raise RuntimeError(self.failure_message or "controlled executor failure")
         authorized = self.outcome == "authorized"
         experiment = manifest.experiment
+        molecule = experiment.molecular_system
+        structure_sha256 = artifact_reference(
+            "molecular_structure",
+            "molecular_structure",
+            {
+                **molecule.model_dump(mode="json"),
+                "driver_spin": molecule.driver_spin,
+                "total_electron_count": molecule.total_electron_count,
+            },
+            filename="molecular-structure.json",
+        ).content_sha256
         common = {
             "preset_identifier": preset_identifier,
             "experiment_identifier": experiment.experiment_identifier,
@@ -80,7 +91,7 @@ class ControlledExecutor:
         results = {
             "run_identifier": run_directory.name,
             **common,
-            "structure_sha256": "a" * 64,
+            "structure_sha256": structure_sha256,
             "hamiltonian_sha256": "b" * 64,
             "exact_scientific_result_sha256": "e" * 64,
             "vqe_scientific_result_sha256": "f" * 64,
@@ -101,7 +112,7 @@ class ControlledExecutor:
         verification = {
             "run_identifier": run_directory.name,
             **common,
-            "structure_sha256": "a" * 64,
+            "structure_sha256": structure_sha256,
             "verification_completed": True,
             "verification_passed": authorized,
             "authorization_state": self.outcome,
@@ -118,7 +129,7 @@ class ControlledExecutor:
             "run_identifier": run_directory.name,
             **common,
             "execution_identifier": "controlled-execution",
-            "structure_sha256": "a" * 64,
+            "structure_sha256": structure_sha256,
             "hamiltonian_sha256": "b" * 64,
             "exact_scientific_result_sha256": "e" * 64,
             "vqe_scientific_result_sha256": "f" * 64,

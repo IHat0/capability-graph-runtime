@@ -1,10 +1,15 @@
-import type { PresetSummaryResponse } from '../api/types'
+import type { ExperimentPlanResponse, PresetSummaryResponse } from '../api/types'
 import { PresetMenu } from './PresetMenu'
 
-function ObjectiveComposer({ presets, loading, onPresetChange }: {
+function ObjectiveComposer({ presets, loading, onPresetChange, question, planning, plan, onQuestionChange, onPlan }: {
   presets: PresetSummaryResponse[]
   loading: boolean
   onPresetChange: (identifier: string) => void
+  question: string
+  planning: boolean
+  plan: ExperimentPlanResponse | null
+  onQuestionChange: (value: string) => void
+  onPlan: () => void
 }) {
   return (
     <section className="objective-composer" aria-labelledby="objective-title">
@@ -16,12 +21,21 @@ function ObjectiveComposer({ presets, loading, onPresetChange }: {
         id="scientific-objective"
         rows={5}
         placeholder="Calculate the ground-state energy of lithium hydride at 1.6 angstrom using a minimal basis and compare the quantum result with a classical reference."
+        value={question}
+        onChange={(event) => onQuestionChange(event.target.value)}
       />
       <div className="objective-actions">
         <PresetMenu presets={presets} disabled={loading} onSelect={onPresetChange} />
-        <button className="primary-button" type="button" disabled aria-describedby="planning-status">Continue</button>
+        <button className="primary-button" type="button" disabled={planning || !question.trim()} aria-describedby="planning-status" onClick={onPlan}>
+          {planning ? 'Planning experiment…' : 'Continue'}
+        </button>
       </div>
-      <p className="planning-status" id="planning-status">Natural-language experiment planning is not connected yet. Use a verified preset to explore the current workspace.</p>
+      <div className="planning-status" id="planning-status" aria-live="polite">
+        {!plan && <p>Describe a two-atom ground-state energy experiment, or use a verified preset.</p>}
+        {plan && !plan.ready_for_execution && <p>More information is required: {plan.missing_fields.join(', ')}.</p>}
+        {plan?.assumptions.length ? <p><strong>Assumptions:</strong> {plan.assumptions.join('; ')}</p> : null}
+        {plan?.warnings.length ? <p><strong>Warnings:</strong> {plan.warnings.join('; ')}</p> : null}
+      </div>
     </section>
   )
 }
@@ -42,14 +56,19 @@ function EmptyMolecularCanvas() {
   )
 }
 
-export function EmptyWorkspace({ presets, loading, onPresetChange }: {
+export function EmptyWorkspace({ presets, loading, onPresetChange, question, planning, plan, onQuestionChange, onPlan }: {
   presets: PresetSummaryResponse[]
   loading: boolean
   onPresetChange: (identifier: string) => void
+  question: string
+  planning: boolean
+  plan: ExperimentPlanResponse | null
+  onQuestionChange: (value: string) => void
+  onPlan: () => void
 }) {
   return (
     <main className="empty-workspace" id="workspace-home">
-      <ObjectiveComposer presets={presets} loading={loading} onPresetChange={onPresetChange} />
+      <ObjectiveComposer presets={presets} loading={loading} onPresetChange={onPresetChange} question={question} planning={planning} plan={plan} onQuestionChange={onQuestionChange} onPlan={onPlan} />
       <EmptyMolecularCanvas />
     </main>
   )

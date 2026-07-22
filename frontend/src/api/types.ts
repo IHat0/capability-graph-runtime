@@ -25,7 +25,9 @@ export type RunStatus =
 
 export interface RunIdentity {
   run_identifier: string
-  preset_identifier: string
+  source_type: 'preset' | 'dynamic_experiment'
+  source_identifier: string
+  preset_identifier: string | null
   experiment_identifier: string
   experiment_fingerprint: string
   expected_experiment_sha256: string
@@ -43,6 +45,26 @@ export interface RunStateResponse extends RunIdentity {
   receipt_sha256?: string | null
   execution_environment_identity?: string | null
   error?: { code: string; message: string }
+  molecule?: SceneResponse
+}
+
+export interface ExperimentPlanResponse {
+  schema_version: string
+  experiment_identifier: string
+  original_question: string
+  specification: Record<string, unknown> | null
+  assumptions: string[]
+  warnings: string[]
+  missing_fields: string[]
+  ready_for_execution: boolean
+  requested_execution_target: 'local_simulator' | 'ibm_quantum'
+  specification_sha256: string | null
+  experiment_fingerprint: string | null
+  expected_experiment_sha256: string | null
+  structure_identifier: string | null
+  structure_hash: string | null
+  molecule: SceneResponse | null
+  created_at: string
 }
 
 export interface RunResultsResponse extends RunIdentity {
@@ -65,13 +87,7 @@ export interface RunResultsResponse extends RunIdentity {
   receipt_sha256: string
 }
 
-export interface RunVerificationResponse {
-  run_identifier: string
-  preset_identifier: string
-  experiment_identifier: string
-  experiment_fingerprint: string
-  expected_experiment_sha256: string
-  structure_identifier: string
+export interface RunVerificationResponse extends RunIdentity {
   structure_sha256: string
   verification_completed: boolean
   verification_passed: boolean
@@ -91,15 +107,9 @@ export interface PublicArtifactIdentity {
   content_sha256: string
 }
 
-export interface RunReceiptResponse {
+export interface RunReceiptResponse extends RunIdentity {
   schema_version: string
-  run_identifier: string
-  preset_identifier: string
   execution_identifier: string
-  experiment_identifier: string
-  experiment_fingerprint: string
-  expected_experiment_sha256: string
-  structure_identifier: string
   structure_sha256: string
   hamiltonian_sha256: string
   exact_scientific_result_sha256: string
@@ -168,6 +178,9 @@ export interface SceneResponse {
   experiment_identifier?: string
   experiment_fingerprint?: string
   structure_hash?: string
+  structure_identifier?: string
+  expected_experiment_sha256?: string
+  specification_sha256?: string
   coordinate_unit: string
   atoms: RawAtomResponse[]
   bonds?: RawBondResponse[]

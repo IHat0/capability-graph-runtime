@@ -64,4 +64,49 @@ describe('Pulsate API client failure handling', () => {
     })))
     await expect(pulsateApi.getRunResults('run-test')).rejects.toBeInstanceOf(ApiError)
   })
+
+  it('posts and validates a dynamic experiment plan', async () => {
+    const experimentIdentifier = `experiment-${'a'.repeat(32)}`
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      schema_version: 'cgr.pulsate-experiment-plan/1.0.0',
+      experiment_identifier: experimentIdentifier,
+      original_question: 'Compute H2', specification: { objective: 'molecular_ground_state_energy' },
+      assumptions: [], warnings: [], missing_fields: [], ready_for_execution: true,
+      requested_execution_target: 'local_simulator',
+      specification_sha256: 'spec-hash', experiment_fingerprint: 'experiment-hash',
+      expected_experiment_sha256: 'experiment-hash', structure_identifier: 'molecular_structure',
+      structure_hash: 'structure-hash', molecule: {
+        ...currentFixtureScene,
+        experiment_identifier: experimentIdentifier,
+        expected_experiment_sha256: 'experiment-hash',
+        structure_identifier: 'molecular_structure',
+      },
+      created_at: '2026-01-01T00:00:00Z',
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const plan = await pulsateApi.planExperiment('Compute H2')
+    expect(plan.experiment_identifier).toBe(experimentIdentifier)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/experiments/plan')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ question: 'Compute H2' })
+  })
+
+  it('creates dynamic runs with only the experiment identifier', async () => {
+    const experimentIdentifier = `experiment-${'b'.repeat(32)}`
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      run_identifier: `run-${'c'.repeat(32)}`, source_type: 'dynamic_experiment',
+      source_identifier: experimentIdentifier, preset_identifier: null,
+      experiment_identifier: experimentIdentifier, experiment_fingerprint: 'experiment-hash',
+      expected_experiment_sha256: 'experiment-hash', structure_identifier: 'molecular_structure',
+      execution_target: 'local_simulator', status: 'queued',
+      created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      status_url: `/api/v1/runs/run-${'c'.repeat(32)}`,
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await pulsateApi.createExperimentRun(experimentIdentifier, 'dynamic-key-0001')
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body).toEqual({ experiment_identifier: experimentIdentifier, execution_target: 'local_simulator' })
+    expect(body).not.toHaveProperty('preset_identifier')
+  })
 })

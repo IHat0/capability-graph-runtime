@@ -1,4 +1,4 @@
-import type { PresetSummaryResponse } from '../api/types'
+import type { ExperimentPlanResponse, PresetSummaryResponse } from '../api/types'
 import type { MolecularScene } from '../scene/types'
 import { humanize } from '../utils/format'
 import { PresetSelector } from './PresetSelector'
@@ -14,7 +14,7 @@ function PropertyList({ rows }: { rows: Array<[string, React.ReactNode]> }) {
   return <dl className="property-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd><Value value={value} /></dd></div>)}</dl>
 }
 
-export function ScientificPanel({ scene, presets, selectedPresetId, displayedPresetId, staleSceneMessage, loading, onPresetChange, presetRun }: {
+export function ScientificPanel({ scene, presets, selectedPresetId, displayedPresetId, staleSceneMessage, loading, onPresetChange, presetRun, plan }: {
   scene: MolecularScene
   presets: PresetSummaryResponse[]
   selectedPresetId: string | null
@@ -23,14 +23,26 @@ export function ScientificPanel({ scene, presets, selectedPresetId, displayedPre
   loading: boolean
   onPresetChange: (identifier: string) => void
   presetRun: ReturnType<typeof usePresetRun>
+  plan: ExperimentPlanResponse | null
 }) {
   return (
     <aside className="science-panel" aria-label="Experiment inspector">
       <section className="inspector-selector" id="preset-menu">
         <PresetSelector presets={presets} value={selectedPresetId} disabled={loading} onChange={onPresetChange} />
+        {plan?.ready_for_execution && <div className="displayed-preset-row"><span>Dynamic experiment</span><strong>{plan.experiment_identifier}</strong></div>}
         {staleSceneMessage && <div className="stale-scene-notice" role="status"><strong>Retained structure</strong><span>{staleSceneMessage}</span></div>}
         <div className="displayed-preset-row"><span>Displayed preset</span><strong>{displayedPresetId ?? 'Unknown'}</strong></div>
       </section>
+
+      {plan && (
+        <section className="inspector-section" aria-labelledby="planning-title">
+          <p className="section-kicker">Scientific intake</p>
+          <h2 id="planning-title">Validated plan</h2>
+          <p>{plan.original_question}</p>
+          {plan.assumptions.length > 0 && <p><strong>Assumptions:</strong> {plan.assumptions.join('; ')}</p>}
+          {plan.warnings.length > 0 && <p><strong>Warnings:</strong> {plan.warnings.join('; ')}</p>}
+        </section>
+      )}
 
       <section className="inspector-section" aria-labelledby="experiment-title">
         <p className="section-kicker">Experiment</p>

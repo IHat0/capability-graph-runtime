@@ -19,6 +19,9 @@ export function App() {
     expectedExperimentSha256: workspace.scene?.expectedExperimentSha256,
     structureIdentifier: workspace.scene?.structureId,
     structureSha256: workspace.scene?.structureHash,
+    experimentRecordIdentifier: workspace.plan?.ready_for_execution
+      ? workspace.plan.experiment_identifier
+      : null,
   })
   const errors = presetRun.error
     ? [...workspace.errors, { scope: 'run' as const, message: presetRun.error }]
@@ -48,11 +51,21 @@ export function App() {
               loading={workspace.presetLoading}
               onPresetChange={workspace.selectPreset}
               presetRun={presetRun}
+              plan={workspace.plan}
             />
           </main>
         ) : (
           <div className="empty-layout">
-            <EmptyWorkspace presets={workspace.presets} loading={workspace.presetLoading} onPresetChange={workspace.selectPreset} />
+            <EmptyWorkspace
+              presets={workspace.presets}
+              loading={workspace.presetLoading}
+              onPresetChange={workspace.selectPreset}
+              question={workspace.planQuestion}
+              planning={workspace.planning}
+              plan={workspace.plan}
+              onQuestionChange={workspace.setPlanQuestion}
+              onPlan={() => void workspace.planExperiment()}
+            />
             <EmptyInspector />
           </div>
         )}

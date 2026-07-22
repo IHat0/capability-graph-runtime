@@ -19,7 +19,7 @@ function nested(receipt: RunReceiptResponse, path: string[]): unknown {
 function ReceiptPanel({ receipt, onClose }: { receipt: RunReceiptResponse; onClose: () => void }) {
   const rows: Array<[string, unknown]> = [
     ['Run', receipt.run_identifier],
-    ['Preset', receipt.preset_identifier],
+    [receipt.source_type === 'preset' ? 'Preset' : 'Dynamic experiment', receipt.source_identifier],
     ['Execution', receipt.execution_identifier],
     ['Experiment SHA-256', nested(receipt, ['experiment', 'content_sha256']) ?? receipt.experiment_identifier],
     ['Structure SHA-256', nested(receipt, ['scientific_outcome', 'molecular_structure_sha256']) ?? receipt.structure_sha256],

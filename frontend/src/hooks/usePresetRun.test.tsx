@@ -6,6 +6,8 @@ import { RUN_POLL_INTERVAL_MS, usePresetRun } from './usePresetRun'
 
 const identity = {
   run_identifier: 'run-11111111111111111111111111111111',
+  source_type: 'preset' as const,
+  source_identifier: 'fixture-preset',
   preset_identifier: 'fixture-preset',
   experiment_identifier: 'fixture-experiment',
   experiment_fingerprint: 'fixture-fingerprint',
@@ -21,6 +23,7 @@ type SceneProps = {
   expectedExperimentSha256: string
   structureIdentifier: string
   structureSha256: string
+  experimentRecordIdentifier?: string | null
 }
 
 const scene: SceneProps = {
@@ -74,10 +77,12 @@ const receipt: RunReceiptResponse = {
 function api(overrides: Partial<PulsateApi> = {}): PulsateApi {
   return {
     getHealth: vi.fn(), getPresets: vi.fn(), getPreset: vi.fn(), getScene: vi.fn(),
+    planExperiment: vi.fn(),
     getRunCapability: vi.fn().mockResolvedValue({
       available: true, execution_targets: ['local_simulator'], reason: null, maximum_run_seconds: 180,
     }),
     createRun: vi.fn().mockResolvedValue(state('queued')),
+    createExperimentRun: vi.fn().mockResolvedValue(state('queued')),
     getRun: vi.fn().mockResolvedValue(state('authorized')),
     getRunResults: vi.fn().mockResolvedValue(results),
     getRunVerification: vi.fn().mockResolvedValue(verification),
@@ -102,6 +107,37 @@ function storeActiveRun(): void {
 beforeEach(() => localStorage.clear())
 
 describe('preset run lifecycle', () => {
+  it('submits a planned experiment identifier without invoking the preset endpoint', async () => {
+    const experimentRecordIdentifier = `experiment-${'a'.repeat(32)}`
+    const dynamicState = {
+      ...state('queued'),
+      source_type: 'dynamic_experiment' as const,
+      source_identifier: experimentRecordIdentifier,
+      preset_identifier: null,
+      experiment_identifier: experimentRecordIdentifier,
+    }
+    const createRun = vi.fn()
+    const createExperimentRun = vi.fn().mockResolvedValue(dynamicState)
+    const { result } = renderRun(api({ createRun, createExperimentRun }), {
+      ...scene,
+      selectedPresetId: null,
+      displayedPresetId: experimentRecordIdentifier,
+      experimentIdentifier: experimentRecordIdentifier,
+      experimentRecordIdentifier,
+    })
+    await waitFor(() => expect(result.current.canRun).toBe(true))
+    await act(async () => { await result.current.startRun() })
+
+    expect(createExperimentRun).toHaveBeenCalledWith(
+      experimentRecordIdentifier, expect.any(String), expect.any(AbortSignal),
+    )
+    expect(createRun).not.toHaveBeenCalled()
+    expect(result.current.run?.experiment_identifier).toBe(experimentRecordIdentifier)
+    expect(result.current.run?.source_type).toBe('dynamic_experiment')
+    expect(result.current.run?.source_identifier).toBe(experimentRecordIdentifier)
+    expect(result.current.run?.preset_identifier).toBeNull()
+  })
+
   it('disables execution without a displayed preset and for a stale selection', async () => {
     const absent = renderRun(api(), { ...scene, selectedPresetId: null, displayedPresetId: null })
     await waitFor(() => expect(absent.result.current.capability?.available).toBe(true))

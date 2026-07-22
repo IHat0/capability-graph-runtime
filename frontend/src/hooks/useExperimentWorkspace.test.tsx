@@ -12,6 +12,47 @@ function deferred<T>() {
 }
 
 describe('experiment request lifecycle', () => {
+  it('plans a natural-language experiment and normalizes its returned molecule', async () => {
+    const experimentIdentifier = `experiment-${'a'.repeat(32)}`
+    const molecule = {
+      ...currentFixtureScene,
+      scene_identifier: `scene.${experimentIdentifier}`,
+      scene_stage: 'planned',
+      experiment_identifier: experimentIdentifier,
+      experiment_fingerprint: 'dynamic-fingerprint',
+      expected_experiment_sha256: 'dynamic-fingerprint',
+      structure_identifier: 'molecular_structure',
+      structure_hash: 'dynamic-structure-hash',
+    }
+    const api: WorkspaceApi = {
+      getHealth: async () => ({ service: 'pulsate-api', status: 'healthy', version: 'test' }),
+      getPresets: async () => ({ count: 0, presets: [] }),
+      getPreset: async () => currentFixtureDetail,
+      getScene: async () => currentFixtureScene,
+      planExperiment: async (question) => ({
+        schema_version: 'cgr.pulsate-experiment-plan/1.0.0',
+        experiment_identifier: experimentIdentifier,
+        original_question: question,
+        specification: { objective: 'molecular_ground_state_energy' },
+        assumptions: ['basis_set=sto-3g (system default)'], warnings: [], missing_fields: [],
+        ready_for_execution: true, requested_execution_target: 'local_simulator', specification_sha256: 'specification-hash',
+        experiment_fingerprint: 'dynamic-fingerprint', expected_experiment_sha256: 'dynamic-fingerprint',
+        structure_identifier: 'molecular_structure', structure_hash: 'dynamic-structure-hash',
+        molecule, created_at: '2026-01-01T00:00:00Z',
+      }),
+    }
+    const { result } = renderHook(() => useExperimentWorkspace(api))
+    await waitFor(() => expect(result.current.initialLoading).toBe(false))
+    act(() => result.current.setPlanQuestion('Compute the ground-state energy of H2 at 0.735 angstrom'))
+    await act(async () => result.current.planExperiment())
+
+    expect(result.current.plan?.ready_for_execution).toBe(true)
+    expect(result.current.displayedPresetId).toBe(experimentIdentifier)
+    expect(result.current.scene?.experimentId).toBe(experimentIdentifier)
+    expect(result.current.scene?.structureHash).toBe('dynamic-structure-hash')
+    expect(result.current.selectedPresetId).toBeNull()
+  })
+
   it('ignores stale preset data even when an API implementation does not honor abort', async () => {
     const first = deferred<SceneResponse>()
     const second = deferred<SceneResponse>()

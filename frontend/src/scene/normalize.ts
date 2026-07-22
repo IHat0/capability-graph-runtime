@@ -80,10 +80,10 @@ export function normalizeScene(raw: SceneResponse, detail?: PresetDetailResponse
 
   return {
     id: raw.scene_identifier,
-    structureId: molecular?.structure_artifact_identifier,
+    structureId: raw.structure_identifier ?? molecular?.structure_artifact_identifier,
     structureHash: raw.structure_hash,
     experimentFingerprint: raw.experiment_fingerprint,
-    expectedExperimentSha256: detail?.manifest.expected_experiment_sha256 ?? undefined,
+    expectedExperimentSha256: raw.expected_experiment_sha256 ?? detail?.manifest.expected_experiment_sha256 ?? undefined,
     experimentId: raw.experiment_identifier ?? experiment?.experiment_identifier,
     stage: raw.scene_stage,
     coordinateUnit: raw.coordinate_unit,

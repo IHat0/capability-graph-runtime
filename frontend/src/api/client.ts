@@ -1,5 +1,6 @@
 import type {
   HealthResponse,
+  ExperimentPlanResponse,
   PresetDetailResponse,
   PresetListResponse,
   PresetSummaryResponse,
@@ -72,7 +73,15 @@ function parseCapability(value: unknown): RunCapabilityResponse {
 }
 
 function hasRunIdentity(value: Record<string, unknown>): boolean {
-  return hasString(value, 'run_identifier') && hasString(value, 'preset_identifier')
+  const sourceType = value.source_type
+  const sourceIdentifier = value.source_identifier
+  const presetIdentifier = value.preset_identifier
+  const experimentIdentifier = value.experiment_identifier
+  const sourceIsValid = sourceType === 'preset'
+    ? typeof presetIdentifier === 'string' && presetIdentifier.trim().length > 0 && sourceIdentifier === presetIdentifier
+    : sourceType === 'dynamic_experiment'
+      && presetIdentifier === null && sourceIdentifier === experimentIdentifier
+  return hasString(value, 'run_identifier') && hasString(value, 'source_identifier') && sourceIsValid
     && hasString(value, 'experiment_identifier') && hasString(value, 'experiment_fingerprint')
     && hasString(value, 'expected_experiment_sha256') && hasString(value, 'structure_identifier')
 }
@@ -226,7 +235,10 @@ function parseScene(value: unknown): SceneResponse {
   if (!isOptionalString(value.scene_stage)
     || !isOptionalString(value.experiment_identifier)
     || !isOptionalString(value.experiment_fingerprint)
-    || !isOptionalString(value.structure_hash)) {
+    || !isOptionalString(value.structure_hash)
+    || !isOptionalString(value.structure_identifier)
+    || !isOptionalString(value.expected_experiment_sha256)
+    || !isOptionalString(value.specification_sha256)) {
     malformed('The backend returned malformed molecular scene identity data.')
   }
   const atomIdentifiers = new Set<string>()
@@ -287,6 +299,30 @@ function parseScene(value: unknown): SceneResponse {
   return value as unknown as SceneResponse
 }
 
+function parseExperimentPlan(value: unknown): ExperimentPlanResponse {
+  if (!isRecord(value) || !hasString(value, 'schema_version')
+    || !hasString(value, 'experiment_identifier') || !hasString(value, 'original_question')
+    || typeof value.ready_for_execution !== 'boolean'
+    || !['local_simulator', 'ibm_quantum'].includes(String(value.requested_execution_target))
+    || !Array.isArray(value.assumptions) || !value.assumptions.every((item) => typeof item === 'string')
+    || !Array.isArray(value.warnings) || !value.warnings.every((item) => typeof item === 'string')
+    || !Array.isArray(value.missing_fields) || !value.missing_fields.every((item) => typeof item === 'string')
+    || !(value.specification === null || isRecord(value.specification))
+    || !(value.specification_sha256 === null || hasString(value, 'specification_sha256'))
+    || !(value.experiment_fingerprint === null || hasString(value, 'experiment_fingerprint'))
+    || !(value.expected_experiment_sha256 === null || hasString(value, 'expected_experiment_sha256'))
+    || !(value.structure_identifier === null || hasString(value, 'structure_identifier'))
+    || !(value.structure_hash === null || hasString(value, 'structure_hash'))
+    || !(value.molecule === null || isRecord(value.molecule)) || !hasString(value, 'created_at')) {
+    malformed('The backend returned a malformed experiment plan.')
+  }
+  if (value.molecule !== null) parseScene(value.molecule)
+  if (value.ready_for_execution && (value.specification === null || value.molecule === null)) {
+    malformed('The backend returned an executable plan without a scientific specification and molecule.')
+  }
+  return value as unknown as ExperimentPlanResponse
+}
+
 async function requestJson<T>(path: string, parser: (value: unknown) => T, signal?: AbortSignal, init?: RequestInit): Promise<T> {
   let response: Response
   try {
@@ -318,8 +354,10 @@ export interface PulsateApi {
   getPresets(signal?: AbortSignal): Promise<PresetListResponse>
   getPreset(identifier: string, signal?: AbortSignal): Promise<PresetDetailResponse>
   getScene(identifier: string, signal?: AbortSignal): Promise<SceneResponse>
+  planExperiment(question: string, signal?: AbortSignal): Promise<ExperimentPlanResponse>
   getRunCapability(signal?: AbortSignal): Promise<RunCapabilityResponse>
   createRun(presetIdentifier: string, idempotencyKey: string, signal?: AbortSignal): Promise<RunStateResponse>
+  createExperimentRun(experimentIdentifier: string, idempotencyKey: string, signal?: AbortSignal): Promise<RunStateResponse>
   getRun(runIdentifier: string, signal?: AbortSignal): Promise<RunStateResponse>
   getRunResults(runIdentifier: string, signal?: AbortSignal): Promise<RunResultsResponse>
   getRunVerification(runIdentifier: string, signal?: AbortSignal): Promise<RunVerificationResponse>
@@ -327,6 +365,7 @@ export interface PulsateApi {
 }
 
 export type WorkspaceApi = Pick<PulsateApi, 'getHealth' | 'getPresets' | 'getPreset' | 'getScene'>
+  & Partial<Pick<PulsateApi, 'planExperiment'>>
 
 function presetPath(identifier: string, suffix = ''): string {
   return `/api/v1/experiments/presets/${encodeURIComponent(identifier)}${suffix}`
@@ -337,11 +376,21 @@ export const pulsateApi: PulsateApi = {
   getPresets: (signal) => requestJson('/api/v1/experiments/presets', parsePresetList, signal),
   getPreset: (identifier, signal) => requestJson(presetPath(identifier), parsePresetDetail, signal),
   getScene: (identifier, signal) => requestJson(presetPath(identifier, '/scene'), parseScene, signal),
+  planExperiment: (question, signal) => requestJson('/api/v1/experiments/plan', parseExperimentPlan, signal, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  }),
   getRunCapability: (signal) => requestJson('/api/v1/runs/capability', parseCapability, signal),
   createRun: (presetIdentifier, idempotencyKey, signal) => requestJson('/api/v1/runs', parseRunState, signal, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify({ preset_identifier: presetIdentifier, execution_target: 'local_simulator' }),
+  }),
+  createExperimentRun: (experimentIdentifier, idempotencyKey, signal) => requestJson('/api/v1/runs', parseRunState, signal, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+    body: JSON.stringify({ experiment_identifier: experimentIdentifier, execution_target: 'local_simulator' }),
   }),
   getRun: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}`, parseRunState, signal),
   getRunResults: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/results`, parseRunResults, signal),

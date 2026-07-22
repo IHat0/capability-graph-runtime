@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
-import type { PresetSummaryResponse } from '../api/types'
+import type { ExperimentPlanResponse, PresetSummaryResponse } from '../api/types'
 import { ConditionalNavigation } from './ConditionalNavigation'
 import { EmptyInspector } from './EmptyInspector'
 import { EmptyWorkspace } from './EmptyWorkspace'
@@ -59,14 +59,33 @@ describe('progressive workspace disclosure', () => {
 
   it('uses the fetched preset list and keeps natural-language planning truthful', () => {
     const onPresetChange = vi.fn()
-    render(<EmptyWorkspace presets={[genericPreset]} loading={false} onPresetChange={onPresetChange} />)
+    const onPlan = vi.fn()
+    const onQuestionChange = vi.fn()
+    const { rerender } = render(<EmptyWorkspace presets={[genericPreset]} loading={false} onPresetChange={onPresetChange} question="" planning={false} plan={null} onQuestionChange={onQuestionChange} onPlan={onPlan} />)
     expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(true)
-    expect(screen.getByText(/Natural-language experiment planning is not connected yet/)).toBeTruthy()
+    expect(screen.getByText(/Describe a two-atom ground-state energy experiment/)).toBeTruthy()
     expect(screen.queryByRole('button', { name: /Ground-state energy|Bond scan|Compare VQE/i })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /Use a preset/ }))
     fireEvent.change(screen.getByRole('combobox', { name: 'Verified preset' }), { target: { value: genericPreset.preset_identifier } })
     expect(onPresetChange).toHaveBeenCalledWith(genericPreset.preset_identifier)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Scientific objective' }), { target: { value: 'Compute H2' } })
+    expect(onQuestionChange).toHaveBeenCalledWith('Compute H2')
+
+    const incompletePlan: ExperimentPlanResponse = {
+      schema_version: 'cgr.pulsate-experiment-plan/1.0.0',
+      experiment_identifier: `experiment-${'a'.repeat(32)}`,
+      original_question: 'Compute H2', specification: null,
+      assumptions: ['basis_set=sto-3g (system default)'], warnings: [],
+      missing_fields: ['bond_length'], ready_for_execution: false,
+      requested_execution_target: 'local_simulator',
+      specification_sha256: null, experiment_fingerprint: null,
+      expected_experiment_sha256: null, structure_identifier: null,
+      structure_hash: null, molecule: null, created_at: '2026-01-01T00:00:00Z',
+    }
+    rerender(<EmptyWorkspace presets={[genericPreset]} loading={false} onPresetChange={onPresetChange} question="Compute H2" planning={false} plan={incompletePlan} onQuestionChange={onQuestionChange} onPlan={onPlan} />)
+    expect(screen.getByText(/More information is required: bond_length/)).toBeTruthy()
+    expect(screen.getByText(/basis_set=sto-3g/)).toBeTruthy()
   })
 
   it('does not embed known preset identifiers in runtime workspace components', () => {
@@ -82,7 +101,7 @@ describe('progressive workspace disclosure', () => {
     expect(screen.queryByRole('button', { name: 'View receipt' })).toBeNull()
     rerender(<ResultSummary run={null} results={null} verification={null} receipt={{
       schema_version: 'cgr.quantum-preflight-receipt/2.0.0',
-      run_identifier: 'run-test', preset_identifier: 'preset-test',
+      run_identifier: 'run-test', source_type: 'preset', source_identifier: 'preset-test', preset_identifier: 'preset-test',
       execution_identifier: 'execution-test', experiment_identifier: 'experiment-test',
       experiment_fingerprint: 'experiment-sha', expected_experiment_sha256: 'experiment-sha',
       structure_identifier: 'structure-test', structure_sha256: 'structure-sha',

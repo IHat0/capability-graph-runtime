@@ -55,6 +55,7 @@ export function usePresetRun({
   expectedExperimentSha256,
   structureIdentifier,
   structureSha256,
+  experimentRecordIdentifier,
 }: {
   api?: PulsateApi
   selectedPresetId: string | null
@@ -64,6 +65,7 @@ export function usePresetRun({
   expectedExperimentSha256?: string
   structureIdentifier?: string
   structureSha256?: string
+  experimentRecordIdentifier?: string | null
 }) {
   const [capability, setCapability] = useState<RunCapabilityResponse | null>(null)
   const [run, setRun] = useState<RunStateResponse | null>(null)
@@ -83,12 +85,14 @@ export function usePresetRun({
   ]), [displayedPresetId, expectedExperimentSha256, experimentFingerprint, experimentIdentifier, structureIdentifier, structureSha256])
 
   const stateIdentityMatches = useCallback((value: RunStateResponse | RunResultsResponse | RunVerificationResponse | RunReceiptResponse): boolean => (
-    value.preset_identifier === displayedPresetId
+    value.source_identifier === displayedPresetId
+    && value.source_type === (experimentRecordIdentifier ? 'dynamic_experiment' : 'preset')
+    && (experimentRecordIdentifier ? value.preset_identifier === null : value.preset_identifier === displayedPresetId)
     && (!experimentIdentifier || value.experiment_identifier === experimentIdentifier)
     && (!experimentFingerprint || value.experiment_fingerprint === experimentFingerprint)
     && (!expectedExperimentSha256 || value.expected_experiment_sha256 === expectedExperimentSha256)
     && (!structureIdentifier || value.structure_identifier === structureIdentifier)
-  ), [displayedPresetId, expectedExperimentSha256, experimentFingerprint, experimentIdentifier, structureIdentifier])
+  ), [displayedPresetId, expectedExperimentSha256, experimentFingerprint, experimentIdentifier, experimentRecordIdentifier, structureIdentifier])
 
   const evidenceIdentityMatches = useCallback((value: RunResultsResponse | RunVerificationResponse | RunReceiptResponse): boolean => (
     stateIdentityMatches(value) && (!structureSha256 || value.structure_sha256 === structureSha256)
@@ -216,7 +220,10 @@ export function usePresetRun({
   }, [api, evidenceIdentityMatches, run])
 
   const startRun = useCallback(async () => {
-    if (creatingRef.current || !displayedPresetId || selectedPresetId !== displayedPresetId || !capability?.available) return
+    const sourceIsCurrent = experimentRecordIdentifier
+      ? experimentRecordIdentifier === displayedPresetId
+      : selectedPresetId === displayedPresetId
+    if (creatingRef.current || !displayedPresetId || !sourceIsCurrent || !capability?.available) return
     const generation = generationRef.current
     const identityKey = sceneIdentityKey
     const controller = new AbortController()
@@ -230,7 +237,9 @@ export function usePresetRun({
     setVerification(null)
     setReceipt(null)
     try {
-      const created = await api.createRun(displayedPresetId, key, controller.signal)
+      const created = experimentRecordIdentifier
+        ? await api.createExperimentRun(experimentRecordIdentifier, key, controller.signal)
+        : await api.createRun(displayedPresetId, key, controller.signal)
       if (controller.signal.aborted || generation !== generationRef.current
         || activeCreateRef.current?.generation !== generation
         || activeCreateRef.current.identityKey !== identityKey) return
@@ -257,9 +266,13 @@ export function usePresetRun({
         setCreating(false)
       }
     }
-  }, [api, capability?.available, displayedPresetId, sceneIdentityKey, selectedPresetId, stateIdentityMatches])
+  }, [api, capability?.available, displayedPresetId, experimentRecordIdentifier, sceneIdentityKey, selectedPresetId, stateIdentityMatches])
 
-  const staleIdentity = Boolean(displayedPresetId && selectedPresetId !== displayedPresetId)
+  const staleIdentity = Boolean(displayedPresetId && (
+    experimentRecordIdentifier
+      ? experimentRecordIdentifier !== displayedPresetId
+      : selectedPresetId !== displayedPresetId
+  ))
   const active = Boolean(run && !TERMINAL.has(run.status))
   const canRun = Boolean(capability?.available && displayedPresetId && !staleIdentity && !creating && !active)
   const disabledReason = !displayedPresetId
