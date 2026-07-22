@@ -5,8 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import stat
+import subprocess
+import sys
 import threading
+import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -16,15 +20,20 @@ from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from cgr.quantum_preflight.artifacts import artifact_reference
+from cgr.quantum_preflight.artifacts import artifact_reference, write_json_atomic
 from cgr.quantum_preflight.contracts import ManifestEnvelope
-from cgr.quantum_preflight.errors import QuantumVerificationError
+from cgr.quantum_preflight.errors import QuantumTimeoutError
 from cgr.quantum_preflight.identities import ScientificResultArtifact
 from cgr.quantum_preflight.receipt import QuantumPreflightReceipt, verify_receipt_identities
 from cgr.quantum_preflight.operators import encode_float
-from cgr.quantum_preflight.runner import run_trusted_reference
 from cgr.quantum_preflight.verification import blocking_findings
 from cgr.quantum_preflight.warnings import CompatibilityWarningEvidence
+from cgr.pulsate_api.quantum_worker import (
+    WORKER_EXIT_CODES,
+    WORKER_MANIFEST_MAXIMUM_BYTES,
+    WORKER_RESULT_MAXIMUM_BYTES,
+    WorkerResultEnvelope,
+)
 
 RunStatus = Literal[
     "queued", "validating", "running_quantum_workflow",
@@ -41,6 +50,12 @@ _DEFAULT_MAX_RUN_SECONDS = 180
 _MAX_CONFIGURED_RUN_SECONDS = 3600
 _DEFAULT_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 _MAX_RUN_ENVELOPE_BYTES = 2 * 1024 * 1024
+_WORKER_SHUTDOWN_GRACE_SECONDS = 5
+_WORKER_TERMINATION_GRACE_SECONDS = 1.0
+_WORKER_COLLECTION_TIMEOUT_SECONDS = 2.0
+_WORKER_LOG_JOIN_TIMEOUT_SECONDS = 2.0
+WORKER_LOG_MAXIMUM_BYTES = 1 * 1024 * 1024
+_WORKER_LOG_TRUNCATION_MARKER = b"\n...[worker output truncated]...\n"
 
 _AUTHORITATIVE_ARTIFACTS = {
     "experiment": ("quantum_chemistry_experiment", "experiment.json"),
@@ -321,12 +336,101 @@ class PresetRunExecutor(Protocol):
     ) -> ExecutionOutput: ...
 
 
-class ExistingQuantumPreflightExecutor:
-    """Thin, fail-closed adapter over the trusted quantum-preflight runner."""
+class _BoundedLogCollector:
+    """Continuously drain one worker pipe while retaining a bounded prefix."""
 
-    def __init__(self, *, repository_root: Path, image_identifier: str) -> None:
+    def __init__(self, stream: Any, path: Path, *, thread_name: str) -> None:
+        self.stream = stream
+        self.path = path
+        self.buffer = bytearray()
+        self.truncated = False
+        self.error: Exception | None = None
+        self.persisted = False
+        self.started = False
+        self.thread = threading.Thread(
+            target=self._drain, name=thread_name, daemon=True
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+        self.started = True
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self.stream.read(64 * 1024)
+                if not chunk:
+                    break
+                remaining = WORKER_LOG_MAXIMUM_BYTES - len(self.buffer)
+                if remaining > 0:
+                    self.buffer.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    self.truncated = True
+        except Exception as exc:
+            self.error = exc
+        finally:
+            try:
+                self.stream.close()
+            except Exception as exc:
+                if self.error is None:
+                    self.error = exc
+
+    def finish(self) -> None:
+        if self.persisted:
+            if self.error is not None:
+                raise RuntimeError("A quantum worker log reader failed.") from self.error
+            return
+        if self.started:
+            self.thread.join(timeout=_WORKER_LOG_JOIN_TIMEOUT_SECONDS)
+        if self.started and self.thread.is_alive():
+            close_error: Exception | None = None
+            try:
+                self.stream.close()
+            except Exception as exc:
+                close_error = exc
+            self.thread.join(timeout=_WORKER_LOG_JOIN_TIMEOUT_SECONDS)
+            if close_error is not None:
+                raise RuntimeError("A quantum worker log pipe could not be closed.") from close_error
+        if self.started and self.thread.is_alive():
+            raise RuntimeError("A quantum worker log reader could not be collected.")
+        if not self.started:
+            try:
+                self.stream.close()
+            except Exception as exc:
+                raise RuntimeError("A quantum worker log pipe could not be closed.") from exc
+
+        payload = bytes(self.buffer)
+        if self.truncated:
+            retained = WORKER_LOG_MAXIMUM_BYTES - len(
+                _WORKER_LOG_TRUNCATION_MARKER
+            )
+            payload = payload[:retained] + _WORKER_LOG_TRUNCATION_MARKER
+        if len(payload) > WORKER_LOG_MAXIMUM_BYTES:
+            raise RuntimeError("A quantum worker log exceeded its size ceiling.")
+        with self.path.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.persisted = True
+        if self.error is not None:
+            raise RuntimeError("A quantum worker log reader failed.") from self.error
+
+
+class ExistingQuantumPreflightExecutor:
+    """Fail-closed process adapter over the trusted quantum-preflight runner."""
+
+    def __init__(
+        self,
+        *,
+        repository_root: Path,
+        image_identifier: str,
+        _process_factory: Callable[..., Any] | None = None,
+        _worker_timeout_override_seconds: float | None = None,
+    ) -> None:
         self.repository_root = repository_root.resolve()
         self.image_identifier = image_identifier
+        self._process_factory = _process_factory or subprocess.Popen
+        self._worker_timeout_override_seconds = _worker_timeout_override_seconds
 
     def execute(
         self,
@@ -337,38 +441,292 @@ class ExistingQuantumPreflightExecutor:
         maximum_seconds: int,
     ) -> ExecutionOutput:
         result_root = run_directory / "runner-artifacts"
+        if result_root.is_symlink() or result_root.exists():
+            raise ValueError("The quantum runner artifact root must not pre-exist.")
         maximum_bytes = manifest.experiment.execution_policy.maximum_result_bytes
+        worker_directory = self._create_worker_directory(run_directory)
+        manifest_path = worker_directory / "manifest.json"
+        result_envelope_path = worker_directory / "result.json"
+        stdout_path = worker_directory / "stdout.log"
+        stderr_path = worker_directory / "stderr.log"
+        lock_path = self.repository_root / "requirements" / "quantum-preflight.lock"
+        if lock_path.is_symlink() or not lock_path.is_file():
+            raise ValueError("The scientific dependency lock is unavailable.")
+        write_json_atomic(
+            manifest_path,
+            manifest.model_dump(mode="json"),
+            maximum_bytes=WORKER_MANIFEST_MAXIMUM_BYTES,
+        )
+        command = [
+            sys.executable,
+            "-m",
+            "cgr.pulsate_api.quantum_worker",
+            "--manifest-json",
+            str(manifest_path),
+            "--result-root",
+            str(result_root),
+            "--scientific-lock",
+            str(lock_path),
+            "--image-identifier",
+            self.image_identifier,
+            "--maximum-seconds",
+            str(maximum_seconds),
+            "--result-envelope",
+            str(result_envelope_path),
+        ]
+        process_options: dict[str, Any] = {
+            "cwd": self.repository_root,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+        }
+        if os.name == "posix":
+            process_options["start_new_session"] = True
+        process = self._process_factory(command, **process_options)
+        if process.stdout is None or process.stderr is None:
+            self._terminate_worker(process)
+            raise RuntimeError("The quantum worker output pipes were not created.")
+        collectors = (
+            _BoundedLogCollector(
+                process.stdout,
+                stdout_path,
+                thread_name=f"pulsate-worker-log-{run_directory.name}-stdout",
+            ),
+            _BoundedLogCollector(
+                process.stderr,
+                stderr_path,
+                thread_name=f"pulsate-worker-log-{run_directory.name}-stderr",
+            ),
+        )
         try:
-            summary = run_trusted_reference(
-                manifest,
-                result_root=result_root,
-                lock_path=self.repository_root / "requirements" / "quantum-preflight.lock",
-                image_identifier=self.image_identifier,
-                maximum_seconds=maximum_seconds,
+            for collector in collectors:
+                collector.start()
+        except BaseException:
+            cleanup_errors: list[Exception] = []
+            try:
+                self._terminate_worker(process)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            try:
+                self._finish_log_collectors(collectors)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            if cleanup_errors:
+                raise RuntimeError(
+                    "Quantum worker startup cleanup could not be confirmed."
+                ) from cleanup_errors[0]
+            raise
+
+        timeout = (
+            self._worker_timeout_override_seconds
+            if self._worker_timeout_override_seconds is not None
+            else maximum_seconds + _WORKER_SHUTDOWN_GRACE_SECONDS
+        )
+        try:
+            return_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            cleanup_errors: list[Exception] = []
+            try:
+                self._terminate_worker(process)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            try:
+                self._finish_log_collectors(collectors)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            if cleanup_errors:
+                raise QuantumTimeoutError(
+                    "The trusted quantum worker timed out and cleanup could not be confirmed."
+                ) from cleanup_errors[0]
+            raise QuantumTimeoutError(
+                "The trusted quantum worker exceeded its outer process timeout."
+            ) from exc
+        except BaseException:
+            cleanup_errors = []
+            try:
+                self._terminate_worker(process)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            try:
+                self._finish_log_collectors(collectors)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            if cleanup_errors:
+                raise RuntimeError(
+                    "Quantum worker cleanup could not be confirmed."
+                ) from cleanup_errors[0]
+            raise
+        try:
+            self._finish_log_collectors(collectors)
+        except Exception as exc:
+            try:
+                self._terminate_worker(process)
+                self._finish_log_collectors(collectors)
+            except Exception as cleanup_exc:
+                raise RuntimeError(
+                    "Quantum worker output cleanup could not be confirmed."
+                ) from cleanup_exc
+            raise RuntimeError("Quantum worker output collection failed.") from exc
+
+        envelope = WorkerResultEnvelope.model_validate(
+            _controlled_json(
+                worker_directory,
+                result_envelope_path.name,
+                maximum_bytes=WORKER_RESULT_MAXIMUM_BYTES,
             )
+        )
+        expected_exit_code = WORKER_EXIT_CODES[envelope.outcome]
+        if return_code != expected_exit_code:
+            raise ValueError("Quantum worker exit status disagrees with its result envelope.")
+
+        if envelope.outcome == "completed":
+            assert envelope.summary is not None
+            summary = envelope.summary
+            receipt_path = summary.get("receipt_path")
+            if not isinstance(receipt_path, str):
+                raise ValueError("Quantum worker summary has no receipt path.")
             artifact_directory = self._validated_artifact_directory(
-                Path(str(summary["receipt_path"])).parent, result_root
+                Path(receipt_path).parent, result_root
             )
-        except QuantumVerificationError:
-            candidates = sorted(result_root.glob("*/*-failed"), key=lambda path: path.stat().st_mtime)
+        elif envelope.outcome == "verification_failed":
+            self._validated_result_root(result_root)
+            candidates = sorted(
+                result_root.glob("*/*-failed"), key=lambda path: path.lstat().st_mtime
+            )
             if not candidates:
-                raise
+                raise ValueError("Quantum verification failed without controlled evidence.")
             artifact_directory = self._validated_artifact_directory(candidates[-1], result_root)
             summary = _controlled_json(artifact_directory, "summary.json", maximum_bytes=maximum_bytes)
+        elif envelope.outcome == "timed_out":
+            raise QuantumTimeoutError("The trusted quantum workflow exceeded its scientific timeout.")
+        else:
+            assert envelope.error is not None
+            raise RuntimeError(
+                f"Quantum worker failed ({envelope.error.error_type}): {envelope.error.message}"
+            )
         return self._project(
             manifest, preset_identifier, run_directory.name, artifact_directory, summary,
             maximum_bytes=maximum_bytes,
         )
 
     @staticmethod
+    def _finish_log_collectors(
+        collectors: tuple[_BoundedLogCollector, ...],
+    ) -> None:
+        errors: list[Exception] = []
+        for collector in collectors:
+            try:
+                collector.finish()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError("Quantum worker log collection failed.") from errors[0]
+
+    @staticmethod
+    def _process_group_has_live_members(process_group: int) -> bool:
+        proc_root = Path("/proc")
+        if proc_root.is_dir():
+            for status_path in proc_root.glob("[0-9]*/stat"):
+                try:
+                    remainder = status_path.read_text(encoding="utf-8").rsplit(")", 1)[1]
+                    fields = remainder.split()
+                    state = fields[0]
+                    member_group = int(fields[2])
+                except (FileNotFoundError, IndexError, ValueError):
+                    continue
+                if member_group == process_group and state != "Z":
+                    return True
+            return False
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @classmethod
+    def _terminate_worker(cls, process: Any) -> None:
+        if os.name == "posix":
+            process_group = process.pid
+            try:
+                os.killpg(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            direct_collected = False
+            try:
+                process.wait(timeout=_WORKER_TERMINATION_GRACE_SECONDS)
+                direct_collected = True
+            except subprocess.TimeoutExpired:
+                pass
+            if cls._process_group_has_live_members(process_group):
+                try:
+                    os.killpg(process_group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if not direct_collected:
+                try:
+                    process.wait(timeout=_WORKER_COLLECTION_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        "The quantum worker direct process could not be collected."
+                    ) from exc
+            deadline = time.monotonic() + _WORKER_COLLECTION_TIMEOUT_SECONDS
+            while cls._process_group_has_live_members(process_group):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "The quantum worker process group could not be fully terminated."
+                    )
+                time.sleep(0.01)
+            return
+
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=_WORKER_COLLECTION_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "The quantum worker direct process could not be collected."
+            ) from exc
+
+    @staticmethod
+    def _create_worker_directory(run_directory: Path) -> Path:
+        if run_directory.is_symlink() or not run_directory.is_dir():
+            raise ValueError("The server-created run directory is invalid.")
+        resolved_run = run_directory.resolve(strict=True)
+        worker_directory = run_directory / "quantum-worker"
+        worker_directory.mkdir(mode=0o700)
+        metadata = worker_directory.lstat()
+        resolved_worker = worker_directory.resolve(strict=True)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or resolved_worker.parent != resolved_run
+        ):
+            raise ValueError("The quantum worker control directory escaped its run directory.")
+        return resolved_worker
+
+    @staticmethod
     def _validated_artifact_directory(directory: Path, result_root: Path) -> Path:
-        resolved_root = result_root.resolve(strict=True)
+        resolved_root = ExistingQuantumPreflightExecutor._validated_result_root(
+            result_root
+        )
         if directory.is_symlink():
             raise ValueError("Runner artifact directory must not be a symbolic link.")
         resolved = directory.resolve(strict=True)
         if not resolved.is_dir() or resolved == resolved_root or resolved_root not in resolved.parents:
             raise ValueError("Runner artifact directory escaped the controlled run root.")
         return resolved
+
+    @staticmethod
+    def _validated_result_root(result_root: Path) -> Path:
+        try:
+            metadata = result_root.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError("Runner artifact root is missing.") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("Runner artifact root must be a regular directory.")
+        return result_root.resolve(strict=True)
 
     @staticmethod
     def _project(

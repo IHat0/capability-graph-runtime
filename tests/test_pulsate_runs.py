@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import io
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,14 +19,21 @@ from cgr.quantum_preflight.artifacts import artifact_document, artifact_referenc
 from cgr.quantum_preflight.identities import ScientificResultIdentity
 from cgr.quantum_preflight.receipt import assemble_receipt
 from cgr.quantum_preflight.runner import _ARTIFACT_TYPES, _FILENAMES
-from cgr.quantum_preflight.verification import verify_execution
+from cgr.quantum_preflight.verification import blocking_findings, verify_execution
 from cgr.pulsate_api.app import _load_preset, create_app
+from cgr.pulsate_api.quantum_worker import (
+    WORKER_EXIT_COMPLETED,
+    WORKER_EXIT_VERIFICATION_FAILED,
+    WORKER_RESULT_MAXIMUM_BYTES,
+    WORKER_RESULT_SCHEMA,
+)
 from cgr.pulsate_api.runs import (
     CoordinatorConfigurationError,
     ExecutionOutput,
     ExistingQuantumPreflightExecutor,
     RunCoordinator,
     RunRootOwnershipError,
+    TERMINAL_STATUSES,
     assert_public_response_safe,
 )
 from test_quantum_preflight import _synthetic_evidence, _synthetic_outcome
@@ -369,6 +378,105 @@ def test_timeout_is_forwarded_and_bounded_by_manifest_policy(tmp_path: Path) -> 
         assert executor.maximum_seconds == [73]
 
 
+def test_existing_executor_runs_from_real_coordinator_thread_via_worker_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct_runner_called = False
+    process_threads: list[str] = []
+
+    def forbidden_direct_runner(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal direct_runner_called
+        del args, kwargs
+        direct_runner_called = True
+        raise AssertionError("The coordinator worker must not call trusted science directly.")
+
+    monkeypatch.setattr(
+        "cgr.quantum_preflight.runner.run_trusted_reference", forbidden_direct_runner
+    )
+
+    class CompletedProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return WORKER_EXIT_COMPLETED
+
+        def kill(self) -> None:
+            raise AssertionError("The completed worker must not be killed.")
+
+    def argument(command: list[str], name: str) -> Path:
+        return Path(command[command.index(name) + 1])
+
+    def process_factory(command: list[str], **options: Any) -> CompletedProcess:
+        del options
+        process_threads.append(threading.current_thread().name)
+        result_root = argument(command, "--result-root")
+        artifact_directory = result_root / "controlled" / "run-001"
+        artifact_directory.mkdir(parents=True)
+        write_json_atomic(
+            argument(command, "--result-envelope"),
+            {
+                "schema_version": WORKER_RESULT_SCHEMA,
+                "outcome": "completed",
+                "summary": {"receipt_path": str(artifact_directory / "receipt.json")},
+                "error": None,
+            },
+            maximum_bytes=WORKER_RESULT_MAXIMUM_BYTES,
+        )
+        return CompletedProcess()
+
+    projector = ControlledExecutor()
+
+    def controlled_projection(
+        manifest: Any,
+        preset_identifier: str,
+        run_identifier: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> ExecutionOutput:
+        del args, kwargs
+        return projector.execute(
+            manifest,
+            preset_identifier=preset_identifier,
+            run_directory=Path(run_identifier),
+            maximum_seconds=1,
+        )
+
+    monkeypatch.setattr(
+        ExistingQuantumPreflightExecutor,
+        "_project",
+        staticmethod(controlled_projection),
+    )
+    executor = ExistingQuantumPreflightExecutor(
+        repository_root=Path(__file__).resolve().parents[1],
+        image_identifier="sha256:controlled",
+        _process_factory=process_factory,
+    )
+    coordinator = RunCoordinator(
+        run_root=tmp_path / "runs",
+        manifest_resolver=_load_preset,
+        executor=executor,
+        enabled=True,
+    )
+    coordinator.start()
+    try:
+        state, _ = coordinator.create(
+            "h2-ground-state-v1", "local_simulator", "worker-boundary-0001"
+        )
+        for _ in range(200):
+            state = coordinator.get(state["run_identifier"])
+            if state["status"] in TERMINAL_STATUSES:
+                break
+            time.sleep(0.01)
+        assert state["status"] == "authorized", state
+    finally:
+        coordinator.close()
+    assert process_threads and process_threads[0].startswith("pulsate-run")
+    assert not direct_runner_called
+
+
 @pytest.mark.parametrize("value", ["invalid", 0, -1, 3601])
 def test_invalid_timeout_fails_at_startup(tmp_path: Path, value: int | str) -> None:
     coordinator = coordinator_for(tmp_path, ControlledExecutor(), max_run_seconds=value)
@@ -509,9 +617,23 @@ def test_shutdown_interrupts_queued_run_without_overwriting_active_result(tmp_pa
     assert json.loads(second_path.read_text(encoding="utf-8"))["status"] == "interrupted"
 
 
-def _projection_bundle(directory: Path) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+def _projection_bundle(
+    directory: Path, *, authorized: bool = True,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
     """Write deterministic, model-valid evidence without invoking a quantum backend."""
     manifest = _load_preset("lih-ground-state-v1")
+    if not authorized:
+        manifest_data = manifest.model_dump(mode="json")
+        manifest_data["expected_experiment_sha256"] = None
+        manifest_data["experiment"]["verification_policy"][
+            "energy_difference_tolerance_hartree"
+        ] = 1e-9
+        mutated_manifest = type(manifest).model_validate(manifest_data)
+        manifest = mutated_manifest.model_copy(
+            update={
+                "expected_experiment_sha256": mutated_manifest.experiment.fingerprint
+            }
+        )
     payloads, references, lineage = _synthetic_evidence(manifest)
     results = verify_execution(manifest.experiment, references, payloads, lineage)
     outcome = _synthetic_outcome(manifest, payloads, references, results)
@@ -565,8 +687,8 @@ def _projection_bundle(directory: Path) -> tuple[Any, dict[str, Any], dict[str, 
         "structure_sha256": outcome.molecular_structure_sha256,
         "qubit_hamiltonian_sha256": outcome.qubit_hamiltonian_sha256,
         "receipt_sha256": receipt_reference.content_sha256,
-        "scientific_verification_passed": True,
-        "authorized": True,
+        "scientific_verification_passed": not blocking_findings(results),
+        "authorized": receipt.authorized,
     }
     return manifest, summary, payloads
 
@@ -608,6 +730,65 @@ def _project_bundle(directory: Path, manifest: Any, summary: dict[str, Any]) -> 
     return ExistingQuantumPreflightExecutor._project(
         manifest, "lih-ground-state-v1", "run-" + "2" * 32, directory, summary
     )
+
+
+def test_worker_verification_failure_with_valid_evidence_projects_rejected(
+    tmp_path: Path,
+) -> None:
+    run_directory = tmp_path / ("run-" + "3" * 32)
+    run_directory.mkdir()
+    result_root = run_directory / "runner-artifacts"
+    prepared_directory = tmp_path / "prepared-rejected-evidence"
+    manifest, summary, _ = _projection_bundle(prepared_directory, authorized=False)
+    write_json_atomic(
+        prepared_directory / "summary.json", summary, maximum_bytes=1_000_000
+    )
+
+    class VerificationFailedProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return WORKER_EXIT_VERIFICATION_FAILED
+
+        def kill(self) -> None:
+            raise AssertionError("The completed worker must not be killed.")
+
+    def process_factory(command: list[str], **options: Any) -> VerificationFailedProcess:
+        del options
+        artifact_directory = result_root / "controlled" / "run-001-failed"
+        shutil.copytree(prepared_directory, artifact_directory)
+        envelope = Path(command[command.index("--result-envelope") + 1])
+        write_json_atomic(
+            envelope,
+            {
+                "schema_version": WORKER_RESULT_SCHEMA,
+                "outcome": "verification_failed",
+                "summary": None,
+                "error": {
+                    "error_type": "QuantumVerificationError",
+                    "message": "Trusted execution was not authorized.",
+                },
+            },
+            maximum_bytes=WORKER_RESULT_MAXIMUM_BYTES,
+        )
+        return VerificationFailedProcess()
+
+    output = ExistingQuantumPreflightExecutor(
+        repository_root=Path(__file__).resolve().parents[1],
+        image_identifier="sha256:controlled",
+        _process_factory=process_factory,
+    ).execute(
+        manifest,
+        preset_identifier="lih-ground-state-v1",
+        run_directory=run_directory,
+        maximum_seconds=30,
+    )
+    assert output.receipt["authorized"] is False
+    assert output.receipt["authorization_state"] == "rejected"
+    assert output.verification["verification_passed"] is False
 
 
 def test_real_projection_accepts_canonical_model_valid_evidence(tmp_path: Path) -> None:

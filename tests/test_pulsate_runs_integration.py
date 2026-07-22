@@ -38,7 +38,7 @@ def test_real_preset_completes_through_http_api(tmp_path: Path) -> None:
             if state["status"] in {"authorized", "rejected", "failed", "interrupted"}:
                 break
             time.sleep(0.5)
-        assert state["status"] == "authorized"
+        assert state["status"] == "authorized", state
         assert client.get(f"/api/v1/runs/{run_identifier}/results").status_code == 200
         assert client.get(f"/api/v1/runs/{run_identifier}/verification").json()["verification_passed"] is True
         assert client.get(f"/api/v1/runs/{run_identifier}/receipt").json()["authorized"] is True
