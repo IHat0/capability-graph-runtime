@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.dist-info/
 .pytest_cache/
 .pytest_*/
 .mypy_cache/

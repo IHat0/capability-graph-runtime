@@ -17,6 +17,23 @@ fi
 
 CGR_QUANTUM_IMAGE="$base_image" "$repo_root/scripts/build-quantum-preflight-image.sh"
 base_image_id="$(docker image inspect --format '{{.Id}}' "$base_image")"
+
+docker run --rm \
+  --network none \
+  --read-only \
+  --entrypoint /bin/sh \
+  "$base_image_id" \
+  -c 'set -eu
+unexpected_metadata="$(find /app/src \
+  \( -type d \( -name "*.egg-info" -o -name "*.dist-info" \) \
+  -o -type f -name "*.pth" \) -print)"
+if [ -n "$unexpected_metadata" ]; then
+  printf "Unexpected Python packaging metadata under /app/src:\n%s\n" \
+    "$unexpected_metadata" >&2
+  exit 1
+fi
+python -m pip check'
+
 base_image_hex="${base_image_id#sha256:}"
 pinned_base_image="cgr-quantum-preflight-pinned:${base_image_hex}"
 

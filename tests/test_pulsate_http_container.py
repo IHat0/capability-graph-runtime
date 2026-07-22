@@ -2,15 +2,45 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCIENTIFIC_LOCK_SHA256 = "2513a1f187309b8aab78e087c3009444aaf5c19a783c54ad61c4ca8d1327605f"
+HTTP_LOCK_SHA256 = "aa41c475a1d179968b9c32cf6cd89c90630e2935d0e82d24397ebad5c23c11df"
 
 
 def source(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
+
+
+def test_generated_python_packaging_metadata_is_untracked_and_ignored() -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\0")
+    generated_metadata = re.compile(
+        r"(?:^|/)[^/]+\.(?:egg|dist)-info(?:/|$)|(?:^|/)[^/]+\.pth$"
+    )
+    assert not [path for path in tracked if generated_metadata.search(path)]
+
+    ignore_rules = source(".gitignore").splitlines()
+    assert "*.egg-info/" in ignore_rules
+    assert "*.dist-info/" in ignore_rules
+    for generated_path in (
+        "src/cgr.egg-info/PKG-INFO",
+        "src/cgr.dist-info/METADATA",
+    ):
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--no-index", "--quiet", generated_path],
+            cwd=ROOT,
+            check=False,
+        )
+        assert ignored.returncode == 0
 
 
 def test_scientific_lock_is_unchanged_by_http_layer() -> None:
@@ -33,7 +63,10 @@ def test_http_input_has_only_the_declared_application_dependencies() -> None:
 
 
 def test_http_lock_is_exact_and_hash_locked_without_scientific_or_swe_packages() -> None:
-    lock = source("requirements/pulsate-http-integration.lock")
+    lock_path = ROOT / "requirements/pulsate-http-integration.lock"
+    lock_bytes = lock_path.read_bytes()
+    assert hashlib.sha256(lock_bytes).hexdigest() == HTTP_LOCK_SHA256
+    lock = lock_bytes.decode("utf-8")
     requirement_starts = list(re.finditer(r"(?m)^([A-Za-z0-9_.-]+)==([^ \\\n]+)", lock))
     assert requirement_starts
     for index, match in enumerate(requirement_starts):
@@ -45,6 +78,54 @@ def test_http_lock_is_exact_and_hash_locked_without_scientific_or_swe_packages()
         "bashlex", "python-multipart", "rich", "requests",
     })
     assert "pydantic==2.13.4" in lock
+
+
+def test_source_copying_docker_contexts_exclude_packaging_metadata() -> None:
+    required_rules = {
+        "**/*.egg-info",
+        "**/*.egg-info/**",
+        "**/*.dist-info",
+        "**/*.dist-info/**",
+        "**/*.pth",
+    }
+    source_copying_contexts: list[Path] = []
+    for dockerfile in (ROOT / "docker").glob("*/Dockerfile"):
+        dockerfile_source = dockerfile.read_text(encoding="utf-8")
+        if re.search(r"(?m)^(?:COPY|ADD)\s+[^\n]*\bsrc(?:/|\s)", dockerfile_source):
+            source_copying_contexts.append(dockerfile)
+            ignore_file = dockerfile.with_name(f"{dockerfile.name}.dockerignore")
+            assert ignore_file.is_file(), f"Missing ignore file for {dockerfile}"
+            assert required_rules.issubset(
+                set(ignore_file.read_text(encoding="utf-8").splitlines())
+            ), f"Packaging metadata can enter the context for {dockerfile}"
+
+    assert source_copying_contexts == [ROOT / "docker/quantum-preflight/Dockerfile"]
+
+    candidate = source("docker/quantum-candidate/Dockerfile")
+    candidate_rules = source(
+        "docker/quantum-candidate/Dockerfile.dockerignore"
+    ).splitlines()
+    assert not re.search(r"(?m)^(?:COPY|ADD)\s+[^\n]*\bsrc(?:/|\s)", candidate)
+    assert candidate_rules[0] == "**"
+    assert not any(rule.startswith("!src") for rule in candidate_rules)
+
+
+def test_scientific_image_verifies_copied_source_before_dropping_privileges() -> None:
+    dockerfile = source("docker/quantum-preflight/Dockerfile")
+    copied_source = dockerfile.index("COPY src /app/src")
+    copied_project = dockerfile.index("COPY pyproject.toml /app/pyproject.toml")
+    metadata_check = dockerfile.index("unexpected_metadata=")
+    pip_check = dockerfile.index("python -m pip check")
+    final_user = dockerfile.index("USER 10001:10001")
+
+    assert copied_source < copied_project < metadata_check < pip_check < final_user
+    assert "find /app/src" in dockerfile
+    for pattern in ("*.egg-info", "*.dist-info", "*.pth"):
+        assert pattern in dockerfile
+    assert "Unexpected Python packaging metadata under /app/src" in dockerfile
+    assert dockerfile.rstrip().endswith(
+        'ENTRYPOINT ["python", "-m", "cgr.quantum_preflight.cli"]'
+    )
 
 
 def test_derived_dockerfile_preserves_scientific_base_and_user_boundary() -> None:
@@ -85,6 +166,25 @@ def test_build_script_pins_provenance_and_verifies_derived_labels() -> None:
     assert 'cgr-quantum-preflight:1.0.0' in build
     assert 'cgr-pulsate-http-integration:1.0.0' in build
     assert 'build-quantum-preflight-image.sh' in build
+    base_id_assignment = build.index(
+        'base_image_id="$(docker image inspect --format \'{{.Id}}\' "$base_image")"'
+    )
+    base_integrity_check = build.index("docker run --rm", base_id_assignment)
+    derived_build = build.index("docker build \\")
+    assert base_id_assignment < base_integrity_check < derived_build
+    integrity_block = build[base_integrity_check:derived_build]
+    for requirement in (
+        "--network none",
+        "--read-only",
+        "--entrypoint /bin/sh",
+        '"$base_image_id"',
+        "find /app/src",
+        "*.egg-info",
+        "*.dist-info",
+        "*.pth",
+        "python -m pip check",
+    ):
+        assert requirement in integrity_block
     assert 'source_checkpoint="$(git -C "$repo_root" rev-parse HEAD)"' in build
     assert 'git -C "$repo_root" diff --quiet' in build
     assert 'git -C "$repo_root" diff --cached --quiet' in build

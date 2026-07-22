@@ -4,6 +4,11 @@
 *.pem
 *.key
 **/__pycache__
+**/*.egg-info
+**/*.egg-info/**
+**/*.dist-info
+**/*.dist-info/**
+**/*.pth
 .venv*
 .sandbox-*
 .quixbugs-src

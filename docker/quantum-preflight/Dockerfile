@@ -25,6 +25,16 @@ COPY tests /app/tests
 COPY benchmark-manifests /app/benchmark-manifests
 COPY pyproject.toml /app/pyproject.toml
 
+RUN unexpected_metadata="$(find /app/src \
+      \( -type d \( -name '*.egg-info' -o -name '*.dist-info' \) \
+      -o -type f -name '*.pth' \) -print)" \
+    && if [ -n "$unexpected_metadata" ]; then \
+         printf 'Unexpected Python packaging metadata under /app/src:\n%s\n' \
+           "$unexpected_metadata" >&2; \
+         exit 1; \
+       fi \
+    && python -m pip check
+
 USER 10001:10001
 WORKDIR /app
 ENTRYPOINT ["python", "-m", "cgr.quantum_preflight.cli"]
