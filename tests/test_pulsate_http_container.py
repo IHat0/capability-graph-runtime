@@ -90,8 +90,15 @@ def test_build_script_pins_provenance_and_verifies_derived_labels() -> None:
     assert 'git -C "$repo_root" diff --cached --quiet' in build
     assert "PULSATE_SOURCE_CHECKPOINT" not in build
     assert "7164aebccdf2b404dd6b1eedaddbadc46e055814" not in build
-    assert '--build-arg "BASE_IMAGE=$base_image_id"' in build
+    assert 'base_image_hex="${base_image_id#sha256:}"' in build
+    assert 'pinned_base_image="cgr-quantum-preflight-pinned:${base_image_hex}"' in build
+    assert 'docker image tag "$base_image_id" "$pinned_base_image"' in build
+    assert 'pinned_base_image_id="$(docker image inspect' in build
+    assert '[[ "$pinned_base_image_id" != "$base_image_id" ]]' in build
+    assert '--build-arg "BASE_IMAGE=$pinned_base_image"' in build
     assert '--build-arg "BASE_IMAGE=$base_image"' not in build
+    assert '--build-arg "BASE_IMAGE=$base_image_id"' not in build
+    assert "--pull=false" in build
     assert '--build-arg "BASE_IMAGE_NAME=$base_image"' in build
     assert 'org.opencontainers.image.base.name=$base_image' in build
     assert 'io.pulsate.base.image.id=$base_image_id' in build
@@ -100,9 +107,16 @@ def test_build_script_pins_provenance_and_verifies_derived_labels() -> None:
     assert 'recorded_source_checkpoint' in build
     assert '[[ "$recorded_base_image_id" != "$base_image_id" ]]' in build
     assert '[[ "$recorded_source_checkpoint" != "$source_checkpoint" ]]' in build
+    assert 'post_build_pinned_base_image_id="$(docker image inspect' in build
+    assert '[[ "$post_build_pinned_base_image_id" != "$base_image_id" ]]' in build
+    assert 'docker image rm "$pinned_base_image"' in build
+    assert "trap cleanup EXIT" in build
+    assert 'docker image rm "$base_image"' not in build
+    assert 'docker image rm "$derived_image"' not in build
     for output in (
         "Source checkpoint", "Base image tag", "Exact base image ID",
-        "Derived image tag", "Exact derived image ID",
+        "Temporary pinned local base reference", "Derived image tag",
+        "Exact derived image ID",
     ):
         assert output in build
 

@@ -17,11 +17,26 @@ fi
 
 CGR_QUANTUM_IMAGE="$base_image" "$repo_root/scripts/build-quantum-preflight-image.sh"
 base_image_id="$(docker image inspect --format '{{.Id}}' "$base_image")"
+base_image_hex="${base_image_id#sha256:}"
+pinned_base_image="cgr-quantum-preflight-pinned:${base_image_hex}"
+
+cleanup() {
+  docker image rm "$pinned_base_image" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+docker image tag "$base_image_id" "$pinned_base_image"
+pinned_base_image_id="$(docker image inspect --format '{{.Id}}' "$pinned_base_image")"
+if [[ "$pinned_base_image_id" != "$base_image_id" ]]; then
+  echo "Pinned base-image reference mismatch" >&2
+  exit 1
+fi
 
 docker build \
+  --pull=false \
   --file "$repo_root/docker/pulsate-http-integration/Dockerfile" \
   --tag "$derived_image" \
-  --build-arg "BASE_IMAGE=$base_image_id" \
+  --build-arg "BASE_IMAGE=$pinned_base_image" \
   --build-arg "BASE_IMAGE_NAME=$base_image" \
   --build-arg "BASE_IMAGE_ID=$base_image_id" \
   --build-arg "SOURCE_CHECKPOINT=$source_checkpoint" \
@@ -29,6 +44,12 @@ docker build \
   --label "io.pulsate.base.image.id=$base_image_id" \
   --label "org.opencontainers.image.revision=$source_checkpoint" \
   "$repo_root"
+
+post_build_pinned_base_image_id="$(docker image inspect --format '{{.Id}}' "$pinned_base_image")"
+if [[ "$post_build_pinned_base_image_id" != "$base_image_id" ]]; then
+  echo "Pinned base-image reference mismatch after derived build" >&2
+  exit 1
+fi
 
 derived_image_id="$(docker image inspect --format '{{.Id}}' "$derived_image")"
 recorded_base_image_id="$(docker image inspect --format '{{ index .Config.Labels "io.pulsate.base.image.id" }}' "$derived_image_id")"
@@ -46,5 +67,6 @@ fi
 printf 'Source checkpoint: %s\n' "$source_checkpoint"
 printf 'Base image tag: %s\n' "$base_image"
 printf 'Exact base image ID: %s\n' "$base_image_id"
+printf 'Temporary pinned local base reference: %s\n' "$pinned_base_image"
 printf 'Derived image tag: %s\n' "$derived_image"
 printf 'Exact derived image ID: %s\n' "$derived_image_id"
