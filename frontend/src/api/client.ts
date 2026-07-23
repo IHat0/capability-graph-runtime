@@ -1,6 +1,9 @@
 import type {
   HealthResponse,
+  ApprovedExperimentResponse,
   ExperimentPlanResponse,
+  InterpretationResponse,
+  InterpretedScientificSpecification,
   PresetDetailResponse,
   PresetListResponse,
   PresetSummaryResponse,
@@ -346,6 +349,36 @@ function parseExperimentPlan(value: unknown): ExperimentPlanResponse {
   return value as unknown as ExperimentPlanResponse
 }
 
+function parseInterpretation(value: unknown): InterpretationResponse {
+  if (!isRecord(value) || !hasString(value, 'schema_version')
+    || !hasString(value, 'interpretation_identifier') || !hasString(value, 'original_question')
+    || !isRecord(value.specification) || !isStringArray(value.assumptions)
+    || !Array.isArray(value.missing_required_information)
+    || !Array.isArray(value.warnings) || !hasString(value, 'interpretation_status')
+    || !hasString(value, 'execution_support_status') || !isRecord(value.model_provenance)
+    || typeof value.scientist_approval_possible !== 'boolean' || !hasString(value, 'created_at')
+    || containsCredentialField(value)) {
+    malformed('The backend returned a malformed or unsafe interpretation.')
+  }
+  return value as unknown as InterpretationResponse
+}
+
+function parseApprovedExperiment(value: unknown): ApprovedExperimentResponse {
+  if (!isRecord(value) || !hasString(value, 'schema_version')
+    || !hasString(value, 'experiment_identifier') || !hasString(value, 'interpretation_identifier')
+    || !hasString(value, 'original_question') || !isRecord(value.specification)
+    || !hasString(value, 'specification_sha256')
+    || !['ibm_quantum', 'local_simulator'].includes(String(value.requested_execution_target))
+    || !['ready_for_ibm_submission', 'approved_pending_compiler_support'].includes(String(value.status))
+    || value.assumptions_accepted !== true
+    || !isStringArray(value.scientist_reviewed_overrides)
+    || !hasString(value, 'approved_at')
+    || containsCredentialField(value)) {
+    malformed('The backend returned a malformed or unsafe approved experiment.')
+  }
+  return value as unknown as ApprovedExperimentResponse
+}
+
 async function requestJson<T>(path: string, parser: (value: unknown) => T, signal?: AbortSignal, init?: RequestInit): Promise<T> {
   let response: Response
   try {
@@ -359,7 +392,8 @@ async function requestJson<T>(path: string, parser: (value: unknown) => T, signa
     let message = `Pulsate API request failed (${response.status}).`
     try {
       const body = await response.json()
-      if (isRecord(body) && isRecord(body.detail) && typeof body.detail.message === 'string') message = body.detail.message
+      if (isRecord(body) && typeof body.detail === 'string') message = body.detail
+      else if (isRecord(body) && isRecord(body.detail) && typeof body.detail.message === 'string') message = body.detail.message
     } catch { /* Preserve the status-based message for non-JSON errors. */ }
     throw new ApiError(message, response.status)
   }
@@ -378,6 +412,8 @@ export interface PulsateApi {
   getPreset(identifier: string, signal?: AbortSignal): Promise<PresetDetailResponse>
   getScene(identifier: string, signal?: AbortSignal): Promise<SceneResponse>
   planExperiment(question: string, signal?: AbortSignal): Promise<ExperimentPlanResponse>
+  interpretQuestion(question: string, signal?: AbortSignal): Promise<InterpretationResponse>
+  approveInterpretation(identifier: string, specification: InterpretedScientificSpecification, acceptedAssumptions: boolean, signal?: AbortSignal): Promise<ApprovedExperimentResponse>
   getRunCapability(signal?: AbortSignal): Promise<RunCapabilityResponse>
   createRun(presetIdentifier: string, idempotencyKey: string, signal?: AbortSignal): Promise<RunStateResponse>
   createExperimentRun(experimentIdentifier: string, idempotencyKey: string, signal?: AbortSignal, executionTarget?: 'local_simulator' | 'ibm_quantum'): Promise<RunStateResponse>
@@ -388,7 +424,7 @@ export interface PulsateApi {
 }
 
 export type WorkspaceApi = Pick<PulsateApi, 'getHealth' | 'getPresets' | 'getPreset' | 'getScene'>
-  & Partial<Pick<PulsateApi, 'planExperiment'>>
+  & Partial<Pick<PulsateApi, 'planExperiment' | 'interpretQuestion' | 'approveInterpretation'>>
 
 function presetPath(identifier: string, suffix = ''): string {
   return `/api/v1/experiments/presets/${encodeURIComponent(identifier)}${suffix}`
@@ -404,6 +440,21 @@ export const pulsateApi: PulsateApi = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question }),
   }),
+  interpretQuestion: (question, signal) => requestJson('/api/v1/experiments/interpret', parseInterpretation, signal, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  }),
+  approveInterpretation: (identifier, specification, acceptedAssumptions, signal) => requestJson(
+    `/api/v1/experiments/${encodeURIComponent(identifier)}/approve`,
+    parseApprovedExperiment,
+    signal,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ specification, accepted_assumptions: acceptedAssumptions }),
+    },
+  ),
   getRunCapability: (signal) => requestJson('/api/v1/runs/capability', parseCapability, signal),
   createRun: (presetIdentifier, idempotencyKey, signal) => requestJson('/api/v1/runs', parseRunState, signal, {
     method: 'POST',

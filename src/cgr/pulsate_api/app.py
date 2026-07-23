@@ -13,9 +13,10 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cgr.quantum_preflight.contracts import ManifestEnvelope
-from cgr.quantum_preflight.manifests import load_manifest
 from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
+from cgr.quantum_preflight.manifests import load_manifest
+
 from .experiments import (
     ExperimentNotFoundError,
     ExperimentStore,
@@ -27,6 +28,14 @@ from .ibm import (
     RunBoundIsolatedIBMPreflightExecutor,
     SubprocessIBMRuntimeAdapter,
     UnavailableIBMPreflightExecutor,
+)
+from .natural_language import (
+    ApprovalRequest,
+    ApprovalValidationError,
+    InterpretationNotFoundError,
+    NaturalLanguageInterpretationError,
+    NaturalLanguageInterpretationStore,
+    NaturalLanguageUnavailableError,
 )
 from .runs import (
     ArtifactUnavailableError,
@@ -152,13 +161,19 @@ class CreateRunRequest(BaseModel):
     execution_target: Literal["local_simulator", "ibm_quantum"]
 
     @model_validator(mode="after")
-    def validate_source(self) -> "CreateRunRequest":
+    def validate_source(self) -> CreateRunRequest:
         if (self.preset_identifier is None) == (self.experiment_identifier is None):
             raise ValueError("Exactly one experiment_identifier or preset_identifier is required.")
         return self
 
 
 class PlanExperimentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=4096)
+
+
+class InterpretQuestionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=1, max_length=4096)
@@ -229,6 +244,7 @@ def create_app(
     *,
     coordinator: RunCoordinator | None = None,
     experiment_store: ExperimentStore | None = None,
+    natural_language_store: NaturalLanguageInterpretationStore | None = None,
 ) -> FastAPI:
     if experiment_store is None:
         if coordinator is not None:
@@ -244,10 +260,21 @@ def create_app(
     if run_coordinator.experiment_resolver is None:
         run_coordinator.experiment_resolver = experiment_store.resolve_for_targeted_run
     experiment_store.ibm_capability = lambda: run_coordinator.capability()["ibm_quantum"]
+    if natural_language_store is None:
+        interpretation_root = Path(
+            os.environ.get(
+                "PULSATE_INTERPRETATION_ROOT",
+                str(REPO_ROOT / ".pulsate-interpretations"),
+            )
+        )
+        natural_language_store = NaturalLanguageInterpretationStore.from_environment(
+            interpretation_root
+        )
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         experiment_store.start()
+        natural_language_store.start()
         try:
             run_coordinator.start()
             try:
@@ -255,16 +282,21 @@ def create_app(
             finally:
                 run_coordinator.close()
         finally:
+            natural_language_store.close()
             experiment_store.close()
 
     application = FastAPI(
         title="Pulsate Labs API",
         version="0.2.0",
-        description="Coordinates discovered presets through the verified quantum-preflight workflow.",
+        description=(
+            "Interprets reviewable scientific questions and coordinates approved "
+            "or discovered experiments through controlled workflows."
+        ),
         lifespan=lifespan,
     )
     application.state.run_coordinator = run_coordinator
     application.state.experiment_store = experiment_store
+    application.state.natural_language_store = natural_language_store
 
     @application.get("/api/v1/health")
     def health() -> dict[str, str]:
@@ -296,6 +328,49 @@ def create_app(
             return experiment_store.plan(request.question)
         except PlannerInputError as exc:
             raise _typed_error(422, "invalid_experiment_question", str(exc)) from None
+
+    @application.get("/api/v1/experiments/interpreter/capability")
+    def interpretation_capability() -> dict[str, Any]:
+        return natural_language_store.capability()
+
+    @application.post("/api/v1/experiments/interpret", status_code=201)
+    def interpret_question(request: InterpretQuestionRequest) -> dict[str, Any]:
+        try:
+            return natural_language_store.interpret(request.question).model_dump(
+                mode="json"
+            )
+        except NaturalLanguageUnavailableError as exc:
+            raise _typed_error(
+                503, "natural_language_interpreter_unavailable", str(exc)
+            ) from None
+        except NaturalLanguageInterpretationError as exc:
+            raise _typed_error(
+                502, "natural_language_interpretation_failed", str(exc)
+            ) from None
+        except ApprovalValidationError as exc:
+            raise _typed_error(
+                422, "invalid_experiment_question", str(exc)
+            ) from None
+
+    @application.post(
+        "/api/v1/experiments/{interpretation_identifier}/approve",
+        status_code=201,
+    )
+    def approve_interpretation(
+        interpretation_identifier: str, request: ApprovalRequest
+    ) -> dict[str, Any]:
+        try:
+            return natural_language_store.approve(
+                interpretation_identifier, request
+            ).model_dump(mode="json")
+        except InterpretationNotFoundError:
+            raise _typed_error(
+                404, "interpretation_not_found", "Interpretation not found."
+            ) from None
+        except ApprovalValidationError as exc:
+            raise _typed_error(
+                422, "interpretation_approval_rejected", str(exc)
+            ) from None
 
     @application.get("/api/v1/experiments/{experiment_identifier}")
     def read_experiment(experiment_identifier: str) -> dict[str, Any]:

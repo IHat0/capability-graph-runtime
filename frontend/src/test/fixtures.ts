@@ -1,4 +1,4 @@
-import type { PresetDetailResponse, SceneResponse } from '../api/types'
+import type { InterpretationResponse, PresetDetailResponse, SceneResponse } from '../api/types'
 
 export const currentFixtureScene: SceneResponse = {
   scene_identifier: 'scene.fixture',
@@ -50,6 +50,80 @@ export const currentFixtureDetail: PresetDetailResponse = {
       },
       quantum_model: { mapper: 'jordan_wigner', ansatz: 'uccsd' },
       execution_policy: { runtime_identifier: 'quantum_preflight_linux', network_disabled: true, maximum_duration_seconds: 180 },
+    },
+  },
+}
+
+export const naturalLanguageInterpretation: InterpretationResponse = {
+  schema_version: 'cgr.pulsate-natural-language-interpretation/1.0.0',
+  interpretation_identifier: `interpretation-${'a'.repeat(32)}`,
+  original_question: 'Calculate the ground-state energy of lithium hydride at 1.6 angstrom on IBM Quantum.',
+  assumptions: ['charge=0', 'multiplicity=1'],
+  missing_required_information: [],
+  warnings: [],
+  interpretation_status: 'ready_for_review',
+  execution_support_status: 'supported',
+  scientist_approval_possible: true,
+  created_at: '2026-07-23T00:00:00Z',
+  model_provenance: {
+    provider_kind: 'controlled_test_provider',
+    model_name: 'controlled-model',
+    prompt_sha256: 'prompt-sha',
+    response_sha256: 'response-sha',
+    requested_at: '2026-07-23T00:00:00Z',
+    repair_attempted: false,
+    request_count_for_interpretation: 1,
+  },
+  specification: {
+    schema_version: 'cgr.pulsate-model-scientific-draft/1.0.0',
+    original_question: 'Calculate the ground-state energy of lithium hydride at 1.6 angstrom on IBM Quantum.',
+    scientific_objective: { value: 'ground-state experiment', provenance: 'explicit' },
+    requested_quantity: { value: 'ground-state energy', provenance: 'explicit' },
+    molecule: {
+      name: { value: 'lithium hydride', provenance: 'explicit' },
+      formula: { value: 'LiH', provenance: 'derived' },
+      smiles: { value: null, provenance: 'missing' },
+      inchi: { value: null, provenance: 'missing' },
+      atoms: {
+        value: [
+          { element: 'Li', coordinates: [-0.8, 0, 0] },
+          { element: 'H', coordinates: [0.8, 0, 0] },
+        ],
+        provenance: 'derived',
+      },
+      geometry_description: { value: 'linear', provenance: 'derived' },
+      bond_lengths: {
+        value: [{ atom_indices: [0, 1], value: 1.6, unit: 'angstrom' }],
+        provenance: 'explicit',
+      },
+    },
+    coordinate_unit: { value: 'angstrom', provenance: 'derived' },
+    charge: { value: 0, provenance: 'assumed' },
+    multiplicity: { value: 1, provenance: 'assumed' },
+    basis: { value: 'sto-3g', provenance: 'explicit' },
+    electronic_structure_method: { value: 'rhf', provenance: 'assumed' },
+    active_space: { value: '2 electrons in 2 spatial orbitals', provenance: 'assumed' },
+    mapper: { value: 'jordan_wigner', provenance: 'assumed' },
+    ansatz: { value: 'uccsd', provenance: 'assumed' },
+    optimizer: { value: 'slsqp', provenance: 'assumed' },
+    tolerance: { value: 0.00001, provenance: 'assumed' },
+    requested_execution_target: { value: 'ibm_quantum', provenance: 'explicit' },
+    requested_backend: { value: null, provenance: 'missing' },
+    shots: { value: null, provenance: 'missing' },
+    precision: { value: 0.015, provenance: 'assumed' },
+    assumptions: ['charge=0', 'multiplicity=1'],
+    missing_required_information: [],
+    warnings: [],
+    interpretation_status: 'ready_for_review',
+    execution_support_status: 'supported',
+    model_provenance: {
+      provider_kind: 'controlled_test_provider',
+      model_name: 'controlled-model',
+      prompt_sha256: 'prompt-sha',
+      response_sha256: 'response-sha',
+      requested_at: '2026-07-23T00:00:00Z',
+      repair_attempted: false,
+      request_count_for_interpretation: 1,
     },
   },
 }

@@ -121,6 +121,99 @@ export interface ExperimentPlanResponse {
   created_at: string
 }
 
+export type ScientificFieldProvenance = 'explicit' | 'derived' | 'assumed' | 'missing'
+
+export interface ProvenancedValue<T> {
+  value: T | null
+  provenance: ScientificFieldProvenance
+}
+
+export interface InterpretedAtom {
+  element: string
+  coordinates: Vector3Tuple | null
+}
+
+export interface InterpretedBondLength {
+  atom_indices: [number, number]
+  value: number
+  unit: 'angstrom' | 'bohr'
+}
+
+export interface ModelProvenance {
+  provider_kind: 'openai_compatible_http' | 'controlled_test_provider'
+  model_name: string
+  prompt_sha256: string
+  response_sha256: string
+  requested_at: string
+  repair_attempted: boolean
+  request_count_for_interpretation: number
+}
+
+export interface InterpretedScientificSpecification {
+  schema_version: string
+  original_question: string
+  scientific_objective: ProvenancedValue<string>
+  requested_quantity: ProvenancedValue<string>
+  molecule: {
+    name: ProvenancedValue<string>
+    formula: ProvenancedValue<string>
+    smiles: ProvenancedValue<string>
+    inchi: ProvenancedValue<string>
+    atoms: ProvenancedValue<InterpretedAtom[]>
+    geometry_description: ProvenancedValue<string>
+    bond_lengths: ProvenancedValue<InterpretedBondLength[]>
+  }
+  coordinate_unit: ProvenancedValue<string>
+  charge: ProvenancedValue<number>
+  multiplicity: ProvenancedValue<number>
+  basis: ProvenancedValue<string>
+  electronic_structure_method: ProvenancedValue<string>
+  active_space: ProvenancedValue<string>
+  mapper: ProvenancedValue<string>
+  ansatz: ProvenancedValue<string>
+  optimizer: ProvenancedValue<string>
+  tolerance: ProvenancedValue<number>
+  requested_execution_target: ProvenancedValue<string>
+  requested_backend: ProvenancedValue<string>
+  shots: ProvenancedValue<number>
+  precision: ProvenancedValue<number>
+  assumptions: string[]
+  missing_required_information: string[]
+  warnings: string[]
+  interpretation_status: 'ready_for_review' | 'needs_clarification' | 'interpretation_failed'
+  execution_support_status: 'supported' | 'requires_compiler_capability' | 'needs_clarification'
+  model_provenance: ModelProvenance
+}
+
+export interface InterpretationResponse {
+  schema_version: string
+  interpretation_identifier: string
+  original_question: string
+  specification: InterpretedScientificSpecification
+  assumptions: string[]
+  missing_required_information: string[]
+  warnings: string[]
+  interpretation_status: string
+  execution_support_status: string
+  model_provenance: ModelProvenance
+  scientist_approval_possible: boolean
+  created_at: string
+}
+
+export interface ApprovedExperimentResponse {
+  schema_version: string
+  experiment_identifier: string
+  interpretation_identifier: string
+  original_question: string
+  specification: InterpretedScientificSpecification
+  specification_sha256: string
+  requested_execution_target: 'ibm_quantum' | 'local_simulator'
+  status: 'ready_for_ibm_submission' | 'approved_pending_compiler_support'
+  assumptions_accepted: true
+  scientist_reviewed_overrides: string[]
+  approved_at: string
+}
+
 export interface RunResultsResponse extends RunIdentity {
   structure_sha256: string
   hamiltonian_sha256: string

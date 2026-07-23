@@ -78,7 +78,7 @@ const receipt: RunReceiptResponse = {
 function api(overrides: Partial<PulsateApi> = {}): PulsateApi {
   return {
     getHealth: vi.fn(), getPresets: vi.fn(), getPreset: vi.fn(), getScene: vi.fn(),
-    planExperiment: vi.fn(),
+    planExperiment: vi.fn(), interpretQuestion: vi.fn(), approveInterpretation: vi.fn(),
     getRunCapability: vi.fn().mockResolvedValue({
       available: true, execution_targets: ['local_simulator'], reason: null, maximum_run_seconds: 180,
     }),

@@ -1,6 +1,6 @@
 # Pulsate Scientific Workspace
 
-This directory contains the Pulsate Labs scientific workspace: a custom React application shell around a controlled Mol* molecular viewer. A displayed, discovered preset can now run through the existing verified local quantum-preflight workflow. Natural-language compilation, Qwen repair, and IBM Quantum execution are not connected.
+This directory contains the Pulsate Labs scientific workspace: a custom React application shell around a controlled Mol* molecular viewer. The primary starting workflow now sends a scientist's free-form chemistry question to the configured server-side language-model interpreter, displays its strictly validated draft with field-level provenance, and requires review and explicit acknowledgement before immutable approval. Model credentials never enter frontend state. Interpretation and approval do not submit an IBM job or start a local calculation.
 
 ## Run locally
 
@@ -51,7 +51,7 @@ python -m pytest tests/test_pulsate_api.py tests/test_pulsate_runs.py
 
 ## Interface states
 
-The workspace uses progressive disclosure. After startup it fetches the verified preset catalogue but does not automatically choose or render a molecule. The initial workspace contains the scientific-objective composer, a dynamic **Use a preset** menu, a blank molecular canvas, and a short introduction. Natural-language experiment planning is not connected, so **Continue** remains disabled and never fabricates an experiment.
+The workspace uses progressive disclosure. After startup it fetches the verified preset catalogue but does not automatically choose or render a molecule. The initial workspace contains a large chemistry-question composer, an **Interpret question** action, a secondary dynamic **Use a preset** menu, and interpretation guidance. A returned draft exposes explicit, derived, assumed, and missing values, including atom geometry, bond lengths and units, shots, and precision. Missing or invalid scientific data and unacknowledged assumptions keep approval disabled. Changing the visible question invalidates its old interpretation; changing any reviewed scientific field clears assumption acknowledgement and any prior approval. The exact interpreted question remains visible in review. Successful approval displays the immutable experiment identifier, specification SHA-256, actual execution target, and actual returned status; only an IBM-targeted `ready_for_ibm_submission` response is described as IBM-ready. There is no local-run action in this workflow.
 
 After the user explicitly selects a verified preset, the Mol* structure workspace and scientific inspector replace the empty state. Structure, workflow, results, and evidence navigation appear only while a valid scene exists. If a later preset fails to load, the retained scene keeps its original displayed-preset identity and the warning names that prior preset.
 

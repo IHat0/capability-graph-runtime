@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, pulsateApi } from './client'
-import { currentFixtureDetail, currentFixtureScene } from '../test/fixtures'
+import { currentFixtureDetail, currentFixtureScene, naturalLanguageInterpretation } from '../test/fixtures'
 
 function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -89,6 +89,40 @@ describe('Pulsate API client failure handling', () => {
     expect(plan.experiment_identifier).toBe(experimentIdentifier)
     expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/experiments/plan')
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ question: 'Compute H2' })
+  })
+
+  it('uses the two-stage interpretation and approval contracts without a run request', async () => {
+    const approved = {
+      schema_version: 'cgr.pulsate-approved-experiment/1.0.0',
+      experiment_identifier: `experiment-${'f'.repeat(32)}`,
+      interpretation_identifier: naturalLanguageInterpretation.interpretation_identifier,
+      original_question: naturalLanguageInterpretation.original_question,
+      specification: naturalLanguageInterpretation.specification,
+      specification_sha256: 'e'.repeat(64),
+      requested_execution_target: 'ibm_quantum',
+      status: 'ready_for_ibm_submission',
+      assumptions_accepted: true,
+      scientist_reviewed_overrides: [],
+      approved_at: '2026-07-23T00:00:00Z',
+    }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(naturalLanguageInterpretation))
+      .mockResolvedValueOnce(jsonResponse(approved))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const interpreted = await pulsateApi.interpretQuestion('Free-form chemistry question')
+    await pulsateApi.approveInterpretation(
+      interpreted.interpretation_identifier,
+      interpreted.specification,
+      true,
+    )
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      '/api/v1/experiments/interpret',
+      `/api/v1/experiments/${naturalLanguageInterpretation.interpretation_identifier}/approve`,
+    ])
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ question: 'Free-form chemistry question' })
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toMatchObject({ accepted_assumptions: true })
   })
 
   it('creates dynamic runs with only the experiment identifier', async () => {

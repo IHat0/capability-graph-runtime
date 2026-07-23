@@ -1,15 +1,17 @@
 import { ConditionalNavigation } from './components/ConditionalNavigation'
 import { EmptyInspector } from './components/EmptyInspector'
-import { EmptyWorkspace } from './components/EmptyWorkspace'
 import { ErrorNotice } from './components/ErrorNotice'
 import { Header } from './components/Header'
 import { MolecularViewer } from './components/MolecularViewer'
+import { NaturalLanguageWorkspace } from './components/NaturalLanguageWorkspace'
 import { ScientificPanel } from './components/ScientificPanel'
 import { useExperimentWorkspace } from './hooks/useExperimentWorkspace'
+import { useNaturalLanguageExperiment } from './hooks/useNaturalLanguageExperiment'
 import { usePresetRun } from './hooks/usePresetRun'
 
 export function App() {
   const workspace = useExperimentWorkspace()
+  const naturalLanguage = useNaturalLanguageExperiment()
   const hasScene = workspace.scene !== null
   const presetRun = usePresetRun({
     selectedPresetId: workspace.selectedPresetId,
@@ -59,15 +61,11 @@ export function App() {
           </main>
         ) : (
           <div className="empty-layout">
-            <EmptyWorkspace
+            <NaturalLanguageWorkspace
               presets={workspace.presets}
               loading={workspace.presetLoading}
               onPresetChange={workspace.selectPreset}
-              question={workspace.planQuestion}
-              planning={workspace.planning}
-              plan={workspace.plan}
-              onQuestionChange={workspace.setPlanQuestion}
-              onPlan={() => void workspace.planExperiment()}
+              naturalLanguage={naturalLanguage}
             />
             <EmptyInspector />
           </div>
