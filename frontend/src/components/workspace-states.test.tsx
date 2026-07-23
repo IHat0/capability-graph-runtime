@@ -95,9 +95,9 @@ describe('progressive workspace disclosure', () => {
     expect(runtimeComponents).not.toMatch(/h2-ground-state-v1|lih-ground-state-v1/i)
   })
 
-  it('keeps IBM unconfigured and hides receipt actions until evidence exists', () => {
+  it('keeps IBM pending and displays IBM receipt identities only when evidence exists', () => {
     const { rerender } = render(<ResultSummary run={null} results={null} verification={null} receipt={null} />)
-    expect(screen.getByText('Not configured')).toBeTruthy()
+    expect(screen.getAllByText('Not executed').length).toBeGreaterThan(0)
     expect(screen.queryByRole('button', { name: 'View receipt' })).toBeNull()
     rerender(<ResultSummary run={null} results={null} verification={null} receipt={{
       schema_version: 'cgr.quantum-preflight-receipt/2.0.0',
@@ -109,9 +109,18 @@ describe('progressive workspace disclosure', () => {
       vqe_scientific_result_sha256: 'vqe-sha', scientific_outcome_sha256: 'outcome-sha',
       execution_environment_identity: 'environment-sha', receipt_sha256: 'receipt-sha',
       verification_passed: true, authorization_state: 'authorized', authorized: true, artifacts: [],
+      ibm_execution: {
+        hardware_role: 'final_energy_evaluation_at_locally_optimized_parameters',
+        submission_status: 'completed', job_identifier: 'ibm-job-test', backend_name: 'ibm_backend_test',
+        execution_integrity_passed: true, scientific_quality_passed: true,
+        ibm_receipt_sha256: 'ibm-receipt-sha',
+      },
     }} />)
     expect(screen.getByRole('button', { name: 'View receipt' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'View receipt' }))
     expect(screen.getByRole('region', { name: 'Authorization receipt' })).toBeTruthy()
+    expect(screen.getByText('ibm-job-test')).toBeTruthy()
+    expect(screen.getByText('ibm_backend_test')).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/token|credential/i)
   })
 })

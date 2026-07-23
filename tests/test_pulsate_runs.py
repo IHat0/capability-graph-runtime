@@ -274,10 +274,16 @@ def test_disabled_execution_capability_returns_503(tmp_path: Path) -> None:
         unavailable_reason="Pinned quantum dependencies are unavailable.",
     ) as (client, _coordinator):
         capability = client.get("/api/v1/runs/capability").json()
-        assert capability == {
-            "available": False, "execution_targets": [],
-            "reason": "Pinned quantum dependencies are unavailable.", "maximum_run_seconds": 180,
+        assert capability["available"] is False
+        assert capability["execution_targets"] == []
+        assert capability["reason"] == "Pinned quantum dependencies are unavailable."
+        assert capability["maximum_run_seconds"] == 180
+        assert capability["local_simulator"] == {
+            "available": False,
+            "reason": "Pinned quantum dependencies are unavailable.",
+            "maximum_run_seconds": 180,
         }
+        assert capability["ibm_quantum"]["available"] is False
         response = client.post("/api/v1/runs", json={
             "preset_identifier": "h2-ground-state-v1", "execution_target": "local_simulator",
         })

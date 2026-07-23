@@ -22,6 +22,9 @@ export function App() {
     experimentRecordIdentifier: workspace.plan?.ready_for_execution
       ? workspace.plan.experiment_identifier
       : null,
+    executionTarget: workspace.plan?.ready_for_execution
+      ? workspace.plan.requested_execution_target
+      : 'local_simulator',
   })
   const errors = presetRun.error
     ? [...workspace.errors, { scope: 'run' as const, message: presetRun.error }]

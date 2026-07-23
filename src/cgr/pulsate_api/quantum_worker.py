@@ -127,6 +127,7 @@ def _validate_worker_inputs(
     result_root: Path,
     lock_path: Path,
     result_envelope_path: Path,
+    ibm_preflight_evidence_path: Path | None,
 ) -> None:
     worker_directory = result_envelope_path.parent
     resolved_worker = worker_directory.resolve(strict=True)
@@ -144,6 +145,13 @@ def _validate_worker_inputs(
         raise ValueError("The quantum worker result root must not pre-exist.")
     if lock_path.is_symlink() or not lock_path.is_file():
         raise ValueError("The scientific lock must be a regular file.")
+    if ibm_preflight_evidence_path is not None and (
+        ibm_preflight_evidence_path.name != "ibm-preflight-evidence.json"
+        or ibm_preflight_evidence_path.parent.resolve(strict=True) != resolved_worker
+        or ibm_preflight_evidence_path.exists()
+        or ibm_preflight_evidence_path.is_symlink()
+    ):
+        raise ValueError("The IBM preflight sidecar destination is invalid.")
 
 
 def _write_result(path: Path, result: WorkerResultEnvelope) -> None:
@@ -164,6 +172,7 @@ def run_worker(
     image_identifier: str,
     maximum_seconds: int,
     result_envelope_path: Path,
+    ibm_preflight_evidence_path: Path | None = None,
     runner: Runner = run_trusted_reference,
 ) -> int:
     """Run trusted science on this interpreter's main thread and record control status."""
@@ -176,7 +185,11 @@ def run_worker(
 
     try:
         _validate_worker_inputs(
-            manifest_path, result_root, lock_path, controlled_result_path
+            manifest_path,
+            result_root,
+            lock_path,
+            controlled_result_path,
+            ibm_preflight_evidence_path,
         )
         if maximum_seconds <= 0:
             raise ValueError("The worker maximum duration must be positive.")
@@ -185,13 +198,17 @@ def run_worker(
                 manifest_path, maximum_bytes=WORKER_MANIFEST_MAXIMUM_BYTES
             )
         )
-        summary = runner(
-            manifest,
-            result_root=result_root,
-            lock_path=lock_path,
-            image_identifier=image_identifier,
-            maximum_seconds=maximum_seconds,
-        )
+        runner_arguments: dict[str, Any] = {
+            "result_root": result_root,
+            "lock_path": lock_path,
+            "image_identifier": image_identifier,
+            "maximum_seconds": maximum_seconds,
+        }
+        if ibm_preflight_evidence_path is not None:
+            runner_arguments["ibm_preflight_evidence_path"] = (
+                ibm_preflight_evidence_path
+            )
+        summary = runner(manifest, **runner_arguments)
         if not isinstance(summary, dict):
             raise TypeError("The trusted runner returned an invalid summary.")
         result = WorkerResultEnvelope(outcome="completed", summary=summary)
@@ -225,6 +242,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-identifier", required=True)
     parser.add_argument("--maximum-seconds", required=True, type=int)
     parser.add_argument("--result-envelope", required=True, type=Path)
+    parser.add_argument("--ibm-preflight-evidence", type=Path)
     return parser
 
 
@@ -237,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         image_identifier=arguments.image_identifier,
         maximum_seconds=arguments.maximum_seconds,
         result_envelope_path=arguments.result_envelope,
+        ibm_preflight_evidence_path=arguments.ibm_preflight_evidence,
     )
 
 

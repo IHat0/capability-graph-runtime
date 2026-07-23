@@ -24,6 +24,7 @@ type SceneProps = {
   structureIdentifier: string
   structureSha256: string
   experimentRecordIdentifier?: string | null
+  executionTarget?: 'local_simulator' | 'ibm_quantum'
 }
 
 const scene: SceneProps = {
@@ -129,13 +130,43 @@ describe('preset run lifecycle', () => {
     await act(async () => { await result.current.startRun() })
 
     expect(createExperimentRun).toHaveBeenCalledWith(
-      experimentRecordIdentifier, expect.any(String), expect.any(AbortSignal),
+      experimentRecordIdentifier, expect.any(String), expect.any(AbortSignal), 'local_simulator',
     )
     expect(createRun).not.toHaveBeenCalled()
     expect(result.current.run?.experiment_identifier).toBe(experimentRecordIdentifier)
     expect(result.current.run?.source_type).toBe('dynamic_experiment')
     expect(result.current.run?.source_identifier).toBe(experimentRecordIdentifier)
     expect(result.current.run?.preset_identifier).toBeNull()
+  })
+
+  it('submits an IBM plan only when the IBM capability is available', async () => {
+    const experimentRecordIdentifier = `experiment-${'b'.repeat(32)}`
+    const createExperimentRun = vi.fn().mockResolvedValue({
+      ...state('queued'), execution_target: 'ibm_quantum' as const,
+      source_type: 'dynamic_experiment' as const,
+      source_identifier: experimentRecordIdentifier,
+      preset_identifier: null,
+      experiment_identifier: experimentRecordIdentifier,
+    })
+    const runApi = api({
+      getRunCapability: vi.fn().mockResolvedValue({
+        available: true, execution_targets: ['local_simulator', 'ibm_quantum'], reason: null,
+        maximum_run_seconds: 180,
+        local_simulator: { available: true, reason: null, maximum_run_seconds: 180 },
+        ibm_quantum: { available: true, reason: null, maximum_run_seconds: 1800, backend_name: 'ibm_test', target_precision: 0.015 },
+      }),
+      createExperimentRun,
+    })
+    const { result } = renderRun(runApi, {
+      ...scene, selectedPresetId: null, displayedPresetId: experimentRecordIdentifier,
+      experimentIdentifier: experimentRecordIdentifier, experimentRecordIdentifier,
+      executionTarget: 'ibm_quantum',
+    })
+    await waitFor(() => expect(result.current.canRun).toBe(true))
+    await act(async () => { await result.current.startRun() })
+    expect(createExperimentRun).toHaveBeenCalledWith(
+      experimentRecordIdentifier, expect.any(String), expect.any(AbortSignal), 'ibm_quantum',
+    )
   })
 
   it('disables execution without a displayed preset and for a stale selection', async () => {

@@ -29,6 +29,12 @@ function ReceiptPanel({ receipt, onClose }: { receipt: RunReceiptResponse; onClo
     ['Verification outcome', receipt.verification_passed],
     ['Environment identity', receipt.execution_environment_identity],
     ['Authorized', receipt.authorized],
+    ['IBM job', receipt.ibm_execution?.job_identifier],
+    ['IBM backend', receipt.ibm_execution?.backend_name],
+    ['Hardware role', receipt.ibm_execution?.hardware_role],
+    ['Execution integrity', receipt.ibm_execution?.execution_integrity_passed],
+    ['Scientific quality', receipt.ibm_execution?.scientific_quality_passed],
+    ['IBM receipt SHA-256', receipt.ibm_execution?.ibm_receipt_sha256],
   ]
   return (
     <div className="receipt-panel" role="region" aria-label="Authorization receipt">
@@ -60,7 +66,7 @@ export function ResultSummary({ run, results, verification, receipt }: {
           <div><dt>Absolute difference</dt><dd>{scientificValue(results?.absolute_difference_hartree)}</dd></div>
           <div><dt>Tolerance</dt><dd>{scientificValue(results?.tolerance_hartree)}</dd></div>
           <div><dt>Energy unit</dt><dd>{results?.energy_unit ?? 'Not executed'}</dd></div>
-          <div><dt>IBM energy</dt><dd>Not configured</dd></div>
+          <div><dt>IBM hardware energy</dt><dd>{scientificValue(results?.ibm_execution?.ibm_total_energy_hartree as number | undefined)}</dd></div>
         </dl>
       </section>
       <section className="inspector-section" id="evidence" aria-labelledby="evidence-title">
@@ -71,6 +77,10 @@ export function ResultSummary({ run, results, verification, receipt }: {
           <div><dt>Verification</dt><dd>{verification ? (verification.verification_passed ? 'Passed' : 'Rejected') : 'Pending execution'}</dd></div>
           <div><dt>Authorization</dt><dd>{verification?.authorization_state ?? 'Pending execution'}</dd></div>
           <div><dt>Receipt</dt><dd>{receipt ? 'Available' : 'Unavailable'}</dd></div>
+          {verification?.ibm_execution && <div><dt>IBM execution integrity</dt><dd>{verification.ibm_execution.execution_integrity_passed ? 'Passed' : 'Failed'}</dd></div>}
+          {verification?.ibm_execution && <div><dt>IBM scientific quality</dt><dd>{verification.ibm_execution.scientific_quality_passed ? 'Passed' : 'Rejected'}</dd></div>}
+          {run?.ibm_job_identifier && <div><dt>IBM job</dt><dd>{run.ibm_job_identifier}</dd></div>}
+          {run?.ibm_backend_name && <div><dt>IBM backend</dt><dd>{run.ibm_backend_name}</dd></div>}
         </dl>
         {receipt ? <button className="receipt-action" type="button" onClick={() => setShowReceipt((value) => !value)}>{showReceipt ? 'Hide receipt' : 'View receipt'}</button>
           : <p className="supporting-copy">Receipt unavailable until scientific execution reaches verification.</p>}

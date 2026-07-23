@@ -1,0 +1,20 @@
+# Linux x86_64 / CPython 3.12 IBM Runtime extension lock.
+# Resolved against qiskit==2.3.1 and the trusted quantum/HTTP base images.
+# Install with --no-deps --require-hashes, then run pip check.
+cffi==2.1.0 --hash=sha256:1e9f50d192a3e525b15a75ab5114e442d83d657b7ec29182a991bc9a88fd3a66
+charset-normalizer==3.4.9 --hash=sha256:5e226f6218febc71f6c1fc2fafb91c226f75bdc1d8fb12d66823716e891608fd
+cryptography==49.0.0 --hash=sha256:0e959b578856a3924bc0cbb710fc12c387b9412a951389f3ca61704a9e25f325
+ibm-cloud-sdk-core==3.26.0 --hash=sha256:e96098cbd7abce67ad856bccf3696443b5ae497dde644cd532d7fc6040db4240
+ibm-platform-services==0.77.0 --hash=sha256:4c580d65af0daade9e875a2dda3d8685aa9c818bc4d57289eca3421f6b356d1b
+ibm-quantum-schemas==0.9.20260612 --hash=sha256:31afc35c15c56d10f4c9c39155478802daaab5baffb4215fbb93d8ddbdf3f285
+orjson==3.11.9 --hash=sha256:be4fa4f0af7fa18951f7ab3fc2148e223af211bf03f59e1c6034ec3f97f21d61
+pybase64==1.4.3 --hash=sha256:bb632edfd132b3eaf90c39c89aa314beec4e946e210099b57d40311f704e11d4
+pycparser==3.0 --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+pyjwt==2.13.0 --hash=sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728
+pyspnego==0.12.1 --hash=sha256:7237cb47985ccf5da512106ddb2731e4f9cefec00991f76c054488eb95fb1a2d
+qiskit-ibm-runtime==0.48.0 --hash=sha256:ecbd70a85efbbeec4add8de1c446ace21b196b2587c74306e9d3fe1e4fdddd2e
+requests==2.34.2 --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+requests-ntlm==1.3.0 --hash=sha256:4c7534a7d0e482bb0928531d621be4b2c74ace437e88c5a357ceb7452d25a510
+samplomatic==0.20.0 --hash=sha256:c6faf4d94f4e6ae5cd0a1fecb6035d9da3a91b6ccbd8a4d515703f6e9704a85e
+sspilib==0.3.1 --hash=sha256:8c6d11fd6e47ba964881c8980476354259bf0b570fa32b986697f7681b1fc5be
+urllib3==2.7.0 --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897

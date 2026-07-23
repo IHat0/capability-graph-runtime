@@ -60,8 +60,27 @@ function parseHealth(value: unknown): HealthResponse {
 }
 
 const runStatuses = new Set<RunStatus>([
-  'queued', 'validating', 'running_quantum_workflow', 'authorized', 'rejected', 'failed', 'interrupted',
+  'queued', 'validating', 'running_quantum_workflow', 'running_local_preflight',
+  'awaiting_ibm_submission', 'queued_on_ibm', 'running_on_ibm', 'verifying_ibm_result',
+  'authorized', 'rejected', 'failed', 'interrupted',
 ])
+
+function containsCredentialField(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsCredentialField)
+  if (!isRecord(value)) return false
+  return Object.entries(value).some(([key, item]) =>
+    /token|credential|password|api[_-]?key/i.test(key) || containsCredentialField(item))
+}
+
+function isOptionalIBMExecution(value: unknown): boolean {
+  return value === undefined || value === null || (isRecord(value)
+    && hasString(value, 'hardware_role') && hasString(value, 'submission_status')
+    && (value.job_identifier === null || hasString(value, 'job_identifier'))
+    && (value.backend_name === null || hasString(value, 'backend_name'))
+    && typeof value.execution_integrity_passed === 'boolean'
+    && typeof value.scientific_quality_passed === 'boolean'
+    && !containsCredentialField(value))
+}
 
 function parseCapability(value: unknown): RunCapabilityResponse {
   if (!isRecord(value) || typeof value.available !== 'boolean' || !isStringArray(value.execution_targets)
@@ -69,6 +88,7 @@ function parseCapability(value: unknown): RunCapabilityResponse {
     || !(value.maximum_run_seconds === null || (isFiniteNumber(value.maximum_run_seconds) && value.maximum_run_seconds > 0))) {
     malformed('The backend returned a malformed execution capability response.')
   }
+  if (containsCredentialField(value)) malformed('The backend returned unsafe execution capability data.')
   return value as unknown as RunCapabilityResponse
 }
 
@@ -88,7 +108,7 @@ function hasRunIdentity(value: Record<string, unknown>): boolean {
 
 function parseRunState(value: unknown): RunStateResponse {
   if (!isRecord(value) || !hasRunIdentity(value) || !runStatuses.has(value.status as RunStatus)
-    || value.execution_target !== 'local_simulator' || !hasString(value, 'created_at')
+    || !['local_simulator', 'ibm_quantum'].includes(String(value.execution_target)) || !hasString(value, 'created_at')
     || !hasString(value, 'updated_at') || !hasString(value, 'status_url')) {
     malformed('The backend returned a malformed run status response.')
   }
@@ -109,7 +129,8 @@ function parseRunResults(value: unknown): RunResultsResponse {
     || !(value.optimizer_evaluations === null || isFiniteNumber(value.optimizer_evaluations))
     || !(value.converged === null || typeof value.converged === 'boolean')
     || !Array.isArray(value.compatibility_warnings)
-    || !hasString(value, 'execution_environment_identity') || !hasString(value, 'receipt_sha256')) {
+    || !hasString(value, 'execution_environment_identity') || !hasString(value, 'receipt_sha256')
+    || !isOptionalIBMExecution(value.ibm_execution)) {
     malformed('The backend returned malformed scientific run results.')
   }
   return value as unknown as RunResultsResponse
@@ -122,7 +143,8 @@ function parseVerification(value: unknown): RunVerificationResponse {
     || !Array.isArray(value.blocking_findings) || !Array.isArray(value.nonblocking_findings)
     || !(value.tolerance_check === null || isRecord(value.tolerance_check))
     || !Array.isArray(value.scientific_identity_checks) || !Array.isArray(value.artifact_integrity_checks)
-    || !Array.isArray(value.checks) || !Array.isArray(value.compatibility_warnings)) {
+    || !Array.isArray(value.checks) || !Array.isArray(value.compatibility_warnings)
+    || !isOptionalIBMExecution(value.ibm_execution)) {
     malformed('The backend returned malformed scientific verification evidence.')
   }
   return value as unknown as RunVerificationResponse
@@ -138,7 +160,8 @@ function parseReceipt(value: unknown): RunReceiptResponse {
     || !['authorized', 'rejected'].includes(String(value.authorization_state))
     || typeof value.authorized !== 'boolean' || !Array.isArray(value.artifacts)
     || !value.artifacts.every((item) => isRecord(item) && hasString(item, 'artifact_identifier')
-      && hasString(item, 'artifact_type') && hasString(item, 'content_sha256'))) {
+      && hasString(item, 'artifact_type') && hasString(item, 'content_sha256'))
+    || !isOptionalIBMExecution(value.ibm_execution)) {
     malformed('The backend returned a malformed authorization receipt.')
   }
   return value as unknown as RunReceiptResponse
@@ -357,7 +380,7 @@ export interface PulsateApi {
   planExperiment(question: string, signal?: AbortSignal): Promise<ExperimentPlanResponse>
   getRunCapability(signal?: AbortSignal): Promise<RunCapabilityResponse>
   createRun(presetIdentifier: string, idempotencyKey: string, signal?: AbortSignal): Promise<RunStateResponse>
-  createExperimentRun(experimentIdentifier: string, idempotencyKey: string, signal?: AbortSignal): Promise<RunStateResponse>
+  createExperimentRun(experimentIdentifier: string, idempotencyKey: string, signal?: AbortSignal, executionTarget?: 'local_simulator' | 'ibm_quantum'): Promise<RunStateResponse>
   getRun(runIdentifier: string, signal?: AbortSignal): Promise<RunStateResponse>
   getRunResults(runIdentifier: string, signal?: AbortSignal): Promise<RunResultsResponse>
   getRunVerification(runIdentifier: string, signal?: AbortSignal): Promise<RunVerificationResponse>
@@ -387,10 +410,10 @@ export const pulsateApi: PulsateApi = {
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify({ preset_identifier: presetIdentifier, execution_target: 'local_simulator' }),
   }),
-  createExperimentRun: (experimentIdentifier, idempotencyKey, signal) => requestJson('/api/v1/runs', parseRunState, signal, {
+  createExperimentRun: (experimentIdentifier, idempotencyKey, signal, executionTarget = 'local_simulator') => requestJson('/api/v1/runs', parseRunState, signal, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
-    body: JSON.stringify({ experiment_identifier: experimentIdentifier, execution_target: 'local_simulator' }),
+    body: JSON.stringify({ experiment_identifier: experimentIdentifier, execution_target: executionTarget }),
   }),
   getRun: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}`, parseRunState, signal),
   getRunResults: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/results`, parseRunResults, signal),

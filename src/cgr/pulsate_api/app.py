@@ -21,6 +21,13 @@ from .experiments import (
     ExperimentStore,
     PlannerInputError,
 )
+from .ibm import (
+    IBMQuantumConfiguration,
+    IBMQuantumRunExecutor,
+    RunBoundIsolatedIBMPreflightExecutor,
+    SubprocessIBMRuntimeAdapter,
+    UnavailableIBMPreflightExecutor,
+)
 from .runs import (
     ArtifactUnavailableError,
     ExistingQuantumPreflightExecutor,
@@ -142,7 +149,7 @@ class CreateRunRequest(BaseModel):
 
     preset_identifier: str | None = None
     experiment_identifier: str | None = None
-    execution_target: Literal["local_simulator"]
+    execution_target: Literal["local_simulator", "ibm_quantum"]
 
     @model_validator(mode="after")
     def validate_source(self) -> "CreateRunRequest":
@@ -183,11 +190,34 @@ def _configured_coordinator(experiment_store: ExperimentStore) -> RunCoordinator
         repository_root=REPO_ROOT,
         image_identifier=os.environ.get("PULSATE_QUANTUM_IMAGE_IDENTIFIER", "local-uncontainerized"),
     )
+    ibm_configuration = IBMQuantumConfiguration.from_environment()
+    handoff_root = os.environ.get("PULSATE_IBM_PREFLIGHT_HANDOFF_ROOT")
+    scientific_image_identifier = os.environ.get(
+        "PULSATE_IBM_SCIENTIFIC_IMAGE_IDENTIFIER"
+    )
+    ibm_preflight_executor = (
+        RunBoundIsolatedIBMPreflightExecutor(
+            Path(handoff_root),
+            scientific_preflight_image_identifier=scientific_image_identifier,
+            ibm_runtime_image_identifier=ibm_configuration.image_identifier,
+        )
+        if handoff_root and scientific_image_identifier
+        else UnavailableIBMPreflightExecutor()
+    )
+    ibm_executor = IBMQuantumRunExecutor(
+        local_executor=ibm_preflight_executor,
+        adapter=SubprocessIBMRuntimeAdapter(
+            repository_root=REPO_ROOT,
+            configuration=ibm_configuration,
+        ),
+        configuration=ibm_configuration,
+    )
     return RunCoordinator(
         run_root=run_root,
         manifest_resolver=_load_preset,
-        experiment_resolver=experiment_store.resolve_for_run,
+        experiment_resolver=experiment_store.resolve_for_targeted_run,
         executor=executor,
+        ibm_executor=ibm_executor,
         enabled=enabled,
         max_workers=workers,
         max_run_seconds=os.environ.get("PULSATE_MAX_RUN_SECONDS", "180"),
@@ -212,7 +242,8 @@ def create_app(
         experiment_store = ExperimentStore(experiment_root)
     run_coordinator = coordinator or _configured_coordinator(experiment_store)
     if run_coordinator.experiment_resolver is None:
-        run_coordinator.experiment_resolver = experiment_store.resolve_for_run
+        run_coordinator.experiment_resolver = experiment_store.resolve_for_targeted_run
+    experiment_store.ibm_capability = lambda: run_coordinator.capability()["ibm_quantum"]
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
@@ -300,9 +331,15 @@ def create_app(
             raise _typed_error(400, "invalid_idempotency_key", str(exc)) from None
         except IdempotencyConflictError as exc:
             raise _typed_error(409, "idempotency_conflict", str(exc)) from None
+        except ValueError as exc:
+            if str(exc) in {"unsupported_execution_target", "execution_target_mismatch"}:
+                raise _typed_error(422, str(exc), "The execution target does not match the experiment specification.") from None
+            raise
         except RuntimeError as exc:
             if str(exc) == "execution_unavailable":
                 raise _typed_error(503, "execution_unavailable", "Local quantum execution is not enabled on this backend.") from None
+            if str(exc) == "ibm_execution_unavailable":
+                raise _typed_error(503, "ibm_execution_unavailable", "IBM Quantum execution is unavailable on this backend.") from None
             raise
 
     @application.get("/api/v1/runs/{run_identifier}")

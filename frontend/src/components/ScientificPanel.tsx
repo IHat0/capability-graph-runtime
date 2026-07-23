@@ -41,6 +41,7 @@ export function ScientificPanel({ scene, presets, selectedPresetId, displayedPre
           <p>{plan.original_question}</p>
           {plan.assumptions.length > 0 && <p><strong>Assumptions:</strong> {plan.assumptions.join('; ')}</p>}
           {plan.warnings.length > 0 && <p><strong>Warnings:</strong> {plan.warnings.join('; ')}</p>}
+          <p><strong>Requested execution:</strong> {plan.requested_execution_target === 'ibm_quantum' ? 'IBM Quantum hardware' : 'Local simulator'}</p>
         </section>
       )}
 
@@ -80,7 +81,7 @@ export function ScientificPanel({ scene, presets, selectedPresetId, displayedPre
         <button type="button" disabled={!presetRun.canRun} onClick={() => void presetRun.startRun()}>
           {presetRun.creating ? 'Creating run…' : presetRun.run && !['authorized', 'rejected', 'failed', 'interrupted'].includes(presetRun.run.status) ? 'Run in progress' : 'Run experiment'}
         </button>
-        <p>{presetRun.disabledReason ?? (presetRun.run ? `Run ${presetRun.run.run_identifier} is ${presetRun.run.status}.` : 'Verified local simulator execution is available.')}</p>
+        <p>{presetRun.disabledReason ?? (presetRun.run ? `Run ${presetRun.run.run_identifier} is ${presetRun.run.status}.` : plan?.requested_execution_target === 'ibm_quantum' ? 'Trusted local preflight and IBM Quantum execution are available.' : 'Verified local simulator execution is available.')}</p>
       </section>
     </aside>
   )

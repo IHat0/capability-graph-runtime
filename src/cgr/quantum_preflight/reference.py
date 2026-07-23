@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.metadata
+import io
 import json
 import math
 import time
@@ -31,6 +33,42 @@ class PreparedProblem:
     fermionic_operator: Any
     qubit_operator: Any
     payloads: dict[str, Any]
+
+
+CANONICAL_QPY_MAXIMUM_BYTES = 4 * 1024 * 1024
+
+
+def canonical_qpy_bytes(circuit: Any) -> bytes:
+    """Return the bounded pinned QPY serialization of an actual circuit."""
+    try:
+        from qiskit import qpy  # type: ignore[import-not-found]
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise QuantumDependencyError("Qiskit QPY serialization is unavailable.") from exc
+    stream = io.BytesIO()
+    qpy.dump(circuit, stream)
+    payload = stream.getvalue()
+    if not payload or len(payload) > CANONICAL_QPY_MAXIMUM_BYTES:
+        raise QuantumIntegrityError("Canonical circuit serialization is empty or oversized.")
+    return payload
+
+
+def canonical_qpy_sha256(circuit: Any) -> str:
+    """Hash the pinned QPY serialization of an actual circuit object."""
+    return hashlib.sha256(canonical_qpy_bytes(circuit)).hexdigest()
+
+
+def canonical_sparse_pauli_op_payload(operator: Any, *, mapper: str) -> dict[str, Any]:
+    """Return the canonical SparsePauliOp coefficient and Pauli serialization."""
+    return serialize_qubit_operator(
+        operator.to_list(),
+        number_of_qubits=int(operator.num_qubits),
+        mapper=mapper,
+    )
+
+
+def canonical_sparse_pauli_op_sha256(operator: Any, *, mapper: str) -> str:
+    """Hash the canonical SparsePauliOp coefficient and Pauli serialization."""
+    return sha256_fingerprint(canonical_sparse_pauli_op_payload(operator, mapper=mapper))
 
 
 def _qiskit_api() -> dict[str, Any]:
@@ -241,7 +279,8 @@ def run_vqe(
     *,
     hamiltonian_sha256: str,
     environment_sha256: str,
-) -> tuple[VQEResult, list[dict[str, Any]], dict[str, Any]]:
+    capture_ibm_preflight: bool = False,
+) -> tuple[VQEResult, list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     """Run VQE independently; this function cannot receive an exact energy."""
     api = _qiskit_api()
     problem = prepared.active_problem
@@ -323,7 +362,28 @@ def run_vqe(
         "operation_counts": dict(ansatz.decompose().count_ops()),
         "qiskit_version": importlib.metadata.version("qiskit"),
     }
-    return vqe, [item.model_dump(mode="json") for item in trace], ansatz_manifest
+    ibm_preflight: dict[str, Any] | None = None
+    if capture_ibm_preflight:
+        bound_ansatz = ansatz.assign_parameters(point, inplace=False)
+        ibm_preflight = {
+            "schema_version": "cgr.pulsate-ibm-local-preflight/1.0.0",
+            "optimized_parameters": point,
+            "optimized_parameters_sha256": vqe.optimized_parameters_sha256,
+            "source_bound_circuit_sha256": canonical_qpy_sha256(bound_ansatz),
+            "source_observable_sha256": canonical_sparse_pauli_op_sha256(
+                prepared.qubit_operator,
+                mapper=quantum.mapper,
+            ),
+            "number_of_qubits": int(ansatz.num_qubits),
+            "number_of_parameters": int(ansatz.num_parameters),
+            "circuit_depth": int(ansatz.decompose().depth()),
+        }
+    return (
+        vqe,
+        [item.model_dump(mode="json") for item in trace],
+        ansatz_manifest,
+        ibm_preflight,
+    )
 
 
 def _energy_result(

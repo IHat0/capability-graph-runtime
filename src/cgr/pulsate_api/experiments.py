@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Callable, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
@@ -324,7 +324,12 @@ def _parse_setting_intent(question: str) -> tuple[dict[str, bool], tuple[str, ..
     return explicit, tuple(sorted(set(unsupported)))
 
 
-def plan_scientific_question(question: str) -> PlannedSpecification:
+def plan_scientific_question(
+    question: str,
+    *,
+    ibm_quantum_available: bool = False,
+    ibm_unavailable_reason: str | None = None,
+) -> PlannedSpecification:
     normalized = question.strip()
     if not normalized or len(normalized) > 4096:
         raise PlannerInputError("Question must contain between 1 and 4096 characters.")
@@ -348,10 +353,11 @@ def plan_scientific_question(question: str) -> PlannedSpecification:
     if ibm_requested and local_requested:
         missing.append("ambiguous_execution_target")
         warnings.append("Multiple incompatible execution targets were requested.")
-    elif ibm_requested:
+    elif ibm_requested and not ibm_quantum_available:
         missing.append("ibm_quantum_execution_unavailable")
         warnings.append(
-            "IBM Quantum execution was requested but is unavailable in Dynamic Experiment Intake v1."
+            ibm_unavailable_reason
+            or "IBM Quantum execution was requested but is unavailable on this server."
         )
     elif not local_requested:
         assumptions.append("execution_target=local_simulator (system default)")
@@ -509,7 +515,7 @@ def plan_scientific_question(question: str) -> PlannedSpecification:
                 network_disabled=True,
                 cpu_limit=2.0,
             ),
-            execution_target="local_simulator",
+            execution_target=requested_execution_target,
         )
     except ValueError as exc:
         raise PlannerInputError(str(exc)) from exc
@@ -538,8 +544,8 @@ def compile_manifest(
 ) -> ManifestEnvelope:
     if not _EXPERIMENT_IDENTIFIER.fullmatch(experiment_identifier):
         raise ValueError("Dynamic experiment identifier is invalid.")
-    if specification.execution_target != "local_simulator":
-        raise ValueError("Dynamic execution v1 supports local_simulator only.")
+    if specification.execution_target not in {"local_simulator", "ibm_quantum"}:
+        raise ValueError("Dynamic execution target is unsupported.")
     if specification.multiplicity != 1:
         raise ValueError("Dynamic execution v1 requires a closed-shell singlet specification.")
     atom_identifiers = _atom_identifiers(specification.atoms)
@@ -699,11 +705,17 @@ def molecule_projection(
 
 
 class ExperimentStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        ibm_capability: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
         self.configured_root = Path(root)
         self.root = self.configured_root
         self._lock = threading.RLock()
         self._started = False
+        self.ibm_capability = ibm_capability
 
     def start(self) -> None:
         with self._lock:
@@ -723,7 +735,16 @@ class ExperimentStore:
     def plan(self, question: str) -> dict[str, Any]:
         if not self._started:
             raise RuntimeError("Experiment store is not started.")
-        planned = plan_scientific_question(question)
+        ibm_capability = self.ibm_capability() if self.ibm_capability is not None else {}
+        planned = plan_scientific_question(
+            question,
+            ibm_quantum_available=ibm_capability.get("available") is True,
+            ibm_unavailable_reason=(
+                str(ibm_capability["reason"])
+                if ibm_capability.get("reason") is not None
+                else None
+            ),
+        )
         experiment_identifier = f"experiment-{uuid.uuid4().hex}"
         specification = planned.specification
         manifest = (
@@ -882,3 +903,11 @@ class ExperimentStore:
             experiment_identifier=experiment_identifier,
             manifest=manifest,
         )
+
+    def resolve_for_targeted_run(
+        self, experiment_identifier: str
+    ) -> tuple[ManifestEnvelope, dict[str, Any], Literal["local_simulator", "ibm_quantum"]]:
+        manifest, molecule = self.resolve_for_run(experiment_identifier)
+        state = self.get(experiment_identifier)
+        specification = ScientificExperimentSpecification.model_validate(state["specification"])
+        return manifest, molecule, specification.execution_target

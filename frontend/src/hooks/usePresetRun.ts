@@ -56,6 +56,7 @@ export function usePresetRun({
   structureIdentifier,
   structureSha256,
   experimentRecordIdentifier,
+  executionTarget = 'local_simulator',
 }: {
   api?: PulsateApi
   selectedPresetId: string | null
@@ -66,6 +67,7 @@ export function usePresetRun({
   structureIdentifier?: string
   structureSha256?: string
   experimentRecordIdentifier?: string | null
+  executionTarget?: 'local_simulator' | 'ibm_quantum'
 }) {
   const [capability, setCapability] = useState<RunCapabilityResponse | null>(null)
   const [run, setRun] = useState<RunStateResponse | null>(null)
@@ -238,7 +240,7 @@ export function usePresetRun({
     setReceipt(null)
     try {
       const created = experimentRecordIdentifier
-        ? await api.createExperimentRun(experimentRecordIdentifier, key, controller.signal)
+        ? await api.createExperimentRun(experimentRecordIdentifier, key, controller.signal, executionTarget)
         : await api.createRun(displayedPresetId, key, controller.signal)
       if (controller.signal.aborted || generation !== generationRef.current
         || activeCreateRef.current?.generation !== generation
@@ -266,7 +268,7 @@ export function usePresetRun({
         setCreating(false)
       }
     }
-  }, [api, capability?.available, displayedPresetId, experimentRecordIdentifier, sceneIdentityKey, selectedPresetId, stateIdentityMatches])
+  }, [api, capability, displayedPresetId, executionTarget, experimentRecordIdentifier, sceneIdentityKey, selectedPresetId, stateIdentityMatches])
 
   const staleIdentity = Boolean(displayedPresetId && (
     experimentRecordIdentifier
@@ -274,19 +276,24 @@ export function usePresetRun({
       : selectedPresetId !== displayedPresetId
   ))
   const active = Boolean(run && !TERMINAL.has(run.status))
-  const canRun = Boolean(capability?.available && displayedPresetId && !staleIdentity && !creating && !active)
+  const targetCapabilityAvailable = executionTarget === 'ibm_quantum'
+    ? capability?.ibm_quantum?.available === true
+    : capability?.local_simulator?.available ?? capability?.available
+  const canRun = Boolean(targetCapabilityAvailable && displayedPresetId && !staleIdentity && !creating && !active)
   const disabledReason = !displayedPresetId
     ? 'Load a verified preset before running.'
     : staleIdentity
       ? 'The selected preset is not the structure currently displayed. Wait for it to load before running.'
-      : capability && !capability.available
-        ? capability.reason ?? 'Local execution is unavailable.'
+      : capability && !targetCapabilityAvailable
+        ? executionTarget === 'ibm_quantum'
+          ? capability.ibm_quantum?.reason ?? 'IBM Quantum execution is unavailable.'
+          : capability.local_simulator?.reason ?? capability.reason ?? 'Local execution is unavailable.'
         : active
           ? 'The active run must finish before another run is started.'
           : creating
             ? 'Creating a run…'
             : capability === null
-              ? 'Checking local execution capability…'
+              ? 'Checking execution capability…'
               : null
 
   return { capability, run, results, verification, receipt, creating, error, canRun, disabledReason, startRun }

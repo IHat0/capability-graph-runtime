@@ -12,12 +12,32 @@ export interface RunCapabilityResponse {
   execution_targets: string[]
   reason: string | null
   maximum_run_seconds: number | null
+  local_simulator?: ExecutionTargetCapability
+  ibm_quantum?: IBMExecutionCapability
+}
+
+export interface ExecutionTargetCapability {
+  available: boolean
+  reason: string | null
+  maximum_run_seconds: number | null
+}
+
+export interface IBMExecutionCapability extends ExecutionTargetCapability {
+  backend_name: string | null
+  target_precision: number | null
+  optimization_level?: number
+  hardware_role?: string
 }
 
 export type RunStatus =
   | 'queued'
   | 'validating'
   | 'running_quantum_workflow'
+  | 'running_local_preflight'
+  | 'awaiting_ibm_submission'
+  | 'queued_on_ibm'
+  | 'running_on_ibm'
+  | 'verifying_ibm_result'
   | 'authorized'
   | 'rejected'
   | 'failed'
@@ -35,7 +55,7 @@ export interface RunIdentity {
 }
 
 export interface RunStateResponse extends RunIdentity {
-  execution_target: 'local_simulator'
+  execution_target: 'local_simulator' | 'ibm_quantum'
   status: RunStatus
   created_at: string
   updated_at: string
@@ -46,6 +66,40 @@ export interface RunStateResponse extends RunIdentity {
   execution_environment_identity?: string | null
   error?: { code: string; message: string }
   molecule?: SceneResponse
+  ibm_job_identifier?: string | null
+  ibm_backend_name?: string | null
+}
+
+export interface IBMExecutionEvidence {
+  hardware_role: string
+  submission_status: string
+  job_identifier: string | null
+  backend_name: string | null
+  execution_integrity_passed: boolean
+  scientific_quality_passed: boolean
+  raw_qubit_expectation_hartree?: number
+  non_nuclear_electronic_shift_hartree?: number
+  electronic_constant_offsets_hartree?: Record<string, number>
+  ibm_electronic_energy_hartree?: number
+  nuclear_repulsion_energy_hartree?: number
+  ibm_total_energy_hartree?: number
+  local_exact_total_energy_hartree?: number
+  local_vqe_total_energy_hartree?: number
+  returned_standard_error?: number | null
+  source_bound_circuit_sha256?: string
+  transpiled_circuit_sha256?: string
+  source_observable_sha256?: string
+  transpiled_observable_sha256?: string
+  layout_sha256?: string
+  runtime_options?: {
+    max_execution_time: number
+    job_tags: string[]
+  }
+  execution_image_identifier?: string
+  scientific_preflight_image_identifier?: string
+  ibm_runtime_image_identifier?: string
+  ibm_receipt_sha256?: string
+  [key: string]: unknown
 }
 
 export interface ExperimentPlanResponse {
@@ -85,6 +139,7 @@ export interface RunResultsResponse extends RunIdentity {
   compatibility_warnings: unknown[]
   execution_environment_identity: string
   receipt_sha256: string
+  ibm_execution?: IBMExecutionEvidence | null
 }
 
 export interface RunVerificationResponse extends RunIdentity {
@@ -99,6 +154,7 @@ export interface RunVerificationResponse extends RunIdentity {
   artifact_integrity_checks: unknown[]
   checks: unknown[]
   compatibility_warnings: unknown[]
+  ibm_execution?: IBMExecutionEvidence | null
 }
 
 export interface PublicArtifactIdentity {
@@ -121,6 +177,7 @@ export interface RunReceiptResponse extends RunIdentity {
   authorization_state: 'authorized' | 'rejected'
   authorized: boolean
   artifacts: PublicArtifactIdentity[]
+  ibm_execution?: IBMExecutionEvidence | null
 }
 
 export interface PresetSummaryResponse {

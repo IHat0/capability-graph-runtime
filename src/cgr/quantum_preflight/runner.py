@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import signal
 import uuid
 from contextlib import contextmanager
@@ -82,6 +83,7 @@ def run_trusted_reference(
     lock_path: Path,
     image_identifier: str,
     maximum_seconds: int | None = None,
+    ibm_preflight_evidence_path: Path | None = None,
 ) -> dict[str, Any]:
     """Execute trusted LiH and atomically commit one immutable evidence directory."""
     policy = manifest.experiment.execution_policy
@@ -102,6 +104,7 @@ def run_trusted_reference(
                 lock_path=lock_path,
                 image_identifier=image_identifier,
                 maximum_bytes=maximum_bytes,
+                ibm_preflight_evidence_path=ibm_preflight_evidence_path,
             )
         os.replace(temporary, final_path)
         return {**summary, "run_id": run_id, "receipt_path": str(final_path / "receipt.json")}
@@ -132,6 +135,7 @@ def _execute(
     lock_path: Path,
     image_identifier: str,
     maximum_bytes: int,
+    ibm_preflight_evidence_path: Path | None,
 ) -> dict[str, Any]:
     experiment = manifest.experiment
     captured_warnings: list[CapturedWarning] = []
@@ -174,11 +178,12 @@ def _execute(
     # VQE executes before the exact solver exists. The function signature has
     # no reference-energy argument, enforcing optimizer/reference separation.
     with capture_warnings("vqe_execution") as phase_warnings:
-        vqe, trace, ansatz = run_vqe(
+        vqe, trace, ansatz, ibm_preflight = run_vqe(
             prepared,
             experiment,
             hamiltonian_sha256=references["qubit_hamiltonian"].content_sha256,
             environment_sha256=references["environment"].content_sha256,
+            capture_ibm_preflight=ibm_preflight_evidence_path is not None,
         )
     captured_warnings.extend(phase_warnings)
     payloads["optimization_trace"] = trace
@@ -362,6 +367,24 @@ def _execute(
     write_json_atomic(directory / "summary.json", summary, maximum_bytes=maximum_bytes)
     if not receipt.authorized:
         raise QuantumVerificationError("Trusted execution completed but was not authorized.")
+    if ibm_preflight_evidence_path is not None:
+        if ibm_preflight is None:
+            raise QuantumIntegrityError("IBM preflight material was not captured.")
+        nuclear = payloads["electronic_problem"].get(
+            "nuclear_repulsion_energy_hartree"
+        )
+        if not isinstance(nuclear, (int, float)) or not math.isfinite(float(nuclear)):
+            raise QuantumIntegrityError("IBM preflight nuclear evidence is unavailable.")
+        write_json_atomic(
+            ibm_preflight_evidence_path,
+            {
+                **ibm_preflight,
+                "ansatz_sha256": references["ansatz_manifest"].content_sha256,
+                "local_receipt_sha256": references["receipt"].content_sha256,
+                "nuclear_repulsion_energy_hartree": float(nuclear),
+            },
+            maximum_bytes=maximum_bytes,
+        )
     return summary
 
 

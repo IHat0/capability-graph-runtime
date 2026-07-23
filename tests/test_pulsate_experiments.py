@@ -149,7 +149,7 @@ def test_plan_api_preserves_ibm_target_and_local_run_endpoint_rejects_it(
     assert plan["ready_for_execution"] is False
     assert plan["requested_execution_target"] == "ibm_quantum"
     assert "ibm_quantum_execution_unavailable" in plan["missing_fields"]
-    assert blocked_run.status_code == 422
+    assert blocked_run.status_code == 404
 
 
 def test_explicit_unsupported_basis_is_not_silently_replaced() -> None:

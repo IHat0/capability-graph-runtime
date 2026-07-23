@@ -109,4 +109,34 @@ describe('Pulsate API client failure handling', () => {
     expect(body).toEqual({ experiment_identifier: experimentIdentifier, execution_target: 'local_simulator' })
     expect(body).not.toHaveProperty('preset_identifier')
   })
+
+  it('submits an IBM dynamic target without credentials or caller options', async () => {
+    const experimentIdentifier = `experiment-${'d'.repeat(32)}`
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      run_identifier: `run-${'e'.repeat(32)}`, source_type: 'dynamic_experiment',
+      source_identifier: experimentIdentifier, preset_identifier: null,
+      experiment_identifier: experimentIdentifier, experiment_fingerprint: 'experiment-hash',
+      expected_experiment_sha256: 'experiment-hash', structure_identifier: 'molecular_structure',
+      execution_target: 'ibm_quantum', status: 'awaiting_ibm_submission',
+      created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      status_url: `/api/v1/runs/run-${'e'.repeat(32)}`,
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    await pulsateApi.createExperimentRun(experimentIdentifier, 'ibm-key-0001', undefined, 'ibm_quantum')
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body).toEqual({ experiment_identifier: experimentIdentifier, execution_target: 'ibm_quantum' })
+    expect(JSON.stringify(body)).not.toMatch(/token|credential|backend|precision/i)
+  })
+
+  it('rejects credential material in capability responses', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      available: true, execution_targets: ['local_simulator', 'ibm_quantum'], reason: null,
+      maximum_run_seconds: 180, ibm_quantum: {
+        available: true, backend_name: 'ibm_test', reason: null,
+        maximum_run_seconds: 1800, target_precision: 0.015,
+        token: 'must-never-reach-browser',
+      },
+    })))
+    await expect(pulsateApi.getRunCapability()).rejects.toBeInstanceOf(ApiError)
+  })
 })

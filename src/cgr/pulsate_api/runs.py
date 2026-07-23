@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import signal
@@ -28,6 +29,7 @@ from cgr.quantum_preflight.receipt import QuantumPreflightReceipt, verify_receip
 from cgr.quantum_preflight.operators import encode_float
 from cgr.quantum_preflight.verification import blocking_findings
 from cgr.quantum_preflight.warnings import CompatibilityWarningEvidence
+from cgr.science import sha256_fingerprint
 from cgr.pulsate_api.quantum_worker import (
     WORKER_EXIT_CODES,
     WORKER_MANIFEST_MAXIMUM_BYTES,
@@ -37,12 +39,19 @@ from cgr.pulsate_api.quantum_worker import (
 
 RunStatus = Literal[
     "queued", "validating", "running_quantum_workflow",
+    "running_local_preflight", "awaiting_ibm_submission", "queued_on_ibm",
+    "running_on_ibm", "verifying_ibm_result",
     "authorized", "rejected", "failed", "interrupted",
 ]
 TERMINAL_STATUSES = frozenset({"authorized", "rejected", "failed", "interrupted"})
-ACTIVE_STATUSES = frozenset({"queued", "validating", "running_quantum_workflow"})
+ACTIVE_STATUSES = frozenset({
+    "queued", "validating", "running_quantum_workflow", "running_local_preflight",
+    "awaiting_ibm_submission", "queued_on_ibm", "running_on_ibm",
+    "verifying_ibm_result",
+})
 _RUN_IDENTIFIER = re.compile(r"^run-[0-9a-f]{32}$")
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _QUOTED_ABSOLUTE_PATH = re.compile(r"(['\"])(?:[A-Za-z]:[\\/]|/)[^'\"\r\n]+\1")
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)[A-Z]:[\\/][^\r\n,;]+")
 _POSIX_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9:])/(?:[^\s/]+/)+[^\r\n,;]+")
@@ -115,16 +124,27 @@ def assert_public_response_safe(value: Any) -> None:
         for key, item in value.items():
             if key in {"receipt_path", "result_root", "storage_location", "filename", "path"}:
                 raise ValueError(f"Public response contains forbidden field {key}.")
+            if re.search(r"(?:token|credential|password|api[_-]?key)", str(key), re.IGNORECASE):
+                raise ValueError("Public response contains a forbidden credential field.")
             assert_public_response_safe(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
             assert_public_response_safe(item)
-    elif isinstance(value, str) and _contains_absolute_path(value):
-        raise ValueError("Public response contains an absolute filesystem path.")
+    elif isinstance(value, str):
+        if _contains_absolute_path(value):
+            raise ValueError("Public response contains an absolute filesystem path.")
+        for variable in ("PULSATE_IBM_QUANTUM_TOKEN", "PULSATE_IBM_QUANTUM_INSTANCE"):
+            secret = os.environ.get(variable)
+            if secret and secret in value:
+                raise ValueError("Public response contains configured credential material.")
 
 
 def _public_error_message(exc: Exception) -> str:
     message = str(exc).strip() or type(exc).__name__
+    for variable in ("PULSATE_IBM_QUANTUM_TOKEN", "PULSATE_IBM_QUANTUM_INSTANCE"):
+        secret = os.environ.get(variable)
+        if secret:
+            message = message.replace(secret, "[redacted]")
     if _contains_absolute_path(message):
         return "The trusted local execution failed while processing server-controlled evidence."
     return message[:1000]
@@ -291,6 +311,7 @@ class PublicReceipt(PublicRunSourceIdentity):
     authorization_state: Literal["authorized", "rejected"]
     authorized: bool
     artifacts: list[PublicArtifactIdentity]
+    ibm_execution: dict[str, Any] | None = None
 
 
 class PublicResults(PublicRunSourceIdentity):
@@ -316,6 +337,7 @@ class PublicResults(PublicRunSourceIdentity):
     compatibility_warnings: list[Any]
     execution_environment_identity: str
     receipt_sha256: str
+    ibm_execution: dict[str, Any] | None = None
 
 
 class PublicVerification(PublicRunSourceIdentity):
@@ -335,6 +357,7 @@ class PublicVerification(PublicRunSourceIdentity):
     artifact_integrity_checks: list[Any]
     checks: list[Any]
     compatibility_warnings: list[Any]
+    ibm_execution: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -386,10 +409,36 @@ class PresetRunExecutor(Protocol):
     ) -> ExecutionOutput: ...
 
 
+class IBMRunExecutor(Protocol):
+    def capability(self) -> dict[str, Any]: ...
+
+    def execute(
+        self,
+        manifest: ManifestEnvelope,
+        *,
+        preset_identifier: str,
+        run_directory: Path,
+        maximum_seconds: int,
+        status_callback: Callable[[str, dict[str, Any] | None], None],
+        source_type: Literal["preset", "dynamic_experiment"],
+        source_identifier: str,
+        source_preset_identifier: str | None,
+        expected_structure_sha256: str | None,
+        run_identifier: str,
+    ) -> ExecutionOutput: ...
+
+
 class _BoundedLogCollector:
     """Continuously drain one worker pipe while retaining a bounded prefix."""
 
-    def __init__(self, stream: Any, path: Path, *, thread_name: str) -> None:
+    def __init__(
+        self,
+        stream: Any,
+        path: Path,
+        *,
+        thread_name: str,
+        redactions: tuple[bytes, ...] = (),
+    ) -> None:
         self.stream = stream
         self.path = path
         self.buffer = bytearray()
@@ -397,6 +446,7 @@ class _BoundedLogCollector:
         self.error: Exception | None = None
         self.persisted = False
         self.started = False
+        self.redactions = tuple(value for value in redactions if value)
         self.thread = threading.Thread(
             target=self._drain, name=thread_name, daemon=True
         )
@@ -450,6 +500,8 @@ class _BoundedLogCollector:
                 raise RuntimeError("A quantum worker log pipe could not be closed.") from exc
 
         payload = bytes(self.buffer)
+        for secret in self.redactions:
+            payload = payload.replace(secret, b"[redacted]")
         if self.truncated:
             retained = WORKER_LOG_MAXIMUM_BYTES - len(
                 _WORKER_LOG_TRUNCATION_MARKER
@@ -490,6 +542,39 @@ class ExistingQuantumPreflightExecutor:
         run_directory: Path,
         maximum_seconds: int,
     ) -> ExecutionOutput:
+        return self._execute(
+            manifest,
+            preset_identifier=preset_identifier,
+            run_directory=run_directory,
+            maximum_seconds=maximum_seconds,
+            capture_ibm_preflight=False,
+        )
+
+    def execute_ibm_preflight(
+        self,
+        manifest: ManifestEnvelope,
+        *,
+        preset_identifier: str,
+        run_directory: Path,
+        maximum_seconds: int,
+    ) -> ExecutionOutput:
+        return self._execute(
+            manifest,
+            preset_identifier=preset_identifier,
+            run_directory=run_directory,
+            maximum_seconds=maximum_seconds,
+            capture_ibm_preflight=True,
+        )
+
+    def _execute(
+        self,
+        manifest: ManifestEnvelope,
+        *,
+        preset_identifier: str,
+        run_directory: Path,
+        maximum_seconds: int,
+        capture_ibm_preflight: bool,
+    ) -> ExecutionOutput:
         result_root = run_directory / "runner-artifacts"
         if result_root.is_symlink() or result_root.exists():
             raise ValueError("The quantum runner artifact root must not pre-exist.")
@@ -497,6 +582,11 @@ class ExistingQuantumPreflightExecutor:
         worker_directory = self._create_worker_directory(run_directory)
         manifest_path = worker_directory / "manifest.json"
         result_envelope_path = worker_directory / "result.json"
+        ibm_preflight_evidence_path = (
+            worker_directory / "ibm-preflight-evidence.json"
+            if capture_ibm_preflight
+            else None
+        )
         stdout_path = worker_directory / "stdout.log"
         stderr_path = worker_directory / "stderr.log"
         lock_path = self.repository_root / "requirements" / "quantum-preflight.lock"
@@ -524,11 +614,27 @@ class ExistingQuantumPreflightExecutor:
             "--result-envelope",
             str(result_envelope_path),
         ]
+        if ibm_preflight_evidence_path is not None:
+            command.extend(
+                [
+                    "--ibm-preflight-evidence",
+                    str(ibm_preflight_evidence_path),
+                ]
+            )
         process_options: dict[str, Any] = {
             "cwd": self.repository_root,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "shell": False,
+            "env": {
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "PULSATE_IBM_QUANTUM_TOKEN",
+                    "PULSATE_IBM_QUANTUM_INSTANCE",
+                }
+            },
         }
         if os.name == "posix":
             process_options["start_new_session"] = True
@@ -657,6 +763,7 @@ class ExistingQuantumPreflightExecutor:
         return self._project(
             manifest, preset_identifier, run_directory.name, artifact_directory, summary,
             maximum_bytes=maximum_bytes,
+            ibm_preflight_evidence_path=ibm_preflight_evidence_path,
         )
 
     @staticmethod
@@ -787,6 +894,7 @@ class ExistingQuantumPreflightExecutor:
         summary: dict[str, Any],
         *,
         maximum_bytes: int = _DEFAULT_MAX_ARTIFACT_BYTES,
+        ibm_preflight_evidence_path: Path | None = None,
     ) -> ExecutionOutput:
         if manifest.experiment.fingerprint != manifest.expected_experiment_sha256:
             raise ValueError("Manifest experiment fingerprint does not match its expected identity.")
@@ -1007,6 +1115,79 @@ class ExistingQuantumPreflightExecutor:
             artifacts=artifact_identities,
         ).model_dump(mode="json")
         safe_summary = {key: value for key, value in summary.items() if key != "receipt_path"}
+        if ibm_preflight_evidence_path is not None:
+            if (
+                ibm_preflight_evidence_path.name != "ibm-preflight-evidence.json"
+                or ibm_preflight_evidence_path.parent.name != "quantum-worker"
+            ):
+                raise ValueError("IBM preflight evidence path is uncontrolled.")
+            sidecar = _controlled_json(
+                ibm_preflight_evidence_path.parent,
+                ibm_preflight_evidence_path.name,
+                maximum_bytes=maximum_bytes,
+            )
+            ansatz_evidence = _validated_receipt_artifact(
+                receipt, directory, "ansatz_manifest", maximum_bytes=maximum_bytes
+            )
+            electronic_evidence = _validated_receipt_artifact(
+                receipt, directory, "electronic_problem", maximum_bytes=maximum_bytes
+            )
+            electronic_payload = electronic_evidence.payload
+            if not isinstance(electronic_payload, dict):
+                raise ValueError("IBM electronic preflight evidence is malformed.")
+            parameters = sidecar.get("optimized_parameters")
+            parameter_sha256 = sidecar.get("optimized_parameters_sha256")
+            source_bound_circuit_sha256 = sidecar.get(
+                "source_bound_circuit_sha256"
+            )
+            source_observable_sha256 = sidecar.get("source_observable_sha256")
+            nuclear_repulsion = sidecar.get("nuclear_repulsion_energy_hartree")
+            electronic_nuclear_repulsion = electronic_payload.get(
+                "nuclear_repulsion_energy_hartree"
+            )
+            if (
+                sidecar.get("schema_version")
+                != "cgr.pulsate-ibm-local-preflight/1.0.0"
+                or sidecar.get("local_receipt_sha256")
+                != receipt_reference.content_sha256
+                or sidecar.get("ansatz_sha256")
+                != ansatz_evidence.pointer.content_sha256
+                or not isinstance(parameters, list)
+                or not parameters
+                or not all(
+                    isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    for value in parameters
+                )
+                or sha256_fingerprint([float(value) for value in parameters])
+                != parameter_sha256
+                or parameter_sha256 != summary.get("optimized_parameters_sha256")
+                or parameter_sha256 != vqe.optimized_parameters_sha256
+                or not isinstance(source_bound_circuit_sha256, str)
+                or not _SHA256.fullmatch(source_bound_circuit_sha256)
+                or not isinstance(source_observable_sha256, str)
+                or not _SHA256.fullmatch(source_observable_sha256)
+                or not isinstance(nuclear_repulsion, (int, float))
+                or not math.isfinite(float(nuclear_repulsion))
+                or not isinstance(electronic_nuclear_repulsion, (int, float))
+                or float(nuclear_repulsion)
+                != float(electronic_nuclear_repulsion)
+            ):
+                raise ValueError("IBM preflight sidecar identity validation failed.")
+            safe_summary["ibm_preflight"] = {
+                "ansatz_sha256": ansatz_evidence.pointer.content_sha256,
+                "optimized_parameters": [float(value) for value in parameters],
+                "optimized_parameters_sha256": parameter_sha256,
+                "source_bound_circuit_sha256": source_bound_circuit_sha256,
+                "source_observable_sha256": source_observable_sha256,
+                "number_of_qubits": sidecar.get("number_of_qubits"),
+                "number_of_parameters": sidecar.get("number_of_parameters"),
+                "circuit_depth": sidecar.get("circuit_depth"),
+                "nuclear_repulsion_energy_hartree": float(nuclear_repulsion),
+                "artifact_lineage_validated": True,
+                "local_receipt_sha256": receipt_reference.content_sha256,
+                "ibm_preflight_evidence_sha256": sha256_fingerprint(sidecar),
+            }
         for response in (results, verification, public_receipt, safe_summary):
             assert_public_response_safe(response)
         return ExecutionOutput(results, verification, public_receipt, safe_summary)
@@ -1018,6 +1199,25 @@ class IdempotencyConflictError(RuntimeError): pass
 class InvalidIdempotencyKeyError(ValueError): pass
 class RunRootOwnershipError(RuntimeError): pass
 class CoordinatorConfigurationError(ValueError): pass
+class RecoverableIBMJobError(RuntimeError):
+    def __init__(self, message: str, *, job_identifier: str) -> None:
+        super().__init__(message)
+        self.job_identifier = job_identifier
+
+
+class TerminalIBMJobError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        job_identifier: str,
+        backend_name: str | None,
+        runtime_status: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.job_identifier = job_identifier
+        self.backend_name = backend_name
+        self.runtime_status = runtime_status
 
 
 class _RunRootLock:
@@ -1070,7 +1270,8 @@ class RunCoordinator:
         manifest_resolver: Callable[[str], ManifestEnvelope],
         executor: PresetRunExecutor,
         enabled: bool,
-        experiment_resolver: Callable[[str], tuple[ManifestEnvelope, dict[str, Any]]] | None = None,
+        experiment_resolver: Callable[[str], tuple[Any, ...]] | None = None,
+        ibm_executor: IBMRunExecutor | None = None,
         unavailable_reason: str | None = None,
         max_workers: int = 1,
         max_run_seconds: int | str = _DEFAULT_MAX_RUN_SECONDS,
@@ -1081,6 +1282,7 @@ class RunCoordinator:
         self.manifest_resolver = manifest_resolver
         self.experiment_resolver = experiment_resolver
         self.executor = executor
+        self.ibm_executor = ibm_executor
         self.configured_enabled = enabled
         self.enabled = False
         self.unavailable_reason = unavailable_reason
@@ -1093,6 +1295,9 @@ class RunCoordinator:
         self._futures: dict[Future[Any], str] = {}
         self._idempotency: dict[str, tuple[dict[str, str], str]] = {}
         self._root_lock: _RunRootLock | None = None
+        self._recoverable_ibm_runs: list[
+            tuple[str, str, str, str | None, ManifestEnvelope, str | None]
+        ] = []
         self._started = False
         self._accepting = False
 
@@ -1119,6 +1324,7 @@ class RunCoordinator:
                 self.max_run_seconds = timeout
                 self._idempotency.clear()
                 self._futures.clear()
+                self._recoverable_ibm_runs.clear()
                 self._recover()
                 self.enabled = self.configured_enabled
                 if self.enabled and self.precondition_check is not None:
@@ -1133,6 +1339,11 @@ class RunCoordinator:
                 )
                 self._accepting = True
                 self._started = True
+                for recovered in self._recoverable_ibm_runs:
+                    future = self._pool.submit(self._execute, *recovered, "ibm_quantum")
+                    self._futures[future] = recovered[0]
+                    future.add_done_callback(self._discard_future)
+                self._recoverable_ibm_runs.clear()
             except Exception:
                 root_lock.release()
                 self._root_lock = None
@@ -1172,18 +1383,40 @@ class RunCoordinator:
         return parsed
 
     def capability(self) -> dict[str, Any]:
-        available = self._started and self._accepting and self.enabled
-        if available:
+        local_available = self._started and self._accepting and self.enabled
+        if local_available:
             reason = None
         elif not self._started:
             reason = "The local run coordinator lifecycle has not started."
         else:
             reason = self.unavailable_reason or "Local quantum execution is unavailable."
+        ibm = (
+            self.ibm_executor.capability()
+            if self.ibm_executor is not None
+            else {
+                "available": False,
+                "backend_name": None,
+                "reason": "IBM Quantum execution is not configured on this server.",
+                "maximum_run_seconds": None,
+                "target_precision": None,
+            }
+        )
+        if not local_available and ibm.get("available") is True:
+            ibm = {**ibm, "available": False, "reason": "The trusted local preflight is unavailable."}
+        targets = (["local_simulator"] if local_available else []) + (
+            ["ibm_quantum"] if ibm.get("available") is True else []
+        )
         response = {
-            "available": available,
-            "execution_targets": ["local_simulator"] if available else [],
+            "available": local_available,
+            "execution_targets": targets,
             "reason": reason,
             "maximum_run_seconds": self.max_run_seconds,
+            "local_simulator": {
+                "available": local_available,
+                "reason": reason,
+                "maximum_run_seconds": self.max_run_seconds,
+            },
+            "ibm_quantum": ibm,
         }
         assert_public_response_safe(response)
         return response
@@ -1196,7 +1429,7 @@ class RunCoordinator:
         *,
         experiment_identifier: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        if execution_target != "local_simulator":
+        if execution_target not in {"local_simulator", "ibm_quantum"}:
             raise ValueError("unsupported_execution_target")
         if idempotency_key is not None and not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise InvalidIdempotencyKeyError("Invalid Idempotency-Key header.")
@@ -1206,7 +1439,16 @@ class RunCoordinator:
         if experiment_identifier is not None:
             if self.experiment_resolver is None:
                 raise RunNotFoundError("Experiment not found.")
-            manifest, molecule = self.experiment_resolver(experiment_identifier)
+            resolved = self.experiment_resolver(experiment_identifier)
+            if len(resolved) == 3:
+                manifest, molecule, requested_target = resolved
+            elif len(resolved) == 2:
+                manifest, molecule = resolved
+                requested_target = "local_simulator"
+            else:
+                raise ValueError("Experiment resolver returned an invalid result.")
+            if execution_target != requested_target:
+                raise ValueError("execution_target_mismatch")
             source_type: Literal["preset", "dynamic_experiment"] = "dynamic_experiment"
             source_identifier = experiment_identifier
             request = {
@@ -1215,6 +1457,8 @@ class RunCoordinator:
             }
         else:
             assert preset_identifier is not None
+            if execution_target != "local_simulator":
+                raise ValueError("execution_target_mismatch")
             manifest = self.manifest_resolver(preset_identifier)
             source_type = "preset"
             source_identifier = preset_identifier
@@ -1225,6 +1469,9 @@ class RunCoordinator:
         with self._lock:
             if not self._started or not self._accepting or not self.enabled or self._pool is None:
                 raise RuntimeError("execution_unavailable")
+            if execution_target == "ibm_quantum":
+                if self.ibm_executor is None or self.ibm_executor.capability().get("available") is not True:
+                    raise RuntimeError("ibm_execution_unavailable")
             if idempotency_key in self._idempotency:
                 previous, run_identifier = self._idempotency[idempotency_key]
                 if previous != request:
@@ -1266,6 +1513,7 @@ class RunCoordinator:
                 preset_identifier,
                 manifest,
                 molecule.get("structure_hash") if molecule is not None else None,
+                execution_target,
             )
             self._futures[future] = run_identifier
             future.add_done_callback(self._discard_future)
@@ -1311,23 +1559,49 @@ class RunCoordinator:
         preset_identifier: str | None,
         manifest: ManifestEnvelope,
         expected_structure_sha256: str | None,
+        execution_target: Literal["local_simulator", "ibm_quantum"],
     ) -> None:
         try:
             self._transition(run_identifier, "validating")
             if manifest.experiment.fingerprint != manifest.expected_experiment_sha256:
                 raise ValueError("Manifest experiment fingerprint does not match its expected identity.")
-            self._transition(run_identifier, "running_quantum_workflow")
+            self._transition(
+                run_identifier,
+                "running_local_preflight" if execution_target == "ibm_quantum" else "running_quantum_workflow",
+            )
             assert self.max_run_seconds is not None
             effective_timeout = min(
                 self.max_run_seconds,
                 manifest.experiment.execution_policy.maximum_duration_seconds,
             )
-            output = self.executor.execute(
-                manifest,
-                preset_identifier=source_identifier,
-                run_directory=self._directory(run_identifier),
-                maximum_seconds=effective_timeout,
-            )
+            if execution_target == "ibm_quantum":
+                if self.ibm_executor is None:
+                    raise RuntimeError("IBM Quantum execution is unavailable.")
+
+                def ibm_status(status: str, additions: dict[str, Any] | None = None) -> None:
+                    if status not in ACTIVE_STATUSES:
+                        raise ValueError("IBM executor attempted an invalid coordinator status.")
+                    self._transition(run_identifier, status, additions)
+
+                output = self.ibm_executor.execute(
+                    manifest,
+                    preset_identifier=source_identifier,
+                    run_directory=self._directory(run_identifier),
+                    maximum_seconds=effective_timeout,
+                    status_callback=ibm_status,
+                    source_type=source_type,
+                    source_identifier=source_identifier,
+                    source_preset_identifier=preset_identifier,
+                    expected_structure_sha256=expected_structure_sha256,
+                    run_identifier=run_identifier,
+                )
+            else:
+                output = self.executor.execute(
+                    manifest,
+                    preset_identifier=source_identifier,
+                    run_directory=self._directory(run_identifier),
+                    maximum_seconds=effective_timeout,
+                )
             output = _bind_public_source_identity(
                 output,
                 source_type=source_type,
@@ -1349,12 +1623,44 @@ class RunCoordinator:
             _write_json_atomic(directory / "verification.json", output.verification)
             _write_json_atomic(directory / "receipt.json", output.receipt)
             terminal: RunStatus = "authorized" if output.receipt["authorized"] else "rejected"
-            self._transition(run_identifier, terminal, {
+            terminal_additions = {
                 "structure_sha256": output.results["structure_sha256"],
                 "hamiltonian_sha256": output.results["hamiltonian_sha256"],
                 "receipt_sha256": output.results["receipt_sha256"],
                 "execution_environment_identity": output.results["execution_environment_identity"],
-            })
+            }
+            ibm_evidence = output.results.get("ibm_execution")
+            if isinstance(ibm_evidence, dict):
+                terminal_additions["ibm_job_identifier"] = ibm_evidence.get("job_identifier")
+                terminal_additions["ibm_backend_name"] = ibm_evidence.get("backend_name")
+            self._transition(run_identifier, terminal, terminal_additions)
+        except RecoverableIBMJobError as exc:
+            self._transition(
+                run_identifier,
+                "queued_on_ibm",
+                {
+                    "ibm_job_identifier": exc.job_identifier,
+                    "recoverable_ibm_retrieval": True,
+                },
+            )
+        except TerminalIBMJobError as exc:
+            message = _public_error_message(exc)
+            error = {
+                "code": "run_execution_failed",
+                "message": message,
+                "type": type(exc).__name__,
+            }
+            _write_json_atomic(self._directory(run_identifier) / "error.json", error)
+            self._transition(
+                run_identifier,
+                "failed",
+                {
+                    "ibm_job_identifier": exc.job_identifier,
+                    "ibm_backend_name": exc.backend_name,
+                    "ibm_runtime_status": exc.runtime_status,
+                    "error": {"code": error["code"], "message": message},
+                },
+            )
         except Exception as exc:
             message = _public_error_message(exc)
             error = {"code": "run_execution_failed", "message": message, "type": type(exc).__name__}
@@ -1510,13 +1816,58 @@ class RunCoordinator:
                         directory.name,
                     )
                 if state.get("status") in ACTIVE_STATUSES:
+                    job_path = directory / "ibm-worker" / "job.json"
+                    attempt_path = directory / "ibm-worker" / "submission-attempt.json"
+                    compiled_path = directory / "compiled-manifest.json"
+                    recover_ibm = (
+                        request.get("execution_target") == "ibm_quantum"
+                        and self.ibm_executor is not None
+                        and (
+                            (
+                                job_path.is_file()
+                                and not job_path.is_symlink()
+                            )
+                            or (
+                                attempt_path.is_file()
+                                and not attempt_path.is_symlink()
+                            )
+                        )
+                        and compiled_path.is_file()
+                        and not compiled_path.is_symlink()
+                    )
                     now = utc_now()
-                    state.update({
-                        "status": "interrupted", "updated_at": now,
-                        "error": {"code": "run_interrupted", "message": "The backend restarted before this run reached a terminal state."},
-                    })
-                    state.setdefault("status_history", []).append({"status": "interrupted", "timestamp": now})
-                    _write_json_atomic(state_path, state)
+                    if recover_ibm:
+                        manifest = ManifestEnvelope.model_validate(
+                            _controlled_run_json(directory, compiled_path.name)
+                        )
+                        molecule = state.get("molecule")
+                        structure_hash = (
+                            molecule.get("structure_hash")
+                            if isinstance(molecule, dict)
+                            else None
+                        )
+                        state.update({"status": "queued", "updated_at": now})
+                        state.setdefault("status_history", []).append(
+                            {"status": "queued", "timestamp": now, "reason": "recover_recorded_ibm_job"}
+                        )
+                        _write_json_atomic(state_path, state)
+                        self._recoverable_ibm_runs.append(
+                            (
+                                directory.name,
+                                source_type,
+                                str(source_identifier),
+                                expected_preset,
+                                manifest,
+                                structure_hash,
+                            )
+                        )
+                    else:
+                        state.update({
+                            "status": "interrupted", "updated_at": now,
+                            "error": {"code": "run_interrupted", "message": "The backend restarted before this run reached a terminal state."},
+                        })
+                        state.setdefault("status_history", []).append({"status": "interrupted", "timestamp": now})
+                        _write_json_atomic(state_path, state)
             except (KeyError, OSError, ValueError, json.JSONDecodeError):
                 continue
 
@@ -1566,6 +1917,8 @@ def validate_execution_output(
         (results.receipt_sha256, receipt.receipt_sha256, "receipt SHA-256"),
         (verification.verification_passed, receipt.verification_passed, "verification decision"),
         (verification.authorization_state, receipt.authorization_state, "authorization state"),
+        (results.ibm_execution, receipt.ibm_execution, "IBM execution evidence"),
+        (verification.ibm_execution, receipt.ibm_execution, "IBM verification evidence"),
     )
     for observed, trusted, label in comparisons:
         if observed != trusted:
@@ -1592,6 +1945,10 @@ def validate_execution_output(
         "receipt_sha256": results.receipt_sha256,
         "scientific_verification_passed": verification.verification_passed,
         "authorized": receipt.authorized,
+        "exact_total_energy_hartree": results.exact_total_energy_hartree,
+        "vqe_total_energy_hartree": results.vqe_total_energy_hartree,
+        "absolute_difference_hartree": results.absolute_difference_hartree,
+        "tolerance_hartree": results.tolerance_hartree,
     }
     for field, expected_value in summary_comparisons.items():
         if field in output.runner_summary and output.runner_summary[field] != expected_value:
