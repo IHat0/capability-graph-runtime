@@ -22,7 +22,7 @@ if [[ "${PULSATE_RUN_IBM_INTEGRATION,,}" != "true" || "${PULSATE_IBM_ACKNOWLEDGE
   exit 1
 fi
 
-"$repo_root/scripts/build-pulsate-ibm-runtime-image.sh"
+bash "$repo_root/scripts/build-pulsate-ibm-runtime-image.sh"
 derived_image_id="$(docker image inspect --format '{{.Id}}' "$derived_image")"
 scientific_image_id="$(docker image inspect --format '{{.Id}}' "$scientific_image")"
 if [[ "$scientific_image_id" == "$derived_image_id" ]]; then

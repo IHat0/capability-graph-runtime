@@ -32,6 +32,7 @@ def test_ibm_image_is_pinned_http_derivative_and_runs_pip_check() -> None:
 
 def test_ibm_build_pins_exact_local_base_identity_and_provenance() -> None:
     build = source("scripts/build-pulsate-ibm-runtime-image.sh")
+    assert 'bash "$repo_root/scripts/build-pulsate-http-integration-image.sh"' in build
     assert 'base_image_id="$(docker image inspect --format \'{{.Id}}\' "$base_image")"' in build
     assert 'base_image_hex="${base_image_id#sha256:}"' in build
     assert 'docker image tag "$base_image_id" "$pinned_base_image"' in build
@@ -44,6 +45,7 @@ def test_ibm_build_pins_exact_local_base_identity_and_provenance() -> None:
 
 def test_live_script_requires_cost_gates_and_passes_credentials_by_name() -> None:
     run = source("scripts/run-pulsate-ibm-integration.sh")
+    assert 'bash "$repo_root/scripts/build-pulsate-ibm-runtime-image.sh"' in run
     for name in (
         "PULSATE_RUN_IBM_INTEGRATION",
         "PULSATE_IBM_ACKNOWLEDGE_COSTS",
@@ -70,6 +72,7 @@ def test_live_script_requires_cost_gates_and_passes_credentials_by_name() -> Non
 def test_fake_integration_is_separate_nonpaid_and_network_local_only() -> None:
     run = source("scripts/run-pulsate-ibm-fake-integration.sh")
     acceptance = source("tests/test_pulsate_ibm_fake_integration.py")
+    assert 'bash "$repo_root/scripts/build-pulsate-ibm-runtime-image.sh"' in run
     assert "unset PULSATE_RUN_IBM_INTEGRATION" in run
     assert "unset PULSATE_IBM_ACKNOWLEDGE_COSTS" in run
     assert "unset PULSATE_IBM_QUANTUM_TOKEN" in run

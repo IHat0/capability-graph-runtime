@@ -11,7 +11,8 @@ if ! git -C "$repo_root" diff --quiet || ! git -C "$repo_root" diff --cached --q
   exit 1
 fi
 
-PULSATE_HTTP_IMAGE="$base_image" "$repo_root/scripts/build-pulsate-http-integration-image.sh"
+PULSATE_HTTP_IMAGE="$base_image" \
+  bash "$repo_root/scripts/build-pulsate-http-integration-image.sh"
 base_image_id="$(docker image inspect --format '{{.Id}}' "$base_image")"
 base_image_hex="${base_image_id#sha256:}"
 pinned_base_image="cgr-pulsate-http-pinned:${base_image_hex}"
