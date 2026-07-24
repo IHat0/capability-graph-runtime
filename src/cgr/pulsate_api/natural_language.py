@@ -11,12 +11,20 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol, Self
+from typing import Any, Literal, NamedTuple, Protocol, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from cgr.quantum_preflight.artifacts import write_json_atomic
 from cgr.science import sha256_fingerprint
@@ -27,6 +35,8 @@ MODEL_DRAFT_SCHEMA = "cgr.pulsate-model-scientific-draft/1.0.0"
 MODEL_RESPONSE_MAXIMUM_BYTES = 512 * 1024
 MODEL_REQUEST_MAXIMUM_BYTES = 512 * 1024
 INTERPRETATION_RECORD_MAXIMUM_BYTES = 2 * 1024 * 1024
+REPAIR_FEEDBACK_MAXIMUM_BYTES = 8 * 1024
+REPAIR_DRAFT_MAXIMUM_BYTES = 64 * 1024
 _INTERPRETATION_IDENTIFIER = re.compile(r"^interpretation-[0-9a-f]{32}$")
 _ELEMENT = re.compile(r"^[A-Z][a-z]?$")
 _IMAGE_OR_PATH = re.compile(
@@ -129,6 +139,55 @@ _OBJECTIVE_GENERIC_TOKENS = frozenset(
         "using",
     }
 )
+_GENERIC_MOLECULE_NAME_TOKENS = frozenset(
+    {
+        "calculate",
+        "compute",
+        "determine",
+        "electronic",
+        "energy",
+        "experiment",
+        "ground",
+        "hardware",
+        "molecular",
+        "molecule",
+        "prepare",
+        "quantum",
+        "simulator",
+        "species",
+        "state",
+        "study",
+    }
+)
+_EXECUTION_TARGET_ALIASES = {
+    "ibm quantum": "ibm_quantum",
+    "ibm hardware": "ibm_quantum",
+    "quantum hardware": "ibm_quantum",
+    "local simulator": "local_simulator",
+    "simulator": "local_simulator",
+}
+_MAPPER_ALIASES = {
+    "jordan wigner": "jordan_wigner",
+    "jordanwignermapper": "jordan_wigner",
+}
+_COORDINATE_UNIT_ALIASES = {
+    "angstrom": "angstrom",
+    "å": "angstrom",
+    "ångström": "angstrom",
+    "bohr": "bohr",
+}
+_SERVER_COMPUTATIONAL_ASSUMPTIONS: dict[str, str | int | float] = {
+    "charge": 0,
+    "multiplicity": 1,
+    "basis": "sto-3g",
+    "electronic_structure_method": "rhf",
+    "mapper": "jordan_wigner",
+    "ansatz": "uccsd",
+    "optimizer": "slsqp",
+    "tolerance": 1e-5,
+    "precision": 0.015,
+    "requested_execution_target": "ibm_quantum",
+}
 
 
 def _utc_now() -> str:
@@ -522,7 +581,7 @@ class OpenAICompatibleModelProvider:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        if len(request_payload) > MODEL_REQUEST_MAXIMUM_BYTES:
+        if len(request_payload) >= MODEL_REQUEST_MAXIMUM_BYTES:
             raise NaturalLanguageInterpretationError("The model request is oversized.")
         request = urllib.request.Request(
             f"{self._base_url}/chat/completions",
@@ -579,6 +638,150 @@ def _extract_json(content: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError("Model content is not a JSON object.")
     return value
+
+
+def _normalize_alias(value: str, aliases: dict[str, str]) -> str:
+    normalized = _normalize_evidence_text(value)
+    canonical = _canonical_scientific_text(value)
+    return aliases.get(normalized, aliases.get(canonical, value))
+
+
+def _normalize_draft_aliases(raw_draft: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(raw_draft)
+
+    def normalize_wrapper(
+        container: dict[str, Any], field: str, aliases: dict[str, str]
+    ) -> None:
+        wrapper = container.get(field)
+        if isinstance(wrapper, dict) and isinstance(wrapper.get("value"), str):
+            wrapper["value"] = _normalize_alias(wrapper["value"], aliases)
+
+    normalize_wrapper(
+        normalized, "requested_execution_target", _EXECUTION_TARGET_ALIASES
+    )
+    normalize_wrapper(normalized, "mapper", _MAPPER_ALIASES)
+    normalize_wrapper(normalized, "coordinate_unit", _COORDINATE_UNIT_ALIASES)
+    molecule = normalized.get("molecule")
+    if isinstance(molecule, dict):
+        bonds = molecule.get("bond_lengths")
+        if isinstance(bonds, dict) and isinstance(bonds.get("value"), list):
+            for bond in bonds["value"]:
+                if isinstance(bond, dict) and isinstance(bond.get("unit"), str):
+                    bond["unit"] = _normalize_alias(
+                        bond["unit"], _COORDINATE_UNIT_ALIASES
+                    )
+    return normalized
+
+
+class _ValidatedModelContent(NamedTuple):
+    parsed: dict[str, Any]
+    normalized: dict[str, Any]
+    draft: ModelScientificDraft
+
+
+def _validate_model_content(content: str) -> _ValidatedModelContent:
+    parsed = _extract_json(content)
+    normalized = _normalize_draft_aliases(parsed)
+    return _ValidatedModelContent(
+        parsed=parsed,
+        normalized=normalized,
+        draft=ModelScientificDraft.model_validate(normalized),
+    )
+
+
+def _bounded_utf8(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return value
+    return encoded[:maximum_bytes].decode("utf-8", errors="ignore")
+
+
+def _sanitized_error_message(message: str) -> str:
+    sanitized = " ".join(message.split())
+    sanitized = re.sub(
+        r"(?i)\b(?:authorization|api[_-]?key|token|password|credential)\b"
+        r"\s*[:=]\s*\S+",
+        "[redacted]",
+        sanitized,
+    )
+    sanitized = re.sub(r"[A-Za-z]:[\\/]\S+", "[path]", sanitized)
+    sanitized = re.sub(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]*", "[path]", sanitized)
+    return _bounded_utf8(sanitized, 512)
+
+
+def _sanitized_validation_report(error: Exception) -> str:
+    if isinstance(error, ValidationError):
+        candidates = [
+            {
+                "location": ".".join(str(segment) for segment in item["loc"]),
+                "type": str(item["type"])[:128],
+                "message": _sanitized_error_message(str(item["msg"])),
+            }
+            for item in error.errors(include_url=False, include_context=False)
+        ]
+    else:
+        candidates = [
+            {
+                "location": "model_response",
+                "type": type(error).__name__[:128],
+                "message": _sanitized_error_message(str(error)),
+            }
+        ]
+    report: list[dict[str, str]] = []
+    for candidate in candidates:
+        proposed = json.dumps(
+            {"validation_errors": [*report, candidate]},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        if len(proposed.encode("utf-8")) > REPAIR_FEEDBACK_MAXIMUM_BYTES:
+            break
+        report.append(candidate)
+    if not report:
+        report = [
+            {
+                "location": "model_response",
+                "type": "validation_error",
+                "message": "Validation failed; return the exact schema.",
+            }
+        ]
+    encoded = json.dumps(
+        {"validation_errors": report},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return _bounded_utf8(encoded, REPAIR_FEEDBACK_MAXIMUM_BYTES)
+
+
+_ALLOWED_EVIDENCE_PATHS_TEXT = ", ".join(sorted(_EXPLICIT_FIELD_PATHS))
+_REPAIR_CORRECTION_RULES = (
+    "Correction rules: provenance appears only on provenanced wrapper objects; "
+    "atom items contain only element and coordinates; bond items contain only "
+    "atom_indices, value, and unit; a null value always has provenance missing; "
+    "explicit_evidence keys must be exact members of this allowed field-path set: "
+    f"{_ALLOWED_EVIDENCE_PATHS_TEXT}; "
+    "bond evidence uses only molecule.bond_lengths; controlled execution values "
+    "are exactly ibm_quantum or local_simulator; inferred formulas are derived, "
+    "not explicit; SMILES and InChI are explicit only when literally present in "
+    "the scientist question; never invent an evidence quotation; omitted "
+    "scientific settings must be missing rather than arbitrarily guessed."
+)
+
+
+def _repair_prompt(
+    *, question: str, malformed_draft: str, validation_report: str
+) -> str:
+    bounded_draft = _bounded_utf8(
+        malformed_draft, REPAIR_DRAFT_MAXIMUM_BYTES
+    )
+    return (
+        "Repair the malformed scientific draft into the exact supplied schema. "
+        "Return JSON only.\n"
+        f"Original scientist question:\n{question}\n"
+        f"Sanitized validation report:\n{validation_report}\n"
+        f"{_REPAIR_CORRECTION_RULES}\n"
+        f"Malformed draft:\n{bounded_draft}"
+    )
 
 
 def _formula_atoms(formula: str) -> tuple[str, ...] | None:
@@ -682,6 +885,67 @@ def _objective_is_supported(value: str, quotation: str) -> bool:
     return bool(objective_tokens) and objective_tokens.issubset(evidence_tokens)
 
 
+def _literal_formula_token_is_grounded(value: str, quotation: str) -> bool:
+    if _formula_atoms(value) is None:
+        return False
+    return (
+        re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])",
+            unicodedata.normalize("NFKC", quotation),
+        )
+        is not None
+    )
+
+
+def _molecule_name_is_grounded(value: str, quotation: str) -> bool:
+    canonical_value = _canonical_scientific_text(value)
+    tokens = tuple(re.findall(r"[a-z0-9]+", canonical_value))
+    if not tokens or all(
+        token in _GENERIC_MOLECULE_NAME_TOKENS for token in tokens
+    ):
+        return False
+    canonical_quotation = _canonical_scientific_text(quotation)
+    return (
+        re.search(
+            rf"(?<![a-z0-9]){re.escape(canonical_value)}(?![a-z0-9])",
+            canonical_quotation,
+        )
+        is not None
+    )
+
+
+def _smiles_is_explicitly_grounded(value: str, quotation: str) -> bool:
+    return (
+        re.search(
+            rf"(?i:\bsmiles\b)\s*(?::|=|(?i:is)\b)\s*"
+            rf"{re.escape(value)}(?=$|[\s,;.!?])",
+            unicodedata.normalize("NFKC", quotation),
+        )
+        is not None
+    )
+
+
+def _inchi_is_explicitly_grounded(value: str, quotation: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", quotation)
+    terminator = r"(?=$|[\s,;.!?])"
+    if value.startswith("InChI="):
+        return (
+            re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(value)}{terminator}",
+                normalized,
+            )
+            is not None
+        )
+    return (
+        re.search(
+            rf"(?i:\binchi\b)\s*(?::|=|(?i:is)\b)\s*"
+            rf"{re.escape(value)}{terminator}",
+            normalized,
+        )
+        is not None
+    )
+
+
 def _bond_length_is_supported(bond: BondLength, quotation: str) -> bool:
     distance_terms = ("bond", "bond length", "distance", "separation", "apart")
     unit_terms = {
@@ -744,12 +1008,16 @@ def _explicit_value_matches_evidence(
     canonical_evidence = _canonical_scientific_text(quotation)
     if path == "scientific_objective":
         return _objective_is_supported(str(value), quotation)
+    if path == "molecule.name":
+        return _molecule_name_is_grounded(str(value), quotation)
+    if path == "molecule.formula":
+        return _literal_formula_token_is_grounded(str(value), quotation)
+    if path == "molecule.smiles":
+        return _smiles_is_explicitly_grounded(str(value), quotation)
+    if path == "molecule.inchi":
+        return _inchi_is_explicitly_grounded(str(value), quotation)
     if path in {
         "requested_quantity",
-        "molecule.name",
-        "molecule.formula",
-        "molecule.smiles",
-        "molecule.inchi",
         "molecule.geometry_description",
         "basis",
         "electronic_structure_method",
@@ -833,8 +1101,10 @@ def _explicit_value_matches_evidence(
     return False
 
 
-def _formula_is_derived_from_grounded_name(draft: ModelScientificDraft) -> bool:
-    formula = draft.molecule.formula.value
+def _formula_is_derived_from_grounded_name(
+    draft: ModelScientificDraft, formula: str | None = None
+) -> bool:
+    formula = formula if formula is not None else draft.molecule.formula.value
     name = draft.molecule.name.value
     if (
         formula is None
@@ -843,17 +1113,21 @@ def _formula_is_derived_from_grounded_name(draft: ModelScientificDraft) -> bool:
     ):
         return False
     atoms = _formula_atoms(formula)
-    if atoms is None:
+    if atoms is None or len(atoms) < 2:
         return False
-    counts = {element: atoms.count(element) for element in set(atoms)}
     normalized_name = _canonical_scientific_text(name)
-    for element, count in counts.items():
-        tokens = _CONSERVATIVE_ELEMENT_NAME_TOKENS.get(element)
-        if tokens is None or not any(token in normalized_name for token in tokens):
-            return False
-        if count != 1:
-            return False
-    return True
+    name_tokens = re.findall(r"[a-z]+", normalized_name)
+    named_elements = tuple(
+        element
+        for token in name_tokens
+        for element, aliases in _CONSERVATIVE_ELEMENT_NAME_TOKENS.items()
+        if token in aliases
+    )
+    return (
+        len(set(atoms)) == len(atoms)
+        and len(named_elements) == len(atoms)
+        and named_elements == atoms
+    )
 
 
 def _downgrade_unverified_field(path: str, field: Any) -> Any:
@@ -861,6 +1135,9 @@ def _downgrade_unverified_field(path: str, field: Any) -> Any:
         "molecule.atoms",
         "molecule.bond_lengths",
         "molecule.geometry_description",
+        "molecule.formula",
+        "molecule.smiles",
+        "molecule.inchi",
         "scientific_objective",
         "requested_quantity",
         "molecule.name",
@@ -877,21 +1154,52 @@ def _ground_model_draft(
 ) -> ModelScientificDraft:
     value = draft.model_copy(deep=True)
     evidence = dict(value.explicit_evidence)
+    formula_candidate = value.molecule.formula.value
+    explicit_supported: dict[str, bool] = {}
     for path in _EXPLICIT_FIELD_PATHS:
         field = _field_at(value, path)
         if field.provenance == "explicit":
             quotation = evidence.get(path)
-            if (
-                quotation is None
-                or not _quotation_is_grounded(quotation, original_question)
-                or not _explicit_value_matches_evidence(path, field, quotation)
-            ):
-                _downgrade_unverified_field(path, field)
+            supplied_evidence_is_valid = (
+                quotation is not None
+                and _quotation_is_grounded(quotation, original_question)
+                and _explicit_value_matches_evidence(path, field, quotation)
+            )
+            direct_question_is_valid = _explicit_value_matches_evidence(
+                path, field, original_question
+            )
+            explicit_supported[path] = (
+                supplied_evidence_is_valid or direct_question_is_valid
+            )
+    for path, supported in explicit_supported.items():
+        if not supported and path != "molecule.formula":
+            field = _field_at(value, path)
+            _downgrade_unverified_field(path, field)
+
+    formula = value.molecule.formula
+    if formula_candidate is not None:
+        if (
+            formula.provenance == "explicit"
+            and explicit_supported.get("molecule.formula", False)
+        ):
+            pass
+        elif _formula_is_derived_from_grounded_name(value, formula_candidate):
+            formula.value = formula_candidate
+            formula.provenance = "derived"
+        else:
+            _downgrade_unverified_field("molecule.formula", formula)
+
     for path in _EXPLICIT_FIELD_PATHS:
         field = _field_at(value, path)
         if field.provenance == "derived":
             trusted = False
-            if path == "molecule.formula":
+            if path in {"scientific_objective", "requested_quantity"}:
+                trusted = _explicit_value_matches_evidence(
+                    path, field, original_question
+                )
+                if trusted:
+                    field.provenance = "explicit"
+            elif path == "molecule.formula":
                 trusted = _formula_is_derived_from_grounded_name(value)
             elif path == "molecule.atoms":
                 formula_is_trusted = (
@@ -918,6 +1226,19 @@ def _ground_model_draft(
                 trusted = bool(bonds) and {bond.unit for bond in bonds} == {field.value}
             if not trusted:
                 _downgrade_unverified_field(path, field)
+
+    for path in (
+        "scientific_objective",
+        "requested_quantity",
+        "molecule.name",
+        "molecule.smiles",
+        "molecule.inchi",
+        "molecule.geometry_description",
+        "molecule.bond_lengths",
+    ):
+        field = _field_at(value, path)
+        if field.provenance == "assumed":
+            _downgrade_unverified_field(path, field)
     value.assumptions = ()
     value.missing_required_information = ()
     value.warnings = ()
@@ -1009,10 +1330,19 @@ def _scientific_conflicts(draft: ModelScientificDraft) -> tuple[str, ...]:
 
 def _postprocess_draft(draft: ModelScientificDraft) -> ModelScientificDraft:
     value = draft.model_copy(deep=True)
-    if value.requested_execution_target.value is None:
-        value.requested_execution_target = ProvenancedString(
-            value="ibm_quantum", provenance="assumed"
-        )
+    for path, assumed_value in _SERVER_COMPUTATIONAL_ASSUMPTIONS.items():
+        field = _field_at(value, path)
+        if field.provenance != "explicit":
+            field.value = assumed_value
+            field.provenance = "assumed"
+    for path in ("requested_backend", "shots"):
+        field = _field_at(value, path)
+        if field.provenance != "explicit":
+            field.value = None
+            field.provenance = "missing"
+    if value.coordinate_unit.provenance not in {"explicit", "derived"}:
+        value.coordinate_unit.value = None
+        value.coordinate_unit.provenance = "missing"
     formula = value.molecule.formula.value
     formula_atoms = (
         _formula_atoms(formula)
@@ -1027,6 +1357,20 @@ def _postprocess_draft(draft: ModelScientificDraft) -> ModelScientificDraft:
             provenance="derived",
         )
         atoms = value.molecule.atoms.value
+    if value.active_space.provenance != "explicit":
+        current_compiler_structure = (
+            atoms is not None
+            and len(atoms) == 2
+            and all(atom.element in {"H", "He", "Li"} for atom in atoms)
+        )
+        value.active_space = ProvenancedString(
+            value=(
+                "2 electrons in 2 spatial orbitals"
+                if current_compiler_structure
+                else None
+            ),
+            provenance="assumed" if current_compiler_structure else "missing",
+        )
     bonds = value.molecule.bond_lengths.value
     if (
         atoms is not None
@@ -1150,16 +1494,97 @@ def _system_prompt() -> str:
     schema = json.dumps(
         ModelScientificDraft.model_json_schema(), separators=(",", ":")
     )
+    example = json.dumps(
+        {
+            "schema_version": MODEL_DRAFT_SCHEMA,
+            "scientific_objective": {
+                "value": "calculate ground-state energy",
+                "provenance": "explicit",
+            },
+            "requested_quantity": {
+                "value": "ground-state energy",
+                "provenance": "explicit",
+            },
+            "molecule": {
+                "name": {"value": "example species", "provenance": "explicit"},
+                "formula": {"value": None, "provenance": "missing"},
+                "smiles": {"value": None, "provenance": "missing"},
+                "inchi": {"value": None, "provenance": "missing"},
+                "atoms": {
+                    "value": [
+                        {"element": "C", "coordinates": [0.0, 0.0, 0.0]},
+                        {"element": "O", "coordinates": [1.2, 0.0, 0.0]},
+                    ],
+                    "provenance": "explicit",
+                },
+                "geometry_description": {
+                    "value": None,
+                    "provenance": "missing",
+                },
+                "bond_lengths": {
+                    "value": [
+                        {
+                            "atom_indices": [0, 1],
+                            "value": 1.2,
+                            "unit": "angstrom",
+                        }
+                    ],
+                    "provenance": "explicit",
+                },
+            },
+            "coordinate_unit": {"value": "angstrom", "provenance": "explicit"},
+            "charge": {"value": None, "provenance": "missing"},
+            "multiplicity": {"value": None, "provenance": "missing"},
+            "basis": {"value": None, "provenance": "missing"},
+            "electronic_structure_method": {
+                "value": None,
+                "provenance": "missing",
+            },
+            "active_space": {"value": None, "provenance": "missing"},
+            "mapper": {"value": None, "provenance": "missing"},
+            "ansatz": {"value": None, "provenance": "missing"},
+            "optimizer": {"value": None, "provenance": "missing"},
+            "tolerance": {"value": None, "provenance": "missing"},
+            "requested_execution_target": {
+                "value": "ibm_quantum",
+                "provenance": "explicit",
+            },
+            "requested_backend": {"value": None, "provenance": "missing"},
+            "shots": {"value": None, "provenance": "missing"},
+            "precision": {"value": None, "provenance": "missing"},
+            "assumptions": [],
+            "missing_required_information": [],
+            "warnings": [],
+            "explicit_evidence": {
+                "scientific_objective": "calculate ground-state energy",
+                "requested_quantity": "ground-state energy",
+                "molecule.name": "example species",
+                "molecule.atoms": "C (0, 0, 0) and O (1.2, 0, 0)",
+                "molecule.bond_lengths": "bond length 1.2 angstrom",
+                "coordinate_unit": "1.2 angstrom",
+                "requested_execution_target": "IBM Quantum",
+            },
+        },
+        separators=(",", ":"),
+    )
     return (
         "You interpret chemistry questions into a draft only. Return exactly one JSON "
         "object matching the supplied schema and no commentary. Preserve arbitrary "
-        "molecule identities. Never invent geometry. Mark each field explicit, derived, "
-        "assumed, or missing. For every explicit field, add its allowed field path to "
-        "explicit_evidence with an exact quotation from the user's question. Do not "
-        "claim atoms or coordinates are explicit unless the quotation contains them. "
-        "Proposed defaults must be assumed. IBM Quantum is the "
-        "visible assumed target only when no target is explicit. Do not emit credentials, "
-        "environment variables, file paths, code, or shell commands. Schema: "
+        "molecule identities. Extract only the scientist's statements; the model does "
+        "not own Pulsate's computational defaults. Never invent geometry, identity, "
+        "settings, or evidence. Provenance belongs on field wrapper objects only, never "
+        "inside atom or bond items. Null values always use missing provenance. For every "
+        "explicit field, use an exact allowed aggregate field path in explicit_evidence "
+        "with a literal quotation from the question. Use canonical controlled values "
+        "ibm_quantum, local_simulator, jordan_wigner, angstrom, or bohr where applicable. "
+        "Omitted scientific settings must be missing. The example demonstrates structure "
+        "only and is not a molecule whitelist or execution rule. Do not emit credentials, "
+        "environment variables, file paths, code, or shell commands. Allowed evidence "
+        "paths are: "
+        + _ALLOWED_EVIDENCE_PATHS_TEXT
+        + ". Valid example: "
+        + example
+        + " Schema: "
         + schema
     )
 
@@ -1235,29 +1660,30 @@ class NaturalLanguageInterpretationStore:
         )
         repair_attempted = False
         try:
-            raw_draft = _extract_json(content)
-            draft = ModelScientificDraft.model_validate(raw_draft)
-        except (TypeError, ValueError):
+            validated = _validate_model_content(content)
+        except (TypeError, ValueError) as first_error:
             repair_attempted = True
+            validation_report = _sanitized_validation_report(first_error)
             content = self.provider.complete(
                 [
                     {"role": "system", "content": prompt},
                     {
                         "role": "user",
-                        "content": (
-                            "Repair the following malformed draft into the exact schema. "
-                            "Return JSON only:\n" + content[:65536]
+                        "content": _repair_prompt(
+                            question=normalized,
+                            malformed_draft=content,
+                            validation_report=validation_report,
                         ),
                     },
                 ]
             )
             try:
-                raw_draft = _extract_json(content)
-                draft = ModelScientificDraft.model_validate(raw_draft)
+                validated = _validate_model_content(content)
             except (TypeError, ValueError):
                 raise NaturalLanguageInterpretationError(
                     "The language model did not return a valid scientific draft."
                 ) from None
+        draft = validated.draft
         draft = _postprocess_draft(_ground_model_draft(draft, normalized))
         missing = _missing_information(draft)
         conflicts = _scientific_conflicts(draft)
@@ -1267,7 +1693,7 @@ class NaturalLanguageInterpretationStore:
             provider_kind=self.provider.provider_kind,
             model_name=self.provider.model_name,
             prompt_sha256=sha256_fingerprint({"prompt": prompt}),
-            response_sha256=sha256_fingerprint(raw_draft),
+            response_sha256=sha256_fingerprint(validated.parsed),
             requested_at=_utc_now(),
             repair_attempted=repair_attempted,
             request_count_for_interpretation=2 if repair_attempted else 1,

@@ -158,14 +158,18 @@ for _attempt in {1..100}; do
   fi
   if PULSATE_NL_ACCEPTANCE_API_BASE_URL="$api_base_url" "$python_bin" - <<'PY'
 import os
+import urllib.error
 import urllib.request
 
-with urllib.request.urlopen(
-    os.environ["PULSATE_NL_ACCEPTANCE_API_BASE_URL"] + "/api/v1/health",
-    timeout=1,
-) as response:
-    if response.status != 200:
-        raise SystemExit(1)
+try:
+    with urllib.request.urlopen(
+        os.environ["PULSATE_NL_ACCEPTANCE_API_BASE_URL"] + "/api/v1/health",
+        timeout=1,
+    ) as response:
+        if response.status != 200:
+            raise SystemExit(1)
+except (urllib.error.URLError, TimeoutError, OSError):
+    raise SystemExit(1) from None
 PY
   then
     ready="true"

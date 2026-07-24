@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -16,13 +17,19 @@ from test_pulsate_runs import ControlledExecutor
 from cgr.pulsate_api.app import _load_preset, create_app
 from cgr.pulsate_api.experiments import ExperimentStore
 from cgr.pulsate_api.natural_language import (
+    MODEL_REQUEST_MAXIMUM_BYTES,
+    REPAIR_DRAFT_MAXIMUM_BYTES,
+    REPAIR_FEEDBACK_MAXIMUM_BYTES,
     ApprovalRequest,
     ModelScientificDraft,
     NaturalLanguageInterpretationError,
     NaturalLanguageInterpretationStore,
     OpenAICompatibleModelProvider,
+    _sanitized_validation_report,
+    _validate_model_content,
 )
 from cgr.pulsate_api.runs import RunCoordinator
+from cgr.science import sha256_fingerprint
 
 LIH_QUESTION = (
     "Calculate the ground-state energy of lithium hydride at a bond length "
@@ -124,6 +131,60 @@ def _complete_draft(
     }
 
 
+def _real_qwen_malformed_draft() -> dict[str, Any]:
+    draft = _complete_draft()
+    for atom in draft["molecule"]["atoms"]["value"]:
+        atom["provenance"] = "explicit"
+    for bond in draft["molecule"]["bond_lengths"]["value"]:
+        bond["provenance"] = "explicit"
+        bond["unit"] = "Å"
+    draft["active_space"] = _field(None)
+    draft["active_space"]["provenance"] = "assumed"
+    draft["requested_backend"] = _field(None)
+    draft["requested_backend"]["provenance"] = "assumed"
+    draft["requested_execution_target"] = _field("IBM Quantum")
+    draft["mapper"] = _field("JordanWignerMapper")
+    draft["coordinate_unit"] = _field("ångström")
+    draft["molecule"]["formula"] = _field("LiH")
+    draft["molecule"]["smiles"] = _field("[LiH]")
+    draft["molecule"]["inchi"] = _field("InChI=1S/Li.H")
+    draft["electronic_structure_method"] = _field("SCF", "assumed")
+    draft["optimizer"] = _field("BFGS", "assumed")
+    draft["shots"] = _field(1000, "assumed")
+    draft["precision"] = _field(1e-6, "assumed")
+    draft["assumptions"] = (
+        "Use SCF, BFGS, 1000 shots, and precision 1e-6.",
+    )
+    draft["explicit_evidence"].update(
+        {
+            "molecule.formula": "lithium hydride",
+            "molecule.smiles": "lithium hydride",
+            "molecule.inchi": "lithium hydride",
+            "molecule.bond_lengths.value": "1.6 angstrom",
+            "molecule.bond_lengths.unit": "angstrom",
+        }
+    )
+    return draft
+
+
+def _corrected_qwen_repair_draft() -> dict[str, Any]:
+    draft = deepcopy(_real_qwen_malformed_draft())
+    for atom in draft["molecule"]["atoms"]["value"]:
+        atom.pop("provenance")
+    for bond in draft["molecule"]["bond_lengths"]["value"]:
+        bond.pop("provenance")
+    draft["active_space"] = _field(None)
+    draft["requested_backend"] = _field(None)
+    draft["explicit_evidence"] = {
+        "scientific_objective": LIH_QUESTION,
+        "requested_quantity": "ground-state energy",
+        "molecule.smiles": "lithium hydride",
+        "molecule.inchi": "lithium hydride",
+        "coordinate_unit": "1.6 angstrom",
+    }
+    return draft
+
+
 class ControlledProvider:
     provider_kind = "controlled_test_provider"
     model_name = "controlled-scientific-model"
@@ -145,6 +206,28 @@ def _interpret(tmp_path: Path, question: str, draft: dict[str, Any]):
     store = NaturalLanguageInterpretationStore(tmp_path / "interpretations", provider)
     store.start()
     return store, provider, store.interpret(question)
+
+
+def _identity_draft(
+    question: str,
+    *,
+    field: str,
+    value: str,
+    provenance: str = "explicit",
+) -> dict[str, Any]:
+    draft = _complete_draft(
+        question=question,
+        name=None,
+        formula=None,
+        elements=("C",),
+        distance=None,
+        target=None,
+    )
+    for identity_field in ("name", "formula", "smiles", "inchi"):
+        draft["molecule"][identity_field] = _field(None)
+    draft["molecule"][field] = _field(value, provenance)
+    draft["explicit_evidence"][f"molecule.{field}"] = question
+    return draft
 
 
 @pytest.mark.parametrize(
@@ -306,9 +389,403 @@ def test_malformed_model_output_receives_only_one_repair_then_fails(tmp_path: Pa
         with pytest.raises(NaturalLanguageInterpretationError, match="valid scientific draft"):
             store.interpret("Calculate a ground-state energy.")
         assert provider.request_count == 2
-        assert "Repair the following malformed draft" in provider.messages[1][1]["content"]
+        assert "Repair the malformed scientific draft" in provider.messages[1][1]["content"]
     finally:
         store.close()
+
+
+def test_real_qwen_shape_gets_one_error_aware_repair_and_server_policy(
+    tmp_path: Path,
+) -> None:
+    provider = ControlledProvider(
+        [
+            json.dumps(_real_qwen_malformed_draft()),
+            json.dumps(_corrected_qwen_repair_draft()),
+        ]
+    )
+    store = NaturalLanguageInterpretationStore(tmp_path / "interpretations", provider)
+    store.start()
+    try:
+        response = store.interpret(LIH_QUESTION)
+        assert provider.request_count == 2
+        assert response.model_provenance.repair_attempted is True
+        repair = provider.messages[1][1]["content"]
+        assert LIH_QUESTION in repair
+        assert "molecule.atoms.value.0.provenance" in repair
+        assert "molecule.bond_lengths.value.0.provenance" in repair
+        assert "active_space" in repair
+        assert "requested_backend" in repair
+        assert "explicit_evidence" in repair
+        assert "atom items contain only element and coordinates" in repair
+        assert "bond evidence uses only molecule.bond_lengths" in repair
+        assert "a null value always has provenance missing" in repair
+        assert provider.messages[0][0]["content"] != repair
+
+        specification = response.specification
+        assert specification.molecule.name.value == "lithium hydride"
+        assert specification.molecule.name.provenance == "explicit"
+        assert specification.molecule.formula.value == "LiH"
+        assert specification.molecule.formula.provenance == "derived"
+        assert specification.molecule.smiles.provenance == "missing"
+        assert specification.molecule.inchi.provenance == "missing"
+        assert specification.molecule.bond_lengths.provenance == "explicit"
+        assert specification.coordinate_unit.value == "angstrom"
+        assert specification.basis.provenance == "explicit"
+        assert specification.requested_execution_target.value == "ibm_quantum"
+        assert specification.requested_execution_target.provenance == "explicit"
+        assert specification.mapper.value == "jordan_wigner"
+        assert specification.mapper.provenance == "assumed"
+        assert specification.charge.value == 0
+        assert specification.multiplicity.value == 1
+        assert specification.electronic_structure_method.value == "rhf"
+        assert specification.ansatz.value == "uccsd"
+        assert specification.optimizer.value == "slsqp"
+        assert specification.tolerance.value == 1e-5
+        assert specification.precision.value == 0.015
+        assert specification.requested_backend.provenance == "missing"
+        assert specification.shots.provenance == "missing"
+        assert specification.active_space.value == "2 electrons in 2 spatial orbitals"
+        assert all(
+            field.provenance == "assumed"
+            for field in (
+                specification.electronic_structure_method,
+                specification.mapper,
+                specification.optimizer,
+                specification.precision,
+                specification.active_space,
+            )
+        )
+        assert not any("SCF" in item or "BFGS" in item for item in response.assumptions)
+        assert response.interpretation_status == "ready_for_review"
+        assert response.execution_support_status == "supported"
+        assert response.model_provenance.response_sha256 == sha256_fingerprint(
+            _corrected_qwen_repair_draft()
+        )
+        assert response.model_provenance.response_sha256 != sha256_fingerprint(
+            _real_qwen_malformed_draft()
+        )
+
+        approved = store.approve(
+            response.interpretation_identifier,
+            ApprovalRequest(
+                specification=response.specification,
+                accepted_assumptions=True,
+            ),
+        )
+        assert approved.status == "ready_for_ibm_submission"
+        assert provider.request_count == 2
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("formula", "question"),
+    [
+        ("C", "Calculate the ground-state energy."),
+        ("Li", "Calculate lithium hydride."),
+        ("H", "Calculate lithium hydride."),
+        ("CO", "Compute the ground-state energy."),
+        ("LiH", "Calculate lih."),
+    ],
+)
+def test_formula_identity_rejects_substrings_incomplete_derivations_and_wrong_case(
+    tmp_path: Path,
+    formula: str,
+    question: str,
+) -> None:
+    provenance = "derived" if "lithium hydride" in question else "explicit"
+    draft = _identity_draft(
+        question,
+        field="formula",
+        value=formula,
+        provenance=provenance,
+    )
+    if "lithium hydride" in question:
+        draft["molecule"]["name"] = _field("lithium hydride")
+        draft["explicit_evidence"]["molecule.name"] = "lithium hydride"
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.formula.provenance == "missing"
+        assert response.specification.molecule.formula.value is None
+    finally:
+        store.close()
+
+
+def test_formula_identity_uses_case_sensitive_literal_tokens_and_safe_name_derivation(
+    tmp_path: Path,
+) -> None:
+    explicit_question = "Calculate the ground-state energy of LiH."
+    explicit = _identity_draft(
+        explicit_question,
+        field="formula",
+        value="LiH",
+    )
+    explicit_store, _, explicit_response = _interpret(
+        tmp_path / "explicit", explicit_question, explicit
+    )
+    derived_question = "Calculate the ground-state energy of lithium hydride."
+    derived = _identity_draft(
+        derived_question,
+        field="formula",
+        value="LiH",
+        provenance="derived",
+    )
+    derived["molecule"]["name"] = _field("lithium hydride")
+    derived["explicit_evidence"]["molecule.name"] = "lithium hydride"
+    derived_store, _, derived_response = _interpret(
+        tmp_path / "derived", derived_question, derived
+    )
+    try:
+        assert explicit_response.specification.molecule.formula.value == "LiH"
+        assert explicit_response.specification.molecule.formula.provenance == "explicit"
+        assert derived_response.specification.molecule.formula.value == "LiH"
+        assert derived_response.specification.molecule.formula.provenance == "derived"
+    finally:
+        explicit_store.close()
+        derived_store.close()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "lithium hydride",
+        "molecular hydrogen",
+        "beryllium hydride",
+        "caffeine",
+    ],
+)
+def test_molecule_names_ground_as_whole_phrases_without_a_molecule_whitelist(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    question = f"Study {name}."
+    draft = _identity_draft(question, field="name", value=name)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.name.value == name
+        assert response.specification.molecule.name.provenance == "explicit"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "energy",
+        "state",
+        "quantum",
+        "experiment",
+        "molecule",
+        "calculate",
+        "compute",
+        "determine",
+        "electronic",
+        "ground",
+        "hardware",
+        "molecular",
+        "prepare",
+        "simulator",
+        "species",
+        "study",
+        "electronic ground state",
+        "quantum hardware",
+        "molecular species",
+    ],
+)
+def test_generic_workflow_terms_cannot_become_molecule_names(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    question = f"Calculate an energy experiment and {name} the molecule."
+    draft = _identity_draft(question, field="name", value=name)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.name.value is None
+        assert response.specification.molecule.name.provenance == "missing"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "labelled_value",
+    ["SMILES: C", "SMILES=C", "SMILES is C"],
+)
+def test_smiles_requires_and_accepts_an_explicit_label(
+    tmp_path: Path,
+    labelled_value: str,
+) -> None:
+    question = f"Study a species with {labelled_value}."
+    draft = _identity_draft(question, field="smiles", value="C")
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.smiles.value == "C"
+        assert response.specification.molecule.smiles.provenance == "explicit"
+    finally:
+        store.close()
+
+
+def test_unlabelled_smiles_identity_becomes_missing(tmp_path: Path) -> None:
+    question = "Study a carbon species represented by C."
+    draft = _identity_draft(question, field="smiles", value="C")
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.smiles.value is None
+        assert response.specification.molecule.smiles.provenance == "missing"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("question", "value"),
+    [
+        ("Study methane with InChI: 1S/CH4/h1H4.", "1S/CH4/h1H4"),
+        ("Study methane; InChI is 1S/CH4/h1H4.", "1S/CH4/h1H4"),
+        ("Study methane InChI=1S/CH4/h1H4.", "InChI=1S/CH4/h1H4"),
+    ],
+)
+def test_inchi_requires_an_explicit_label_or_exact_prefixed_literal(
+    tmp_path: Path,
+    question: str,
+    value: str,
+) -> None:
+    draft = _identity_draft(question, field="inchi", value=value)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.inchi.value == value
+        assert response.specification.molecule.inchi.provenance == "explicit"
+    finally:
+        store.close()
+
+
+def test_unlabelled_inchi_identity_becomes_missing(tmp_path: Path) -> None:
+    question = "Study methane using identifier 1S/CH4/h1H4."
+    draft = _identity_draft(question, field="inchi", value="1S/CH4/h1H4")
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.inchi.value is None
+        assert response.specification.molecule.inchi.provenance == "missing"
+    finally:
+        store.close()
+
+
+def test_response_hash_uses_exact_parsed_json_before_alias_normalization(
+    tmp_path: Path,
+) -> None:
+    alias_draft = _complete_draft()
+    alias_draft["requested_execution_target"] = _field("IBM Quantum")
+    canonical_draft = deepcopy(alias_draft)
+    canonical_draft["requested_execution_target"] = _field("ibm_quantum")
+
+    alias_validated = _validate_model_content(json.dumps(alias_draft))
+    canonical_validated = _validate_model_content(json.dumps(canonical_draft))
+    assert alias_validated.parsed["requested_execution_target"]["value"] == "IBM Quantum"
+    assert alias_validated.normalized["requested_execution_target"]["value"] == (
+        "ibm_quantum"
+    )
+    assert canonical_validated.normalized == alias_validated.normalized
+
+    alias_store, _, alias_response = _interpret(
+        tmp_path / "alias", LIH_QUESTION, alias_draft
+    )
+    canonical_store, _, canonical_response = _interpret(
+        tmp_path / "canonical", LIH_QUESTION, canonical_draft
+    )
+    try:
+        alias_specification = alias_response.specification.model_dump(mode="json")
+        canonical_specification = canonical_response.specification.model_dump(mode="json")
+        alias_specification.pop("model_provenance")
+        canonical_specification.pop("model_provenance")
+        assert alias_specification == canonical_specification
+        assert alias_response.model_provenance.response_sha256 == sha256_fingerprint(
+            alias_draft
+        )
+        assert canonical_response.model_provenance.response_sha256 == sha256_fingerprint(
+            canonical_draft
+        )
+        assert (
+            alias_response.model_provenance.response_sha256
+            != canonical_response.model_provenance.response_sha256
+        )
+    finally:
+        alias_store.close()
+        canonical_store.close()
+
+
+def test_pathological_repair_draft_is_bounded_in_the_actual_encoded_request(
+    tmp_path: Path,
+) -> None:
+    question = (LIH_QUESTION + (' "\\\N{GRINNING FACE}' * 1000))[:4096]
+    malformed = '"\\\x00\N{GRINNING FACE}' * 12000
+    repaired = json.dumps(_complete_draft())
+    responses = [malformed, repaired]
+    observed_requests: list[bytes] = []
+    observed_payloads: list[dict[str, Any]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            observed_requests.append(raw)
+            observed_payloads.append(json.loads(raw))
+            content = responses[len(observed_requests) - 1]
+            response = json.dumps(
+                {"choices": [{"message": {"content": content}}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    store: NaturalLanguageInterpretationStore | None = None
+    try:
+        provider = OpenAICompatibleModelProvider(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="test-only-secret",
+            model_name="configured-model",
+            timeout_seconds=2,
+        )
+        store = NaturalLanguageInterpretationStore(
+            tmp_path / "interpretations", provider
+        )
+        store.start()
+        response = store.interpret(question)
+    finally:
+        if store is not None:
+            store.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert response.model_provenance.repair_attempted is True
+    assert provider.request_count == 2
+    assert len(observed_requests) == 2
+    repair_prompt = observed_payloads[1]["messages"][1]["content"]
+    bounded_malformed = repair_prompt.split("Malformed draft:\n", 1)[1]
+    assert len(bounded_malformed.encode("utf-8")) <= REPAIR_DRAFT_MAXIMUM_BYTES
+    assert len(malformed.encode("utf-8")) > REPAIR_DRAFT_MAXIMUM_BYTES
+    assert question in repair_prompt
+    assert '"location":"model_response"' in repair_prompt
+    assert "atom items contain only element and coordinates" in repair_prompt
+    assert len(observed_requests[1]) < MODEL_REQUEST_MAXIMUM_BYTES
+
+
+def test_repair_diagnostics_are_bounded_and_exclude_invalid_input_values() -> None:
+    malformed = _complete_draft()
+    malformed["molecule"]["atoms"]["value"][0]["provenance"] = (
+        "secret-input-value-that-must-not-appear"
+    )
+    with pytest.raises(ValidationError) as raised:
+        ModelScientificDraft.model_validate(malformed)
+    report = _sanitized_validation_report(raised.value)
+    assert len(report.encode("utf-8")) <= REPAIR_FEEDBACK_MAXIMUM_BYTES
+    assert "molecule.atoms.value.0.provenance" in report
+    assert "secret-input-value-that-must-not-appear" not in report
 
 
 def test_unknown_model_structures_and_unsafe_paths_are_rejected() -> None:
@@ -763,6 +1240,8 @@ def test_real_qwen_acceptance_uses_production_api_and_never_starts_execution() -
         assert f'"{artifact_name}"' in script
     assert "Fresh Pulsate API log tail (bounded and redacted)" in script
     assert "tail -c 16384" in script
+    assert "except (urllib.error.URLError, TimeoutError, OSError):" in script
+    assert "raise SystemExit(1) from None" in script
     assert '"ibm_job_submitted": False' not in script
     assert '"local_scientific_calculation_started": False' not in script
     assert "LiH 1.6 angstrom bond evidence was not preserved" in script
