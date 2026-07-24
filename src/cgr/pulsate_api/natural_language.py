@@ -1159,32 +1159,58 @@ def _quarantine_unsupported_explicit_geometry(
         evidence.pop(path, None)
 
 
+def _conservative_elements_from_grounded_name(
+    draft: ModelScientificDraft,
+) -> tuple[str, ...]:
+    name = draft.molecule.name.value
+    if name is None or draft.molecule.name.provenance != "explicit":
+        return ()
+    normalized_name = _canonical_scientific_text(name)
+    name_tokens = re.findall(r"[a-z]+", normalized_name)
+    named_elements: list[str] = []
+    for token in name_tokens:
+        matches = tuple(
+            element
+            for element, aliases in _CONSERVATIVE_ELEMENT_NAME_TOKENS.items()
+            if token in aliases
+        )
+        if len(matches) != 1:
+            return ()
+        named_elements.append(matches[0])
+    return tuple(named_elements)
+
+
 def _formula_is_derived_from_grounded_name(
     draft: ModelScientificDraft, formula: str | None = None
 ) -> bool:
     formula = formula if formula is not None else draft.molecule.formula.value
-    name = draft.molecule.name.value
-    if (
-        formula is None
-        or name is None
-        or draft.molecule.name.provenance != "explicit"
-    ):
+    if formula is None:
         return False
     atoms = _formula_atoms(formula)
     if atoms is None or len(atoms) < 2:
         return False
-    normalized_name = _canonical_scientific_text(name)
-    name_tokens = re.findall(r"[a-z]+", normalized_name)
-    named_elements = tuple(
-        element
-        for token in name_tokens
-        for element, aliases in _CONSERVATIVE_ELEMENT_NAME_TOKENS.items()
-        if token in aliases
-    )
+    named_elements = _conservative_elements_from_grounded_name(draft)
     return (
         len(set(atoms)) == len(atoms)
         and len(named_elements) == len(atoms)
         and named_elements == atoms
+    )
+
+
+def _derive_diatomic_formula_from_grounded_name(
+    draft: ModelScientificDraft,
+) -> str | None:
+    formula = draft.molecule.formula
+    if formula.value is not None or formula.provenance != "missing":
+        return None
+    named_elements = _conservative_elements_from_grounded_name(draft)
+    if len(named_elements) != 2 or len(set(named_elements)) != 2:
+        return None
+    candidate = "".join(named_elements)
+    return (
+        candidate
+        if _formula_is_derived_from_grounded_name(draft, candidate)
+        else None
     )
 
 
@@ -1297,6 +1323,12 @@ def _ground_model_draft(
         field = _field_at(value, path)
         if field.provenance == "assumed":
             _downgrade_unverified_field(path, field)
+    derived_formula = _derive_diatomic_formula_from_grounded_name(value)
+    if derived_formula is not None:
+        value.molecule.formula = ProvenancedString(
+            value=derived_formula,
+            provenance="derived",
+        )
     value.assumptions = ()
     value.missing_required_information = ()
     value.warnings = ()
@@ -1446,9 +1478,10 @@ def _postprocess_draft(draft: ModelScientificDraft) -> ModelScientificDraft:
             ),
             provenance="derived",
         )
-        value.coordinate_unit = ProvenancedString(
-            value=bonds[0].unit, provenance="derived"
-        )
+        if value.coordinate_unit.provenance != "explicit":
+            value.coordinate_unit = ProvenancedString(
+                value=bonds[0].unit, provenance="derived"
+            )
     elif value.coordinate_unit.provenance == "derived":
         bond_units = {bond.unit for bond in bonds or ()}
         if len(bond_units) == 1 and value.coordinate_unit.value in bond_units:

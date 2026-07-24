@@ -224,6 +224,15 @@ def _real_qwen_caffeine_draft() -> dict[str, Any]:
     return draft
 
 
+def _real_qwen_lih_name_only_draft() -> dict[str, Any]:
+    draft = _complete_draft()
+    draft["scientific_objective"] = _field("calculate ground-state energy")
+    draft["molecule"]["formula"] = _field(None)
+    draft["molecule"]["atoms"] = _field(None)
+    draft["active_space"] = _field(None)
+    return draft
+
+
 class ControlledProvider:
     provider_kind = "controlled_test_provider"
     model_name = "controlled-scientific-model"
@@ -362,7 +371,7 @@ def test_incomplete_questions_need_clarification_without_inventing_geometry(
         store.close()
 
 
-def test_diatomic_coordinates_are_deterministically_derived_and_not_invented(
+def test_diatomic_coordinates_preserve_the_explicit_coordinate_unit(
     tmp_path: Path,
 ) -> None:
     question = "LiH at a bond length of 1.6 angstrom"
@@ -380,7 +389,7 @@ def test_diatomic_coordinates_are_deterministically_derived_and_not_invented(
         assert atoms.value is not None
         assert atoms.value[0].coordinates == (-0.8, 0.0, 0.0)
         assert atoms.value[1].coordinates == (0.8, 0.0, 0.0)
-        assert response.specification.coordinate_unit.provenance == "derived"
+        assert response.specification.coordinate_unit.provenance == "explicit"
     finally:
         store.close()
 
@@ -551,6 +560,55 @@ def test_ungrounded_real_qwen_caffeine_geometry_is_quarantined_before_validation
         store.close()
 
 
+def test_real_qwen_lih_name_derives_reviewable_geometry_without_changing_raw_hash(
+    tmp_path: Path,
+) -> None:
+    draft = _real_qwen_lih_name_only_draft()
+    assert draft["molecule"]["formula"]["value"] is None
+    assert draft["molecule"]["atoms"]["value"] is None
+    store, provider, response = _interpret(tmp_path, LIH_QUESTION, draft)
+    try:
+        specification = response.specification
+        assert specification.molecule.formula.value == "LiH"
+        assert specification.molecule.formula.provenance == "derived"
+        atoms = specification.molecule.atoms
+        assert atoms.provenance == "derived"
+        assert atoms.value is not None
+        assert tuple(atom.element for atom in atoms.value) == ("Li", "H")
+        assert atoms.value[0].coordinates == (-0.8, 0.0, 0.0)
+        assert atoms.value[1].coordinates == (0.8, 0.0, 0.0)
+        assert specification.molecule.bond_lengths.provenance == "explicit"
+        assert specification.coordinate_unit.value == "angstrom"
+        assert specification.coordinate_unit.provenance == "explicit"
+        assert specification.active_space.value == (
+            "2 electrons in 2 spatial orbitals"
+        )
+        assert specification.active_space.provenance == "assumed"
+        assert response.missing_required_information == ()
+        assert response.interpretation_status == "ready_for_review"
+        assert response.execution_support_status == "supported"
+        assert response.scientist_approval_possible is True
+        assert response.model_provenance.repair_attempted is False
+        assert response.model_provenance.request_count_for_interpretation == 1
+        assert response.model_provenance.response_sha256 == sha256_fingerprint(
+            draft
+        )
+        assert provider.request_count == 1
+        with pytest.raises(ValueError, match="assumptions"):
+            store.approve(
+                response.interpretation_identifier,
+                ApprovalRequest(
+                    specification=response.specification,
+                    accepted_assumptions=False,
+                ),
+            )
+        assert not (tmp_path / "runs").exists()
+        assert not (tmp_path / "qiskit").exists()
+        assert not (tmp_path / "ibm").exists()
+    finally:
+        store.close()
+
+
 def test_grounded_invalid_geometry_uses_the_bounded_repair_path(
     tmp_path: Path,
 ) -> None:
@@ -592,19 +650,21 @@ def test_grounded_invalid_geometry_uses_the_bounded_repair_path(
 
 
 @pytest.mark.parametrize(
-    ("formula", "question"),
+    ("formula", "question", "expected_formula", "expected_provenance"),
     [
-        ("C", "Calculate the ground-state energy."),
-        ("Li", "Calculate lithium hydride."),
-        ("H", "Calculate lithium hydride."),
-        ("CO", "Compute the ground-state energy."),
-        ("LiH", "Calculate lih."),
+        ("C", "Calculate the ground-state energy.", None, "missing"),
+        ("Li", "Calculate lithium hydride.", "LiH", "derived"),
+        ("H", "Calculate lithium hydride.", "LiH", "derived"),
+        ("CO", "Compute the ground-state energy.", None, "missing"),
+        ("LiH", "Calculate lih.", None, "missing"),
     ],
 )
 def test_formula_identity_rejects_substrings_incomplete_derivations_and_wrong_case(
     tmp_path: Path,
     formula: str,
     question: str,
+    expected_formula: str | None,
+    expected_provenance: str,
 ) -> None:
     provenance = "derived" if "lithium hydride" in question else "explicit"
     draft = _identity_draft(
@@ -618,8 +678,12 @@ def test_formula_identity_rejects_substrings_incomplete_derivations_and_wrong_ca
         draft["explicit_evidence"]["molecule.name"] = "lithium hydride"
     store, _, response = _interpret(tmp_path, question, draft)
     try:
-        assert response.specification.molecule.formula.provenance == "missing"
-        assert response.specification.molecule.formula.value is None
+        assert response.specification.molecule.formula.value == expected_formula
+        assert (
+            response.specification.molecule.formula.provenance
+            == expected_provenance
+        )
+        assert response.specification.molecule.formula.value != formula
     finally:
         store.close()
 
@@ -656,6 +720,148 @@ def test_formula_identity_uses_case_sensitive_literal_tokens_and_safe_name_deriv
     finally:
         explicit_store.close()
         derived_store.close()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "caffeine",
+        "lithium",
+        "hydride",
+        "molecular hydrogen",
+        "electronic ground state",
+        "quantum hardware",
+        "arbitrary unknown molecule",
+    ],
+)
+def test_grounded_names_do_not_use_a_molecule_whitelist_for_formula_derivation(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    question = f"Study {name}."
+    draft = _identity_draft(question, field="name", value=name)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.formula.value is None
+        assert response.specification.molecule.formula.provenance == "missing"
+        assert response.specification.molecule.atoms.value is None
+        assert response.specification.molecule.atoms.provenance == "missing"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "lithium aluminum hydride",
+        "lithium aluminium hydride",
+        "lithium carbon hydride",
+        "lithium foo hydride",
+        "lithium hydride complex",
+    ],
+)
+def test_formula_derivation_rejects_partially_consumed_molecule_names(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    question = f"Study {name}."
+    draft = _identity_draft(question, field="name", value=name)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        formula = response.specification.molecule.formula
+        atoms = response.specification.molecule.atoms
+        assert formula.value is None
+        assert formula.provenance == "missing"
+        assert atoms.value is None
+        assert atoms.provenance == "missing"
+    finally:
+        store.close()
+
+
+def test_hyphenated_grounded_lithium_hydride_consumes_both_name_tokens(
+    tmp_path: Path,
+) -> None:
+    question = "Study lithium-hydride."
+    draft = _identity_draft(
+        question,
+        field="name",
+        value="lithium-hydride",
+    )
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        formula = response.specification.molecule.formula
+        atoms = response.specification.molecule.atoms
+        assert formula.value == "LiH"
+        assert formula.provenance == "derived"
+        assert atoms.value is not None
+        assert tuple(atom.element for atom in atoms.value) == ("Li", "H")
+        assert all(atom.coordinates is None for atom in atoms.value)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("formula", "name", "elements", "distance"),
+    [
+        ("LiH", "lithium hydride", ("Li", "H"), 1.6),
+        ("H2", "molecular hydrogen", ("H", "H"), 0.735),
+    ],
+)
+def test_grounded_explicit_diatomic_formulas_remain_explicit(
+    tmp_path: Path,
+    formula: str,
+    name: str,
+    elements: tuple[str, str],
+    distance: float,
+) -> None:
+    question = (
+        f"Calculate the ground-state energy of {formula} ({name}) at bond "
+        f"length {distance} angstrom on IBM Quantum."
+    )
+    draft = _complete_draft(
+        question=question,
+        name=name,
+        formula=formula,
+        formula_provenance="explicit",
+        elements=elements,
+        distance=distance,
+    )
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        assert response.specification.molecule.formula.value == formula
+        assert response.specification.molecule.formula.provenance == "explicit"
+        assert response.specification.molecule.atoms.provenance == "derived"
+        assert response.interpretation_status == "ready_for_review"
+    finally:
+        store.close()
+
+
+def test_grounded_lithium_hydride_without_a_bond_does_not_invent_coordinates(
+    tmp_path: Path,
+) -> None:
+    question = "Study lithium hydride on IBM Quantum."
+    draft = _complete_draft(
+        question=question,
+        name="lithium hydride",
+        formula=None,
+        elements=("Li", "H"),
+        distance=None,
+    )
+    draft["molecule"]["atoms"] = _field(None)
+    draft["active_space"] = _field(None)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        specification = response.specification
+        assert specification.molecule.formula.value == "LiH"
+        assert specification.molecule.formula.provenance == "derived"
+        atoms = specification.molecule.atoms
+        assert atoms.provenance == "derived"
+        assert atoms.value is not None
+        assert all(atom.coordinates is None for atom in atoms.value)
+        assert "geometry" in response.missing_required_information
+        assert response.interpretation_status == "needs_clarification"
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize(
