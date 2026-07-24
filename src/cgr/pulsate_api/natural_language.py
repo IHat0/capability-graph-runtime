@@ -679,9 +679,12 @@ class _ValidatedModelContent(NamedTuple):
     draft: ModelScientificDraft
 
 
-def _validate_model_content(content: str) -> _ValidatedModelContent:
+def _validate_model_content(
+    content: str, original_question: str
+) -> _ValidatedModelContent:
     parsed = _extract_json(content)
     normalized = _normalize_draft_aliases(parsed)
+    _quarantine_unsupported_explicit_geometry(normalized, original_question)
     return _ValidatedModelContent(
         parsed=parsed,
         normalized=normalized,
@@ -1099,6 +1102,61 @@ def _explicit_value_matches_evidence(
             return False
         return _atom_coordinates_are_supported(value, quotation)
     return False
+
+
+def _quarantine_unsupported_explicit_geometry(
+    normalized: dict[str, Any], original_question: str
+) -> None:
+    molecule = normalized.get("molecule")
+    if not isinstance(molecule, dict):
+        return
+
+    aggregates: dict[str, ProvenancedAtoms | ProvenancedBondLengths] = {}
+    aggregates_are_valid = True
+    for path, field_name, aggregate_type in (
+        ("molecule.atoms", "atoms", ProvenancedAtoms),
+        ("molecule.bond_lengths", "bond_lengths", ProvenancedBondLengths),
+    ):
+        if field_name in molecule:
+            try:
+                aggregates[path] = aggregate_type.model_validate(
+                    molecule[field_name]
+                )
+            except (TypeError, ValueError):
+                aggregates_are_valid = False
+    if not aggregates_are_valid:
+        return
+
+    evidence = normalized.get("explicit_evidence", {})
+    if not isinstance(evidence, dict) or any(
+        not isinstance(path, str)
+        or path not in _EXPLICIT_FIELD_PATHS
+        or not isinstance(quotation, str)
+        or not quotation
+        or len(quotation) > 512
+        for path, quotation in evidence.items()
+    ):
+        return
+
+    for path, aggregate in aggregates.items():
+        if aggregate.provenance != "explicit":
+            continue
+        quotation = evidence.get(path)
+        supplied_evidence_is_valid = (
+            quotation is not None
+            and _quotation_is_grounded(quotation, original_question)
+            and _explicit_value_matches_evidence(path, aggregate, quotation)
+        )
+        directly_supported = _explicit_value_matches_evidence(
+            path, aggregate, original_question
+        )
+        if supplied_evidence_is_valid or directly_supported:
+            continue
+        molecule[path.split(".", 1)[1]] = {
+            "value": None,
+            "provenance": "missing",
+        }
+        evidence.pop(path, None)
 
 
 def _formula_is_derived_from_grounded_name(
@@ -1660,7 +1718,7 @@ class NaturalLanguageInterpretationStore:
         )
         repair_attempted = False
         try:
-            validated = _validate_model_content(content)
+            validated = _validate_model_content(content, normalized)
         except (TypeError, ValueError) as first_error:
             repair_attempted = True
             validation_report = _sanitized_validation_report(first_error)
@@ -1678,7 +1736,7 @@ class NaturalLanguageInterpretationStore:
                 ]
             )
             try:
-                validated = _validate_model_content(content)
+                validated = _validate_model_content(content, normalized)
             except (TypeError, ValueError):
                 raise NaturalLanguageInterpretationError(
                     "The language model did not return a valid scientific draft."

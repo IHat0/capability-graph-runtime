@@ -43,6 +43,7 @@ BEH2_QUESTION = (
     "Prepare a ground-state experiment for linear beryllium hydride with "
     "1.33 angstrom Be-H bonds."
 )
+CAFFEINE_QUESTION = "Study caffeine on IBM Quantum."
 
 
 def _field(value: Any, provenance: str = "explicit") -> dict[str, Any]:
@@ -182,6 +183,44 @@ def _corrected_qwen_repair_draft() -> dict[str, Any]:
         "molecule.inchi": "lithium hydride",
         "coordinate_unit": "1.6 angstrom",
     }
+    return draft
+
+
+def _real_qwen_caffeine_draft() -> dict[str, Any]:
+    elements = ("C", "C", "C", "C", "N", "N", "N", "N", "O", "O", "H")
+    coordinates = tuple(
+        (float(index), float(index % 3), float(index % 2))
+        for index in range(len(elements))
+    )
+    draft = _complete_draft(
+        question=CAFFEINE_QUESTION,
+        name="caffeine",
+        formula="C8H10N4O2",
+        formula_provenance="explicit",
+        elements=elements,
+        coordinates=coordinates,
+        distance=None,
+    )
+    draft["molecule"]["smiles"] = _field("C8H10N4O2")
+    draft["molecule"]["bond_lengths"] = _field(
+        [
+            {
+                "atom_indices": [index, index + 1],
+                "value": 1.4,
+                "unit": "angstrom",
+            }
+            for index in range(11)
+        ]
+    )
+    draft["explicit_evidence"].update(
+        {
+            "molecule.formula": "Caffeine has formula C8H10N4O2",
+            "molecule.smiles": "SMILES: C8H10N4O2",
+            "molecule.atoms": "Caffeine Cartesian coordinates were supplied",
+            "molecule.bond_lengths": "Caffeine bond length 1.4 angstrom",
+            "coordinate_unit": "Coordinates use angstrom",
+        }
+    )
     return draft
 
 
@@ -478,6 +517,80 @@ def test_real_qwen_shape_gets_one_error_aware_repair_and_server_policy(
         store.close()
 
 
+def test_ungrounded_real_qwen_caffeine_geometry_is_quarantined_before_validation(
+    tmp_path: Path,
+) -> None:
+    draft = _real_qwen_caffeine_draft()
+    store, provider, response = _interpret(
+        tmp_path, CAFFEINE_QUESTION, draft
+    )
+    try:
+        specification = response.specification
+        assert specification.molecule.name.value == "caffeine"
+        assert specification.molecule.name.provenance == "explicit"
+        assert specification.requested_execution_target.value == "ibm_quantum"
+        assert specification.requested_execution_target.provenance == "explicit"
+        assert specification.molecule.atoms.value is None
+        assert specification.molecule.atoms.provenance == "missing"
+        assert specification.molecule.bond_lengths.value is None
+        assert specification.molecule.bond_lengths.provenance == "missing"
+        assert specification.molecule.smiles.value is None
+        assert specification.molecule.smiles.provenance == "missing"
+        assert specification.molecule.formula.value is None
+        assert specification.molecule.formula.provenance == "missing"
+        assert response.interpretation_status == "needs_clarification"
+        assert response.model_provenance.repair_attempted is False
+        assert response.model_provenance.request_count_for_interpretation == 1
+        assert response.model_provenance.response_sha256 == sha256_fingerprint(
+            draft
+        )
+        assert provider.request_count == 1
+        assert not (tmp_path / "experiments").exists()
+        assert not (tmp_path / "runs").exists()
+    finally:
+        store.close()
+
+
+def test_grounded_invalid_geometry_uses_the_bounded_repair_path(
+    tmp_path: Path,
+) -> None:
+    question = (
+        "Study molecular hydrogen H2 using atoms H (0, 0, 0) and "
+        "H (0.735, 0, 0) with bond length 0.735 angstrom."
+    )
+    draft = _complete_draft(
+        question=question,
+        name="molecular hydrogen",
+        formula="H2",
+        formula_provenance="explicit",
+        elements=("H", "H"),
+        coordinates=((0.0, 0.0, 0.0), (0.735, 0.0, 0.0)),
+        distance=0.735,
+        target=None,
+    )
+    draft["molecule"]["bond_lengths"]["value"][0]["atom_indices"] = [0, 2]
+    draft["explicit_evidence"]["molecule.atoms"] = (
+        "H (0, 0, 0) and H (0.735, 0, 0)"
+    )
+    provider = ControlledProvider([json.dumps(draft), json.dumps(draft)])
+    store = NaturalLanguageInterpretationStore(
+        tmp_path / "interpretations", provider
+    )
+    store.start()
+    try:
+        with pytest.raises(
+            NaturalLanguageInterpretationError,
+            match="valid scientific draft",
+        ):
+            store.interpret(question)
+        assert provider.request_count == 2
+        assert "Bond indices exceed the atom count" in (
+            provider.messages[1][1]["content"]
+        )
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize(
     ("formula", "question"),
     [
@@ -676,8 +789,12 @@ def test_response_hash_uses_exact_parsed_json_before_alias_normalization(
     canonical_draft = deepcopy(alias_draft)
     canonical_draft["requested_execution_target"] = _field("ibm_quantum")
 
-    alias_validated = _validate_model_content(json.dumps(alias_draft))
-    canonical_validated = _validate_model_content(json.dumps(canonical_draft))
+    alias_validated = _validate_model_content(
+        json.dumps(alias_draft), LIH_QUESTION
+    )
+    canonical_validated = _validate_model_content(
+        json.dumps(canonical_draft), LIH_QUESTION
+    )
     assert alias_validated.parsed["requested_execution_target"]["value"] == "IBM Quantum"
     assert alias_validated.normalized["requested_execution_target"]["value"] == (
         "ibm_quantum"
