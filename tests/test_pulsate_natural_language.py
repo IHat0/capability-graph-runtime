@@ -233,6 +233,39 @@ def _real_qwen_lih_name_only_draft() -> dict[str, Any]:
     return draft
 
 
+def _missing_identity_draft(
+    question: str,
+    *,
+    distance: float | None = None,
+    mapper: str = "jordan_wigner",
+    target: str | None = None,
+) -> dict[str, Any]:
+    draft = _complete_draft(
+        question=question,
+        name=None,
+        formula=None,
+        elements=("H", "H"),
+        distance=distance,
+        mapper=mapper,
+        target=target,
+    )
+    draft["molecule"]["atoms"] = _field(None)
+    draft["active_space"] = _field(None)
+    return draft
+
+
+def _real_qwen_h2_identity_omitted_draft() -> dict[str, Any]:
+    draft = _missing_identity_draft(
+        H2_QUESTION,
+        distance=0.735,
+        target="ibm_quantum",
+    )
+    draft["scientific_objective"] = _field(
+        "calculate electronic ground-state energy"
+    )
+    return draft
+
+
 class ControlledProvider:
     provider_kind = "controlled_test_provider"
     model_name = "controlled-scientific-model"
@@ -605,6 +638,159 @@ def test_real_qwen_lih_name_derives_reviewable_geometry_without_changing_raw_has
         assert not (tmp_path / "runs").exists()
         assert not (tmp_path / "qiskit").exists()
         assert not (tmp_path / "ibm").exists()
+    finally:
+        store.close()
+
+
+def test_real_qwen_h2_literal_formula_recovers_reviewable_structure_and_raw_hash(
+    tmp_path: Path,
+) -> None:
+    draft = _real_qwen_h2_identity_omitted_draft()
+    for field in ("name", "formula", "smiles", "inchi", "atoms"):
+        assert draft["molecule"][field]["value"] is None
+    store, provider, response = _interpret(tmp_path, H2_QUESTION, draft)
+    try:
+        specification = response.specification
+        assert specification.molecule.formula.value == "H2"
+        assert specification.molecule.formula.provenance == "explicit"
+        atoms = specification.molecule.atoms
+        assert atoms.provenance == "derived"
+        assert atoms.value is not None
+        assert tuple(atom.element for atom in atoms.value) == ("H", "H")
+        assert atoms.value[0].coordinates == (-0.3675, 0.0, 0.0)
+        assert atoms.value[1].coordinates == (0.3675, 0.0, 0.0)
+        bonds = specification.molecule.bond_lengths
+        assert bonds.provenance == "explicit"
+        assert bonds.value is not None
+        assert bonds.value[0].value == 0.735
+        assert bonds.value[0].atom_indices == (0, 1)
+        assert specification.coordinate_unit.value == "angstrom"
+        assert specification.coordinate_unit.provenance == "explicit"
+        assert specification.active_space.value == (
+            "2 electrons in 2 spatial orbitals"
+        )
+        assert specification.active_space.provenance == "assumed"
+        assert specification.mapper.value == "jordan_wigner"
+        assert specification.mapper.provenance == "explicit"
+        assert specification.requested_execution_target.value == "ibm_quantum"
+        assert specification.requested_execution_target.provenance == "explicit"
+        assert response.missing_required_information == ()
+        assert response.interpretation_status == "ready_for_review"
+        assert response.execution_support_status == "supported"
+        assert response.scientist_approval_possible is True
+        assert response.model_provenance.repair_attempted is False
+        assert response.model_provenance.request_count_for_interpretation == 1
+        assert response.model_provenance.response_sha256 == sha256_fingerprint(
+            draft
+        )
+        assert provider.request_count == 1
+        with pytest.raises(ValueError, match="assumptions"):
+            store.approve(
+                response.interpretation_identifier,
+                ApprovalRequest(
+                    specification=response.specification,
+                    accepted_assumptions=False,
+                ),
+            )
+        assert not (tmp_path / "runs").exists()
+        assert not (tmp_path / "qiskit").exists()
+        assert not (tmp_path / "ibm").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Compare H2 and LiH.",
+        "Study H2O and CO2.",
+        "Study sampleH2value.",
+        "Study He.",
+        (
+            "Calculate the electronic ground-state energy using STO-3G "
+            "on IBM Quantum."
+        ),
+        "Use HF.",
+        "Use method HF.",
+        "Run SCF.",
+        "Use the FCI algorithm.",
+        "Use CI.",
+        "Use basis def2-SVP.",
+        "Run on backend H2-1E.",
+        "Run HPC workloads.",
+        "Use CC2.",
+        "Use CC3.",
+        "Use method LiH.",
+        "Use basis H2.",
+        "Use LiH ansatz.",
+    ],
+)
+def test_literal_formula_recovery_fails_closed_on_ambiguity_and_non_formulas(
+    tmp_path: Path,
+    question: str,
+) -> None:
+    draft = _missing_identity_draft(question)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        formula = response.specification.molecule.formula
+        atoms = response.specification.molecule.atoms
+        assert formula.value is None
+        assert formula.provenance == "missing"
+        assert atoms.value is None
+        assert atoms.provenance == "missing"
+    finally:
+        store.close()
+
+
+def test_unique_general_literal_formula_is_recovered_without_execution_support(
+    tmp_path: Path,
+) -> None:
+    question = "Study CO2."
+    draft = _missing_identity_draft(question)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        formula = response.specification.molecule.formula
+        atoms = response.specification.molecule.atoms
+        assert formula.value == "CO2"
+        assert formula.provenance == "explicit"
+        assert atoms.value is not None
+        assert atoms.provenance == "derived"
+        assert tuple(atom.element for atom in atoms.value) == ("C", "O", "O")
+        assert all(atom.coordinates is None for atom in atoms.value)
+        assert response.interpretation_status == "needs_clarification"
+        assert response.execution_support_status == "needs_clarification"
+        assert not (tmp_path / "runs").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "question"),
+    [
+        ("name", "caffeine", "Study caffeine with H2."),
+        ("smiles", "C", "Study SMILES: C with H2."),
+        (
+            "inchi",
+            "InChI=1S/CH4/h1H4",
+            "Study InChI=1S/CH4/h1H4 with H2.",
+        ),
+    ],
+)
+def test_literal_formula_recovery_never_overwrites_surviving_identity(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    question: str,
+) -> None:
+    draft = _identity_draft(question, field=field, value=value)
+    store, _, response = _interpret(tmp_path, question, draft)
+    try:
+        identity = getattr(response.specification.molecule, field)
+        assert identity.value == value
+        assert identity.provenance == "explicit"
+        assert response.specification.molecule.formula.value is None
+        assert response.specification.molecule.formula.provenance == "missing"
+        assert response.specification.molecule.atoms.value is None
     finally:
         store.close()
 

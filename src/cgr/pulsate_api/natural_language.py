@@ -13,6 +13,7 @@ import urllib.request
 import uuid
 from copy import deepcopy
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol, Self
 from urllib.parse import urlsplit
@@ -47,6 +48,13 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     r"\b(?:api[_-]?key|token|password|credential)\b\s*[:=]", re.IGNORECASE
 )
 _FORMULA_TOKEN = re.compile(r"([A-Z][a-z]?)([0-9]*)")
+_ALPHANUMERIC_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])(?P<token>[A-Za-z0-9]+)(?![A-Za-z0-9])"
+)
+_NON_MOLECULAR_FORMULA_LABEL = (
+    r"(?:electronic(?:[\s-]+)structure[\s-]+method|basis(?:[\s-]+set)?|"
+    r"method|mapper|ansatz|optimizer|algorithm|backend|device|processor|model)"
+)
 _NUMBER_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 _NUMBER_TOKEN = re.compile(rf"(?<![A-Za-z0-9.]){_NUMBER_PATTERN}")
 _SUPPORTED_ELEMENT_SYMBOLS = frozenset(
@@ -787,16 +795,26 @@ def _repair_prompt(
     )
 
 
-def _formula_atoms(formula: str) -> tuple[str, ...] | None:
+def _formula_segments(formula: str) -> tuple[tuple[str, int], ...] | None:
     tokens = list(_FORMULA_TOKEN.finditer(formula))
     if not tokens or "".join(token.group(0) for token in tokens) != formula:
         return None
-    atoms: list[str] = []
+    segments: list[tuple[str, int]] = []
     for token in tokens:
         element = token.group(1)
         count = int(token.group(2) or "1")
         if element not in _SUPPORTED_ELEMENT_SYMBOLS or count <= 0 or count > 512:
             return None
+        segments.append((element, count))
+    return tuple(segments)
+
+
+def _formula_atoms(formula: str) -> tuple[str, ...] | None:
+    segments = _formula_segments(formula)
+    if segments is None:
+        return None
+    atoms: list[str] = []
+    for element, count in segments:
         atoms.extend([element] * count)
     return tuple(atoms) if atoms else None
 
@@ -1214,6 +1232,68 @@ def _derive_diatomic_formula_from_grounded_name(
     )
 
 
+def _recover_unique_literal_formula(
+    draft: ModelScientificDraft, original_question: str
+) -> str | None:
+    molecule = draft.molecule
+    if any(
+        field.value is not None
+        for field in (
+            molecule.name,
+            molecule.formula,
+            molecule.smiles,
+            molecule.inchi,
+            molecule.atoms,
+        )
+    ):
+        return None
+    normalized_question = unicodedata.normalize("NFKC", original_question)
+    candidates: set[str] = set()
+    for match in _ALPHANUMERIC_TOKEN.finditer(normalized_question):
+        token = match.group("token")
+        atoms = _formula_atoms(token)
+        segments = _formula_segments(token)
+        if (
+            atoms is not None
+            and segments is not None
+            and len(atoms) >= 2
+            and (
+                any(character.isdigit() for character in token)
+                or any(len(element) == 2 for element, _ in segments)
+            )
+            and not any(
+                first[0] == second[0]
+                for first, second in pairwise(segments)
+            )
+            and not _literal_formula_has_non_molecular_label(
+                normalized_question, match.start(), match.end()
+            )
+            and _literal_formula_token_is_grounded(token, original_question)
+        ):
+            candidates.add(token)
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _literal_formula_has_non_molecular_label(
+    question: str, start: int, end: int
+) -> bool:
+    prefix = question[max(0, start - 96) : start]
+    suffix = question[end : end + 96]
+    return (
+        re.search(
+            rf"(?i)\b{_NON_MOLECULAR_FORMULA_LABEL}\b"
+            r"(?:\s*(?::|=|is))?\s*$",
+            prefix,
+        )
+        is not None
+        or re.match(
+            rf"(?i)^\s*{_NON_MOLECULAR_FORMULA_LABEL}\b",
+            suffix,
+        )
+        is not None
+    )
+
+
 def _downgrade_unverified_field(path: str, field: Any) -> Any:
     if path in {
         "molecule.atoms",
@@ -1328,6 +1408,12 @@ def _ground_model_draft(
         value.molecule.formula = ProvenancedString(
             value=derived_formula,
             provenance="derived",
+        )
+    recovered_formula = _recover_unique_literal_formula(value, original_question)
+    if recovered_formula is not None:
+        value.molecule.formula = ProvenancedString(
+            value=recovered_formula,
+            provenance="explicit",
         )
     value.assumptions = ()
     value.missing_required_information = ()
