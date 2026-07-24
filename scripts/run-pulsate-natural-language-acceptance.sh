@@ -401,7 +401,7 @@ beh2_identity = {
     str(field(beh2_spec, "molecule.name") or "").casefold(),
     str(field(beh2_spec, "molecule.formula") or "").casefold(),
 }
-if not ({"beryllium hydride", "beh2"} & beh2_identity):
+if not ({"beryllium hydride", "linear beryllium hydride", "beh2"} & beh2_identity):
     raise RuntimeError("BeH2 molecular identity was not preserved.")
 beh2_atoms = field(beh2_spec, "molecule.atoms")
 beh2_geometry_missing = "geometry" in beh2.get("missing_required_information", [])
