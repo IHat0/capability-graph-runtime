@@ -17,6 +17,11 @@ from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
 from cgr.quantum_preflight.manifests import load_manifest
 
+from .approved_experiments import (
+    ApprovedExperimentExecutionResolver,
+    ApprovedExperimentNotFoundError,
+    ApprovedExperimentValidationError,
+)
 from .experiments import (
     ExperimentNotFoundError,
     ExperimentStore,
@@ -158,12 +163,26 @@ class CreateRunRequest(BaseModel):
 
     preset_identifier: str | None = None
     experiment_identifier: str | None = None
+    approved_experiment_identifier: str | None = None
     execution_target: Literal["local_simulator", "ibm_quantum"]
 
     @model_validator(mode="after")
     def validate_source(self) -> CreateRunRequest:
-        if (self.preset_identifier is None) == (self.experiment_identifier is None):
-            raise ValueError("Exactly one experiment_identifier or preset_identifier is required.")
+        if (
+            sum(
+                source is not None
+                for source in (
+                    self.preset_identifier,
+                    self.experiment_identifier,
+                    self.approved_experiment_identifier,
+                )
+            )
+            != 1
+        ):
+            raise ValueError(
+                "Exactly one approved_experiment_identifier, "
+                "experiment_identifier, or preset_identifier is required."
+            )
         return self
 
 
@@ -269,6 +288,10 @@ def create_app(
         )
         natural_language_store = NaturalLanguageInterpretationStore.from_environment(
             interpretation_root
+        )
+    if run_coordinator.approved_experiment_resolver is None:
+        run_coordinator.approved_experiment_resolver = (
+            ApprovedExperimentExecutionResolver(natural_language_store)
         )
 
     @asynccontextmanager
@@ -390,6 +413,9 @@ def create_app(
                 request.execution_target,
                 idempotency_key,
                 experiment_identifier=request.experiment_identifier,
+                approved_experiment_identifier=(
+                    request.approved_experiment_identifier
+                ),
             )
             return state
         except HTTPException as exc:
@@ -397,11 +423,30 @@ def create_app(
                 raise _typed_error(404, "preset_not_found", "Experiment preset not found.") from None
             raise
         except RunNotFoundError:
-            code = "experiment_not_found" if request.experiment_identifier else "preset_not_found"
-            message = "Experiment not found." if request.experiment_identifier else "Experiment preset not found."
+            if request.approved_experiment_identifier:
+                code = "approved_experiment_not_found"
+                message = "Approved experiment not found."
+            elif request.experiment_identifier:
+                code = "experiment_not_found"
+                message = "Experiment not found."
+            else:
+                code = "preset_not_found"
+                message = "Experiment preset not found."
             raise _typed_error(404, code, message) from None
         except ExperimentNotFoundError:
             raise _typed_error(404, "experiment_not_found", "Experiment not found.") from None
+        except ApprovedExperimentNotFoundError:
+            raise _typed_error(
+                404,
+                "approved_experiment_not_found",
+                "Approved experiment not found.",
+            ) from None
+        except ApprovedExperimentValidationError as exc:
+            raise _typed_error(
+                422,
+                "approved_experiment_not_executable",
+                str(exc),
+            ) from None
         except InvalidIdempotencyKeyError as exc:
             raise _typed_error(400, "invalid_idempotency_key", str(exc)) from None
         except IdempotencyConflictError as exc:

@@ -9,9 +9,10 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,13 +24,13 @@ from .runs import (
     ExecutionOutput,
     ExistingQuantumPreflightExecutor,
     PresetRunExecutor,
-    _BoundedLogCollector,
+    RecoverableIBMJobError,
+    RunSourceType,
+    TerminalIBMJobError,
     _bind_public_source_identity,
+    _BoundedLogCollector,
     _controlled_json,
     assert_public_response_safe,
-    RecoverableIBMJobError,
-    TerminalIBMJobError,
-    utc_now,
     validate_execution_output,
 )
 
@@ -711,11 +712,14 @@ class IBMQuantumRunExecutor:
         run_directory: Path,
         maximum_seconds: int,
         status_callback: Callable[[str, dict[str, Any] | None], None],
-        source_type: Literal["preset", "dynamic_experiment"] = "preset",
+        source_type: RunSourceType = "preset",
         source_identifier: str | None = None,
         source_preset_identifier: str | None = None,
         expected_structure_sha256: str | None = None,
         run_identifier: str | None = None,
+        requested_precision: float | None = None,
+        requested_backend: str | None = None,
+        approved_experiment: dict[str, Any] | None = None,
     ) -> ExecutionOutput:
         capability = self.capability()
         reason = capability.get("reason") if capability.get("available") is not True else None
@@ -733,7 +737,7 @@ class IBMQuantumRunExecutor:
         effective_source_identifier = source_identifier or preset_identifier
         effective_preset_identifier = (
             source_preset_identifier
-            if source_type == "dynamic_experiment"
+            if source_type != "preset"
             else (source_preset_identifier or preset_identifier)
         )
         effective_run_identifier = run_identifier or run_directory.name
@@ -766,6 +770,7 @@ class IBMQuantumRunExecutor:
                 preset_identifier=effective_preset_identifier,
                 run_identifier=effective_run_identifier,
                 expected_structure_sha256=expected_structure_sha256,
+                approved_experiment=approved_experiment,
             )
         else:
             local = self.local_executor.execute(
@@ -779,6 +784,7 @@ class IBMQuantumRunExecutor:
                 source_type=source_type,
                 source_identifier=effective_source_identifier,
                 preset_identifier=effective_preset_identifier,
+                approved_experiment=approved_experiment,
             )
             local = self._validate_local_preflight(
                 local,
@@ -788,6 +794,7 @@ class IBMQuantumRunExecutor:
                 preset_identifier=effective_preset_identifier,
                 run_identifier=effective_run_identifier,
                 expected_structure_sha256=expected_structure_sha256,
+                approved_experiment=approved_experiment,
             )
             local_payload = {
                 "results": local.results,
@@ -807,7 +814,18 @@ class IBMQuantumRunExecutor:
             return self._blocked_preflight(local)
 
         self._validate_preflight_image_identities(local)
-        bundle = self._bundle(manifest, local)
+        if (
+            requested_backend is not None
+            and requested_backend != self.configuration.backend_name
+        ):
+            raise ValueError(
+                "Approved IBM backend does not match the configured backend."
+            )
+        bundle = self._bundle(
+            manifest,
+            local,
+            requested_precision=requested_precision,
+        )
         self._enforce_submission_policy(bundle)
         write_json_atomic(
             ibm_directory / "submission.json",
@@ -844,11 +862,12 @@ class IBMQuantumRunExecutor:
         local: ExecutionOutput,
         *,
         manifest: ManifestEnvelope,
-        source_type: Literal["preset", "dynamic_experiment"],
+        source_type: RunSourceType,
         source_identifier: str,
         preset_identifier: str | None,
         run_identifier: str,
         expected_structure_sha256: str | None,
+        approved_experiment: dict[str, Any] | None,
     ) -> ExecutionOutput:
         validated = validate_execution_output(
             local,
@@ -858,6 +877,7 @@ class IBMQuantumRunExecutor:
             preset_identifier=preset_identifier,
             run_identifier=run_identifier,
             expected_structure_sha256=expected_structure_sha256,
+            approved_experiment=approved_experiment,
         )
         if validated.receipt.get("authorized") is True:
             preflight = validated.runner_summary.get("ibm_preflight")
@@ -914,7 +934,13 @@ class IBMQuantumRunExecutor:
         ):
             raise ValueError("Trusted preflight image identities are invalid.")
 
-    def _bundle(self, manifest: ManifestEnvelope, local: ExecutionOutput) -> IBMSubmissionBundle:
+    def _bundle(
+        self,
+        manifest: ManifestEnvelope,
+        local: ExecutionOutput,
+        *,
+        requested_precision: float | None = None,
+    ) -> IBMSubmissionBundle:
         preflight = local.runner_summary.get("ibm_preflight")
         if not isinstance(preflight, dict):
             raise ValueError("Trusted local preflight did not provide IBM submission evidence.")
@@ -935,12 +961,23 @@ class IBMQuantumRunExecutor:
             raise ValueError(
                 "Trusted local preflight did not provide canonical circuit and observable identities."
             )
+        target_precision = (
+            self.configuration.target_precision
+            if requested_precision is None
+            else requested_precision
+        )
+        if (
+            not isinstance(target_precision, (int, float))
+            or not math.isfinite(float(target_precision))
+            or not 0 < float(target_precision) <= 1
+        ):
+            raise ValueError("Requested IBM precision is invalid.")
         bundle_identifier = "ibm-submission-" + sha256_fingerprint(
             {
                 "experiment_sha256": manifest.experiment.fingerprint,
                 "local_receipt_sha256": local.receipt["receipt_sha256"],
                 "backend_name": self.configuration.backend_name,
-                "target_precision": self.configuration.target_precision,
+                "target_precision": float(target_precision),
                 "optimization_level": self.configuration.optimization_level,
             }
         )[:32]
@@ -961,7 +998,7 @@ class IBMQuantumRunExecutor:
             required_qubits=int(preflight.get("number_of_qubits")),
             circuit_depth=int(preflight.get("circuit_depth")),
             backend_name=str(self.configuration.backend_name),
-            target_precision=self.configuration.target_precision,
+            target_precision=float(target_precision),
             optimization_level=self.configuration.optimization_level,
             seed_transpiler=self.configuration.seed_transpiler,
             maximum_execution_time_seconds=self.configuration.maximum_seconds,
@@ -1074,6 +1111,9 @@ class IBMQuantumRunExecutor:
         )
         evidence = {
             "submission_status": "completed",
+            "prepared_submission_identifier": bundle.bundle_identifier,
+            "prepared_submission_sha256": bundle.bundle_sha256,
+            "job_correlation_identifier": bundle.job_correlation_identifier,
             "hardware_role": HARDWARE_ROLE,
             "job_identifier": result.job_identifier,
             "backend_name": result.backend_name,

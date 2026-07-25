@@ -13,29 +13,33 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from cgr.quantum_preflight.artifacts import artifact_reference, write_json_atomic
-from cgr.quantum_preflight.contracts import ManifestEnvelope
-from cgr.quantum_preflight.errors import QuantumTimeoutError
-from cgr.quantum_preflight.identities import ScientificResultArtifact
-from cgr.quantum_preflight.receipt import QuantumPreflightReceipt, verify_receipt_identities
-from cgr.quantum_preflight.operators import encode_float
-from cgr.quantum_preflight.verification import blocking_findings
-from cgr.quantum_preflight.warnings import CompatibilityWarningEvidence
-from cgr.science import sha256_fingerprint
 from cgr.pulsate_api.quantum_worker import (
     WORKER_EXIT_CODES,
     WORKER_MANIFEST_MAXIMUM_BYTES,
     WORKER_RESULT_MAXIMUM_BYTES,
     WorkerResultEnvelope,
 )
+from cgr.quantum_preflight.artifacts import artifact_reference, write_json_atomic
+from cgr.quantum_preflight.contracts import ManifestEnvelope
+from cgr.quantum_preflight.errors import QuantumTimeoutError
+from cgr.quantum_preflight.identities import ScientificResultArtifact
+from cgr.quantum_preflight.operators import encode_float
+from cgr.quantum_preflight.receipt import (
+    QuantumPreflightReceipt,
+    verify_receipt_identities,
+)
+from cgr.quantum_preflight.verification import blocking_findings
+from cgr.quantum_preflight.warnings import CompatibilityWarningEvidence
+from cgr.science import sha256_fingerprint
 
 RunStatus = Literal[
     "queued", "validating", "running_quantum_workflow",
@@ -43,6 +47,7 @@ RunStatus = Literal[
     "running_on_ibm", "verifying_ibm_result",
     "authorized", "rejected", "failed", "interrupted",
 ]
+RunSourceType = Literal["preset", "dynamic_experiment", "approved_experiment"]
 TERMINAL_STATUSES = frozenset({"authorized", "rejected", "failed", "interrupted"})
 ACTIVE_STATUSES = frozenset({
     "queued", "validating", "running_quantum_workflow", "running_local_preflight",
@@ -267,15 +272,36 @@ class PublicArtifactIdentity(BaseModel):
     content_sha256: str
 
 
+class ApprovedExecutionProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    interpretation_identifier: str
+    approved_experiment_identifier: str
+    approved_scientific_objective: str
+    approved_requested_quantity: str
+    approved_specification_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    compiled_execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    compiled_objective: Literal["molecular_ground_state_energy"]
+    molecule_structure_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mapper: str
+    ansatz: str
+    optimizer: str
+    optimizer_tolerance: float = Field(gt=0)
+    execution_target: Literal["ibm_quantum"]
+    requested_precision: float = Field(gt=0, le=1)
+    requested_backend: str | None = None
+
+
 class PublicRunSourceIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source_type: Literal["preset", "dynamic_experiment"] = "preset"
+    source_type: RunSourceType = "preset"
     source_identifier: str | None = None
     preset_identifier: str | None
+    approved_experiment: ApprovedExecutionProvenance | None = None
 
     @model_validator(mode="after")
-    def validate_source_identity(self) -> "PublicRunSourceIdentity":
+    def validate_source_identity(self) -> PublicRunSourceIdentity:
         experiment_identifier = getattr(self, "experiment_identifier", None)
         if self.source_type == "preset":
             if not self.preset_identifier:
@@ -284,11 +310,28 @@ class PublicRunSourceIdentity(BaseModel):
                 self.source_identifier = self.preset_identifier
             if self.source_identifier != self.preset_identifier:
                 raise ValueError("Preset source identity is mismatched.")
-        else:
+            if self.approved_experiment is not None:
+                raise ValueError("Preset source must not publish approved-experiment provenance.")
+        elif self.source_type == "dynamic_experiment":
             if self.preset_identifier is not None:
                 raise ValueError("Dynamic experiment source must not publish a preset identifier.")
             if not self.source_identifier or self.source_identifier != experiment_identifier:
                 raise ValueError("Dynamic experiment source identity is mismatched.")
+            if self.approved_experiment is not None:
+                raise ValueError(
+                    "Dynamic experiment source must not publish approval provenance."
+                )
+        else:
+            if self.preset_identifier is not None:
+                raise ValueError("Approved experiment source must not publish a preset identifier.")
+            if not self.source_identifier or self.source_identifier != experiment_identifier:
+                raise ValueError("Approved experiment source identity is mismatched.")
+            if (
+                self.approved_experiment is None
+                or self.approved_experiment.approved_experiment_identifier
+                != self.source_identifier
+            ):
+                raise ValueError("Approved experiment provenance is mismatched.")
         return self
 
 
@@ -371,9 +414,10 @@ class ExecutionOutput:
 def _bind_public_source_identity(
     output: ExecutionOutput,
     *,
-    source_type: Literal["preset", "dynamic_experiment"],
+    source_type: RunSourceType,
     source_identifier: str,
     preset_identifier: str | None,
+    approved_experiment: dict[str, Any] | None = None,
 ) -> ExecutionOutput:
     """Bind server-owned source identity without changing scientific evidence."""
     projections: list[dict[str, Any]] = []
@@ -386,6 +430,8 @@ def _bind_public_source_identity(
                 "preset_identifier": preset_identifier,
             }
         )
+        if approved_experiment is not None:
+            bound["approved_experiment"] = approved_experiment
         projections.append(bound)
     summary = dict(output.runner_summary)
     summary.update(
@@ -395,6 +441,8 @@ def _bind_public_source_identity(
             "preset_identifier": preset_identifier,
         }
     )
+    if approved_experiment is not None:
+        summary["approved_experiment"] = approved_experiment
     return ExecutionOutput(*projections, summary)
 
 
@@ -420,11 +468,14 @@ class IBMRunExecutor(Protocol):
         run_directory: Path,
         maximum_seconds: int,
         status_callback: Callable[[str, dict[str, Any] | None], None],
-        source_type: Literal["preset", "dynamic_experiment"],
+        source_type: RunSourceType,
         source_identifier: str,
         source_preset_identifier: str | None,
         expected_structure_sha256: str | None,
         run_identifier: str,
+        requested_precision: float | None,
+        requested_backend: str | None,
+        approved_experiment: dict[str, Any] | None,
     ) -> ExecutionOutput: ...
 
 
@@ -1271,6 +1322,7 @@ class RunCoordinator:
         executor: PresetRunExecutor,
         enabled: bool,
         experiment_resolver: Callable[[str], tuple[Any, ...]] | None = None,
+        approved_experiment_resolver: Callable[[str], Any] | None = None,
         ibm_executor: IBMRunExecutor | None = None,
         unavailable_reason: str | None = None,
         max_workers: int = 1,
@@ -1281,6 +1333,7 @@ class RunCoordinator:
         self.run_root = self.configured_run_root
         self.manifest_resolver = manifest_resolver
         self.experiment_resolver = experiment_resolver
+        self.approved_experiment_resolver = approved_experiment_resolver
         self.executor = executor
         self.ibm_executor = ibm_executor
         self.configured_enabled = enabled
@@ -1296,7 +1349,15 @@ class RunCoordinator:
         self._idempotency: dict[str, tuple[dict[str, str], str]] = {}
         self._root_lock: _RunRootLock | None = None
         self._recoverable_ibm_runs: list[
-            tuple[str, str, str, str | None, ManifestEnvelope, str | None]
+            tuple[
+                str,
+                RunSourceType,
+                str,
+                str | None,
+                ManifestEnvelope,
+                str | None,
+                dict[str, Any] | None,
+            ]
         ] = []
         self._started = False
         self._accepting = False
@@ -1428,15 +1489,47 @@ class RunCoordinator:
         idempotency_key: str | None,
         *,
         experiment_identifier: str | None = None,
+        approved_experiment_identifier: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         if execution_target not in {"local_simulator", "ibm_quantum"}:
             raise ValueError("unsupported_execution_target")
         if idempotency_key is not None and not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise InvalidIdempotencyKeyError("Invalid Idempotency-Key header.")
-        if (preset_identifier is None) == (experiment_identifier is None):
+        if (
+            sum(
+                source is not None
+                for source in (
+                    preset_identifier,
+                    experiment_identifier,
+                    approved_experiment_identifier,
+                )
+            )
+            != 1
+        ):
             raise ValueError("exactly_one_experiment_source_required")
         molecule: dict[str, Any] | None = None
-        if experiment_identifier is not None:
+        approved_provenance: dict[str, Any] | None = None
+        if approved_experiment_identifier is not None:
+            if self.approved_experiment_resolver is None:
+                raise RunNotFoundError("Approved experiment not found.")
+            resolved = self.approved_experiment_resolver(
+                approved_experiment_identifier
+            )
+            manifest = resolved.manifest
+            molecule = resolved.molecule
+            requested_target = resolved.execution_target
+            approved_provenance = ApprovedExecutionProvenance.model_validate(
+                resolved.provenance
+            ).model_dump(mode="json")
+            if execution_target != requested_target:
+                raise ValueError("execution_target_mismatch")
+            source_type: RunSourceType = "approved_experiment"
+            source_identifier = approved_experiment_identifier
+            request = {
+                "approved_experiment_identifier": approved_experiment_identifier,
+                "execution_target": execution_target,
+            }
+        elif experiment_identifier is not None:
             if self.experiment_resolver is None:
                 raise RunNotFoundError("Experiment not found.")
             resolved = self.experiment_resolver(experiment_identifier)
@@ -1449,7 +1542,7 @@ class RunCoordinator:
                 raise ValueError("Experiment resolver returned an invalid result.")
             if execution_target != requested_target:
                 raise ValueError("execution_target_mismatch")
-            source_type: Literal["preset", "dynamic_experiment"] = "dynamic_experiment"
+            source_type = "dynamic_experiment"
             source_identifier = experiment_identifier
             request = {
                 "experiment_identifier": experiment_identifier,
@@ -1487,6 +1580,7 @@ class RunCoordinator:
                 source_identifier=source_identifier,
                 preset_identifier=preset_identifier,
                 molecule=molecule,
+                approved_experiment=approved_provenance,
             )
             request_document = {**request, "idempotency_key": idempotency_key, "created_at": now}
             state = {
@@ -1496,7 +1590,7 @@ class RunCoordinator:
                 "status_url": f"/api/v1/runs/{run_identifier}",
             }
             _write_json_atomic(directory / "request.json", request_document)
-            if experiment_identifier is not None:
+            if source_type != "preset":
                 write_json_atomic(
                     directory / "compiled-manifest.json",
                     manifest.model_dump(mode="json"),
@@ -1513,6 +1607,7 @@ class RunCoordinator:
                 preset_identifier,
                 manifest,
                 molecule.get("structure_hash") if molecule is not None else None,
+                approved_provenance,
                 execution_target,
             )
             self._futures[future] = run_identifier
@@ -1543,10 +1638,17 @@ class RunCoordinator:
         value = models[name].model_validate(
             _controlled_run_json(directory, f"{name}.json")
         ).model_dump(mode="json")
+        if value.get("approved_experiment") is None:
+            value.pop("approved_experiment", None)
         if value["run_identifier"] != run_identifier:
             raise ValueError("Persisted public projection has a mismatched run identifier.")
-        for field in ("source_type", "source_identifier", "preset_identifier"):
-            if value[field] != state[field]:
+        for field in (
+            "source_type",
+            "source_identifier",
+            "preset_identifier",
+            "approved_experiment",
+        ):
+            if value.get(field) != state.get(field):
                 raise ValueError(f"Persisted public projection has a mismatched {field}.")
         assert_public_response_safe(value)
         return value
@@ -1554,17 +1656,24 @@ class RunCoordinator:
     def _execute(
         self,
         run_identifier: str,
-        source_type: Literal["preset", "dynamic_experiment"],
+        source_type: RunSourceType,
         source_identifier: str,
         preset_identifier: str | None,
         manifest: ManifestEnvelope,
         expected_structure_sha256: str | None,
+        approved_experiment: dict[str, Any] | None,
         execution_target: Literal["local_simulator", "ibm_quantum"],
     ) -> None:
         try:
             self._transition(run_identifier, "validating")
             if manifest.experiment.fingerprint != manifest.expected_experiment_sha256:
                 raise ValueError("Manifest experiment fingerprint does not match its expected identity.")
+            self._validate_approved_execution_binding(
+                manifest=manifest,
+                approved_experiment=approved_experiment,
+                expected_structure_sha256=expected_structure_sha256,
+                execution_target=execution_target,
+            )
             self._transition(
                 run_identifier,
                 "running_local_preflight" if execution_target == "ibm_quantum" else "running_quantum_workflow",
@@ -1594,6 +1703,17 @@ class RunCoordinator:
                     source_preset_identifier=preset_identifier,
                     expected_structure_sha256=expected_structure_sha256,
                     run_identifier=run_identifier,
+                    requested_precision=(
+                        approved_experiment.get("requested_precision")
+                        if approved_experiment is not None
+                        else None
+                    ),
+                    requested_backend=(
+                        approved_experiment.get("requested_backend")
+                        if approved_experiment is not None
+                        else None
+                    ),
+                    approved_experiment=approved_experiment,
                 )
             else:
                 output = self.executor.execute(
@@ -1607,6 +1727,7 @@ class RunCoordinator:
                 source_type=source_type,
                 source_identifier=source_identifier,
                 preset_identifier=preset_identifier,
+                approved_experiment=approved_experiment,
             )
             output = validate_execution_output(
                 output,
@@ -1616,6 +1737,7 @@ class RunCoordinator:
                 preset_identifier=preset_identifier,
                 run_identifier=run_identifier,
                 expected_structure_sha256=expected_structure_sha256,
+                approved_experiment=approved_experiment,
             )
             directory = self._directory(run_identifier)
             _write_json_atomic(directory / "runner-summary.json", output.runner_summary)
@@ -1667,6 +1789,48 @@ class RunCoordinator:
             _write_json_atomic(self._directory(run_identifier) / "error.json", error)
             self._transition(run_identifier, "failed", {"error": {"code": error["code"], "message": message}})
 
+    @staticmethod
+    def _validate_approved_execution_binding(
+        *,
+        manifest: ManifestEnvelope,
+        approved_experiment: dict[str, Any] | None,
+        expected_structure_sha256: str | None,
+        execution_target: str,
+    ) -> None:
+        if approved_experiment is None:
+            return
+        provenance = ApprovedExecutionProvenance.model_validate(
+            approved_experiment
+        )
+        execution_parameters = (
+            manifest.experiment.parent_experiment.execution_policy.parameters
+        )
+        if (
+            provenance.approved_experiment_identifier
+            != manifest.experiment.experiment_identifier
+            or provenance.compiled_execution_manifest_sha256
+            != sha256_fingerprint(manifest.model_dump(mode="json"))
+            or provenance.molecule_structure_sha256
+            != expected_structure_sha256
+            or provenance.execution_target != execution_target
+            or provenance.mapper != manifest.experiment.quantum_model.mapper
+            or provenance.ansatz != manifest.experiment.quantum_model.ansatz
+            or provenance.optimizer != manifest.experiment.quantum_model.optimizer
+            or provenance.optimizer_tolerance
+            != manifest.experiment.quantum_model.convergence_threshold
+            or execution_parameters.get("approved_scientific_objective")
+            != provenance.approved_scientific_objective
+            or execution_parameters.get("approved_requested_quantity")
+            != provenance.approved_requested_quantity
+            or execution_parameters.get("compiled_objective")
+            != provenance.compiled_objective
+            or execution_parameters.get("approved_specification_sha256")
+            != provenance.approved_specification_sha256
+        ):
+            raise ValueError(
+                "Approved experiment provenance does not match the compiled execution manifest."
+            )
+
     def _transition(self, run_identifier: str, status: RunStatus, additions: dict[str, Any] | None = None) -> None:
         with self._lock:
             state = self._read_validated_state(run_identifier)
@@ -1682,10 +1846,11 @@ class RunCoordinator:
     def _identity(
         manifest: ManifestEnvelope,
         *,
-        source_type: Literal["preset", "dynamic_experiment"],
+        source_type: RunSourceType,
         source_identifier: str,
         preset_identifier: str | None,
         molecule: dict[str, Any] | None = None,
+        approved_experiment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         experiment = manifest.experiment
         identity = {
@@ -1697,6 +1862,8 @@ class RunCoordinator:
             "expected_experiment_sha256": manifest.expected_experiment_sha256,
             "structure_identifier": experiment.molecular_system.structure_artifact_identifier,
         }
+        if approved_experiment is not None:
+            identity["approved_experiment"] = approved_experiment
         if molecule is not None:
             identity["molecule"] = molecule
         return identity
@@ -1721,13 +1888,9 @@ class RunCoordinator:
         request = _controlled_run_json(directory, "request.json")
         if state.get("run_identifier") != run_identifier:
             raise ValueError("Persisted run state has a mismatched run identifier.")
-        preset_identifier = request.get("preset_identifier")
-        experiment_identifier = request.get("experiment_identifier")
-        if (isinstance(preset_identifier, str)) == (isinstance(experiment_identifier, str)):
-            raise ValueError("Persisted run request has an invalid experiment source.")
-        source_identifier = experiment_identifier or preset_identifier
-        source_type = "dynamic_experiment" if experiment_identifier is not None else "preset"
-        expected_preset = None if experiment_identifier is not None else preset_identifier
+        source_type, source_identifier, expected_preset = self._request_source_identity(
+            request
+        )
         if "source_type" not in state and "source_identifier" not in state:
             if state.get("preset_identifier") != source_identifier:
                 raise ValueError("Persisted legacy run state has a mismatched source identity.")
@@ -1745,9 +1908,39 @@ class RunCoordinator:
             or state.get("preset_identifier") != expected_preset
         ):
             raise ValueError("Persisted run state has a mismatched source identity.")
-        if experiment_identifier is not None and state.get("experiment_identifier") != experiment_identifier:
+        if source_type != "preset" and state.get("experiment_identifier") != source_identifier:
             raise ValueError("Persisted run state has a mismatched experiment identifier.")
+        approved = state.get("approved_experiment")
+        if source_type == "approved_experiment":
+            validated_approved = ApprovedExecutionProvenance.model_validate(approved)
+            if validated_approved.approved_experiment_identifier != source_identifier:
+                raise ValueError("Persisted run state has mismatched approval provenance.")
+        elif approved is not None:
+            raise ValueError("Persisted run state has unexpected approval provenance.")
         return state
+
+    @staticmethod
+    def _request_source_identity(
+        request: dict[str, Any],
+    ) -> tuple[RunSourceType, str, str | None]:
+        sources = {
+            "preset": request.get("preset_identifier"),
+            "dynamic_experiment": request.get("experiment_identifier"),
+            "approved_experiment": request.get("approved_experiment_identifier"),
+        }
+        present = [
+            (source_type, identifier)
+            for source_type, identifier in sources.items()
+            if isinstance(identifier, str)
+        ]
+        if len(present) != 1:
+            raise ValueError("Persisted run request has an invalid experiment source.")
+        source_type, source_identifier = present[0]
+        return (
+            source_type,
+            source_identifier,
+            source_identifier if source_type == "preset" else None,
+        )
 
     def _discard_future(self, future: Future[Any]) -> None:
         with self._lock:
@@ -1778,13 +1971,9 @@ class RunCoordinator:
                 request = _controlled_run_json(directory, request_path.name)
                 if state.get("run_identifier") != directory.name:
                     continue
-                preset_identifier = request.get("preset_identifier")
-                experiment_identifier = request.get("experiment_identifier")
-                if (isinstance(preset_identifier, str)) == (isinstance(experiment_identifier, str)):
-                    continue
-                source_identifier = experiment_identifier or preset_identifier
-                source_type = "dynamic_experiment" if experiment_identifier is not None else "preset"
-                expected_preset = None if experiment_identifier is not None else preset_identifier
+                source_type, source_identifier, expected_preset = (
+                    self._request_source_identity(request)
+                )
                 if "source_type" not in state and "source_identifier" not in state:
                     if state.get("preset_identifier") != source_identifier:
                         continue
@@ -1806,11 +1995,11 @@ class RunCoordinator:
                 if isinstance(key, str):
                     self._idempotency[key] = (
                         {
-                            **(
-                                {"experiment_identifier": experiment_identifier}
-                                if experiment_identifier is not None
-                                else {"preset_identifier": preset_identifier}
-                            ),
+                            {
+                                "preset": "preset_identifier",
+                                "dynamic_experiment": "experiment_identifier",
+                                "approved_experiment": "approved_experiment_identifier",
+                            }[source_type]: source_identifier,
                             "execution_target": request["execution_target"],
                         },
                         directory.name,
@@ -1859,6 +2048,7 @@ class RunCoordinator:
                                 expected_preset,
                                 manifest,
                                 structure_hash,
+                                state.get("approved_experiment"),
                             )
                         )
                     else:
@@ -1878,9 +2068,10 @@ def validate_execution_output(
     manifest: ManifestEnvelope,
     preset_identifier: str | None,
     run_identifier: str,
-    source_type: Literal["preset", "dynamic_experiment"] = "preset",
+    source_type: RunSourceType = "preset",
     source_identifier: str | None = None,
     expected_structure_sha256: str | None = None,
+    approved_experiment: dict[str, Any] | None = None,
 ) -> ExecutionOutput:
     """Confirm injected or production projections agree with trusted identities."""
     results = PublicResults.model_validate(output.results)
@@ -1902,6 +2093,23 @@ def validate_execution_output(
     for field, value in expected.items():
         if getattr(results, field) != value or getattr(verification, field) != value or getattr(receipt, field) != value:
             raise ValueError(f"Executor output {field} does not match the requested experiment.")
+    expected_approval = (
+        ApprovedExecutionProvenance.model_validate(
+            approved_experiment
+        ).model_dump(mode="json")
+        if approved_experiment is not None
+        else None
+    )
+    for projection in (results, verification, receipt):
+        observed_approval = (
+            projection.approved_experiment.model_dump(mode="json")
+            if projection.approved_experiment is not None
+            else None
+        )
+        if observed_approval != expected_approval:
+            raise ValueError(
+                "Executor output approved-experiment provenance is mismatched."
+            )
     if receipt.run_identifier != run_identifier or verification.run_identifier != run_identifier:
         raise ValueError("Executor receipt run identifier mismatch.")
     if results.run_identifier != run_identifier:
@@ -1955,7 +2163,12 @@ def validate_execution_output(
             raise ValueError(f"Executor runner summary {field} is inconsistent.")
     for value in (output.results, output.verification, output.receipt, output.runner_summary):
         assert_public_response_safe(value)
-    return ExecutionOutput(
-        results.model_dump(mode="json"), verification.model_dump(mode="json"),
-        receipt.model_dump(mode="json"), dict(output.runner_summary),
-    )
+    projections = [
+        results.model_dump(mode="json"),
+        verification.model_dump(mode="json"),
+        receipt.model_dump(mode="json"),
+    ]
+    if approved_experiment is None:
+        for projection in projections:
+            projection.pop("approved_experiment", None)
+    return ExecutionOutput(*projections, dict(output.runner_summary))

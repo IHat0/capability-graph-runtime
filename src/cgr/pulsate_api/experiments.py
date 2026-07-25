@@ -541,6 +541,8 @@ def compile_manifest(
     specification: ScientificExperimentSpecification,
     *,
     experiment_identifier: str,
+    optimizer_tolerance: float = 1e-9,
+    execution_parameters: dict[str, Any] | None = None,
 ) -> ManifestEnvelope:
     if not _EXPERIMENT_IDENTIFIER.fullmatch(experiment_identifier):
         raise ValueError("Dynamic experiment identifier is invalid.")
@@ -598,7 +600,8 @@ def compile_manifest(
             require_all_blocking_assumptions_approved=True,
             permitted_runtimes=(specification.execution_policy.runtime_identifier,),
             parameters={
-                "maximum_duration_seconds": specification.execution_policy.maximum_duration_seconds
+                "maximum_duration_seconds": specification.execution_policy.maximum_duration_seconds,
+                **(execution_parameters or {}),
             },
         ),
         provenance=CreationProvenance(
@@ -620,10 +623,14 @@ def compile_manifest(
             ansatz=specification.ansatz,
             initial_state="hartree_fock",
             optimizer=specification.optimizer,
-            optimizer_settings={"maxiter": 200, "ftol": 1e-9, "disp": False},
+            optimizer_settings={
+                "maxiter": 200,
+                "ftol": optimizer_tolerance,
+                "disp": False,
+            },
             initial_point_policy="all_zeros",
             maximum_iterations=200,
-            convergence_threshold=1e-9,
+            convergence_threshold=optimizer_tolerance,
             random_seed=1701,
             simulator_type="statevector_estimator",
         ),
