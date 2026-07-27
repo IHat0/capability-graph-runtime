@@ -8,9 +8,11 @@ import importlib.metadata
 import io
 import json
 import math
+import numbers
 import os
 import re
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -38,6 +40,8 @@ from .ibm import (
 _MAXIMUM_BYTES = 2 * 1024 * 1024
 _STATUS_POLL_INTERVAL_SECONDS = 1.0
 _NUCLEAR_CONSTANT_KEY = "nuclear_repulsion_energy"
+_WORKLOAD_TARGET_MAXIMUM_INSTRUCTIONS = 100_000
+_WORKLOAD_TARGET_MAXIMUM_ENTRIES = 4_096
 
 
 class _ControlledWorkerFailure(RuntimeError):
@@ -119,39 +123,193 @@ def _read_binary(path: Path) -> bytes:
     return path.read_bytes()
 
 
-def _backend_target_sha256(backend: Any) -> str | None:
+def _target_text(value: Any, *, label: str, allow_empty: bool = False) -> str:
+    if (
+        not isinstance(value, str)
+        or (not value and not allow_empty)
+        or len(value) > 256
+    ):
+        raise ValueError(f"IBM backend target {label} is malformed.")
+    return value
+
+
+def _target_integer(value: Any, *, label: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, numbers.Integral)
+        or int(value) < 0
+    ):
+        raise ValueError(f"IBM backend target {label} is malformed.")
+    return int(value)
+
+
+def _target_numeric(
+    value: Any,
+    *,
+    label: str,
+    allow_none: bool,
+) -> int | dict[str, str] | None:
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"IBM backend target {label} is malformed.")
+    if isinstance(value, numbers.Integral):
+        numeric = int(value)
+        if numeric < 0:
+            raise ValueError(f"IBM backend target {label} is malformed.")
+        return numeric
+    if isinstance(value, numbers.Real):
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError(f"IBM backend target {label} is malformed.")
+        normalized = 0.0 if numeric == 0.0 else numeric
+        return {"type": "float", "hex": normalized.hex()}
+    raise ValueError(f"IBM backend target {label} has an unsupported type.")
+
+
+def _circuit_bit_indices(isa_circuit: Any, bits: Iterable[Any]) -> tuple[int, ...]:
+    try:
+        return tuple(int(isa_circuit.find_bit(bit).index) for bit in bits)
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        raise ValueError("IBM ISA circuit physical-qubit identity is malformed.") from exc
+
+
+def _backend_target_payload(backend: Any, isa_circuit: Any) -> dict[str, Any] | None:
     target = getattr(backend, "target", None)
     if target is None:
         return None
-    operations = sorted(str(value) for value in getattr(target, "operation_names", ()))
+    try:
+        from qiskit.circuit import (  # type: ignore[import-not-found]
+            Barrier,
+            ControlFlowOp,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ValueError("Qiskit instruction APIs are unavailable.") from exc
+    backend_qubits = _target_integer(
+        getattr(backend, "num_qubits", None),
+        label="qubit count",
+    )
+    target_qubits = _target_integer(
+        getattr(target, "num_qubits", None),
+        label="target qubit count",
+    )
+    if backend_qubits == 0 or target_qubits == 0:
+        raise ValueError("IBM backend target qubit counts must be positive.")
+    circuit_instructions = getattr(isa_circuit, "data", None)
+    try:
+        instruction_count = len(circuit_instructions)
+    except (TypeError, AttributeError) as exc:
+        raise ValueError("IBM ISA circuit instructions are unavailable.") from exc
+    if instruction_count > _WORKLOAD_TARGET_MAXIMUM_INSTRUCTIONS:
+        raise ValueError("IBM ISA circuit instruction evidence is oversized.")
+    used_instances: set[tuple[str, tuple[int, ...]]] = set()
+    directives: set[tuple[str, tuple[int, ...]]] = set()
+    for item in circuit_instructions:
+        operation = getattr(item, "operation", None)
+        if operation is None or isinstance(operation, ControlFlowOp):
+            raise ValueError(
+                "IBM ISA circuit contains an unsupported control-flow instruction."
+            )
+        name = _target_text(
+            getattr(operation, "name", None),
+            label="operation name",
+        )
+        qubits = _circuit_bit_indices(isa_circuit, getattr(item, "qubits", ()))
+        if (
+            len(qubits) != _target_integer(
+                getattr(operation, "num_qubits", None),
+                label="operation qubit arity",
+            )
+            or any(
+                qubit < 0 or qubit >= target_qubits or qubit >= backend_qubits
+                for qubit in qubits
+            )
+        ):
+            raise ValueError("IBM ISA circuit operation qubit tuple is malformed.")
+        if isinstance(operation, Barrier):
+            directives.add(("barrier", qubits))
+        elif getattr(operation, "_directive", False):
+            raise ValueError(
+                "IBM ISA circuit contains an unsupported compiler directive."
+            )
+        else:
+            used_instances.add((name, qubits))
+        if len(used_instances) + len(directives) > _WORKLOAD_TARGET_MAXIMUM_ENTRIES:
+            raise ValueError("IBM workload-scoped target evidence is oversized.")
     instruction_properties: list[dict[str, Any]] = []
-    for operation_name in operations[:256]:
+    for operation_name, qubits in sorted(used_instances):
         try:
-            properties = target[operation_name]
-            items = properties.items() if hasattr(properties, "items") else ()
-            for qubits, value in items:
-                if len(instruction_properties) >= 1024:
-                    raise ValueError("IBM backend target calibration evidence is oversized.")
-                instruction_properties.append(
-                    {
-                        "operation": operation_name,
-                        "qubits": [int(qubit) for qubit in qubits],
-                        "duration": _json_safe(getattr(value, "duration", None)),
-                        "error": _json_safe(getattr(value, "error", None)),
-                    }
+            properties_by_qubits = target[operation_name]
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError(
+                "IBM ISA circuit operation is absent from the backend target."
+            ) from exc
+        if not isinstance(properties_by_qubits, Mapping) or (
+            qubits not in properties_by_qubits
+        ):
+            raise ValueError(
+                "IBM ISA circuit operation qubit tuple is absent from the backend target."
+            )
+        properties = properties_by_qubits[qubits]
+        if properties is None:
+            duration = None
+            error = None
+        else:
+            if not hasattr(properties, "duration") or not hasattr(properties, "error"):
+                raise ValueError(
+                    "IBM backend target instruction properties are malformed."
                 )
-        except (KeyError, TypeError, AttributeError):
-            continue
-    payload = {
-        "backend_name": str(getattr(backend, "name", "")),
-        "backend_version": str(getattr(backend, "backend_version", "")),
-        "number_of_qubits": int(getattr(backend, "num_qubits", 0)),
-        "target_number_of_qubits": int(getattr(target, "num_qubits", 0)),
-        "operation_names": operations[:256],
-        "dt": _json_safe(getattr(target, "dt", None)),
+            duration = _target_numeric(
+                properties.duration,
+                label="instruction duration",
+                allow_none=True,
+            )
+            error = _target_numeric(
+                properties.error,
+                label="instruction error",
+                allow_none=True,
+            )
+        instruction_properties.append(
+            {
+                "operation": operation_name,
+                "qubits": list(qubits),
+                "duration": duration,
+                "error": error,
+            }
+        )
+    return {
+        "schema_version": "cgr.pulsate-ibm-workload-target/1.0.0",
+        "backend_name": _target_text(
+            getattr(backend, "name", None),
+            label="backend name",
+        ),
+        "backend_version": _target_text(
+            getattr(backend, "backend_version", None),
+            label="backend version",
+            allow_empty=True,
+        ),
+        "number_of_qubits": backend_qubits,
+        "target_number_of_qubits": target_qubits,
+        "dt": _target_numeric(
+            getattr(target, "dt", None),
+            label="dt",
+            allow_none=True,
+        ),
         "instruction_properties": instruction_properties,
+        "compiler_directives": [
+            {
+                "operation": operation_name,
+                "qubits": list(qubits),
+                "api_class": "qiskit.circuit.barrier.Barrier",
+            }
+            for operation_name, qubits in sorted(directives)
+        ],
     }
-    return sha256_fingerprint(payload)
+
+
+def _backend_target_sha256(backend: Any, isa_circuit: Any) -> str | None:
+    payload = _backend_target_payload(backend, isa_circuit)
+    return None if payload is None else sha256_fingerprint(payload)
 
 
 def _observable_from_payload(payload: dict[str, Any]) -> Any:
@@ -212,7 +370,7 @@ def _persist_prepared_submission(
         seed_transpiler=bundle.seed_transpiler,
         optimization_level=bundle.optimization_level,
         backend_name=bundle.backend_name,
-        backend_target_sha256=_backend_target_sha256(backend),
+        backend_target_sha256=_backend_target_sha256(backend, isa_circuit),
         qiskit_version=importlib.metadata.version("qiskit"),
         observable_file_sha256=sha256_fingerprint(observable_payload),
     )

@@ -40,6 +40,8 @@ from cgr.pulsate_api.ibm import (
     UnavailableIBMPreflightExecutor,
 )
 from cgr.pulsate_api.ibm_worker import (
+    _backend_target_payload,
+    _backend_target_sha256,
     _load_prepared_submission,
     _layout_indices,
     _obtain_job,
@@ -244,6 +246,475 @@ def controlled_bundle() -> IBMSubmissionBundle:
         job_correlation_identifier="pulsate-" + "8" * 40,
         ibm_runtime_image_identifier="sha256:" + "b" * 64,
     )
+
+
+class _SyntheticTarget:
+    def __init__(
+        self,
+        entries: dict[str, dict[tuple[int, ...], Any]],
+        *,
+        unrelated_entries: int = 0,
+        unrelated_value: float = 0.001,
+    ) -> None:
+        self.num_qubits = 4
+        self.dt = 2.22e-10
+        self._entries = dict(entries)
+        self._entries.update(
+            {
+                f"unrelated_{index:04d}": {
+                    (index % self.num_qubits,): types.SimpleNamespace(
+                        duration=unrelated_value + index * 1e-12,
+                        error=unrelated_value + index * 1e-15,
+                    )
+                }
+                for index in range(unrelated_entries)
+            }
+        )
+        self.operation_names = frozenset(self._entries)
+        self.accessed_operations: list[str] = []
+
+    def __getitem__(self, operation_name: str) -> dict[tuple[int, ...], Any]:
+        self.accessed_operations.append(operation_name)
+        return self._entries[operation_name]
+
+
+class _SyntheticBackend:
+    name = "ibm_synthetic"
+    backend_version = "1.2.3"
+    num_qubits = 4
+
+    def __init__(self, target: _SyntheticTarget) -> None:
+        self.target = target
+
+
+def _instruction_properties(
+    *,
+    duration: Any = 1.25e-7,
+    error: Any = 0.001,
+) -> Any:
+    return types.SimpleNamespace(duration=duration, error=error)
+
+
+def _synthetic_backend(
+    *,
+    entries: dict[str, dict[tuple[int, ...], Any]] | None = None,
+    unrelated_entries: int = 0,
+    unrelated_value: float = 0.001,
+) -> _SyntheticBackend:
+    return _SyntheticBackend(
+        _SyntheticTarget(
+            {
+                "x": {(0,): _instruction_properties()},
+                "sx": {(0,): _instruction_properties()},
+                "cx": {
+                    (0, 1): _instruction_properties(
+                        duration=3.5e-7,
+                        error=0.005,
+                    ),
+                    (1, 0): _instruction_properties(
+                        duration=3.75e-7,
+                        error=0.006,
+                    ),
+                },
+            }
+            if entries is None
+            else entries,
+            unrelated_entries=unrelated_entries,
+            unrelated_value=unrelated_value,
+        )
+    )
+
+
+def test_workload_target_hash_ignores_more_than_1024_unrelated_entries() -> None:
+    from qiskit import QuantumCircuit
+
+    circuit = QuantumCircuit(2)
+    circuit.x(0)
+    circuit.cx(0, 1)
+    first = _synthetic_backend(
+        unrelated_entries=1_500,
+        unrelated_value=0.001,
+    )
+    second = _synthetic_backend(
+        unrelated_entries=1_500,
+        unrelated_value=0.75,
+    )
+
+    first_sha = _backend_target_sha256(first, circuit)
+    second_sha = _backend_target_sha256(second, circuit)
+
+    assert first_sha == second_sha
+    assert sorted(first.target.accessed_operations) == ["cx", "x"]
+    assert sorted(second.target.accessed_operations) == ["cx", "x"]
+    payload = _backend_target_payload(first, circuit)
+    assert payload is not None
+    assert len(payload["instruction_properties"]) == 2
+    assert len(first.target.operation_names) > 1_024
+
+
+@pytest.mark.parametrize(
+    ("operation", "qubits", "duration", "error"),
+    [
+        ("x", (0,), 2.5e-7, 0.001),
+        ("x", (0,), 1.25e-7, 0.125),
+        ("cx", (0, 1), 7.5e-7, 0.005),
+    ],
+)
+def test_workload_target_hash_changes_for_used_calibration(
+    operation: str,
+    qubits: tuple[int, ...],
+    duration: float,
+    error: float,
+) -> None:
+    from qiskit import QuantumCircuit
+
+    circuit = QuantumCircuit(2)
+    circuit.x(0)
+    circuit.cx(0, 1)
+    baseline = _synthetic_backend()
+    changed = _synthetic_backend()
+    changed.target._entries[operation][qubits] = _instruction_properties(
+        duration=duration,
+        error=error,
+    )
+
+    assert _backend_target_sha256(baseline, circuit) != (
+        _backend_target_sha256(changed, circuit)
+    )
+
+
+def test_workload_target_hash_changes_for_used_operation_or_qubit_order() -> None:
+    from qiskit import QuantumCircuit
+
+    source = QuantumCircuit(2)
+    source.x(0)
+    source.cx(0, 1)
+    changed_operation = QuantumCircuit(2)
+    changed_operation.sx(0)
+    changed_operation.cx(0, 1)
+    changed_order = QuantumCircuit(2)
+    changed_order.x(0)
+    changed_order.cx(1, 0)
+    backend = _synthetic_backend()
+    source_sha = _backend_target_sha256(backend, source)
+
+    assert _backend_target_sha256(backend, changed_operation) != source_sha
+    assert _backend_target_sha256(backend, changed_order) != source_sha
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ({}, "operation is absent"),
+        (
+            {"x": {(1,): _instruction_properties()}},
+            "qubit tuple is absent",
+        ),
+        (
+            {"x": {(0,): object()}},
+            "instruction properties are malformed",
+        ),
+        (
+            {
+                "x": {
+                    (0,): _instruction_properties(
+                        duration=object(),
+                    )
+                }
+            },
+            "unsupported type",
+        ),
+    ],
+)
+def test_workload_target_hash_rejects_missing_or_malformed_used_evidence(
+    entries: dict[str, dict[tuple[int, ...], Any]],
+    message: str,
+) -> None:
+    from qiskit import QuantumCircuit
+
+    circuit = QuantumCircuit(1)
+    circuit.x(0)
+    backend = _synthetic_backend(entries=entries)
+
+    with pytest.raises(ValueError, match=message):
+        _backend_target_sha256(backend, circuit)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duration", math.nan),
+        ("duration", math.inf),
+        ("error", -math.inf),
+        ("error", math.nan),
+    ],
+)
+def test_workload_target_hash_rejects_nonfinite_used_calibration(
+    field: str,
+    value: float,
+) -> None:
+    from qiskit import QuantumCircuit
+
+    circuit = QuantumCircuit(1)
+    circuit.x(0)
+    values = {"duration": 1.25e-7, "error": 0.001}
+    values[field] = value
+    backend = _synthetic_backend(
+        entries={"x": {(0,): _instruction_properties(**values)}}
+    )
+
+    with pytest.raises(ValueError, match="malformed"):
+        _backend_target_sha256(backend, circuit)
+
+
+def test_workload_target_hash_rejects_unsupported_instruction_and_control_flow() -> None:
+    from qiskit import QuantumCircuit
+    from qiskit.circuit import Instruction
+
+    unsupported = QuantumCircuit(1)
+    unsupported.append(Instruction("opaque", 1, 0, []), [0])
+    with pytest.raises(ValueError, match="operation is absent"):
+        _backend_target_sha256(_synthetic_backend(), unsupported)
+
+    unsupported_directive = QuantumCircuit(1)
+    directive = Instruction("opaque_directive", 1, 0, [])
+    directive._directive = True
+    unsupported_directive.append(directive, [0])
+    with pytest.raises(ValueError, match="unsupported compiler directive"):
+        _backend_target_sha256(_synthetic_backend(), unsupported_directive)
+
+    controlled = QuantumCircuit(1, 1)
+    with controlled.if_test((controlled.clbits[0], True)):
+        controlled.x(0)
+    with pytest.raises(ValueError, match="control-flow"):
+        _backend_target_sha256(_synthetic_backend(), controlled)
+
+
+def test_workload_target_hash_handles_barrier_without_scanning_unrelated_entries() -> None:
+    from qiskit import QuantumCircuit
+
+    first = QuantumCircuit(2, name="first")
+    first.x(0)
+    first.barrier(0, 1)
+    second = QuantumCircuit(2, name="second")
+    second.x(0)
+    second.barrier(0, 1)
+    backend = _synthetic_backend(unrelated_entries=1_500)
+
+    first_payload = _backend_target_payload(backend, first)
+    second_payload = _backend_target_payload(backend, second)
+
+    assert first_payload == second_payload
+    assert first_payload is not None
+    assert first_payload["compiler_directives"] == [
+        {
+            "operation": "barrier",
+            "qubits": [0, 1],
+            "api_class": "qiskit.circuit.barrier.Barrier",
+        }
+    ]
+    assert backend.target.accessed_operations == ["x", "x"]
+
+
+def test_ibm_worker_reaches_pre_submission_sentinel_without_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.metadata
+
+    import cgr.pulsate_api.ibm_worker as ibm_worker
+    import qiskit_ibm_runtime
+    from qiskit import QuantumCircuit
+    from qiskit.circuit import Parameter
+    from qiskit.providers.fake_provider import GenericBackendV2
+    from qiskit.quantum_info import SparsePauliOp
+
+    from cgr.quantum_preflight.artifacts import artifact_reference
+    from cgr.science import sha256_fingerprint
+
+    manifest = _load_preset("lih-ground-state-v1")
+    backend = GenericBackendV2(num_qubits=4, seed=91)
+    prepared = types.SimpleNamespace(
+        active_problem=types.SimpleNamespace(
+            num_spatial_orbitals=2,
+            num_particles=(1, 1),
+        ),
+        mapper=object(),
+        qubit_operator=SparsePauliOp.from_list(
+            [
+                ("IIII", -1.0),
+                ("ZIII", 0.25),
+                ("IZII", -0.125),
+            ]
+        ),
+        payloads={
+            "active_space": {
+                "active_electrons": 2,
+                "active_spatial_orbitals": 2,
+            },
+            "qubit_hamiltonian": {
+                "mapper": "jordan_wigner",
+                "number_of_qubits": 4,
+                "terms": [
+                    {"pauli": "IIII", "real": -1.0, "imaginary": 0.0},
+                    {"pauli": "ZIII", "real": 0.25, "imaginary": 0.0},
+                    {"pauli": "IZII", "real": -0.125, "imaginary": 0.0},
+                ],
+            },
+        },
+    )
+
+    def hartree_fock(
+        num_spatial_orbitals: int,
+        num_particles: tuple[int, int],
+        mapper: object,
+    ) -> QuantumCircuit:
+        del num_particles, mapper
+        circuit = QuantumCircuit(2 * num_spatial_orbitals)
+        circuit.x(0)
+        circuit.x(1)
+        return circuit
+
+    def uccsd(
+        num_spatial_orbitals: int,
+        num_particles: tuple[int, int],
+        mapper: object,
+        *,
+        initial_state: QuantumCircuit,
+    ) -> QuantumCircuit:
+        del num_particles, mapper
+        circuit = QuantumCircuit(2 * num_spatial_orbitals)
+        circuit.compose(initial_state, inplace=True)
+        circuit.ry(Parameter("theta"), 0)
+        circuit.cx(0, 1)
+        circuit.cx(1, 2)
+        circuit.cx(2, 3)
+        return circuit
+
+    qiskit_nature = types.ModuleType("qiskit_nature")
+    second_q = types.ModuleType("qiskit_nature.second_q")
+    circuit_module = types.ModuleType("qiskit_nature.second_q.circuit")
+    library = types.ModuleType("qiskit_nature.second_q.circuit.library")
+    library.HartreeFock = hartree_fock
+    library.UCCSD = uccsd
+    monkeypatch.setitem(sys.modules, "qiskit_nature", qiskit_nature)
+    monkeypatch.setitem(sys.modules, "qiskit_nature.second_q", second_q)
+    monkeypatch.setitem(sys.modules, "qiskit_nature.second_q.circuit", circuit_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "qiskit_nature.second_q.circuit.library",
+        library,
+    )
+
+    ansatz = uccsd(
+        prepared.active_problem.num_spatial_orbitals,
+        prepared.active_problem.num_particles,
+        prepared.mapper,
+        initial_state=hartree_fock(
+            prepared.active_problem.num_spatial_orbitals,
+            prepared.active_problem.num_particles,
+            prepared.mapper,
+        ),
+    )
+    optimized_parameters = (0.125,)
+    bound = ansatz.assign_parameters(optimized_parameters, inplace=False)
+    hamiltonian_sha = artifact_reference(
+        "qubit_hamiltonian",
+        "qubit_hamiltonian",
+        prepared.payloads["qubit_hamiltonian"],
+        filename="qubit-hamiltonian.json",
+    ).content_sha256
+    optimized_parameters_sha = sha256_fingerprint(list(optimized_parameters))
+    ansatz_payload = {
+        "schema_version": "cgr.ansatz-manifest/1.0.0",
+        "ansatz": manifest.experiment.quantum_model.ansatz,
+        "number_of_qubits": int(ansatz.num_qubits),
+        "number_of_parameters": int(ansatz.num_parameters),
+        "initial_state": manifest.experiment.quantum_model.initial_state,
+        "mapper": manifest.experiment.quantum_model.mapper,
+        "active_space_sha256": sha256_fingerprint(prepared.payloads["active_space"]),
+        "hamiltonian_sha256": hamiltonian_sha,
+        "initial_point_sha256": sha256_fingerprint(
+            [0.0] * int(ansatz.num_parameters)
+        ),
+        "optimized_parameters_sha256": optimized_parameters_sha,
+        "circuit_depth": int(ansatz.decompose().depth()),
+        "operation_counts": dict(ansatz.decompose().count_ops()),
+        "qiskit_version": importlib.metadata.version("qiskit"),
+    }
+    ansatz_sha = artifact_reference(
+        "ansatz_manifest",
+        "circuit_ansatz_manifest",
+        ansatz_payload,
+        filename="ansatz-manifest.json",
+    ).content_sha256
+    bundle = IBMSubmissionBundle.model_validate(
+        {
+            **controlled_bundle().model_dump(mode="json"),
+            "experiment_sha256": manifest.experiment.fingerprint,
+            "hamiltonian_sha256": hamiltonian_sha,
+            "ansatz_sha256": ansatz_sha,
+            "optimized_parameters": list(optimized_parameters),
+            "optimized_parameters_sha256": optimized_parameters_sha,
+            "source_bound_circuit_sha256": canonical_bound_circuit_sha256(bound),
+            "source_observable_sha256": canonical_sparse_pauli_op_sha256(
+                prepared.qubit_operator,
+                mapper=manifest.experiment.quantum_model.mapper,
+            ),
+            "required_qubits": int(ansatz.num_qubits),
+            "circuit_depth": int(ansatz.decompose().depth()),
+            "backend_name": backend.name,
+        }
+    )
+
+    class FakeRuntimeService:
+        def __init__(self, **kwargs: Any) -> None:
+            assert kwargs == {
+                "channel": "ibm_quantum_platform",
+                "token": "controlled-test-token",
+                "instance": "controlled-test-instance",
+            }
+
+        def backend(self, backend_name: str) -> GenericBackendV2:
+            assert backend_name == backend.name
+            return backend
+
+    directory = tmp_path / "ibm-worker"
+    directory.mkdir()
+    job_record_path = directory / "job.json"
+    sentinel_calls = 0
+
+    def pre_submission_sentinel(**kwargs: Any) -> None:
+        nonlocal sentinel_calls
+        sentinel_calls += 1
+        assert kwargs["bundle"] == bundle
+        assert (directory / "prepared-submission.json").is_file()
+        assert not (directory / "submission-attempt.json").exists()
+        assert not job_record_path.exists()
+        raise RuntimeError("ALL_PRE_SUBMISSION_CHECKS_PASSED")
+
+    monkeypatch.setattr(ibm_worker, "prepare_problem", lambda experiment: prepared)
+    monkeypatch.setattr(
+        qiskit_ibm_runtime,
+        "QiskitRuntimeService",
+        FakeRuntimeService,
+    )
+    monkeypatch.setattr(ibm_worker, "_obtain_job", pre_submission_sentinel)
+    monkeypatch.setenv("PULSATE_IBM_QUANTUM_TOKEN", "controlled-test-token")
+    monkeypatch.setenv("PULSATE_IBM_QUANTUM_INSTANCE", "controlled-test-instance")
+    monkeypatch.setenv("PULSATE_IBM_QUANTUM_BACKEND", backend.name)
+    monkeypatch.setenv(
+        "PULSATE_IBM_IMAGE_IDENTIFIER",
+        bundle.ibm_runtime_image_identifier,
+    )
+
+    with pytest.raises(RuntimeError, match="ALL_PRE_SUBMISSION_CHECKS_PASSED"):
+        execute_ibm_worker(bundle, manifest, job_record_path=job_record_path)
+
+    assert sentinel_calls == 1
+    assert (directory / "prepared-submission.json").is_file()
+    assert not (directory / "submission-attempt.json").exists()
+    assert not job_record_path.exists()
 
 
 def test_prepared_isa_evidence_is_loaded_without_retranspiling_on_recovery(
