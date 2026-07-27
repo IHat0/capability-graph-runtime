@@ -75,6 +75,7 @@ REQUIRED_PRODUCTION_BASE = "d4002efefde4d8681a086a380acd9d6925c79d86"
 ALLOWED_COMMITTED_PATHS = (
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.py",
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.sh",
+    "src/cgr/pulsate_api/__init__.py",
     "src/cgr/pulsate_api/approved_experiments.py",
     "tests/test_pulsate_approved_execution.py",
 )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -43,6 +44,7 @@ from cgr.science import sha256_fingerprint
 APPROVED_PREFLIGHT_COMMITTED_PATHS = (
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.py",
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.sh",
+    "src/cgr/pulsate_api/__init__.py",
     "src/cgr/pulsate_api/approved_experiments.py",
     "tests/test_pulsate_approved_execution.py",
 )
@@ -103,6 +105,44 @@ except runner.AcceptanceFailure as exc:
     response["message"] = str(exc)
 print(json.dumps(response))
 """
+_FASTAPI_IMPORT_BLOCKER = """
+import importlib.abc
+import sys
+
+
+class FastAPIImportBlocker(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        del path, target
+        if fullname == "fastapi" or fullname.startswith("fastapi."):
+            raise ImportError(f"FastAPI import forbidden during probe: {fullname}")
+        return None
+
+
+sys.meta_path.insert(0, FastAPIImportBlocker())
+"""
+
+
+def _run_isolated_python(source: str, *, input_text: str | None = None) -> str:
+    repository_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(repository_root / "src"), existing_pythonpath))
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        input=input_text,
+        cwd=repository_root,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip()
 
 
 def _probe_production_source_identity(
@@ -116,25 +156,17 @@ def _probe_production_source_identity(
         / "scripts"
         / "run-pulsate-approved-qiskit-preflight-acceptance.py"
     )
-    completed = subprocess.run(
-        [sys.executable, "-c", _SOURCE_IDENTITY_PROBE],
-        input=json.dumps(
+    output = _run_isolated_python(
+        _SOURCE_IDENTITY_PROBE,
+        input_text=json.dumps(
             {
                 "runner_path": str(runner_path),
                 "committed_paths": committed_paths,
                 "tracked_status": tracked_status,
             }
         ),
-        cwd=repository_root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-        check=False,
-        timeout=30,
     )
-    assert completed.returncode == 0, completed.stderr
-    return json.loads(completed.stdout)
+    return json.loads(output)
 
 
 def _configuration() -> IBMQuantumConfiguration:
@@ -381,6 +413,59 @@ def test_approved_qiskit_wrapper_prepends_repository_src_to_pythonpath() -> None
         in wrapper
     )
     assert 'if [[ "$(uname -s)" != "Linux" ]]; then' in wrapper
+
+
+def test_pulsate_api_package_import_does_not_require_fastapi() -> None:
+    output = _run_isolated_python(
+        _FASTAPI_IMPORT_BLOCKER
+        + """
+import cgr.pulsate_api
+
+assert not any(
+    name == "fastapi" or name.startswith("fastapi.")
+    for name in sys.modules
+)
+print("package-imported-without-fastapi")
+"""
+    )
+
+    assert output == "package-imported-without-fastapi"
+
+
+def test_quantum_worker_import_does_not_require_fastapi() -> None:
+    output = _run_isolated_python(
+        _FASTAPI_IMPORT_BLOCKER
+        + """
+import cgr.pulsate_api.quantum_worker
+
+assert not any(
+    name == "fastapi" or name.startswith("fastapi.")
+    for name in sys.modules
+)
+print("quantum-worker-imported-without-fastapi")
+"""
+    )
+
+    assert output == "quantum-worker-imported-without-fastapi"
+
+
+def test_pulsate_api_lazy_app_export_preserves_fastapi_compatibility() -> None:
+    output = _run_isolated_python(
+        """
+from importlib import import_module
+
+from fastapi import FastAPI
+
+from cgr.pulsate_api import app
+
+application_module = import_module("cgr.pulsate_api.app")
+assert app is application_module.app
+assert isinstance(app, FastAPI)
+print(f"{type(app).__module__}.{type(app).__qualname__}")
+"""
+    )
+
+    assert output == "fastapi.applications.FastAPI"
 
 
 def test_production_preflight_guard_accepts_exact_approved_change_set() -> None:
