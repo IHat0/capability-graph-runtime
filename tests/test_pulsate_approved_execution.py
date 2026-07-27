@@ -46,7 +46,11 @@ APPROVED_PREFLIGHT_COMMITTED_PATHS = (
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.sh",
     "src/cgr/pulsate_api/__init__.py",
     "src/cgr/pulsate_api/approved_experiments.py",
+    "src/cgr/pulsate_api/ibm_worker.py",
+    "src/cgr/quantum_preflight/reference.py",
     "tests/test_pulsate_approved_execution.py",
+    "tests/test_pulsate_ibm.py",
+    "tests/test_pulsate_ibm_container.py",
 )
 APPROVED_PREFLIGHT_PATH_FAILURE = (
     "Committed changes above the production base must exactly match the "

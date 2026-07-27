@@ -77,7 +77,11 @@ ALLOWED_COMMITTED_PATHS = (
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.sh",
     "src/cgr/pulsate_api/__init__.py",
     "src/cgr/pulsate_api/approved_experiments.py",
+    "src/cgr/pulsate_api/ibm_worker.py",
+    "src/cgr/quantum_preflight/reference.py",
     "tests/test_pulsate_approved_execution.py",
+    "tests/test_pulsate_ibm.py",
+    "tests/test_pulsate_ibm_container.py",
 )
 QUESTION = (
     "Calculate the ground-state energy of lithium hydride at a bond length of "
