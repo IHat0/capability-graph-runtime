@@ -34,12 +34,16 @@ _ACTIVE_SPACE = re.compile(
     r"^(\d+) electrons? in (\d+) spatial orbitals?$", re.IGNORECASE
 )
 _FORMULA_TOKEN = re.compile(r"([A-Z][a-z]?)([1-9][0-9]*)?")
+_INTENT_SEPARATORS = re.compile(
+    r"[\s_\-\N{HYPHEN}\N{NON-BREAKING HYPHEN}\N{EN DASH}\N{EM DASH}]+"
+)
 _MAXIMUM_APPROVED_EXPERIMENT_BYTES = 2 * 1024 * 1024
 _SUPPORTED_ATOMIC_NUMBERS = {"H": 1, "He": 2, "Li": 3}
 _SUPPORTED_GROUND_STATE_OBJECTIVES = frozenset(
     {
         "prepare an electronic ground state experiment",
         "prepare a ground state experiment",
+        "calculate ground state energy",
         "calculate the ground state energy",
         "calculate the electronic ground state energy",
         "calculate the molecular ground state energy",
@@ -110,11 +114,7 @@ def _formula_elements(formula: str) -> tuple[str, ...]:
 
 
 def _canonical_intent(value: str) -> str:
-    return " ".join(
-        re.sub(r"[-\N{HYPHEN}\N{NON-BREAKING HYPHEN}\N{EN DASH}\N{EM DASH}]+", " ", value)
-        .casefold()
-        .split()
-    )
+    return _INTENT_SEPARATORS.sub(" ", value.casefold()).strip()
 
 
 class ApprovedExperimentExecutionResolver:

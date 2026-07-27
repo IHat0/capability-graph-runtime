@@ -16,14 +16,23 @@ from test_pulsate_natural_language import (
     LIH_QUESTION,
     ControlledProvider,
     _complete_draft,
+    _real_qwen_lih_name_only_draft,
     _real_qwen_h2_identity_omitted_draft,
 )
 from test_pulsate_runs import wait_for_terminal
 
 from cgr.pulsate_api.app import _load_preset, create_app
+from cgr.pulsate_api.approved_experiments import (
+    ApprovedExperimentExecutionResolver,
+    ApprovedExperimentValidationError,
+)
 from cgr.pulsate_api.experiments import ExperimentStore
 from cgr.pulsate_api.ibm import IBMQuantumConfiguration, IBMQuantumRunExecutor
-from cgr.pulsate_api.natural_language import NaturalLanguageInterpretationStore
+from cgr.pulsate_api.natural_language import (
+    ApprovalRequest,
+    ApprovedExperimentResponse,
+    NaturalLanguageInterpretationStore,
+)
 from cgr.pulsate_api.runs import RunCoordinator
 from cgr.quantum_preflight.artifacts import write_json_atomic
 from cgr.science import sha256_fingerprint
@@ -88,6 +97,191 @@ def _approve_lih(
     assert approved.status_code == 201
     assert approved.json()["status"] == "ready_for_ibm_submission"
     return interpretation, approved.json()
+
+
+def _approved_real_qwen_lih(
+    tmp_path: Path,
+) -> tuple[
+    NaturalLanguageInterpretationStore,
+    Any,
+    Path,
+]:
+    provider = ControlledProvider(
+        [json.dumps(_real_qwen_lih_name_only_draft())]
+    )
+    store = NaturalLanguageInterpretationStore(
+        tmp_path / "interpretations",
+        provider,
+    )
+    store.start()
+    interpretation = store.interpret(LIH_QUESTION)
+    approved = store.approve(
+        interpretation.interpretation_identifier,
+        ApprovalRequest(
+            specification=interpretation.specification,
+            accepted_assumptions=True,
+        ),
+    )
+    record_path = (
+        store.root
+        / "approved"
+        / approved.experiment_identifier
+        / "experiment.json"
+    )
+    return store, approved, record_path
+
+
+def _replace_approved_intent(
+    record_path: Path,
+    *,
+    objective: str,
+    quantity: str,
+) -> None:
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["specification"]["scientific_objective"]["value"] = objective
+    record["specification"]["requested_quantity"]["value"] = quantity
+    validated = ApprovedExperimentResponse.model_validate(record)
+    record["specification"] = validated.specification.model_dump(mode="json")
+    record["specification_sha256"] = sha256_fingerprint(
+        record["specification"]
+    )
+    write_json_atomic(
+        record_path,
+        record,
+        maximum_bytes=2 * 1024 * 1024,
+    )
+
+
+def test_real_qwen_ground_state_intent_compiles_without_losing_provenance(
+    tmp_path: Path,
+) -> None:
+    store, approved, _ = _approved_real_qwen_lih(tmp_path)
+    try:
+        assert (
+            approved.specification.scientific_objective.value
+            == "calculate ground-state energy"
+        )
+        assert (
+            approved.specification.requested_quantity.value
+            == "ground-state energy"
+        )
+        assert approved.status == "ready_for_ibm_submission"
+        assert approved.requested_execution_target == "ibm_quantum"
+
+        compiled = ApprovedExperimentExecutionResolver(store)(
+            approved.experiment_identifier
+        )
+    finally:
+        store.close()
+
+    parameters = compiled.manifest.experiment.parent_experiment.execution_policy.parameters
+    assert parameters["compiled_objective"] == "molecular_ground_state_energy"
+    assert (
+        parameters["approved_scientific_objective"]
+        == "calculate ground-state energy"
+    )
+    assert parameters["approved_requested_quantity"] == "ground-state energy"
+    assert compiled.provenance["compiled_objective"] == (
+        "molecular_ground_state_energy"
+    )
+    assert (
+        compiled.provenance["approved_scientific_objective"]
+        == "calculate ground-state energy"
+    )
+    assert (
+        compiled.provenance["approved_requested_quantity"]
+        == "ground-state energy"
+    )
+    experiment = compiled.manifest.experiment
+    assert [atom.element for atom in experiment.molecular_system.atoms] == [
+        "Li",
+        "H",
+    ]
+    assert experiment.molecular_system.coordinate_unit == "angstrom"
+    assert experiment.electronic_structure.basis_set == "sto-3g"
+    assert experiment.quantum_model.mapper == "jordan_wigner"
+    assert experiment.quantum_model.ansatz == "uccsd"
+    assert experiment.quantum_model.optimizer == "slsqp"
+
+
+@pytest.mark.parametrize(
+    ("objective", "quantity"),
+    [
+        (" Calculate Ground-State Energy ", " Ground-State Energy "),
+        ("CALCULATE_GROUND_STATE_ENERGY", "GROUND_STATE_ENERGY"),
+    ],
+)
+def test_approved_intent_normalises_only_supported_separator_variations(
+    tmp_path: Path,
+    objective: str,
+    quantity: str,
+) -> None:
+    store, approved, record_path = _approved_real_qwen_lih(tmp_path)
+    try:
+        _replace_approved_intent(
+            record_path,
+            objective=objective,
+            quantity=quantity,
+        )
+        compiled = ApprovedExperimentExecutionResolver(store)(
+            approved.experiment_identifier
+        )
+    finally:
+        store.close()
+
+    parameters = compiled.manifest.experiment.parent_experiment.execution_policy.parameters
+    assert parameters["compiled_objective"] == "molecular_ground_state_energy"
+    assert parameters["approved_scientific_objective"] == objective.strip()
+    assert parameters["approved_requested_quantity"] == quantity.strip()
+
+
+@pytest.mark.parametrize(
+    ("objective", "quantity"),
+    [
+        ("excited-state energy", "ground-state energy"),
+        ("calculate ground-state energy", "dipole moment"),
+        ("geometry optimisation", "reaction energy"),
+        ("arbitrary free text", "ground-state energy"),
+    ],
+)
+def test_approved_intent_still_rejects_unsupported_objective_or_quantity(
+    tmp_path: Path,
+    objective: str,
+    quantity: str,
+) -> None:
+    store, approved, record_path = _approved_real_qwen_lih(tmp_path)
+    try:
+        _replace_approved_intent(
+            record_path,
+            objective=objective,
+            quantity=quantity,
+        )
+        with pytest.raises(
+            ApprovedExperimentValidationError,
+            match="Approved scientific intent exceeds compiler capability",
+        ):
+            ApprovedExperimentExecutionResolver(store)(
+                approved.experiment_identifier
+            )
+    finally:
+        store.close()
+
+
+def test_approved_qiskit_wrapper_prepends_repository_src_to_pythonpath() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    wrapper = (
+        repository_root
+        / "scripts"
+        / "run-pulsate-approved-qiskit-preflight-acceptance.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"' in wrapper
+    assert 'python_bin="${PYTHON:-python3}"' in wrapper
+    assert (
+        'export PYTHONPATH="$repo_root/src${PYTHONPATH:+:$PYTHONPATH}"'
+        in wrapper
+    )
+    assert 'if [[ "$(uname -s)" != "Linux" ]]; then' in wrapper
 
 
 def test_approved_lih_runs_through_existing_fake_ibm_worker_and_recovers(
