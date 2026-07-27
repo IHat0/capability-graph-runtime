@@ -161,7 +161,8 @@ def test_worker_uses_isolated_bounded_boundary_and_platform_channel() -> None:
     assert "options.max_execution_time" in worker
     assert "status.json" in worker
     assert "nuclear_repulsion_energy" in worker
-    assert "canonical_qpy_sha256" in worker
+    assert "canonical_bound_circuit_sha256" in worker
+    assert "canonical_qpy_bytes" in worker
     assert "canonical_sparse_pauli_op_sha256" in worker
     assert "save_account" not in worker
 

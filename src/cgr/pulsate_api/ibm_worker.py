@@ -19,8 +19,8 @@ from cgr.quantum_preflight.artifacts import artifact_reference, write_json_atomi
 from cgr.quantum_preflight.contracts import ManifestEnvelope
 from cgr.quantum_preflight.reference import (
     CANONICAL_QPY_MAXIMUM_BYTES,
+    canonical_bound_circuit_sha256,
     canonical_qpy_bytes,
-    canonical_qpy_sha256,
     canonical_sparse_pauli_op_payload,
     canonical_sparse_pauli_op_sha256,
     prepare_problem,
@@ -570,7 +570,7 @@ def execute(
     if int(ansatz.num_parameters) != len(bundle.optimized_parameters):
         raise ValueError("Optimized parameter count does not match the reconstructed ansatz.")
     bound = ansatz.assign_parameters(list(bundle.optimized_parameters), inplace=False)
-    source_bound_circuit_sha = canonical_qpy_sha256(bound)
+    source_bound_circuit_sha = canonical_bound_circuit_sha256(bound)
     source_observable_sha = canonical_sparse_pauli_op_sha256(
         prepared.qubit_operator,
         mapper=manifest.experiment.quantum_model.mapper,

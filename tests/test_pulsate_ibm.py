@@ -16,7 +16,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cgr.quantum_preflight.artifacts import write_json_atomic
+from cgr.quantum_preflight.errors import QuantumIntegrityError
 from cgr.quantum_preflight.reference import (
+    canonical_bound_circuit_payload,
+    canonical_bound_circuit_sha256,
     canonical_qpy_sha256,
     canonical_sparse_pauli_op_sha256,
 )
@@ -731,6 +734,139 @@ def test_canonical_identities_change_when_actual_objects_change(
     first_layout = type("Circuit", (), {"layout": Layout((0, 2))})()
     second_layout = type("Circuit", (), {"layout": Layout((1, 2))})()
     assert _layout_indices(first_layout) != _layout_indices(second_layout)
+
+
+def test_bound_circuit_semantic_identity_ignores_names_and_object_identity() -> None:
+    from qiskit import QuantumCircuit
+
+    first = QuantumCircuit(2, name="first", metadata={"producer": "local"})
+    first.h(0)
+    first.cx(0, 1)
+    first.ry(0.125, 1)
+    second = QuantumCircuit(2, name="second", metadata={"producer": "worker"})
+    second.h(0)
+    second.cx(0, 1)
+    second.ry(0.125, 1)
+
+    assert first == second
+    first_payload = canonical_bound_circuit_payload(first)
+    second_payload = canonical_bound_circuit_payload(second)
+    assert first_payload == second_payload
+    assert first_payload["number_of_qubits"] == 2
+    assert first_payload["number_of_clbits"] == 0
+    assert first_payload["global_phase"] == {
+        "type": "real",
+        "hex": float(0).hex(),
+    }
+    assert canonical_bound_circuit_sha256(first) == (
+        canonical_bound_circuit_sha256(second)
+    )
+
+
+def test_independently_constructed_bound_uccsd_circuits_have_same_identity() -> None:
+    pytest.importorskip("qiskit_nature")
+    from qiskit_nature.second_q.circuit.library import HartreeFock, UCCSD
+    from qiskit_nature.second_q.mappers import JordanWignerMapper
+
+    def construct() -> Any:
+        mapper = JordanWignerMapper()
+        initial_state = HartreeFock(2, (1, 1), mapper)
+        ansatz = UCCSD(2, (1, 1), mapper, initial_state=initial_state)
+        values = [0.125 + index * 0.01 for index in range(ansatz.num_parameters)]
+        return ansatz.assign_parameters(values, inplace=False)
+
+    first = construct()
+    second = construct()
+
+    assert not first.parameters
+    assert not second.parameters
+    assert canonical_bound_circuit_sha256(first) == (
+        canonical_bound_circuit_sha256(second)
+    )
+
+
+def test_bound_circuit_semantic_identity_detects_parameter_instruction_and_order() -> None:
+    from qiskit import QuantumCircuit
+
+    source = QuantumCircuit(2)
+    source.rx(0.125, 0)
+    source.cx(0, 1)
+    changed_parameter = QuantumCircuit(2)
+    changed_parameter.rx(0.25, 0)
+    changed_parameter.cx(0, 1)
+    changed_instruction = QuantumCircuit(2)
+    changed_instruction.ry(0.125, 0)
+    changed_instruction.cx(0, 1)
+    changed_qubit_order = QuantumCircuit(2)
+    changed_qubit_order.rx(0.125, 0)
+    changed_qubit_order.cx(1, 0)
+    changed_global_phase = source.copy()
+    changed_global_phase.global_phase = 0.125
+
+    source_sha = canonical_bound_circuit_sha256(source)
+    assert canonical_bound_circuit_sha256(changed_parameter) != source_sha
+    assert canonical_bound_circuit_sha256(changed_instruction) != source_sha
+    assert canonical_bound_circuit_sha256(changed_qubit_order) != source_sha
+    assert canonical_bound_circuit_sha256(changed_global_phase) != source_sha
+
+
+def test_bound_circuit_semantic_identity_rejects_unbound_parameters() -> None:
+    from qiskit import QuantumCircuit
+    from qiskit.circuit import Parameter
+
+    circuit = QuantumCircuit(1)
+    circuit.rx(Parameter("theta"), 0)
+
+    with pytest.raises(QuantumIntegrityError, match="unbound parameters"):
+        canonical_bound_circuit_sha256(circuit)
+
+
+@pytest.mark.parametrize("parameter", [math.nan, math.inf, -math.inf, object()])
+def test_bound_circuit_semantic_identity_rejects_unsupported_parameters(
+    parameter: Any,
+) -> None:
+    from qiskit import QuantumCircuit
+    from qiskit.circuit.library import RXGate
+
+    gate = RXGate(0.125).to_mutable()
+    gate.params[0] = parameter
+    circuit = QuantumCircuit(1)
+    circuit.append(gate, [0])
+
+    with pytest.raises(QuantumIntegrityError):
+        canonical_bound_circuit_sha256(circuit)
+
+
+def test_bound_circuit_semantic_identity_rejects_opaque_custom_instruction() -> None:
+    from qiskit import QuantumCircuit
+    from qiskit.circuit import Instruction
+
+    circuit = QuantumCircuit(1)
+    circuit.append(Instruction("opaque", 1, 0, []), [0])
+
+    with pytest.raises(QuantumIntegrityError, match="unsupported primitive"):
+        canonical_bound_circuit_sha256(circuit)
+
+
+def test_local_preflight_and_ibm_worker_share_bound_circuit_fingerprint() -> None:
+    import cgr.pulsate_api.ibm_worker as worker_module
+    import cgr.quantum_preflight.reference as reference_module
+
+    assert worker_module.canonical_bound_circuit_sha256 is (
+        reference_module.canonical_bound_circuit_sha256
+    )
+    local_source = inspect.getsource(reference_module.run_vqe)
+    worker_source = inspect.getsource(worker_module.execute)
+    assert (
+        '"source_bound_circuit_sha256": canonical_bound_circuit_sha256('
+        in local_source
+    )
+    assert (
+        "source_bound_circuit_sha = canonical_bound_circuit_sha256(bound)"
+        in worker_source
+    )
+    assert "canonical_qpy_sha256(bound_ansatz)" not in local_source
+    assert "canonical_qpy_sha256(bound)" not in worker_source
 
 
 @pytest.mark.parametrize(

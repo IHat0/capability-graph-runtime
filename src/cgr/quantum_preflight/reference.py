@@ -8,10 +8,11 @@ import importlib.metadata
 import io
 import json
 import math
+import numbers
 import time
 from typing import Any
 
-from cgr.science import sha256_fingerprint
+from cgr.science import canonical_json, sha256_fingerprint
 
 from .adapters.qiskit_algorithms import deterministic_vqe, exact_eigensolver
 from .contracts import QuantumChemistryExperiment
@@ -36,6 +37,20 @@ class PreparedProblem:
 
 
 CANONICAL_QPY_MAXIMUM_BYTES = 4 * 1024 * 1024
+CANONICAL_BOUND_CIRCUIT_DECOMPOSITION_PASSES = 32
+CANONICAL_BOUND_CIRCUIT_MAXIMUM_INSTRUCTIONS = 100_000
+CANONICAL_BOUND_CIRCUIT_MAXIMUM_BYTES = 16 * 1024 * 1024
+_SUPPORTED_BOUND_CIRCUIT_LEAF_CLASSES = frozenset(
+    {
+        "qiskit.circuit.barrier.Barrier",
+        "qiskit.circuit.delay.Delay",
+        "qiskit.circuit.measure.Measure",
+        "qiskit.circuit.reset.Reset",
+    }
+)
+_SUPPORTED_BOUND_CIRCUIT_LEAF_PREFIX = (
+    "qiskit.circuit.library.standard_gates."
+)
 
 
 def canonical_qpy_bytes(circuit: Any) -> bytes:
@@ -55,6 +70,262 @@ def canonical_qpy_bytes(circuit: Any) -> bytes:
 def canonical_qpy_sha256(circuit: Any) -> str:
     """Hash the pinned QPY serialization of an actual circuit object."""
     return hashlib.sha256(canonical_qpy_bytes(circuit)).hexdigest()
+
+
+def _canonical_bound_numeric(value: Any, *, label: str) -> dict[str, str]:
+    if isinstance(value, bool) or not isinstance(value, numbers.Complex):
+        raise QuantumIntegrityError(
+            f"Bound source circuit {label} has an unsupported numeric type."
+        )
+    try:
+        numeric = complex(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise QuantumIntegrityError(
+            f"Bound source circuit {label} is not a supported numeric value."
+        ) from exc
+    if not math.isfinite(numeric.real) or not math.isfinite(numeric.imag):
+        raise QuantumIntegrityError(
+            f"Bound source circuit {label} must be finite."
+        )
+    real = 0.0 if numeric.real == 0.0 else float(numeric.real)
+    imaginary = 0.0 if numeric.imag == 0.0 else float(numeric.imag)
+    if imaginary == 0.0:
+        return {"type": "real", "hex": real.hex()}
+    return {
+        "type": "complex",
+        "real_hex": real.hex(),
+        "imaginary_hex": imaginary.hex(),
+    }
+
+
+def _bound_operation_class_identifier(operation: Any) -> str:
+    operation_class = getattr(operation, "base_class", type(operation))
+    module = getattr(operation_class, "__module__", None)
+    qualname = getattr(operation_class, "__qualname__", None)
+    if not isinstance(module, str) or not isinstance(qualname, str):
+        raise QuantumIntegrityError(
+            "Bound source circuit operation class identity is unavailable."
+        )
+    identifier = f"{module}.{qualname}"
+    if not (
+        identifier.startswith(_SUPPORTED_BOUND_CIRCUIT_LEAF_PREFIX)
+        or identifier in _SUPPORTED_BOUND_CIRCUIT_LEAF_CLASSES
+    ):
+        raise QuantumIntegrityError(
+            "Bound source circuit contains an unsupported primitive operation."
+        )
+    return identifier
+
+
+def _bound_operation_payload(operation: Any) -> dict[str, Any]:
+    name = getattr(operation, "name", None)
+    if not isinstance(name, str) or not name:
+        raise QuantumIntegrityError(
+            "Bound source circuit operation name is unavailable."
+        )
+    condition = getattr(operation, "condition", None)
+    if condition is not None:
+        raise QuantumIntegrityError(
+            "Bound source circuit classical conditions are unsupported."
+        )
+    try:
+        number_of_qubits = int(operation.num_qubits)
+        number_of_clbits = int(operation.num_clbits)
+        parameters = list(operation.params)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise QuantumIntegrityError(
+            "Bound source circuit operation shape is unsupported."
+        ) from exc
+    payload: dict[str, Any] = {
+        "name": name,
+        "base_class": _bound_operation_class_identifier(operation),
+        "number_of_qubits": number_of_qubits,
+        "number_of_clbits": number_of_clbits,
+        "parameters": [
+            _canonical_bound_numeric(value, label="operation parameter")
+            for value in parameters
+        ],
+    }
+    modifiers: dict[str, Any] = {}
+    control_count = getattr(operation, "num_ctrl_qubits", None)
+    control_state = getattr(operation, "ctrl_state", None)
+    if control_count is not None or control_state is not None:
+        if (
+            isinstance(control_count, bool)
+            or isinstance(control_state, bool)
+            or not isinstance(control_count, numbers.Integral)
+            or not isinstance(control_state, numbers.Integral)
+            or int(control_count) < 1
+            or int(control_state) < 0
+        ):
+            raise QuantumIntegrityError(
+                "Bound source circuit control modifiers are invalid."
+            )
+        modifiers["number_of_control_qubits"] = int(control_count)
+        modifiers["control_state"] = int(control_state)
+        base_gate = getattr(operation, "base_gate", None)
+        if base_gate is None:
+            raise QuantumIntegrityError(
+                "Bound source circuit controlled operation lacks its base gate."
+            )
+        base_name = getattr(base_gate, "name", None)
+        if not isinstance(base_name, str) or not base_name:
+            raise QuantumIntegrityError(
+                "Bound source circuit controlled base-gate name is unavailable."
+            )
+        base_class = getattr(base_gate, "base_class", type(base_gate))
+        base_module = getattr(base_class, "__module__", None)
+        base_qualname = getattr(base_class, "__qualname__", None)
+        if not isinstance(base_module, str) or not isinstance(base_qualname, str):
+            raise QuantumIntegrityError(
+                "Bound source circuit controlled base-gate identity is unavailable."
+            )
+        modifiers["base_gate"] = {
+            "name": base_name,
+            "base_class": f"{base_module}.{base_qualname}",
+        }
+    unit = getattr(operation, "unit", None)
+    if unit is not None:
+        if not isinstance(unit, str) or not unit or len(unit) > 32:
+            raise QuantumIntegrityError(
+                "Bound source circuit operation unit is unsupported."
+            )
+        modifiers["unit"] = unit
+    if modifiers:
+        payload["modifiers"] = modifiers
+    return payload
+
+
+def _bounded_bound_circuit_decomposition(circuit: Any) -> Any:
+    try:
+        from qiskit.circuit import QuantumCircuit  # type: ignore[import-not-found]
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise QuantumDependencyError("Qiskit circuit APIs are unavailable.") from exc
+    if not isinstance(circuit, QuantumCircuit):
+        raise QuantumIntegrityError(
+            "Bound source circuit identity requires a Qiskit QuantumCircuit."
+        )
+    if circuit.parameters:
+        raise QuantumIntegrityError(
+            "Bound source circuit contains unbound parameters."
+        )
+    for attribute in (
+        "num_input_vars",
+        "num_captured_vars",
+        "num_declared_vars",
+        "num_stretches",
+    ):
+        value = getattr(circuit, attribute, 0)
+        if value:
+            raise QuantumIntegrityError(
+                "Bound source circuit real-time variables are unsupported."
+            )
+    calibrations = getattr(circuit, "calibrations", None)
+    if calibrations:
+        raise QuantumIntegrityError(
+            "Bound source circuit calibrations are unsupported."
+        )
+    decomposed = circuit
+    for decomposition_pass in range(
+        CANONICAL_BOUND_CIRCUIT_DECOMPOSITION_PASSES + 1
+    ):
+        instructions = tuple(decomposed.data)
+        if len(instructions) > CANONICAL_BOUND_CIRCUIT_MAXIMUM_INSTRUCTIONS:
+            raise QuantumIntegrityError(
+                "Bound source circuit exceeds the instruction limit."
+            )
+        try:
+            fully_decomposed = all(
+                item.operation.definition is None for item in instructions
+            )
+        except Exception as exc:
+            raise QuantumIntegrityError(
+                "Bound source circuit operation definitions are unavailable."
+            ) from exc
+        if fully_decomposed:
+            if decomposed.parameters:
+                raise QuantumIntegrityError(
+                    "Decomposed source circuit contains unbound parameters."
+                )
+            return decomposed
+        if decomposition_pass == CANONICAL_BOUND_CIRCUIT_DECOMPOSITION_PASSES:
+            break
+        try:
+            decomposed = decomposed.decompose(reps=1)
+        except Exception as exc:
+            raise QuantumIntegrityError(
+                "Bound source circuit decomposition failed."
+            ) from exc
+    raise QuantumIntegrityError(
+        "Bound source circuit exceeded the decomposition-pass limit."
+    )
+
+
+def canonical_bound_circuit_payload(circuit: Any) -> dict[str, Any]:
+    """Return a bounded semantic payload for a fully bound source circuit."""
+    decomposed = _bounded_bound_circuit_decomposition(circuit)
+    try:
+        number_of_qubits = int(decomposed.num_qubits)
+        number_of_clbits = int(decomposed.num_clbits)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise QuantumIntegrityError(
+            "Bound source circuit bit counts are unavailable."
+        ) from exc
+    instructions: list[dict[str, Any]] = []
+    for item in decomposed.data:
+        try:
+            qubits = [int(decomposed.find_bit(bit).index) for bit in item.qubits]
+            clbits = [int(decomposed.find_bit(bit).index) for bit in item.clbits]
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise QuantumIntegrityError(
+                "Bound source circuit bit ordering is invalid."
+            ) from exc
+        if any(index < 0 or index >= number_of_qubits for index in qubits):
+            raise QuantumIntegrityError(
+                "Bound source circuit qubit index is out of range."
+            )
+        if any(index < 0 or index >= number_of_clbits for index in clbits):
+            raise QuantumIntegrityError(
+                "Bound source circuit classical-bit index is out of range."
+            )
+        operation = _bound_operation_payload(item.operation)
+        if operation["number_of_qubits"] != len(qubits):
+            raise QuantumIntegrityError(
+                "Bound source circuit operation qubit arity is inconsistent."
+            )
+        if operation["number_of_clbits"] != len(clbits):
+            raise QuantumIntegrityError(
+                "Bound source circuit operation classical-bit arity is inconsistent."
+            )
+        instructions.append(
+            {
+                "operation": operation,
+                "qubits": qubits,
+                "clbits": clbits,
+            }
+        )
+    payload = {
+        "schema_version": "cgr.bound-source-circuit/1.0.0",
+        "number_of_qubits": number_of_qubits,
+        "number_of_clbits": number_of_clbits,
+        "global_phase": _canonical_bound_numeric(
+            decomposed.global_phase,
+            label="global phase",
+        ),
+        "instructions": instructions,
+    }
+    if len(canonical_json(payload).encode("utf-8")) > (
+        CANONICAL_BOUND_CIRCUIT_MAXIMUM_BYTES
+    ):
+        raise QuantumIntegrityError(
+            "Bound source circuit canonical payload exceeds the byte limit."
+        )
+    return payload
+
+
+def canonical_bound_circuit_sha256(circuit: Any) -> str:
+    """Hash a deterministic semantic identity for a fully bound source circuit."""
+    return sha256_fingerprint(canonical_bound_circuit_payload(circuit))
 
 
 def canonical_sparse_pauli_op_payload(operator: Any, *, mapper: str) -> dict[str, Any]:
@@ -369,7 +640,9 @@ def run_vqe(
             "schema_version": "cgr.pulsate-ibm-local-preflight/1.0.0",
             "optimized_parameters": point,
             "optimized_parameters_sha256": vqe.optimized_parameters_sha256,
-            "source_bound_circuit_sha256": canonical_qpy_sha256(bound_ansatz),
+            "source_bound_circuit_sha256": canonical_bound_circuit_sha256(
+                bound_ansatz
+            ),
             "source_observable_sha256": canonical_sparse_pauli_op_sha256(
                 prepared.qubit_operator,
                 mapper=quantum.mapper,
