@@ -75,6 +75,8 @@ REQUIRED_PRODUCTION_BASE = "d4002efefde4d8681a086a380acd9d6925c79d86"
 ALLOWED_COMMITTED_PATHS = (
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.py",
     "scripts/run-pulsate-approved-qiskit-preflight-acceptance.sh",
+    "src/cgr/pulsate_api/approved_experiments.py",
+    "tests/test_pulsate_approved_execution.py",
 )
 QUESTION = (
     "Calculate the ground-state energy of lithium hydride at a bond length of "
@@ -253,8 +255,8 @@ def _source_identity(
     )
     _require(
         committed_paths == tuple(sorted(ALLOWED_COMMITTED_PATHS)),
-        "Committed changes above the production base must be exactly the two "
-        "approved acceptance scripts.",
+        "Committed changes above the production base must exactly match the "
+        "approved preflight change set.",
     )
     tracked_status = _run_checked(
         ["git", "status", "--porcelain=v1", "--untracked-files=no"],

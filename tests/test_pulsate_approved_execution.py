@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
@@ -36,6 +38,103 @@ from cgr.pulsate_api.natural_language import (
 from cgr.pulsate_api.runs import RunCoordinator
 from cgr.quantum_preflight.artifacts import write_json_atomic
 from cgr.science import sha256_fingerprint
+
+
+APPROVED_PREFLIGHT_COMMITTED_PATHS = (
+    "scripts/run-pulsate-approved-qiskit-preflight-acceptance.py",
+    "scripts/run-pulsate-approved-qiskit-preflight-acceptance.sh",
+    "src/cgr/pulsate_api/approved_experiments.py",
+    "tests/test_pulsate_approved_execution.py",
+)
+APPROVED_PREFLIGHT_PATH_FAILURE = (
+    "Committed changes above the production base must exactly match the "
+    "approved preflight change set."
+)
+_SOURCE_IDENTITY_PROBE = """
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+request = json.load(sys.stdin)
+runner_path = Path(request["runner_path"])
+spec = importlib.util.spec_from_file_location(
+    "pulsate_approved_qiskit_acceptance_probe",
+    runner_path,
+)
+if spec is None or spec.loader is None:
+    raise RuntimeError("Could not load the production acceptance runner.")
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+
+
+def fake_run_checked(arguments, *, cwd, timeout=30):
+    del cwd, timeout
+    if arguments[:2] == ["git", "cat-file"]:
+        return ""
+    if arguments[:3] == ["git", "merge-base", "--is-ancestor"]:
+        return ""
+    if arguments == ["git", "rev-parse", "HEAD"]:
+        return "probe-head"
+    if arguments == ["git", "show", "-s", "--format=%s", "HEAD"]:
+        return "probe subject"
+    if arguments[:3] == ["git", "diff", "--name-only"]:
+        return "\\n".join(request["committed_paths"])
+    if arguments == [
+        "git",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+    ]:
+        return request["tracked_status"]
+    raise AssertionError(f"Unexpected production Git command: {arguments!r}")
+
+
+runner._run_checked = fake_run_checked
+response = {
+    "allowed_paths": list(runner.ALLOWED_COMMITTED_PATHS),
+    "production_base": runner.REQUIRED_PRODUCTION_BASE,
+}
+try:
+    response["result"] = runner._source_identity(Path("."))
+    response["outcome"] = "accepted"
+except runner.AcceptanceFailure as exc:
+    response["outcome"] = "rejected"
+    response["message"] = str(exc)
+print(json.dumps(response))
+"""
+
+
+def _probe_production_source_identity(
+    *,
+    committed_paths: tuple[str, ...] = APPROVED_PREFLIGHT_COMMITTED_PATHS,
+    tracked_status: str = "",
+) -> dict[str, Any]:
+    repository_root = Path(__file__).resolve().parents[1]
+    runner_path = (
+        repository_root
+        / "scripts"
+        / "run-pulsate-approved-qiskit-preflight-acceptance.py"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", _SOURCE_IDENTITY_PROBE],
+        input=json.dumps(
+            {
+                "runner_path": str(runner_path),
+                "committed_paths": committed_paths,
+                "tracked_status": tracked_status,
+            }
+        ),
+        cwd=repository_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
 
 
 def _configuration() -> IBMQuantumConfiguration:
@@ -282,6 +381,56 @@ def test_approved_qiskit_wrapper_prepends_repository_src_to_pythonpath() -> None
         in wrapper
     )
     assert 'if [[ "$(uname -s)" != "Linux" ]]; then' in wrapper
+
+
+def test_production_preflight_guard_accepts_exact_approved_change_set() -> None:
+    probe = _probe_production_source_identity()
+
+    assert probe["outcome"] == "accepted"
+    assert (
+        probe["production_base"]
+        == "d4002efefde4d8681a086a380acd9d6925c79d86"
+    )
+    assert tuple(probe["allowed_paths"]) == APPROVED_PREFLIGHT_COMMITTED_PATHS
+    assert probe["result"] == [
+        "probe-head",
+        "probe subject",
+        list(APPROVED_PREFLIGHT_COMMITTED_PATHS),
+        "",
+    ]
+
+
+@pytest.mark.parametrize(
+    "committed_paths",
+    [
+        (
+            *APPROVED_PREFLIGHT_COMMITTED_PATHS,
+            "src/cgr/pulsate_api/unrelated.py",
+        ),
+        APPROVED_PREFLIGHT_COMMITTED_PATHS[:-1],
+    ],
+    ids=["unrelated-path-added", "approved-path-omitted"],
+)
+def test_production_preflight_guard_rejects_nonexact_change_set(
+    committed_paths: tuple[str, ...],
+) -> None:
+    probe = _probe_production_source_identity(committed_paths=committed_paths)
+
+    assert probe["outcome"] == "rejected"
+    assert probe["message"] == APPROVED_PREFLIGHT_PATH_FAILURE
+    assert "exactly the two approved acceptance scripts" not in probe["message"]
+
+
+def test_production_preflight_guard_rejects_tracked_working_tree_change() -> None:
+    probe = _probe_production_source_identity(
+        tracked_status=" M src/cgr/pulsate_api/approved_experiments.py"
+    )
+
+    assert probe["outcome"] == "rejected"
+    assert (
+        probe["message"]
+        == "Tracked working-tree changes are forbidden during acceptance."
+    )
 
 
 def test_approved_lih_runs_through_existing_fake_ibm_worker_and_recovers(
