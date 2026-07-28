@@ -11,9 +11,12 @@ import math
 import numbers
 import os
 import re
+import sys
 import time
+import traceback
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -34,7 +37,11 @@ from .ibm import (
     IBMRuntimeResult,
     IBMSubmissionAttempt,
     IBMSubmissionBundle,
+    IBMWorkerDiagnosticEnvelope,
     IBMWorkerFailureEnvelope,
+    IBM_WORKER_DIAGNOSTIC_MESSAGE_MAXIMUM_BYTES,
+    IBM_WORKER_DIAGNOSTIC_STAGES,
+    IBM_WORKER_DIAGNOSTIC_TRACEBACK_MAXIMUM_BYTES,
 )
 
 _MAXIMUM_BYTES = 2 * 1024 * 1024
@@ -42,6 +49,46 @@ _STATUS_POLL_INTERVAL_SECONDS = 1.0
 _NUCLEAR_CONSTANT_KEY = "nuclear_repulsion_energy"
 _WORKLOAD_TARGET_MAXIMUM_INSTRUCTIONS = 100_000
 _WORKLOAD_TARGET_MAXIMUM_ENTRIES = 4_096
+_DIAGNOSTIC_TRUNCATION_MARKER = "\n...[truncated]"
+_DIAGNOSTIC_STDERR_MAXIMUM_BYTES = 512
+
+
+class _WorkerStage(str, Enum):
+    LOAD_INPUTS = "load_inputs"
+    VALIDATE_INPUTS = "validate_inputs"
+    VALIDATE_LOCAL_PREFLIGHT = "validate_local_preflight"
+    REBUILD_WORKLOAD = "rebuild_workload"
+    INITIALISE_IBM_SERVICE = "initialise_ibm_service"
+    LOAD_BACKEND = "load_backend"
+    VALIDATE_PREPARED_EVIDENCE = "validate_prepared_evidence"
+    TRANSPILE_CIRCUIT = "transpile_circuit"
+    APPLY_OBSERVABLE_LAYOUT = "apply_observable_layout"
+    BUILD_PREPARED_EVIDENCE = "build_prepared_evidence"
+    FINGERPRINT_BACKEND_TARGET = "fingerprint_backend_target"
+    WRITE_PREPARED_SUBMISSION = "write_prepared_submission"
+    RECOVER_JOB = "recover_job"
+    CREATE_SUBMISSION_ATTEMPT = "create_submission_attempt"
+    CONSTRUCT_ESTIMATOR = "construct_estimator"
+    SUBMIT_ESTIMATOR_JOB = "submit_estimator_job"
+    PERSIST_JOB_IDENTIFIER = "persist_job_identifier"
+    POLL_JOB = "poll_job"
+    RETRIEVE_RESULT = "retrieve_result"
+    VALIDATE_RESULT = "validate_result"
+    WRITE_RESULT_ENVELOPE = "write_result_envelope"
+
+
+if tuple(stage.value for stage in _WorkerStage) != IBM_WORKER_DIAGNOSTIC_STAGES:
+    raise RuntimeError("IBM worker diagnostic stage declarations are inconsistent.")
+
+
+class _WorkerStageTracker:
+    def __init__(self) -> None:
+        self.stage = _WorkerStage.LOAD_INPUTS
+
+    def enter(self, stage: _WorkerStage) -> None:
+        if not isinstance(stage, _WorkerStage):
+            raise TypeError("IBM worker diagnostic stage is invalid.")
+        self.stage = stage
 
 
 class _ControlledWorkerFailure(RuntimeError):
@@ -53,6 +100,152 @@ class _ControlledWorkerFailure(RuntimeError):
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _diagnostic_mode_enabled() -> bool:
+    return os.environ.get("PULSATE_IBM_DIAGNOSTIC_MODE") == "true"
+
+
+def _bounded_utf8(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= maximum_bytes:
+        return value
+    marker = _DIAGNOSTIC_TRUNCATION_MARKER.encode("utf-8")
+    prefix = encoded[: maximum_bytes - len(marker)].decode("utf-8", errors="ignore")
+    return prefix + _DIAGNOSTIC_TRUNCATION_MARKER
+
+
+def _sanitise_diagnostic_text(value: str, *, maximum_bytes: int) -> str:
+    sanitized = value
+    secret_marker = "__PULSATE_SECRET_REDACTED__"
+    for variable in ("PULSATE_IBM_QUANTUM_TOKEN", "PULSATE_IBM_QUANTUM_INSTANCE"):
+        secret = os.environ.get(variable)
+        if secret:
+            sanitized = sanitized.replace(secret, secret_marker)
+    sanitized = re.sub(
+        r"(?is)\b(?:request_)?headers?\s*[:=]\s*\{[^}]*\}",
+        "headers=[REDACTED]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?is)\b(?:os\.)?environ(?:ment)?\s*[:=]\s*\{[^}]*\}",
+        "environment=[REDACTED]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)\b(token|credential|password|api[_-]?key|authorization|instance|account)"
+        r"\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)",
+        r"\1=[REDACTED]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)\bcrn:[^\s'\";,}\]]+",
+        "[REDACTED_IBM_INSTANCE]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]|\\\\)[^\s'\"<>|]+",
+        "[REDACTED_PATH]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?<![A-Za-z0-9:])/(?:[^\s'\"<>|:/]+/)*[^\s'\"<>|:]*",
+        "[REDACTED_PATH]",
+        sanitized,
+    )
+    sanitized = sanitized.replace(secret_marker, "[REDACTED]")
+    sanitized = "".join(
+        character
+        if character in {"\n", "\t"} or ord(character) >= 32
+        else "\N{REPLACEMENT CHARACTER}"
+        for character in sanitized
+    )
+    return _bounded_utf8(sanitized, maximum_bytes)
+
+
+def _diagnostic_file_exists(directory: Path, name: str) -> bool:
+    path = directory / name
+    return path.exists() or path.is_symlink()
+
+
+def _diagnostic_envelope(
+    directory: Path,
+    *,
+    error: BaseException,
+    stage: _WorkerStage,
+) -> IBMWorkerDiagnosticEnvelope:
+    exception_type = type(error).__name__
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", exception_type) is None:
+        exception_type = "Exception"
+    try:
+        raw_message = str(error)
+    except Exception:
+        raw_message = "Exception message unavailable."
+    message = _sanitise_diagnostic_text(
+        raw_message,
+        maximum_bytes=IBM_WORKER_DIAGNOSTIC_MESSAGE_MAXIMUM_BYTES,
+    )
+    try:
+        rendered_traceback = "".join(
+            traceback.TracebackException.from_exception(
+                error,
+                capture_locals=False,
+            ).format()
+        )
+    except Exception:
+        rendered_traceback = f"{exception_type}: {raw_message}"
+    sanitized_traceback = _sanitise_diagnostic_text(
+        rendered_traceback,
+        maximum_bytes=IBM_WORKER_DIAGNOSTIC_TRACEBACK_MAXIMUM_BYTES,
+    )
+    return IBMWorkerDiagnosticEnvelope(
+        created_at=_utc_now(),
+        stage=stage.value,
+        exception_type=exception_type,
+        sanitised_message=message,
+        sanitised_traceback=sanitized_traceback,
+        prepared_submission_exists=_diagnostic_file_exists(
+            directory,
+            "prepared-submission.json",
+        ),
+        submission_attempt_exists=_diagnostic_file_exists(
+            directory,
+            "submission-attempt.json",
+        ),
+        job_record_exists=_diagnostic_file_exists(directory, "job.json"),
+        result_envelope_exists=_diagnostic_file_exists(directory, "result.json"),
+    )
+
+
+def _write_diagnostic(
+    directory: Path,
+    *,
+    error: BaseException,
+    stage: _WorkerStage,
+) -> None:
+    diagnostic = _diagnostic_envelope(directory, error=error, stage=stage)
+    diagnostic_path = directory / "diagnostic.json"
+    if diagnostic_path.is_symlink():
+        raise ValueError("IBM worker diagnostic must not be a symbolic link.")
+    write_json_atomic(
+        diagnostic_path,
+        diagnostic.model_dump(mode="json"),
+        maximum_bytes=_MAXIMUM_BYTES,
+    )
+    stderr_message = " ".join(
+        _bounded_utf8(
+            " ".join(diagnostic.sanitised_message.split()),
+            _DIAGNOSTIC_STDERR_MAXIMUM_BYTES,
+        ).split()
+    )
+    print(
+        "[pulsate-ibm-diagnostic] "
+        f"stage={diagnostic.stage} "
+        f"exception={diagnostic.exception_type} "
+        f"message={stderr_message}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _validated_paths(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
@@ -348,7 +541,10 @@ def _persist_prepared_submission(
     source_bound_circuit_sha256: str,
     source_observable_sha256: str,
     mapper: str,
+    stage_tracker: _WorkerStageTracker | None = None,
 ) -> tuple[Any, Any, IBMPreparedSubmissionEvidence]:
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.BUILD_PREPARED_EVIDENCE)
     qpy_path = directory / "prepared-isa-circuit.qpy"
     observable_path = directory / "prepared-isa-observable.json"
     evidence_path = directory / "prepared-submission.json"
@@ -359,6 +555,11 @@ def _persist_prepared_submission(
         isa_observable, mapper=mapper
     )
     physical_qubits = _layout_indices(isa_circuit)
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.FINGERPRINT_BACKEND_TARGET)
+    backend_target_sha256 = _backend_target_sha256(backend, isa_circuit)
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.BUILD_PREPARED_EVIDENCE)
     evidence = IBMPreparedSubmissionEvidence(
         bundle_sha256=bundle.bundle_sha256,
         source_bound_circuit_sha256=source_bound_circuit_sha256,
@@ -370,10 +571,12 @@ def _persist_prepared_submission(
         seed_transpiler=bundle.seed_transpiler,
         optimization_level=bundle.optimization_level,
         backend_name=bundle.backend_name,
-        backend_target_sha256=_backend_target_sha256(backend, isa_circuit),
+        backend_target_sha256=backend_target_sha256,
         qiskit_version=importlib.metadata.version("qiskit"),
         observable_file_sha256=sha256_fingerprint(observable_payload),
     )
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.WRITE_PREPARED_SUBMISSION)
     _write_binary_atomic(qpy_path, qpy_payload)
     write_json_atomic(observable_path, observable_payload, maximum_bytes=_MAXIMUM_BYTES)
     write_json_atomic(
@@ -576,12 +779,15 @@ def _obtain_job(
     isa_observable: Any,
     attempt_path: Path,
     job_record_path: Path,
+    stage_tracker: _WorkerStageTracker | None = None,
 ) -> tuple[Any, str, str, dict[str, Any]]:
     runtime_options = {
         "max_execution_time": bundle.maximum_execution_time_seconds,
         "job_tags": [bundle.job_correlation_identifier],
     }
     if job_record_path.exists():
+        if stage_tracker is not None:
+            stage_tracker.enter(_WorkerStage.RECOVER_JOB)
         record = _read_object(job_record_path)
         if (
             record.get("bundle_sha256") != bundle.bundle_sha256
@@ -598,6 +804,8 @@ def _obtain_job(
         return job, job_identifier, str(record.get("submitted_at")), runtime_options
 
     if attempt_path.exists():
+        if stage_tracker is not None:
+            stage_tracker.enter(_WorkerStage.RECOVER_JOB)
         attempt = IBMSubmissionAttempt.model_validate(_read_object(attempt_path))
         _validate_attempt(attempt, bundle)
         matches = _matching_jobs(service, bundle)
@@ -606,6 +814,8 @@ def _obtain_job(
         if len(matches) > 1:
             raise RuntimeError("Duplicate IBM submissions matched the controlled job tag.")
         job = matches[0]
+        if stage_tracker is not None:
+            stage_tracker.enter(_WorkerStage.PERSIST_JOB_IDENTIFIER)
         job_identifier = str(job.job_id())
         _persist_job_record(
             job_record_path,
@@ -628,6 +838,8 @@ def _obtain_job(
         )
         return job, job_identifier, attempt.created_at, runtime_options
 
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.CREATE_SUBMISSION_ATTEMPT)
     submitted_at = _utc_now()
     attempt = IBMSubmissionAttempt(
         bundle_sha256=bundle.bundle_sha256,
@@ -642,15 +854,21 @@ def _obtain_job(
         attempt.model_dump(mode="json"),
         maximum_bytes=_MAXIMUM_BYTES,
     )
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.CONSTRUCT_ESTIMATOR)
     estimator = estimator_type(mode=backend)
     estimator.options.max_execution_time = bundle.maximum_execution_time_seconds
     estimator.options.environment.job_tags = [bundle.job_correlation_identifier]
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.SUBMIT_ESTIMATOR_JOB)
     try:
         job = estimator.run(
             [(isa_circuit, isa_observable)], precision=bundle.target_precision
         )
     except Exception as exc:
         raise _ControlledWorkerFailure("submission_indeterminate") from exc
+    if stage_tracker is not None:
+        stage_tracker.enter(_WorkerStage.PERSIST_JOB_IDENTIFIER)
     job_identifier = str(job.job_id())
     _persist_job_record(
         job_record_path,
@@ -679,7 +897,10 @@ def execute(
     manifest: ManifestEnvelope,
     *,
     job_record_path: Path,
+    _stage_tracker: _WorkerStageTracker | None = None,
 ) -> IBMRuntimeResult:
+    stage_tracker = _stage_tracker or _WorkerStageTracker()
+    stage_tracker.enter(_WorkerStage.VALIDATE_LOCAL_PREFLIGHT)
     from qiskit.transpiler.preset_passmanagers import (  # type: ignore[import-not-found]
         generate_preset_pass_manager,
     )
@@ -706,6 +927,7 @@ def execute(
     ):
         raise ValueError("IBM worker server configuration is incomplete or mismatched.")
 
+    stage_tracker.enter(_WorkerStage.REBUILD_WORKLOAD)
     prepared = prepare_problem(manifest.experiment)
     hamiltonian_sha = artifact_reference(
         "qubit_hamiltonian",
@@ -761,9 +983,11 @@ def execute(
     if ansatz_sha != bundle.ansatz_sha256:
         raise ValueError("Reconstructed IBM ansatz identity mismatch.")
 
+    stage_tracker.enter(_WorkerStage.INITIALISE_IBM_SERVICE)
     service = QiskitRuntimeService(
         channel="ibm_quantum_platform", token=token, instance=instance
     )
+    stage_tracker.enter(_WorkerStage.LOAD_BACKEND)
     backend = service.backend(backend_name)
     if int(backend.num_qubits) < bundle.required_qubits:
         raise ValueError("Configured IBM backend does not have enough qubits.")
@@ -771,6 +995,7 @@ def execute(
     status_path = job_record_path.with_name("status.json")
     evidence_path = job_record_path.with_name("prepared-submission.json")
     if attempt_path.exists() or job_record_path.exists() or evidence_path.exists():
+        stage_tracker.enter(_WorkerStage.VALIDATE_PREPARED_EVIDENCE)
         try:
             isa_circuit, isa_observable, evidence = _load_prepared_submission(
                 job_record_path.parent, bundle=bundle
@@ -778,12 +1003,14 @@ def execute(
         except Exception as exc:
             raise _ControlledWorkerFailure("prepared_evidence_failure") from exc
     else:
+        stage_tracker.enter(_WorkerStage.TRANSPILE_CIRCUIT)
         pass_manager = generate_preset_pass_manager(
             backend=backend,
             optimization_level=bundle.optimization_level,
             seed_transpiler=bundle.seed_transpiler,
         )
         isa_circuit = pass_manager.run(bound)
+        stage_tracker.enter(_WorkerStage.APPLY_OBSERVABLE_LAYOUT)
         isa_observable = prepared.qubit_operator.apply_layout(isa_circuit.layout)
         isa_circuit, isa_observable, evidence = _persist_prepared_submission(
             job_record_path.parent,
@@ -794,6 +1021,7 @@ def execute(
             source_bound_circuit_sha256=source_bound_circuit_sha,
             source_observable_sha256=source_observable_sha,
             mapper=manifest.experiment.quantum_model.mapper,
+            stage_tracker=stage_tracker,
         )
     job, job_identifier, submitted_at, runtime_options = _obtain_job(
         service=service,
@@ -804,7 +1032,9 @@ def execute(
         isa_observable=isa_observable,
         attempt_path=attempt_path,
         job_record_path=job_record_path,
+        stage_tracker=stage_tracker,
     )
+    stage_tracker.enter(_WorkerStage.POLL_JOB)
     while True:
         try:
             status = _normalized_job_status(job)
@@ -825,12 +1055,14 @@ def execute(
             raise _ControlledWorkerFailure("terminal_job_failure", status=status)
         raise _ControlledWorkerFailure("transient_status_failure", status="UNKNOWN")
 
+    stage_tracker.enter(_WorkerStage.RETRIEVE_RESULT)
     try:
         primitive_result = job.result()
     except Exception as exc:
         raise _ControlledWorkerFailure(
             "transient_result_failure", status="COMPLETED"
         ) from exc
+    stage_tracker.enter(_WorkerStage.VALIDATE_RESULT)
     publication = primitive_result[0]
     raw_expectation = float(publication.data.evs)
     standard_error_value = getattr(publication.data, "stds", None)
@@ -946,12 +1178,22 @@ def main() -> int:
     parser.add_argument("--result-envelope", required=True)
     arguments = parser.parse_args()
     controlled_directory: Path | None = None
+    stage_tracker = _WorkerStageTracker()
     try:
-        submission_path, manifest_path, job_record_path, result_path = _validated_paths(arguments)
+        submission_path, manifest_path, job_record_path, result_path = _validated_paths(
+            arguments
+        )
         controlled_directory = result_path.parent
+        stage_tracker.enter(_WorkerStage.VALIDATE_INPUTS)
         bundle = IBMSubmissionBundle.model_validate(_read_object(submission_path))
         manifest = ManifestEnvelope.model_validate(_read_object(manifest_path))
-        result = execute(bundle, manifest, job_record_path=job_record_path)
+        result = execute(
+            bundle,
+            manifest,
+            job_record_path=job_record_path,
+            _stage_tracker=stage_tracker,
+        )
+        stage_tracker.enter(_WorkerStage.WRITE_RESULT_ENVELOPE)
         write_json_atomic(
             result_path,
             result.model_dump(mode="json"),
@@ -966,6 +1208,16 @@ def main() -> int:
             except Exception:
                 # A malformed controlled directory must remain failed closed.
                 pass
+            if _diagnostic_mode_enabled():
+                try:
+                    _write_diagnostic(
+                        controlled_directory,
+                        error=exc,
+                        stage=stage_tracker.stage,
+                    )
+                except Exception:
+                    # Diagnostic evidence must never weaken the fail-closed path.
+                    pass
         return 1
 
 

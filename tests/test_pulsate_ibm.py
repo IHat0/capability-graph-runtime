@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -34,19 +35,25 @@ from cgr.pulsate_api.ibm import (
     IBMRuntimeResult,
     IBMSubmissionAttempt,
     IBMSubmissionBundle,
+    IBMWorkerDiagnosticEnvelope,
     IBMWorkerFailureEnvelope,
+    IBM_WORKER_DIAGNOSTIC_MESSAGE_MAXIMUM_BYTES,
+    IBM_WORKER_DIAGNOSTIC_TRACEBACK_MAXIMUM_BYTES,
     RunBoundIsolatedIBMPreflightExecutor,
     SubprocessIBMRuntimeAdapter,
     UnavailableIBMPreflightExecutor,
 )
 from cgr.pulsate_api.ibm_worker import (
+    _WorkerStage,
     _backend_target_payload,
     _backend_target_sha256,
+    _diagnostic_envelope,
     _load_prepared_submission,
     _layout_indices,
     _obtain_job,
     _persist_prepared_submission,
     execute as execute_ibm_worker,
+    main as ibm_worker_main,
     partition_hamiltonian_constants,
 )
 from cgr.pulsate_api.runs import (
@@ -246,6 +253,200 @@ def controlled_bundle() -> IBMSubmissionBundle:
         job_correlation_identifier="pulsate-" + "8" * 40,
         ibm_runtime_image_identifier="sha256:" + "b" * 64,
     )
+
+
+def _worker_control_paths(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path, Path]:
+    directory = tmp_path / ("run-" + "d" * 32) / "ibm-worker"
+    directory.mkdir(parents=True)
+    submission_path = directory / "submission.json"
+    manifest_path = directory / "manifest.json"
+    job_record_path = directory / "job.json"
+    result_path = directory / "result.json"
+    write_json_atomic(
+        submission_path,
+        controlled_bundle().model_dump(mode="json"),
+        maximum_bytes=100_000,
+    )
+    write_json_atomic(
+        manifest_path,
+        _load_preset("h2-ground-state-v1").model_dump(mode="json"),
+        maximum_bytes=100_000,
+    )
+    return directory, submission_path, manifest_path, job_record_path, result_path
+
+
+def _set_worker_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    submission_path: Path,
+    manifest_path: Path,
+    job_record_path: Path,
+    result_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cgr.pulsate_api.ibm_worker",
+            "--submission",
+            str(submission_path),
+            "--manifest",
+            str(manifest_path),
+            "--job-record",
+            str(job_record_path),
+            "--result-envelope",
+            str(result_path),
+        ],
+    )
+
+
+def test_ibm_worker_diagnostic_mode_is_disabled_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory, submission, manifest, job_record, result = _worker_control_paths(
+        tmp_path
+    )
+
+    def fail_before_submission(
+        bundle: IBMSubmissionBundle,
+        envelope: Any,
+        *,
+        job_record_path: Path,
+        _stage_tracker: Any,
+    ) -> IBMRuntimeResult:
+        del bundle, envelope, job_record_path
+        _stage_tracker.enter(_WorkerStage.REBUILD_WORKLOAD)
+        raise ValueError("controlled pre-submission failure")
+
+    monkeypatch.delenv("PULSATE_IBM_DIAGNOSTIC_MODE", raising=False)
+    monkeypatch.setattr("cgr.pulsate_api.ibm_worker.execute", fail_before_submission)
+    _set_worker_arguments(
+        monkeypatch,
+        submission_path=submission,
+        manifest_path=manifest,
+        job_record_path=job_record,
+        result_path=result,
+    )
+
+    assert ibm_worker_main() == 1
+    failure = IBMWorkerFailureEnvelope.model_validate(
+        json.loads((directory / "failure.json").read_text(encoding="utf-8"))
+    )
+    assert failure.category == "pre_submission_failure"
+    assert not (directory / "diagnostic.json").exists()
+    assert capsys.readouterr().err == ""
+
+
+def test_ibm_worker_diagnostic_is_bounded_redacted_and_stage_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory, submission, manifest, job_record, result = _worker_control_paths(
+        tmp_path
+    )
+    token = "controlled-secret-token-for-diagnostics"
+    instance = "crn:v1:bluemix:public:quantum-computing:us-east:a/secret::"
+
+    class ControlledDiagnosticError(RuntimeError):
+        pass
+
+    def fail_during_target_fingerprint(
+        bundle: IBMSubmissionBundle,
+        envelope: Any,
+        *,
+        job_record_path: Path,
+        _stage_tracker: Any,
+    ) -> IBMRuntimeResult:
+        del bundle, envelope, job_record_path
+        _stage_tracker.enter(_WorkerStage.FINGERPRINT_BACKEND_TARGET)
+        write_json_atomic(
+            directory / "prepared-submission.json",
+            {"controlled": True},
+            maximum_bytes=100_000,
+        )
+        raise ControlledDiagnosticError(
+            f"backend target rejected token={token} instance={instance} "
+            + ("multibyte-\N{TEST TUBE}" * 8_000)
+        )
+
+    monkeypatch.setenv("PULSATE_IBM_DIAGNOSTIC_MODE", "true")
+    monkeypatch.setenv("PULSATE_IBM_QUANTUM_TOKEN", token)
+    monkeypatch.setenv("PULSATE_IBM_QUANTUM_INSTANCE", instance)
+    monkeypatch.setattr(
+        "cgr.pulsate_api.ibm_worker.execute",
+        fail_during_target_fingerprint,
+    )
+    _set_worker_arguments(
+        monkeypatch,
+        submission_path=submission,
+        manifest_path=manifest,
+        job_record_path=job_record,
+        result_path=result,
+    )
+
+    assert ibm_worker_main() == 1
+    raw_diagnostic = (directory / "diagnostic.json").read_text(encoding="utf-8")
+    diagnostic = IBMWorkerDiagnosticEnvelope.model_validate_json(raw_diagnostic)
+    stderr = capsys.readouterr().err
+
+    assert diagnostic.stage == "fingerprint_backend_target"
+    assert diagnostic.exception_type == "ControlledDiagnosticError"
+    assert diagnostic.sanitised_message.startswith("backend target rejected")
+    assert len(diagnostic.sanitised_message.encode("utf-8")) <= (
+        IBM_WORKER_DIAGNOSTIC_MESSAGE_MAXIMUM_BYTES
+    )
+    assert len(diagnostic.sanitised_traceback.encode("utf-8")) <= (
+        IBM_WORKER_DIAGNOSTIC_TRACEBACK_MAXIMUM_BYTES
+    )
+    assert diagnostic.sanitised_message.endswith("...[truncated]")
+    assert diagnostic.sanitised_traceback.endswith("...[truncated]")
+    assert diagnostic.prepared_submission_exists is True
+    assert diagnostic.submission_attempt_exists is False
+    assert diagnostic.job_record_exists is False
+    assert diagnostic.result_envelope_exists is False
+    assert token not in raw_diagnostic
+    assert instance not in raw_diagnostic
+    assert token not in stderr
+    assert instance not in stderr
+    assert stderr.count("\n") == 1
+    assert stderr.startswith(
+        "[pulsate-ibm-diagnostic] "
+        "stage=fingerprint_backend_target "
+        "exception=ControlledDiagnosticError "
+    )
+    assert IBMWorkerFailureEnvelope.model_validate_json(
+        (directory / "failure.json").read_text(encoding="utf-8")
+    ).category == "pre_submission_failure"
+
+
+def test_ibm_worker_diagnostic_observes_existing_submission_and_job_files(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "ibm-worker"
+    directory.mkdir()
+    for name in (
+        "prepared-submission.json",
+        "submission-attempt.json",
+        "job.json",
+        "result.json",
+    ):
+        (directory / name).touch()
+
+    diagnostic = _diagnostic_envelope(
+        directory,
+        error=RuntimeError("controlled"),
+        stage=_WorkerStage.POLL_JOB,
+    )
+
+    assert diagnostic.prepared_submission_exists is True
+    assert diagnostic.submission_attempt_exists is True
+    assert diagnostic.job_record_exists is True
+    assert diagnostic.result_envelope_exists is True
 
 
 class _SyntheticTarget:
@@ -761,7 +962,10 @@ def test_prepared_isa_evidence_is_loaded_without_retranspiling_on_recovery(
     assert recovered.layout_sha256 == evidence.layout_sha256
     worker_source = inspect.getsource(execute_ibm_worker)
     recovery_branch = worker_source.index("if attempt_path.exists()")
-    generation_branch = worker_source.index("else:\n        pass_manager", recovery_branch)
+    generation_branch = worker_source.index(
+        "else:\n        stage_tracker.enter(_WorkerStage.TRANSPILE_CIRCUIT)",
+        recovery_branch,
+    )
     assert recovery_branch < worker_source.index(
         "_load_prepared_submission", recovery_branch
     ) < generation_branch
@@ -794,7 +998,10 @@ def test_prepared_isa_evidence_rejects_bundle_or_file_mutation(tmp_path: Path) -
 def test_worker_recovery_branch_loads_prepared_isa_before_generation_branch() -> None:
     worker_source = inspect.getsource(execute_ibm_worker)
     recovery_branch = worker_source.index("if attempt_path.exists()")
-    generation_branch = worker_source.index("else:\n        pass_manager", recovery_branch)
+    generation_branch = worker_source.index(
+        "else:\n        stage_tracker.enter(_WorkerStage.TRANSPILE_CIRCUIT)",
+        recovery_branch,
+    )
     assert recovery_branch < worker_source.index(
         "_load_prepared_submission", recovery_branch
     ) < generation_branch
@@ -1919,6 +2126,7 @@ def test_ibm_worker_environment_is_strictly_allowlisted(
     monkeypatch.setenv("DATABASE_URL", "must-not-cross")
     monkeypatch.setenv("SMTP_PASSWORD", "must-not-cross")
     monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    monkeypatch.delenv("PULSATE_IBM_DIAGNOSTIC_MODE", raising=False)
     adapter = SubprocessIBMRuntimeAdapter(
         repository_root=Path(__file__).resolve().parents[1],
         configuration=configuration(),
@@ -1930,6 +2138,139 @@ def test_ibm_worker_environment_is_strictly_allowlisted(
     assert "AWS_SECRET_ACCESS_KEY" not in environment
     assert "DATABASE_URL" not in environment
     assert "SMTP_PASSWORD" not in environment
+
+
+@pytest.mark.parametrize(
+    ("configured", "propagated"),
+    [
+        (None, False),
+        ("", False),
+        ("1", False),
+        ("TRUE", False),
+        (" true", False),
+        ("true", True),
+    ],
+)
+def test_ibm_worker_diagnostic_environment_requires_exact_literal_true(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    propagated: bool,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("PULSATE_IBM_DIAGNOSTIC_MODE", raising=False)
+    else:
+        monkeypatch.setenv("PULSATE_IBM_DIAGNOSTIC_MODE", configured)
+    adapter = SubprocessIBMRuntimeAdapter(
+        repository_root=Path(__file__).resolve().parents[1],
+        configuration=configuration(),
+    )
+
+    environment = adapter._worker_environment()
+
+    if propagated:
+        assert environment["PULSATE_IBM_DIAGNOSTIC_MODE"] == "true"
+    else:
+        assert "PULSATE_IBM_DIAGNOSTIC_MODE" not in environment
+
+
+@pytest.mark.parametrize(
+    ("diagnostic_mode", "expected_message"),
+    [
+        (None, "The isolated IBM Runtime worker failed."),
+        ("TRUE", "The isolated IBM Runtime worker failed."),
+        (
+            "true",
+            "The isolated IBM Runtime worker failed. "
+            "Diagnostic stage=load_backend "
+            "exception=ControlledBackendError "
+            "message=controlled backend lookup failed",
+        ),
+    ],
+)
+def test_adapter_exposes_diagnostic_only_in_exact_opt_in_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic_mode: str | None,
+    expected_message: str,
+) -> None:
+    bundle = controlled_bundle()
+    work_directory = tmp_path / (
+        "diagnostic-adapter-" + (diagnostic_mode or "unset")
+    )
+    work_directory.mkdir()
+    write_json_atomic(
+        work_directory / "submission.json",
+        bundle.model_dump(mode="json"),
+        maximum_bytes=100_000,
+    )
+    job_path = work_directory / "job.json"
+
+    class Process:
+        def __init__(self, command: list[str], **options: Any) -> None:
+            del command
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+            if diagnostic_mode == "true":
+                assert options["env"]["PULSATE_IBM_DIAGNOSTIC_MODE"] == "true"
+            else:
+                assert "PULSATE_IBM_DIAGNOSTIC_MODE" not in options["env"]
+            write_json_atomic(
+                work_directory / "failure.json",
+                IBMWorkerFailureEnvelope(
+                    category="pre_submission_failure",
+                    job_identifier_persisted=False,
+                    retrieval_recoverable=False,
+                ).model_dump(mode="json"),
+                maximum_bytes=100_000,
+            )
+            write_json_atomic(
+                work_directory / "diagnostic.json",
+                IBMWorkerDiagnosticEnvelope(
+                    created_at="2026-07-28T00:00:00Z",
+                    stage="load_backend",
+                    exception_type="ControlledBackendError",
+                    sanitised_message="controlled backend lookup failed",
+                    sanitised_traceback="ControlledBackendError",
+                    prepared_submission_exists=False,
+                    submission_attempt_exists=False,
+                    job_record_exists=False,
+                    result_envelope_exists=False,
+                ).model_dump(mode="json"),
+                maximum_bytes=100_000,
+            )
+
+        @staticmethod
+        def wait(timeout: float | None = None) -> int:
+            del timeout
+            return 1
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+    if diagnostic_mode is None:
+        monkeypatch.delenv("PULSATE_IBM_DIAGNOSTIC_MODE", raising=False)
+    else:
+        monkeypatch.setenv("PULSATE_IBM_DIAGNOSTIC_MODE", diagnostic_mode)
+    monkeypatch.setattr("cgr.pulsate_api.ibm.subprocess.Popen", Process)
+    adapter = SubprocessIBMRuntimeAdapter(
+        repository_root=Path(__file__).resolve().parents[1],
+        configuration=configuration(),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        adapter.execute(
+            bundle,
+            _load_preset("h2-ground-state-v1"),
+            work_directory=work_directory,
+            job_record_path=job_path,
+            maximum_seconds=1,
+            status_callback=lambda *_: None,
+        )
+
+    assert str(raised.value) == expected_message
+    assert "server-secret-token" not in str(raised.value)
+    assert "server-instance" not in str(raised.value)
 
 
 def test_ibm_capability_fails_closed_without_isolated_preflight_handoff() -> None:

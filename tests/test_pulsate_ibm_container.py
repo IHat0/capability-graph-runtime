@@ -67,6 +67,11 @@ def test_live_script_requires_cost_gates_and_passes_credentials_by_name() -> Non
     assert "--env PULSATE_IBM_QUANTUM_TOKEN" in run
     assert "PULSATE_IBM_IMAGE_IDENTIFIER" in run
     assert "tests/test_pulsate_ibm_integration.py" in run
+    assert 'PULSATE_IBM_DIAGNOSTIC_MODE:-}" == "true"' in run
+    assert "(--env PULSATE_IBM_DIAGNOSTIC_MODE=true)" in run
+    assert "*/ibm-worker/diagnostic.json" in run
+    assert 'cat -- "$diagnostic_path"' in run
+    assert "--network none" in run.split("if [[ \"$diagnostic_mode\"", 1)[1]
 
 
 def test_fake_integration_is_separate_nonpaid_and_network_local_only() -> None:

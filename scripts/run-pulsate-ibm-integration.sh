@@ -4,6 +4,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 derived_image="${PULSATE_IBM_IMAGE:-cgr-pulsate-ibm-runtime:1.0.0}"
 scientific_image="${PULSATE_HTTP_IMAGE:-cgr-pulsate-http-integration:1.0.0}"
+diagnostic_environment=()
+diagnostic_mode=false
+if [[ "${PULSATE_IBM_DIAGNOSTIC_MODE:-}" == "true" ]]; then
+  diagnostic_environment=(--env PULSATE_IBM_DIAGNOSTIC_MODE=true)
+  diagnostic_mode=true
+fi
 
 for variable in \
   PULSATE_RUN_IBM_INTEGRATION \
@@ -81,7 +87,7 @@ docker run --rm \
 
 # Phase 2: only validated persisted preflight is reused. This container has
 # network access and injects credentials solely into its IBM worker process.
-docker run --rm \
+if docker run --rm \
   --network "$network_name" \
   --read-only \
   --cpus 2 \
@@ -101,6 +107,34 @@ docker run --rm \
   --env PULSATE_IBM_QUANTUM_BACKEND \
   --env "PULSATE_IBM_IMAGE_IDENTIFIER=$derived_image_id" \
   --env "PULSATE_IBM_SCIENTIFIC_IMAGE_IDENTIFIER=$scientific_image_id" \
+  "${diagnostic_environment[@]}" \
   "$derived_image_id" \
   pytest -q -s -rs -p no:cacheprovider \
   tests/test_pulsate_ibm_integration.py::test_network_enabled_ibm_runtime_phase
+then
+  :
+else
+  runtime_status=$?
+  if [[ "$diagnostic_mode" == "true" ]]; then
+    docker run --rm \
+      --network none \
+      --read-only \
+      --security-opt no-new-privileges \
+      --cap-drop ALL \
+      --volume "$run_volume:/pulsate-run:ro" \
+      --entrypoint /bin/sh \
+      "$derived_image_id" \
+      -c '
+        diagnostic_path="$(
+          find /pulsate-run -type f \
+            -path "*/ibm-worker/diagnostic.json" -print -quit
+        )"
+        if [ -n "$diagnostic_path" ]; then
+          cat -- "$diagnostic_path"
+        else
+          echo "No Pulsate IBM diagnostic artifact was produced." >&2
+        fi
+      ' || true
+  fi
+  exit "$runtime_status"
+fi

@@ -40,6 +40,7 @@ IBM_SUBMISSION_ATTEMPT_SCHEMA = "cgr.pulsate-ibm-submission-attempt/1.0.0"
 IBM_RESULT_SCHEMA = "cgr.pulsate-ibm-result/1.0.0"
 IBM_PREPARED_SUBMISSION_SCHEMA = "cgr.pulsate-ibm-prepared-submission/1.0.0"
 IBM_WORKER_FAILURE_SCHEMA = "cgr.pulsate-ibm-worker-failure/1.0.0"
+IBM_WORKER_DIAGNOSTIC_SCHEMA = "cgr.pulsate-ibm-worker-diagnostic/1.0.0"
 IBM_PRIMITIVE_IDENTIFIER = "EstimatorV2"
 IBM_MAXIMUM_QUBITS = 32
 IBM_MAXIMUM_CIRCUIT_DEPTH = 100_000
@@ -56,6 +57,31 @@ IBM_PREFLIGHT_LAUNCHER_MAXIMUM_AGE_SECONDS = 10
 _IBM_FILE_MAXIMUM_BYTES = 2 * 1024 * 1024
 _IBM_JOB_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{3,256}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+IBM_WORKER_DIAGNOSTIC_MESSAGE_MAXIMUM_BYTES = 4 * 1024
+IBM_WORKER_DIAGNOSTIC_TRACEBACK_MAXIMUM_BYTES = 32 * 1024
+IBM_WORKER_DIAGNOSTIC_STAGES = (
+    "load_inputs",
+    "validate_inputs",
+    "validate_local_preflight",
+    "rebuild_workload",
+    "initialise_ibm_service",
+    "load_backend",
+    "validate_prepared_evidence",
+    "transpile_circuit",
+    "apply_observable_layout",
+    "build_prepared_evidence",
+    "fingerprint_backend_target",
+    "write_prepared_submission",
+    "recover_job",
+    "create_submission_attempt",
+    "construct_estimator",
+    "submit_estimator_job",
+    "persist_job_identifier",
+    "poll_job",
+    "retrieve_result",
+    "validate_result",
+    "write_result_envelope",
+)
 
 
 @dataclass(frozen=True)
@@ -348,6 +374,68 @@ class IBMWorkerFailureEnvelope(BaseModel):
         ):
             raise ValueError("A terminal IBM job failure cannot be recoverable.")
         return self
+
+
+class IBMWorkerDiagnosticEnvelope(BaseModel):
+    """Bounded internal diagnostic state, never part of the public API."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[IBM_WORKER_DIAGNOSTIC_SCHEMA] = (
+        IBM_WORKER_DIAGNOSTIC_SCHEMA
+    )
+    created_at: str
+    stage: Literal[
+        "load_inputs",
+        "validate_inputs",
+        "validate_local_preflight",
+        "rebuild_workload",
+        "initialise_ibm_service",
+        "load_backend",
+        "validate_prepared_evidence",
+        "transpile_circuit",
+        "apply_observable_layout",
+        "build_prepared_evidence",
+        "fingerprint_backend_target",
+        "write_prepared_submission",
+        "recover_job",
+        "create_submission_attempt",
+        "construct_estimator",
+        "submit_estimator_job",
+        "persist_job_identifier",
+        "poll_job",
+        "retrieve_result",
+        "validate_result",
+        "write_result_envelope",
+    ]
+    exception_type: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+    sanitised_message: str
+    sanitised_traceback: str
+    prepared_submission_exists: bool
+    submission_attempt_exists: bool
+    job_record_exists: bool
+    result_envelope_exists: bool
+
+    @field_validator("created_at")
+    @classmethod
+    def bounded_created_at(cls, value: str) -> str:
+        if not value or len(value.encode("utf-8")) > 64:
+            raise ValueError("IBM diagnostic timestamp is malformed.")
+        return value
+
+    @field_validator("sanitised_message")
+    @classmethod
+    def bounded_message(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > IBM_WORKER_DIAGNOSTIC_MESSAGE_MAXIMUM_BYTES:
+            raise ValueError("IBM diagnostic message is oversized.")
+        return value
+
+    @field_validator("sanitised_traceback")
+    @classmethod
+    def bounded_traceback(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > IBM_WORKER_DIAGNOSTIC_TRACEBACK_MAXIMUM_BYTES:
+            raise ValueError("IBM diagnostic traceback is oversized.")
+        return value
 
 
 class IBMSubmissionAttempt(BaseModel):
@@ -1254,6 +1342,10 @@ class SubprocessIBMRuntimeAdapter:
                 environment.pop(key, None)
             else:
                 environment[key] = value
+        if os.environ.get("PULSATE_IBM_DIAGNOSTIC_MODE") == "true":
+            environment["PULSATE_IBM_DIAGNOSTIC_MODE"] = "true"
+        else:
+            environment.pop("PULSATE_IBM_DIAGNOSTIC_MODE", None)
         return environment
 
     def execute(
@@ -1475,6 +1567,47 @@ class SubprocessIBMRuntimeAdapter:
                         backend_name=bundle.backend_name,
                         runtime_status=failure.last_controlled_ibm_status,
                     )
+            if os.environ.get("PULSATE_IBM_DIAGNOSTIC_MODE") == "true":
+                diagnostic_path = work_directory / "diagnostic.json"
+                if diagnostic_path.is_file() and not diagnostic_path.is_symlink():
+                    diagnostic = IBMWorkerDiagnosticEnvelope.model_validate(
+                        _controlled_json(
+                            work_directory,
+                            diagnostic_path.name,
+                            maximum_bytes=_IBM_FILE_MAXIMUM_BYTES,
+                        )
+                    )
+                    observed_files = {
+                        "prepared_submission_exists": (
+                            (work_directory / "prepared-submission.json").exists()
+                            or (work_directory / "prepared-submission.json").is_symlink()
+                        ),
+                        "submission_attempt_exists": (
+                            (work_directory / "submission-attempt.json").exists()
+                            or (work_directory / "submission-attempt.json").is_symlink()
+                        ),
+                        "job_record_exists": (
+                            job_record_path.exists() or job_record_path.is_symlink()
+                        ),
+                        "result_envelope_exists": (
+                            result_path.exists() or result_path.is_symlink()
+                        ),
+                    }
+                    if any(
+                        getattr(diagnostic, key) != value
+                        for key, value in observed_files.items()
+                    ):
+                        raise ValueError(
+                            "IBM worker diagnostic artifact state is inconsistent."
+                        )
+                    message = (
+                        "The isolated IBM Runtime worker failed. "
+                        f"Diagnostic stage={diagnostic.stage} "
+                        f"exception={diagnostic.exception_type} "
+                        f"message={diagnostic.sanitised_message}"
+                    )
+                    assert_public_response_safe(message)
+                    raise RuntimeError(message)
             raise RuntimeError("The isolated IBM Runtime worker failed.")
         return IBMRuntimeResult.model_validate(
             _controlled_json(work_directory, "result.json", maximum_bytes=_IBM_FILE_MAXIMUM_BYTES)
