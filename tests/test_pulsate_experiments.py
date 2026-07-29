@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import json
 import importlib
+import json
 import math
 import re
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from test_pulsate_runs import ControlledExecutor, wait_for_terminal
 
 from cgr.pulsate_api.app import _load_preset, create_app
 from cgr.pulsate_api.experiments import (
@@ -18,7 +19,6 @@ from cgr.pulsate_api.experiments import (
     plan_scientific_question,
 )
 from cgr.pulsate_api.runs import RunCoordinator, assert_public_response_safe
-from test_pulsate_runs import ControlledExecutor
 
 
 @pytest.mark.parametrize(
@@ -390,6 +390,352 @@ def test_plan_get_and_dynamic_run_preserve_compiled_manifest_and_molecule(tmp_pa
             assert evidence["source_type"] == "dynamic_experiment"
             assert evidence["source_identifier"] == identifier
             assert evidence["preset_identifier"] is None
+
+
+class _IBMExecutionSpy:
+    def __init__(self) -> None:
+        self.execute_calls = 0
+
+    def capability(self) -> dict[str, object]:
+        return {
+            "available": False,
+            "backend_name": None,
+            "reason": "IBM execution is disabled in this test.",
+            "maximum_run_seconds": None,
+            "target_precision": None,
+        }
+
+    def execute(self, *args: object, **kwargs: object) -> object:
+        self.execute_calls += 1
+        raise AssertionError("Scene retrieval must not invoke IBM execution.")
+
+
+def _create_terminal_dynamic_h2(
+    client: TestClient, *, idempotency_key: str
+) -> tuple[dict[str, object], dict[str, object]]:
+    planned = client.post(
+        "/api/v1/experiments/plan",
+        json={"question": "Compute the ground-state energy of H2 at 0.9 angstrom"},
+    )
+    assert planned.status_code == 201
+    plan = planned.json()
+    created = client.post(
+        "/api/v1/runs",
+        headers={"Idempotency-Key": idempotency_key},
+        json={
+            "experiment_identifier": plan["experiment_identifier"],
+            "execution_target": "local_simulator",
+        },
+    )
+    assert created.status_code == 202
+    terminal = wait_for_terminal(client, created.json()["run_identifier"])
+    assert terminal["status"] == "authorized"
+    return plan, terminal
+
+
+def _run_directory_snapshot(directory: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        str(path.relative_to(directory)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in directory.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def test_terminal_dynamic_run_scene_is_persisted_scientific_evidence_and_read_only(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs"
+    experiment_root = tmp_path / "experiments"
+    local_executor = ControlledExecutor()
+    ibm_executor = _IBMExecutionSpy()
+    writer = RunCoordinator(
+        run_root=run_root,
+        manifest_resolver=_load_preset,
+        executor=local_executor,
+        ibm_executor=ibm_executor,
+        enabled=True,
+    )
+    with TestClient(
+        create_app(
+            coordinator=writer,
+            experiment_store=ExperimentStore(experiment_root),
+        )
+    ) as client:
+        plan, terminal = _create_terminal_dynamic_h2(
+            client, idempotency_key="dynamic-scene-read-0001"
+        )
+
+    reader_executor = ControlledExecutor()
+    reader = RunCoordinator(
+        run_root=run_root,
+        manifest_resolver=_load_preset,
+        executor=reader_executor,
+        ibm_executor=ibm_executor,
+        enabled=True,
+    )
+    with TestClient(
+        create_app(
+            coordinator=reader,
+            experiment_store=ExperimentStore(experiment_root),
+        )
+    ) as client:
+        run_directory = reader.run_root / terminal["run_identifier"]
+        before = _run_directory_snapshot(run_directory)
+        response = client.get(f"/api/v1/runs/{terminal['run_identifier']}/scene")
+        after = _run_directory_snapshot(run_directory)
+
+    assert response.status_code == 200
+    scene = response.json()
+    assert scene["experiment_identifier"] == plan["experiment_identifier"]
+    assert scene["experiment_fingerprint"] == plan["experiment_fingerprint"]
+    assert scene["coordinate_unit"] == "angstrom"
+    assert [atom["element"] for atom in scene["atoms"]] == ["H", "H"]
+    assert math.dist(
+        scene["atoms"][0]["coordinates"], scene["atoms"][1]["coordinates"]
+    ) == pytest.approx(0.9)
+    assert scene["bonds"] == [
+        {
+            "bond_identifier": "bond.0-1",
+            "atom_identifiers": [
+                scene["atoms"][0]["atom_identifier"],
+                scene["atoms"][1]["atom_identifier"],
+            ],
+            "declared_distance": 0.9,
+            "derived_distance": pytest.approx(0.9),
+        }
+    ]
+    assert scene["quantum_region"]["atom_identifiers"] == [
+        atom["atom_identifier"] for atom in scene["atoms"]
+    ]
+    assert scene["scientific_model"] == {
+        "charge": 0,
+        "spin_multiplicity": 1,
+        "basis_set": "sto-3g",
+        "reference_method": "restricted_hartree_fock",
+        "active_electron_count": 2,
+        "active_spatial_orbital_count": 2,
+        "mapper": "jordan_wigner",
+        "ansatz": "uccsd",
+    }
+    assert before == after
+    assert local_executor.calls == 1
+    assert reader_executor.calls == 0
+    assert ibm_executor.execute_calls == 0
+
+
+def test_run_scene_unknown_run_uses_typed_not_found(tmp_path: Path) -> None:
+    coordinator = RunCoordinator(
+        run_root=tmp_path / "runs",
+        manifest_resolver=_load_preset,
+        executor=ControlledExecutor(),
+        enabled=True,
+    )
+    with TestClient(create_app(coordinator=coordinator)) as client:
+        response = client.get(f"/api/v1/runs/run-{'f' * 32}/scene")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {"code": "run_not_found", "message": "Run not found."}
+    }
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_manifest",
+        "malformed_manifest",
+        "oversized_manifest",
+        "identity_mismatch",
+        "symlinked_manifest",
+    ],
+)
+def test_dynamic_run_scene_rejects_invalid_persisted_evidence(
+    tmp_path: Path, corruption: str
+) -> None:
+    coordinator = RunCoordinator(
+        run_root=tmp_path / "runs",
+        manifest_resolver=_load_preset,
+        executor=ControlledExecutor(),
+        enabled=True,
+    )
+    with TestClient(
+        create_app(
+            coordinator=coordinator,
+            experiment_store=ExperimentStore(tmp_path / "experiments"),
+        )
+    ) as client:
+        _, terminal = _create_terminal_dynamic_h2(
+            client, idempotency_key=f"dynamic-scene-{corruption}"
+        )
+        directory = coordinator.run_root / terminal["run_identifier"]
+        manifest_path = directory / "compiled-manifest.json"
+        if corruption == "missing_manifest":
+            manifest_path.unlink()
+        elif corruption == "malformed_manifest":
+            manifest_path.write_text("{", encoding="utf-8")
+        elif corruption == "oversized_manifest":
+            manifest_path.write_bytes(b" " * (2 * 1024 * 1024 + 1))
+        elif corruption == "identity_mismatch":
+            state_path = directory / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["experiment_fingerprint"] = "0" * 64
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+        else:
+            target = directory / "compiled-manifest-target.json"
+            manifest_path.rename(target)
+            try:
+                manifest_path.symlink_to(target.name)
+            except (NotImplementedError, OSError):
+                pytest.skip("Symbolic links are unavailable on this platform.")
+
+        local_calls = coordinator.executor.calls
+        response = client.get(f"/api/v1/runs/{terminal['run_identifier']}/scene")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "scene_unavailable",
+            "message": "Run scene is unavailable.",
+        }
+    }
+    assert coordinator.executor.calls == local_calls
+
+
+def test_run_scene_rejects_symlinked_persisted_run_directory(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs"
+    experiment_root = tmp_path / "experiments"
+    writer_executor = ControlledExecutor()
+    ibm_executor = _IBMExecutionSpy()
+    writer = RunCoordinator(
+        run_root=run_root,
+        manifest_resolver=_load_preset,
+        executor=writer_executor,
+        ibm_executor=ibm_executor,
+        enabled=True,
+    )
+    with TestClient(
+        create_app(
+            coordinator=writer,
+            experiment_store=ExperimentStore(experiment_root),
+        )
+    ) as client:
+        _, terminal = _create_terminal_dynamic_h2(
+            client, idempotency_key="dynamic-scene-run-directory-symlink"
+        )
+
+    original_directory = run_root / terminal["run_identifier"]
+    moved_directory = run_root / "moved-persisted-run"
+    original_directory.rename(moved_directory)
+    try:
+        original_directory.symlink_to(moved_directory, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        moved_directory.rename(original_directory)
+        pytest.skip("Directory symbolic links are unavailable on this platform.")
+
+    reader_executor = ControlledExecutor()
+    reader = RunCoordinator(
+        run_root=run_root,
+        manifest_resolver=_load_preset,
+        executor=reader_executor,
+        ibm_executor=ibm_executor,
+        enabled=True,
+    )
+    with TestClient(
+        create_app(
+            coordinator=reader,
+            experiment_store=ExperimentStore(experiment_root),
+        )
+    ) as client:
+        response = client.get(f"/api/v1/runs/{terminal['run_identifier']}/scene")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "scene_unavailable",
+            "message": "Run scene is unavailable.",
+        }
+    }
+    assert writer_executor.calls == 1
+    assert reader_executor.calls == 0
+    assert ibm_executor.execute_calls == 0
+
+
+def test_run_scene_rejects_internally_inconsistent_manifest_identity(
+    tmp_path: Path,
+) -> None:
+    executor = ControlledExecutor()
+    ibm_executor = _IBMExecutionSpy()
+    coordinator = RunCoordinator(
+        run_root=tmp_path / "runs",
+        manifest_resolver=_load_preset,
+        executor=executor,
+        ibm_executor=ibm_executor,
+        enabled=True,
+    )
+    with TestClient(
+        create_app(
+            coordinator=coordinator,
+            experiment_store=ExperimentStore(tmp_path / "experiments"),
+        )
+    ) as client:
+        _, terminal = _create_terminal_dynamic_h2(
+            client, idempotency_key="dynamic-scene-internal-identity"
+        )
+        directory = coordinator.run_root / terminal["run_identifier"]
+        altered_expected_identity = "0" * 64
+
+        manifest_path = directory / "compiled-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["expected_experiment_sha256"] = altered_expected_identity
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        state_path = directory / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["expected_experiment_sha256"] = altered_expected_identity
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        local_calls = executor.calls
+        response = client.get(f"/api/v1/runs/{terminal['run_identifier']}/scene")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "scene_unavailable",
+            "message": "Run scene is unavailable.",
+        }
+    }
+    assert executor.calls == local_calls
+    assert ibm_executor.execute_calls == 0
+
+
+def test_terminal_preset_run_scene_uses_existing_manifest_resolver(
+    tmp_path: Path,
+) -> None:
+    executor = ControlledExecutor()
+    coordinator = RunCoordinator(
+        run_root=tmp_path / "runs",
+        manifest_resolver=_load_preset,
+        executor=executor,
+        enabled=True,
+    )
+    with TestClient(create_app(coordinator=coordinator)) as client:
+        created = client.post(
+            "/api/v1/runs",
+            headers={"Idempotency-Key": "preset-scene-read-0001"},
+            json={
+                "preset_identifier": "h2-ground-state-v1",
+                "execution_target": "local_simulator",
+            },
+        )
+        terminal = wait_for_terminal(client, created.json()["run_identifier"])
+        calls_before_read = executor.calls
+        response = client.get(f"/api/v1/runs/{terminal['run_identifier']}/scene")
+
+    assert response.status_code == 200
+    assert response.json()["experiment_identifier"] == terminal["experiment_identifier"]
+    assert executor.calls == calls_before_read
 
 
 def test_run_request_requires_exactly_one_source(tmp_path: Path) -> None:

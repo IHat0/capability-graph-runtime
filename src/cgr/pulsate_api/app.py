@@ -49,6 +49,8 @@ from .runs import (
     InvalidIdempotencyKeyError,
     RunCoordinator,
     RunNotFoundError,
+    SceneUnavailableError,
+    assert_public_response_safe,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -468,6 +470,27 @@ def create_app(
             return run_coordinator.get(run_identifier)
         except (RunNotFoundError, FileNotFoundError):
             raise _typed_error(404, "run_not_found", "Run not found.") from None
+
+    @application.get("/api/v1/runs/{run_identifier}/scene")
+    def read_run_scene(run_identifier: str) -> dict[str, Any]:
+        try:
+            state, manifest = run_coordinator.scene_manifest(run_identifier)
+            scene = _declared_scene(manifest)
+            if (
+                scene.get("experiment_identifier")
+                != state.get("experiment_identifier")
+                or scene.get("experiment_fingerprint")
+                != state.get("experiment_fingerprint")
+            ):
+                raise SceneUnavailableError("Run scene is unavailable.")
+            assert_public_response_safe(scene)
+            return scene
+        except (RunNotFoundError, FileNotFoundError):
+            raise _typed_error(404, "run_not_found", "Run not found.") from None
+        except (SceneUnavailableError, ValueError, TypeError, IndexError):
+            raise _typed_error(
+                409, "scene_unavailable", "Run scene is unavailable."
+            ) from None
 
     def read_artifact(run_identifier: str, name: Literal["results", "verification", "receipt"]) -> dict[str, Any]:
         try:

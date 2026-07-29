@@ -1246,6 +1246,7 @@ class ExistingQuantumPreflightExecutor:
 
 class RunNotFoundError(LookupError): pass
 class ArtifactUnavailableError(RuntimeError): pass
+class SceneUnavailableError(RuntimeError): pass
 class IdempotencyConflictError(RuntimeError): pass
 class InvalidIdempotencyKeyError(ValueError): pass
 class RunRootOwnershipError(RuntimeError): pass
@@ -1623,6 +1624,79 @@ class RunCoordinator:
             assert_public_response_safe(state)
             return state
 
+    def scene_manifest(
+        self, run_identifier: str
+    ) -> tuple[dict[str, Any], ManifestEnvelope]:
+        """Load a run's declared scene inputs without executing or recovering it."""
+
+        with self._lock:
+            if not self._started:
+                raise RunNotFoundError("Run coordinator is not started.")
+            if not _RUN_IDENTIFIER.fullmatch(run_identifier):
+                raise RunNotFoundError("Run not found.")
+            unresolved_directory = self.run_root / run_identifier
+            try:
+                metadata = unresolved_directory.lstat()
+            except FileNotFoundError as exc:
+                raise RunNotFoundError("Run not found.") from exc
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise SceneUnavailableError("Run scene is unavailable.")
+            directory = self._directory(run_identifier)
+
+            try:
+                state = self._read_validated_state(
+                    run_identifier, persist_legacy_identity=False
+                )
+                source_type = state["source_type"]
+                source_identifier = state["source_identifier"]
+                if source_type == "preset":
+                    resolved = self.manifest_resolver(source_identifier)
+                    manifest = ManifestEnvelope.model_validate(
+                        resolved.model_dump(mode="json")
+                    )
+                elif source_type in {"dynamic_experiment", "approved_experiment"}:
+                    document = _controlled_json(
+                        directory,
+                        "compiled-manifest.json",
+                        maximum_bytes=_MAX_COMPILED_MANIFEST_BYTES,
+                    )
+                    manifest = ManifestEnvelope.model_validate(document)
+                else:
+                    raise ValueError("Persisted run has an invalid source type.")
+
+                experiment = manifest.experiment
+                if experiment.fingerprint != manifest.expected_experiment_sha256:
+                    raise ValueError(
+                        "Scene manifest experiment identity is inconsistent."
+                    )
+                expected_identity = {
+                    "experiment_identifier": experiment.experiment_identifier,
+                    "experiment_fingerprint": experiment.fingerprint,
+                    "expected_experiment_sha256": manifest.expected_experiment_sha256,
+                    "structure_identifier": (
+                        experiment.molecular_system.structure_artifact_identifier
+                    ),
+                }
+                if any(
+                    state.get(name) != expected
+                    for name, expected in expected_identity.items()
+                ):
+                    raise ValueError(
+                        "Persisted run state does not match its scene manifest."
+                    )
+                if (
+                    source_type != "preset"
+                    and experiment.experiment_identifier != source_identifier
+                ):
+                    raise ValueError(
+                        "Persisted run source does not match its scene manifest."
+                    )
+                return state, manifest
+            except SceneUnavailableError:
+                raise
+            except Exception as exc:
+                raise SceneUnavailableError("Run scene is unavailable.") from exc
+
     def artifact(self, run_identifier: str, name: Literal["results", "verification", "receipt"]) -> dict[str, Any]:
         state = self.get(run_identifier)
         directory = self._directory(run_identifier)
@@ -1882,7 +1956,9 @@ class RunCoordinator:
             raise RunNotFoundError("Run not found.")
         return path
 
-    def _read_validated_state(self, run_identifier: str) -> dict[str, Any]:
+    def _read_validated_state(
+        self, run_identifier: str, *, persist_legacy_identity: bool = True
+    ) -> dict[str, Any]:
         directory = self._directory(run_identifier)
         state = _controlled_run_json(directory, "state.json")
         request = _controlled_run_json(directory, "request.json")
@@ -1901,7 +1977,8 @@ class RunCoordinator:
                     "preset_identifier": expected_preset,
                 }
             )
-            _write_json_atomic(directory / "state.json", state)
+            if persist_legacy_identity:
+                _write_json_atomic(directory / "state.json", state)
         if (
             state.get("source_type") != source_type
             or state.get("source_identifier") != source_identifier
