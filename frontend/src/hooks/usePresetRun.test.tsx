@@ -84,7 +84,7 @@ function api(overrides: Partial<PulsateApi> = {}): PulsateApi {
     }),
     createRun: vi.fn().mockResolvedValue(state('queued')),
     createExperimentRun: vi.fn().mockResolvedValue(state('queued')),
-    getRun: vi.fn().mockResolvedValue(state('authorized')),
+    getRun: vi.fn().mockResolvedValue(state('authorized')), getRunScene: vi.fn(),
     getRunResults: vi.fn().mockResolvedValue(results),
     getRunVerification: vi.fn().mockResolvedValue(verification),
     getRunReceipt: vi.fn().mockResolvedValue(receipt),

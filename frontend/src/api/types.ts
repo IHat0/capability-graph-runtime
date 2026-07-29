@@ -45,7 +45,7 @@ export type RunStatus =
 
 export interface RunIdentity {
   run_identifier: string
-  source_type: 'preset' | 'dynamic_experiment'
+  source_type: 'preset' | 'dynamic_experiment' | 'approved_experiment'
   source_identifier: string
   preset_identifier: string | null
   experiment_identifier: string

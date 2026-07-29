@@ -21,6 +21,7 @@ export class ApiError extends Error {
     message: string,
     readonly status?: number,
     readonly cause?: unknown,
+    readonly code?: string,
   ) {
     super(message)
     this.name = 'ApiError'
@@ -102,7 +103,7 @@ function hasRunIdentity(value: Record<string, unknown>): boolean {
   const experimentIdentifier = value.experiment_identifier
   const sourceIsValid = sourceType === 'preset'
     ? typeof presetIdentifier === 'string' && presetIdentifier.trim().length > 0 && sourceIdentifier === presetIdentifier
-    : sourceType === 'dynamic_experiment'
+    : (sourceType === 'dynamic_experiment' || sourceType === 'approved_experiment')
       && presetIdentifier === null && sourceIdentifier === experimentIdentifier
   return hasString(value, 'run_identifier') && hasString(value, 'source_identifier') && sourceIsValid
     && hasString(value, 'experiment_identifier') && hasString(value, 'experiment_fingerprint')
@@ -390,12 +391,16 @@ async function requestJson<T>(path: string, parser: (value: unknown) => T, signa
 
   if (!response.ok) {
     let message = `Pulsate API request failed (${response.status}).`
+    let code: string | undefined
     try {
       const body = await response.json()
       if (isRecord(body) && typeof body.detail === 'string') message = body.detail
-      else if (isRecord(body) && isRecord(body.detail) && typeof body.detail.message === 'string') message = body.detail.message
+      else if (isRecord(body) && isRecord(body.detail)) {
+        if (typeof body.detail.message === 'string') message = body.detail.message
+        if (typeof body.detail.code === 'string') code = body.detail.code
+      }
     } catch { /* Preserve the status-based message for non-JSON errors. */ }
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, undefined, code)
   }
 
   try {
@@ -418,6 +423,7 @@ export interface PulsateApi {
   createRun(presetIdentifier: string, idempotencyKey: string, signal?: AbortSignal): Promise<RunStateResponse>
   createExperimentRun(experimentIdentifier: string, idempotencyKey: string, signal?: AbortSignal, executionTarget?: 'local_simulator' | 'ibm_quantum'): Promise<RunStateResponse>
   getRun(runIdentifier: string, signal?: AbortSignal): Promise<RunStateResponse>
+  getRunScene(runIdentifier: string, signal?: AbortSignal): Promise<SceneResponse>
   getRunResults(runIdentifier: string, signal?: AbortSignal): Promise<RunResultsResponse>
   getRunVerification(runIdentifier: string, signal?: AbortSignal): Promise<RunVerificationResponse>
   getRunReceipt(runIdentifier: string, signal?: AbortSignal): Promise<RunReceiptResponse>
@@ -467,6 +473,7 @@ export const pulsateApi: PulsateApi = {
     body: JSON.stringify({ experiment_identifier: experimentIdentifier, execution_target: executionTarget }),
   }),
   getRun: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}`, parseRunState, signal),
+  getRunScene: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/scene`, parseScene, signal),
   getRunResults: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/results`, parseRunResults, signal),
   getRunVerification: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/verification`, parseVerification, signal),
   getRunReceipt: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/receipt`, parseReceipt, signal),

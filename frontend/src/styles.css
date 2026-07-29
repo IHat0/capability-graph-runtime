@@ -21,9 +21,9 @@
 html { scroll-behavior: smooth; }
 html, body, #root { width: 100%; height: 100%; min-width: 320px; margin: 0; }
 body { min-height: 100dvh; overflow: hidden; background: var(--page); color: var(--text); }
-button, select, textarea { font: inherit; }
-button, a, select, textarea { -webkit-tap-highlight-color: transparent; }
-button:focus-visible, a:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #171717; outline-offset: 3px; }
+button, input, select, textarea { font: inherit; }
+button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #171717; outline-offset: 3px; }
 button:disabled { cursor: not-allowed; }
 a { color: inherit; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
@@ -33,6 +33,12 @@ a { color: inherit; }
 .wordmark { width: max-content; display: flex; align-items: center; gap: 9px; color: #252524; text-decoration: none; font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
 .wordmark__wave { width: 34px; height: 20px; flex: none; overflow: visible; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; }
 .workspace-name { font-size: 13px; font-weight: 550; }
+.header-centre { display: flex; align-items: center; justify-content: center; gap: 16px; }
+.existing-run-form { min-width: 0; display: flex; align-items: center; }
+.existing-run-form input { width: clamp(210px, 25vw, 310px); height: 32px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 6px 0 0 6px; color: var(--text); background: white; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
+.existing-run-form input::placeholder { color: var(--muted); }
+.existing-run-form button { height: 32px; padding: 0 11px; border: 1px solid #252524; border-radius: 0 6px 6px 0; color: white; background: #252524; font-size: 10px; font-weight: 600; white-space: nowrap; }
+.existing-run-form button:disabled { border-color: var(--border-strong); color: var(--muted); background: var(--subtle); }
 .header-status { display: flex; align-items: center; justify-content: flex-end; gap: 18px; color: var(--secondary); font-size: 12px; }
 .header-status-item { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .neutral-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
@@ -185,6 +191,8 @@ a { color: inherit; }
 .execution-control button { width: 100%; height: 42px; border: 1px solid #171717; border-radius: 7px; color: white; background: #171717; font-size: 13px; font-weight: 550; }
 .execution-control button:disabled { border-color: #cfcfcb; color: #92928e; background: #e8e8e5; }
 .execution-control p { margin: 9px 0 0; color: var(--secondary); font-size: 11px; text-align: center; }
+.execution-control--read-only { text-align: center; }
+.execution-control--read-only strong { font-size: 12px; font-weight: 600; }
 .receipt-action { width: 100%; min-height: 36px; margin-top: 13px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--text); background: white; font-size: 11px; }
 .receipt-action:hover { background: var(--subtle); }
 .receipt-panel { margin-top: 13px; padding: 13px; border: 1px solid var(--border); border-radius: 8px; background: var(--subtle); }
@@ -216,6 +224,7 @@ a { color: inherit; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; } }
 
 @media (max-width: 1080px) {
+  .workspace-name { display: none; }
   html, body, #root { height: auto; min-height: 100%; }
   body { overflow: auto; }
   .app-shell { height: auto; min-height: 100dvh; display: block; overflow: visible; }
@@ -229,8 +238,11 @@ a { color: inherit; }
 }
 
 @media (max-width: 760px) {
-  .app-header { height: 54px; padding: 0 14px; grid-template-columns: 1fr auto; }
-  .workspace-name { display: none; }
+  .app-header { height: 54px; padding: 0 14px; grid-template-columns: auto minmax(0, 1fr); gap: 12px; }
+  .header-centre { min-width: 0; justify-content: flex-end; }
+  .header-status { display: none; }
+  .existing-run-form { width: min(100%, 360px); }
+  .existing-run-form input { width: 100%; }
   .header-status { gap: 10px; font-size: 10px; }
   .header-status-item:last-child { display: none; }
   .workspace-frame { min-height: calc(100dvh - 54px); display: block; }

@@ -1,7 +1,14 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
-import type { ExperimentPlanResponse, PresetSummaryResponse } from '../api/types'
+import type {
+  ExperimentPlanResponse,
+  IBMExecutionEvidence,
+  PresetSummaryResponse,
+  RunStateResponse,
+  RunVerificationResponse,
+} from '../api/types'
+import { deriveExistingRunHeaderStatus } from '../existingRunHeaderStatus'
 import { ConditionalNavigation } from './ConditionalNavigation'
 import { EmptyInspector } from './EmptyInspector'
 import { EmptyWorkspace } from './EmptyWorkspace'
@@ -19,6 +26,61 @@ const genericPreset: PresetSummaryResponse = {
   basis_set: 'minimal',
 }
 
+const rejectedRunIdentifier = `run-${'1'.repeat(32)}`
+const rejectedExperimentIdentifier = `experiment-${'2'.repeat(32)}`
+const rejectedExperimentFingerprint = 'a'.repeat(64)
+const rejectedIdentity = {
+  run_identifier: rejectedRunIdentifier,
+  source_type: 'dynamic_experiment' as const,
+  source_identifier: rejectedExperimentIdentifier,
+  preset_identifier: null,
+  experiment_identifier: rejectedExperimentIdentifier,
+  experiment_fingerprint: rejectedExperimentFingerprint,
+  expected_experiment_sha256: rejectedExperimentFingerprint,
+  structure_identifier: 'molecular_structure',
+}
+const rejectedIbmEvidence: IBMExecutionEvidence = {
+  hardware_role: 'final_energy_evaluation_at_locally_optimized_parameters',
+  submission_status: 'completed',
+  job_identifier: 'ibm-job-header-status',
+  backend_name: 'ibm_backend_test',
+  execution_integrity_passed: true,
+  scientific_quality_passed: false,
+  ibm_total_energy_hartree: -7.8,
+}
+const rejectedIbmRun: RunStateResponse = {
+  ...rejectedIdentity,
+  execution_target: 'ibm_quantum',
+  status: 'rejected',
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T01:00:00Z',
+  status_url: `/api/v1/runs/${rejectedRunIdentifier}`,
+  structure_sha256: 'structure-sha',
+  molecule: {
+    scene_identifier: 'scene.rejected-header-run',
+    coordinate_unit: 'angstrom',
+    atoms: [
+      { atom_identifier: 'li', element: 'Li', coordinates: [0, 0, -0.9] },
+      { atom_identifier: 'h', element: 'H', coordinates: [0, 0, 0.9] },
+    ],
+  },
+}
+const rejectedIbmVerification: RunVerificationResponse = {
+  ...rejectedIdentity,
+  structure_sha256: 'structure-sha',
+  verification_completed: true,
+  verification_passed: false,
+  authorization_state: 'rejected',
+  blocking_findings: ['scientific tolerance exceeded'],
+  nonblocking_findings: [],
+  tolerance_check: { passed: false },
+  scientific_identity_checks: [],
+  artifact_integrity_checks: [],
+  checks: [],
+  compatibility_warnings: [],
+  ibm_execution: rejectedIbmEvidence,
+}
+
 describe('progressive workspace disclosure', () => {
   it('uses an ECG wordmark and a centred settings glyph', () => {
     const { container, rerender } = render(<Header />)
@@ -31,6 +93,36 @@ describe('progressive workspace disclosure', () => {
     const centre = settings.querySelector('circle')
     expect(centre?.getAttribute('cx')).toBe('12')
     expect(centre?.getAttribute('cy')).toBe('12')
+  })
+
+  it('keeps the ordinary workspace header defaults when no existing run is active', () => {
+    const status = deriveExistingRunHeaderStatus({
+      loading: false,
+      run: null,
+      results: null,
+      verification: null,
+      receipt: null,
+    })
+    render(<Header status={status} />)
+
+    expect(screen.getByText('Local simulator')).toBeTruthy()
+    expect(screen.getByText('Not executed')).toBeTruthy()
+  })
+
+  it('separates verified IBM execution from scientific rejection in persisted-run status', () => {
+    const status = deriveExistingRunHeaderStatus({
+      loading: false,
+      run: rejectedIbmRun,
+      results: null,
+      verification: rejectedIbmVerification,
+      receipt: null,
+    })
+    render(<Header status={status} />)
+
+    expect(screen.queryByText('Not executed')).toBeNull()
+    expect(screen.queryByText('Local simulator')).toBeNull()
+    expect(screen.getByText('IBM execution verified')).toBeTruthy()
+    expect(screen.getByText('Scientific result rejected')).toBeTruthy()
   })
 
   it('shows only Home, Settings, and Help navigation before a scene exists', () => {

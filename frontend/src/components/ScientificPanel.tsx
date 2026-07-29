@@ -1,4 +1,11 @@
-import type { ExperimentPlanResponse, PresetSummaryResponse } from '../api/types'
+import type {
+  ExperimentPlanResponse,
+  PresetSummaryResponse,
+  RunReceiptResponse,
+  RunResultsResponse,
+  RunStateResponse,
+  RunVerificationResponse,
+} from '../api/types'
 import type { MolecularScene } from '../scene/types'
 import { humanize } from '../utils/format'
 import { PresetSelector } from './PresetSelector'
@@ -14,7 +21,7 @@ function PropertyList({ rows }: { rows: Array<[string, React.ReactNode]> }) {
   return <dl className="property-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd><Value value={value} /></dd></div>)}</dl>
 }
 
-export function ScientificPanel({ scene, presets, selectedPresetId, displayedPresetId, staleSceneMessage, loading, onPresetChange, presetRun, plan }: {
+export function ScientificPanel({ scene, presets, selectedPresetId, displayedPresetId, staleSceneMessage, loading, onPresetChange, presetRun, openedRun, readOnlyLookup = false, plan }: {
   scene: MolecularScene
   presets: PresetSummaryResponse[]
   selectedPresetId: string | null
@@ -23,15 +30,24 @@ export function ScientificPanel({ scene, presets, selectedPresetId, displayedPre
   loading: boolean
   onPresetChange: (identifier: string) => void
   presetRun: ReturnType<typeof usePresetRun>
+  openedRun?: {
+    run: RunStateResponse
+    results: RunResultsResponse | null
+    verification: RunVerificationResponse | null
+    receipt: RunReceiptResponse | null
+  } | null
+  readOnlyLookup?: boolean
   plan: ExperimentPlanResponse | null
 }) {
+  const evidence = openedRun ?? presetRun
   return (
     <aside className="science-panel" aria-label="Experiment inspector">
       <section className="inspector-selector" id="preset-menu">
         <PresetSelector presets={presets} value={selectedPresetId} disabled={loading} onChange={onPresetChange} />
+        {openedRun && <div className="displayed-preset-row"><span>Opened run</span><strong>{openedRun.run.run_identifier}</strong></div>}
         {plan?.ready_for_execution && <div className="displayed-preset-row"><span>Dynamic experiment</span><strong>{plan.experiment_identifier}</strong></div>}
         {staleSceneMessage && <div className="stale-scene-notice" role="status"><strong>Retained structure</strong><span>{staleSceneMessage}</span></div>}
-        <div className="displayed-preset-row"><span>Displayed preset</span><strong>{displayedPresetId ?? 'Unknown'}</strong></div>
+        <div className="displayed-preset-row"><span>{openedRun ? 'Scientific source' : 'Displayed preset'}</span><strong>{displayedPresetId ?? 'Unknown'}</strong></div>
       </section>
 
       {plan && (
@@ -74,15 +90,20 @@ export function ScientificPanel({ scene, presets, selectedPresetId, displayedPre
         ]} />
       </section>
 
-      <WorkflowStepper run={presetRun.run} results={presetRun.results} verification={presetRun.verification} />
-      <ResultSummary run={presetRun.run} results={presetRun.results} verification={presetRun.verification} receipt={presetRun.receipt} />
+      <WorkflowStepper run={evidence.run} results={evidence.results} verification={evidence.verification} />
+      <ResultSummary run={evidence.run} results={evidence.results} verification={evidence.verification} receipt={evidence.receipt} />
 
-      <section className="execution-control">
+      {readOnlyLookup ? <section className="execution-control execution-control--read-only">
+        <strong>{openedRun ? 'Read-only persisted run' : 'Opening persisted run'}</strong>
+        <p>{openedRun
+          ? 'This workspace loaded existing evidence only. It did not create, resume, or execute a run.'
+          : 'The requested run is being loaded read-only. Preset execution is unavailable during this lookup.'}</p>
+      </section> : <section className="execution-control">
         <button type="button" disabled={!presetRun.canRun} onClick={() => void presetRun.startRun()}>
           {presetRun.creating ? 'Creating run…' : presetRun.run && !['authorized', 'rejected', 'failed', 'interrupted'].includes(presetRun.run.status) ? 'Run in progress' : 'Run experiment'}
         </button>
         <p>{presetRun.disabledReason ?? (presetRun.run ? `Run ${presetRun.run.run_identifier} is ${presetRun.run.status}.` : plan?.requested_execution_target === 'ibm_quantum' ? 'Trusted local preflight and IBM Quantum execution are available.' : 'Verified local simulator execution is available.')}</p>
-      </section>
+      </section>}
     </aside>
   )
 }
