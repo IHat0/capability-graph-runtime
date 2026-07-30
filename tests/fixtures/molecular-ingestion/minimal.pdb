@@ -1,0 +1,4 @@
+HEADER    INVENTED MINIMAL STRUCTURE
+ATOM      1  N   GEN A   1       0.000   0.000   0.000  1.00 10.00           N
+ATOM      2  C   GEN A   1       1.250   0.000   0.000  1.00 10.00           C
+END
