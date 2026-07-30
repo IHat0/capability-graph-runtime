@@ -1,5 +1,12 @@
 """Artifact-backed molecular project and scene contracts."""
 
+from .artifact_repository import (
+    MolecularArtifactConflictError,
+    MolecularArtifactIntegrityError,
+    MolecularArtifactNotFoundError,
+    MolecularArtifactRepository,
+    MolecularArtifactRepositoryError,
+)
 from .contracts import (
     MolecularComponent,
     MolecularMemberReference,
@@ -24,6 +31,11 @@ from .topology import (
 )
 
 __all__ = [
+    "MolecularArtifactConflictError",
+    "MolecularArtifactIntegrityError",
+    "MolecularArtifactNotFoundError",
+    "MolecularArtifactRepository",
+    "MolecularArtifactRepositoryError",
     "MolecularComponent",
     "MolecularMemberReference",
     "MolecularProject",
