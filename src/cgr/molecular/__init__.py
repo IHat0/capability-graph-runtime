@@ -22,6 +22,15 @@ from .ingestion import (
     StructureIngestionResult,
     ingest_structure_bytes,
 )
+from .scene_projection import (
+    MolecularSceneProjection,
+    MolecularSceneProjectionError,
+    MolecularSceneProjectionIntegrityError,
+    MolecularSceneProjectionNotFoundError,
+    ProjectedMolecularStructure,
+    project_molecular_scene,
+    read_projected_structure_bytes,
+)
 from .topology import (
     MolecularTopologyAtom,
     MolecularTopologyBond,
@@ -40,7 +49,11 @@ __all__ = [
     "MolecularMemberReference",
     "MolecularProject",
     "MolecularRegion",
+    "MolecularSceneProjection",
+    "MolecularSceneProjectionError",
+    "MolecularSceneProjectionIntegrityError",
     "MolecularSceneManifest",
+    "MolecularSceneProjectionNotFoundError",
     "MolecularSelection",
     "MolecularStructure",
     "MolecularSystem",
@@ -49,7 +62,10 @@ __all__ = [
     "MolecularTopologyChain",
     "MolecularTopologyIndex",
     "MolecularTopologyResidue",
+    "ProjectedMolecularStructure",
     "StructureIngestionError",
     "StructureIngestionResult",
     "ingest_structure_bytes",
+    "project_molecular_scene",
+    "read_projected_structure_bytes",
 ]
