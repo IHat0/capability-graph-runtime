@@ -21,3 +21,8 @@ quantum-model-repair/
 dist/
 build/
 node_modules/
+
+# Playwright browser-test output
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/

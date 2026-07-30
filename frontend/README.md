@@ -92,3 +92,26 @@ H2 and LiH are current backend fixtures, not frontend limitations. The normalize
 - The coordinator is a single-process development facility, not a production-distributed queue. Backend restarts mark active work `interrupted` and do not silently restart it.
 
 See [`../docs/architecture/pulsate-run-api.md`](../docs/architecture/pulsate-run-api.md) for endpoints, statuses, durable persistence, recovery, executor selection, environment variables, and limitations.
+
+## Browser end-to-end test
+
+The persisted-run browser test is independent of the local run repository and
+uses controlled in-browser API fixtures. It verifies that rejected IBM evidence
+opens read-only, distinguishes execution integrity from scientific quality,
+loads the molecular scene into Mol*, sends only GET requests, and exposes no run
+execution action.
+
+Install the Playwright Chromium browser once on a normal development machine:
+
+```powershell
+npx playwright install chromium
+```
+
+Run the browser test from `frontend/`:
+
+```powershell
+npm run test:e2e
+```
+
+Headless Chromium is launched with explicit SwiftShader WebGL support so Mol*
+can render consistently on machines without a physical GPU.
