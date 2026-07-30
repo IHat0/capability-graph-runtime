@@ -8,8 +8,9 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cgr.quantum_preflight.contracts import ManifestEnvelope
@@ -41,6 +42,13 @@ from .natural_language import (
     NaturalLanguageInterpretationError,
     NaturalLanguageInterpretationStore,
     NaturalLanguageUnavailableError,
+)
+from .molecular_scenes import (
+    NativeMolecularSceneError,
+    NativeMolecularSceneNotFoundError,
+    NativeMolecularSceneService,
+    NativeMolecularSceneUnavailableError,
+    NativeMolecularResource,
 )
 from .runs import (
     ArtifactUnavailableError,
@@ -266,6 +274,7 @@ def create_app(
     coordinator: RunCoordinator | None = None,
     experiment_store: ExperimentStore | None = None,
     natural_language_store: NaturalLanguageInterpretationStore | None = None,
+    molecular_scene_service: NativeMolecularSceneService | None = None,
 ) -> FastAPI:
     if experiment_store is None:
         if coordinator is not None:
@@ -298,17 +307,25 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
-        experiment_store.start()
-        natural_language_store.start()
         try:
+            experiment_store.start()
+            natural_language_store.start()
             run_coordinator.start()
-            try:
-                yield
-            finally:
-                run_coordinator.close()
+            if molecular_scene_service is not None:
+                molecular_scene_service.start()
+            yield
         finally:
-            natural_language_store.close()
-            experiment_store.close()
+            try:
+                if molecular_scene_service is not None:
+                    molecular_scene_service.close()
+            finally:
+                try:
+                    run_coordinator.close()
+                finally:
+                    try:
+                        natural_language_store.close()
+                    finally:
+                        experiment_store.close()
 
     application = FastAPI(
         title="Pulsate Labs API",
@@ -322,12 +339,140 @@ def create_app(
     application.state.run_coordinator = run_coordinator
     application.state.experiment_store = experiment_store
     application.state.natural_language_store = natural_language_store
+    application.state.molecular_scene_service = molecular_scene_service
+
+    def require_molecular_scene_service() -> NativeMolecularSceneService:
+        if molecular_scene_service is None:
+            raise _typed_error(
+                503,
+                "molecular_scene_service_unavailable",
+                "Native molecular scene service is unavailable.",
+            )
+        return molecular_scene_service
+
+    def map_molecular_scene_error(exc: NativeMolecularSceneError) -> HTTPException:
+        if isinstance(exc, NativeMolecularSceneUnavailableError):
+            return _typed_error(
+                503,
+                "molecular_scene_service_unavailable",
+                "Native molecular scene service is unavailable.",
+            )
+        if isinstance(exc, NativeMolecularSceneNotFoundError):
+            return _typed_error(
+                404,
+                "molecular_resource_not_found",
+                "Requested molecular resource was not found.",
+            )
+        return _typed_error(
+            409,
+            "molecular_scene_unavailable",
+            "Native molecular scene evidence is unavailable or invalid.",
+        )
+
+    def molecular_resource_response(resource: NativeMolecularResource) -> Response:
+        return Response(
+            content=resource.payload,
+            headers={
+                "Content-Type": resource.media_type,
+                "ETag": f'"{resource.content_sha256}"',
+                "X-Content-SHA256": resource.content_sha256,
+            },
+        )
+
+    def assert_molecular_scene_metadata_safe(
+        metadata: dict[str, object],
+    ) -> None:
+        structures = metadata.get("structures")
+        if not isinstance(structures, list):
+            raise ValueError("Molecular scene structures are malformed.")
+        safe_structures: list[dict[str, object]] = []
+        expected_paths = {
+            "native_structure_url": (
+                "/api/v1/molecular/scenes/native-structure"
+            ),
+            "topology_url": "/api/v1/molecular/scenes/topology",
+        }
+        for structure in structures:
+            if not isinstance(structure, dict):
+                raise ValueError("Molecular scene structures are malformed.")
+            safe_structure = dict(structure)
+            for field, expected_path in expected_paths.items():
+                value = safe_structure.get(field)
+                if not isinstance(value, str):
+                    raise ValueError("Molecular resource URL is malformed.")
+                parsed = urlsplit(value)
+                if (
+                    parsed.scheme
+                    or parsed.netloc
+                    or parsed.fragment
+                    or parsed.path != expected_path
+                    or not parsed.query
+                ):
+                    raise ValueError("Molecular resource URL is malformed.")
+                safe_structure[field] = parsed.path
+            safe_structures.append(safe_structure)
+        assert_public_response_safe(
+            {**metadata, "structures": safe_structures}
+        )
 
     @application.get("/api/v1/health")
     def health() -> dict[str, str]:
         return {
             "service": "pulsate-api", "status": "healthy", "version": "0.2.0",
         }
+
+    @application.get("/api/v1/molecular/scenes/projected")
+    def read_projected_molecular_scene(
+        project_identifier: str,
+        scene_identifier: str,
+    ) -> dict[str, object]:
+        try:
+            metadata = require_molecular_scene_service().describe_scene(
+                project_identifier=project_identifier,
+                scene_identifier=scene_identifier,
+            )
+            assert_molecular_scene_metadata_safe(metadata)
+            return metadata
+        except NativeMolecularSceneError as exc:
+            raise map_molecular_scene_error(exc) from None
+        except (ValueError, TypeError):
+            raise _typed_error(
+                409,
+                "molecular_scene_unavailable",
+                "Native molecular scene evidence is unavailable or invalid.",
+            ) from None
+
+    @application.get("/api/v1/molecular/scenes/native-structure")
+    def read_native_molecular_structure(
+        project_identifier: str,
+        scene_identifier: str,
+        structure_identifier: str,
+    ) -> Response:
+        try:
+            resource = require_molecular_scene_service().read_native_structure(
+                project_identifier=project_identifier,
+                scene_identifier=scene_identifier,
+                structure_identifier=structure_identifier,
+            )
+            return molecular_resource_response(resource)
+        except NativeMolecularSceneError as exc:
+            raise map_molecular_scene_error(exc) from None
+
+    @application.get("/api/v1/molecular/scenes/topology")
+    def read_native_molecular_topology(
+        project_identifier: str,
+        scene_identifier: str,
+        structure_identifier: str,
+    ) -> Response:
+        try:
+            resource = require_molecular_scene_service().read_topology(
+                project_identifier=project_identifier,
+                scene_identifier=scene_identifier,
+                structure_identifier=structure_identifier,
+            )
+            return molecular_resource_response(resource)
+        except NativeMolecularSceneError as exc:
+            raise map_molecular_scene_error(exc) from None
 
     @application.get("/api/v1/runs/capability")
     def run_capability() -> dict[str, Any]:
