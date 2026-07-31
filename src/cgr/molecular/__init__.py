@@ -22,6 +22,13 @@ from .ingestion import (
     StructureIngestionResult,
     ingest_structure_bytes,
 )
+from .project_repository import (
+    MolecularProjectConflictError,
+    MolecularProjectIntegrityError,
+    MolecularProjectNotFoundError,
+    MolecularProjectRepository,
+    MolecularProjectRepositoryError,
+)
 from .scene_projection import (
     MolecularSceneProjection,
     MolecularSceneProjectionError,
@@ -48,6 +55,11 @@ __all__ = [
     "MolecularComponent",
     "MolecularMemberReference",
     "MolecularProject",
+    "MolecularProjectConflictError",
+    "MolecularProjectIntegrityError",
+    "MolecularProjectNotFoundError",
+    "MolecularProjectRepository",
+    "MolecularProjectRepositoryError",
     "MolecularRegion",
     "MolecularSceneProjection",
     "MolecularSceneProjectionError",
