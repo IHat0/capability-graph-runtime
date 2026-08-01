@@ -379,3 +379,13 @@ export interface PresetDetailResponse {
     }
   }
 }
+
+export type {
+  FetchedMolecularResource,
+  LoadedMolecularProjectScene,
+  LoadedMolecularStructure,
+  MolecularTopologyIndex,
+  MolecularArtifactIdentity,
+  ProjectedMolecularSceneMetadata,
+  ProjectedMolecularStructureMetadata,
+} from '../scene/native-project'

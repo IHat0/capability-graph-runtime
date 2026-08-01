@@ -104,12 +104,15 @@ export function useExistingRun(api: ExistingRunApi = pulsateApi) {
     setReceipt(null)
   }, [])
 
-  const openRun = useCallback(async () => {
+  const openRun = useCallback(async (): Promise<boolean> => {
     const runIdentifier = runIdentifierInput.trim()
     if (!CANONICAL_RUN_IDENTIFIER.test(runIdentifier)) {
-      clearOpenedRun()
+      generationRef.current += 1
+      controllerRef.current?.abort()
+      controllerRef.current = null
+      setLoading(false)
       setError('Enter a valid run identifier in the form run- followed by 32 lowercase hexadecimal characters.')
-      return
+      return false
     }
 
     generationRef.current += 1
@@ -120,22 +123,17 @@ export function useExistingRun(api: ExistingRunApi = pulsateApi) {
     setRunIdentifierInput(runIdentifier)
     setLoading(true)
     setError(null)
-    setRun(null)
-    setScene(null)
-    setResults(null)
-    setVerification(null)
-    setReceipt(null)
 
     let stage: LoadStage = 'run'
     try {
       const nextRun = await api.getRun(runIdentifier, controller.signal)
-      if (controller.signal.aborted || generation !== generationRef.current) return
+      if (controller.signal.aborted || generation !== generationRef.current) return false
       if (nextRun.run_identifier !== runIdentifier) {
         throw new Error('identity_mismatch')
       }
       stage = 'scene'
       const rawScene = await api.getRunScene(runIdentifier, controller.signal)
-      if (controller.signal.aborted || generation !== generationRef.current) return
+      if (controller.signal.aborted || generation !== generationRef.current) return false
       if (!sceneIdentityMatches(nextRun, rawScene)) {
         throw new Error('identity_mismatch')
       }
@@ -151,7 +149,7 @@ export function useExistingRun(api: ExistingRunApi = pulsateApi) {
           api.getRunVerification(runIdentifier, controller.signal),
           api.getRunReceipt(runIdentifier, controller.signal),
         ])
-        if (controller.signal.aborted || generation !== generationRef.current) return
+        if (controller.signal.aborted || generation !== generationRef.current) return false
         nextResults = loadedResults
         nextVerification = loadedVerification
         nextReceipt = loadedReceipt
@@ -171,25 +169,22 @@ export function useExistingRun(api: ExistingRunApi = pulsateApi) {
       setResults(nextResults)
       setVerification(nextVerification)
       setReceipt(nextReceipt)
+      return true
     } catch (cause) {
-      if (controller.signal.aborted || generation !== generationRef.current) return
-      setRun(null)
-      setScene(null)
-      setResults(null)
-      setVerification(null)
-      setReceipt(null)
+      if (controller.signal.aborted || generation !== generationRef.current) return false
       setError(
         cause instanceof Error && cause.message === 'identity_mismatch'
           ? 'Run evidence identity mismatch. The requested run was not displayed.'
           : controlledError(cause, stage),
       )
+      return false
     } finally {
       if (generation === generationRef.current) {
         controllerRef.current = null
         setLoading(false)
       }
     }
-  }, [api, clearOpenedRun, runIdentifierInput])
+  }, [api, runIdentifierInput])
 
   useEffect(() => () => {
     generationRef.current += 1

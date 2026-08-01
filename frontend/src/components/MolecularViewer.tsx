@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { MolecularScene } from '../scene/types'
+import type { LoadedMolecularProjectScene } from '../scene/native-project'
+import { isNativeProjectScene } from '../scene/native-molstar'
 import { structureBounds } from '../scene/geometry'
 import { ATOM_LABEL_THRESHOLD, MolstarViewer, type MolstarViewerHandle } from './MolstarViewer'
 
@@ -9,7 +11,45 @@ function CameraIcon({ kind }: { kind: 'reset' | 'fit' }) {
     : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" /></svg>
 }
 
-export function MolecularViewer({ scene, loading }: { scene: MolecularScene; loading: boolean }) {
+export function MolecularViewer({ scene, loading }: { scene: MolecularScene | LoadedMolecularProjectScene; loading: boolean }) {
+  return isNativeProjectScene(scene)
+    ? <NativeMolecularViewer scene={scene} loading={loading} />
+    : <CoordinateMolecularViewer scene={scene} loading={loading} />
+}
+
+function NativeMolecularViewer({ scene, loading }: { scene: LoadedMolecularProjectScene; loading: boolean }) {
+  const viewerRef = useRef<MolstarViewerHandle>(null)
+  const [selectedAtom, setSelectedAtom] = useState<{ structureIdentifier: string | null; atomIdentifier: string } | null>(null)
+  const [rendering, setRendering] = useState({ loading: false, error: null as string | null })
+  const totalAtoms = scene.metadata.structures.reduce((sum, structure) => sum + structure.atom_count, 0)
+
+  useEffect(() => setSelectedAtom(null), [scene.metadata.project_identifier, scene.metadata.scene_identifier])
+
+  return <section className="viewer-shell" id="structure" aria-labelledby="viewer-title">
+    <div className="viewer-titlebar">
+      <div><span className="section-kicker">Native project scene</span><h1 id="viewer-title">Molecular workspace</h1></div>
+      <div className="viewer-meta"><span>{scene.structures.length} structures - {totalAtoms} atoms</span></div>
+    </div>
+    <div className="viewer-stage">
+      <MolstarViewer ref={viewerRef} scene={scene} onAtomSelected={setSelectedAtom} onRenderingStateChange={setRendering} />
+      {(loading || rendering.loading) && <div className="viewer-loading" role="status"><span />Updating native structures...</div>}
+      {rendering.error && <div className="viewer-render-error" role="alert"><strong>Rendering unavailable</strong><span>{rendering.error}</span></div>}
+      <div className="viewer-toolbar" aria-label="Molecular camera controls">
+        <button type="button" onClick={() => viewerRef.current?.resetCamera()}><CameraIcon kind="reset" />Reset camera</button>
+        <button type="button" onClick={() => viewerRef.current?.fitStructure()}><CameraIcon kind="fit" />Fit structure</button>
+      </div>
+    </div>
+    <div className="inspection-strip">
+      <div className="inspection-block inspection-block--selected"><span className="section-kicker">Selected atom</span>{selectedAtom
+        ? <div className="atom-readout"><strong>{selectedAtom.atomIdentifier}</strong><span>{selectedAtom.structureIdentifier}</span></div>
+        : <p>Select an atom to inspect its stable project identity.</p>}</div>
+      <div className="inspection-block"><span className="section-kicker">Project scene</span><strong>{scene.metadata.project_identifier}</strong><span>{scene.metadata.scene_identifier}</span></div>
+      <div className="inspection-block inspection-block--bounds"><span className="section-kicker">Primary structure</span><strong>{scene.metadata.primary_structure_identifier}</strong><span>{scene.metadata.structures.map((item) => item.native_format).join(', ')}</span></div>
+    </div>
+  </section>
+}
+
+function CoordinateMolecularViewer({ scene, loading }: { scene: MolecularScene; loading: boolean }) {
   const viewerRef = useRef<MolstarViewerHandle>(null)
   const [selectedAtomId, setSelectedAtomId] = useState<string | null>(null)
   const [rendering, setRendering] = useState({ loading: false, error: null as string | null })
@@ -35,7 +75,7 @@ export function MolecularViewer({ scene, loading }: { scene: MolecularScene; loa
       </div>
 
       <div className="viewer-stage">
-        <MolstarViewer ref={viewerRef} scene={scene} onAtomSelected={setSelectedAtomId} onRenderingStateChange={setRendering} />
+        <MolstarViewer ref={viewerRef} scene={scene} onAtomSelected={(atom) => setSelectedAtomId(atom?.atomIdentifier ?? null)} onRenderingStateChange={setRendering} />
         {(loading || rendering.loading) && <div className="viewer-loading" role="status"><span />Updating structure…</div>}
         {rendering.error && <div className="viewer-render-error" role="alert"><strong>Rendering unavailable</strong><span>{rendering.error}</span></div>}
         <div className="viewer-toolbar" aria-label="Molecular camera controls">

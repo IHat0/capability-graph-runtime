@@ -4,21 +4,26 @@ import { ErrorNotice } from './components/ErrorNotice'
 import { ExistingRunInput } from './components/ExistingRunInput'
 import { Header } from './components/Header'
 import { MolecularViewer } from './components/MolecularViewer'
+import { MolecularProjectInput } from './components/MolecularProjectInput'
+import { MolecularProjectPanel } from './components/MolecularProjectPanel'
 import { NaturalLanguageWorkspace } from './components/NaturalLanguageWorkspace'
 import { ScientificPanel } from './components/ScientificPanel'
 import { deriveExistingRunHeaderStatus } from './existingRunHeaderStatus'
 import { useExistingRun } from './hooks/useExistingRun'
 import { useExperimentWorkspace } from './hooks/useExperimentWorkspace'
+import { useMolecularProjectScene } from './hooks/useMolecularProjectScene'
 import { useNaturalLanguageExperiment } from './hooks/useNaturalLanguageExperiment'
 import { usePresetRun } from './hooks/usePresetRun'
 
 export function App() {
   const workspace = useExperimentWorkspace()
   const existingRun = useExistingRun()
+  const molecularProject = useMolecularProjectScene()
   const naturalLanguage = useNaturalLanguageExperiment()
-  const displayedScene = existingRun.scene ?? workspace.scene
+  const coordinateScene = existingRun.scene ?? workspace.scene
+  const displayedScene = molecularProject.scene ?? coordinateScene
   const hasScene = displayedScene !== null
-  const readOnlyLookup = existingRun.loading || existingRun.run !== null
+  const readOnlyLookup = molecularProject.loading || molecularProject.scene !== null || existingRun.loading || existingRun.run !== null
   const presetRun = usePresetRun({
     selectedPresetId: workspace.selectedPresetId,
     displayedPresetId: workspace.displayedPresetId,
@@ -37,30 +42,56 @@ export function App() {
   const workspaceErrors = presetRun.error && !existingRun.run
     ? [...workspace.errors, { scope: 'run' as const, message: presetRun.error }]
     : workspace.errors
-  const errors = existingRun.error
+  let errors = existingRun.error
     ? [...workspaceErrors, { scope: 'run' as const, message: existingRun.error }]
     : workspaceErrors
+  if (molecularProject.error) errors = [...errors, { scope: 'scene' as const, message: molecularProject.error }]
   const selectPreset = (identifier: string) => {
+    molecularProject.clear()
     existingRun.clearOpenedRun()
     workspace.selectPreset(identifier)
   }
-  const headerStatus = deriveExistingRunHeaderStatus({
+  const existingRunHeaderStatus = deriveExistingRunHeaderStatus({
     loading: existingRun.loading,
     run: existingRun.run,
     results: existingRun.results,
     verification: existingRun.verification,
     receipt: existingRun.receipt,
   })
+  const headerStatus = molecularProject.loading
+    ? { primary: 'Read-only project', secondary: 'Opening scene' }
+    : molecularProject.scene
+      ? { primary: 'Native molecular project', secondary: 'Read-only verified resources' }
+      : existingRunHeaderStatus
+
+  const openRun = async () => {
+    if (await existingRun.openRun()) molecularProject.clear()
+  }
+  const openProject = async () => {
+    if (await molecularProject.open()) existingRun.clearOpenedRun()
+  }
 
   return (
     <div className="app-shell">
-      <Header runControl={<ExistingRunInput
-        value={existingRun.runIdentifierInput}
-        loading={existingRun.loading}
-        openedRunIdentifier={existingRun.run?.run_identifier ?? null}
-        onChange={existingRun.setRunIdentifierInput}
-        onOpen={() => void existingRun.openRun()}
-      />} status={headerStatus} />
+      <Header runControl={<div className="read-only-open-controls">
+        <ExistingRunInput
+          value={existingRun.runIdentifierInput}
+          loading={existingRun.loading}
+          openedRunIdentifier={existingRun.run?.run_identifier ?? null}
+          onChange={existingRun.setRunIdentifierInput}
+          onOpen={() => void openRun()}
+        />
+        <MolecularProjectInput
+          projectIdentifier={molecularProject.projectIdentifierInput}
+          sceneIdentifier={molecularProject.sceneIdentifierInput}
+          loading={molecularProject.loading}
+          active={molecularProject.scene !== null}
+          onProjectChange={molecularProject.setProjectIdentifierInput}
+          onSceneChange={molecularProject.setSceneIdentifierInput}
+          onOpen={() => void openProject()}
+          onClear={molecularProject.clear}
+        />
+      </div>} status={headerStatus} />
       <ErrorNotice errors={errors} />
       <div className="workspace-frame">
         <ConditionalNavigation hasScene={hasScene} />
@@ -72,14 +103,14 @@ export function App() {
           </main>
         ) : displayedScene ? (
           <main className="loaded-workspace" id="workspace-home">
-            <MolecularViewer scene={displayedScene} loading={workspace.presetLoading || existingRun.loading} />
-            <ScientificPanel
-              scene={displayedScene}
+            <MolecularViewer scene={displayedScene} loading={workspace.presetLoading || existingRun.loading || molecularProject.loading} />
+            {molecularProject.scene ? <MolecularProjectPanel scene={molecularProject.scene} /> : <ScientificPanel
+              scene={coordinateScene!}
               presets={workspace.presets}
               selectedPresetId={workspace.selectedPresetId}
               displayedPresetId={existingRun.run?.source_identifier ?? workspace.displayedPresetId}
               staleSceneMessage={existingRun.run ? null : workspace.staleSceneMessage}
-              loading={workspace.presetLoading || existingRun.loading}
+              loading={workspace.presetLoading || existingRun.loading || molecularProject.loading}
               onPresetChange={selectPreset}
               presetRun={presetRun}
               openedRun={existingRun.run ? {
@@ -90,7 +121,7 @@ export function App() {
               } : null}
               readOnlyLookup={readOnlyLookup}
               plan={existingRun.run ? null : workspace.plan}
-            />
+            />}
           </main>
         ) : (
           <div className="empty-layout">

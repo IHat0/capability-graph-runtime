@@ -5,6 +5,9 @@ import { DefaultPluginSpec } from 'molstar/lib/mol-plugin/spec'
 import { Color } from 'molstar/lib/mol-util/color'
 import { Vec3 } from 'molstar/lib/mol-math/linear-algebra'
 import type { MolecularScene } from '../scene/types'
+import type { LoadedMolecularProjectScene } from '../scene/native-project'
+import { isNativeProjectScene } from '../scene/native-molstar'
+import { loadNativeProjectScene, type NativeAtomLookup } from '../scene/native-molstar-loader'
 import { sceneToMolstarStructure, type MolstarStructureData } from '../scene/molstar-adapter'
 import { structureBounds } from '../scene/geometry'
 import { pointToAngstrom } from '../scene/units'
@@ -18,8 +21,8 @@ export interface MolstarViewerHandle {
 }
 
 export interface MolstarViewerProps {
-  scene: MolecularScene
-  onAtomSelected: (atomId: string | null) => void
+  scene: MolecularScene | LoadedMolecularProjectScene
+  onAtomSelected: (atom: { structureIdentifier: string | null; atomIdentifier: string } | null) => void
   onRenderingStateChange: (state: { loading: boolean; error: string | null }) => void
 }
 
@@ -147,6 +150,7 @@ export const MolstarViewer = forwardRef<MolstarViewerHandle, MolstarViewerProps>
   const hostRef = useRef<HTMLDivElement>(null)
   const pluginRef = useRef<PluginContext | null>(null)
   const adapterRef = useRef<MolstarStructureData | null>(null)
+  const nativeModelLookupRef = useRef(new WeakMap<object, NativeAtomLookup>())
   const sceneRef = useRef(scene)
   sceneRef.current = scene
   const loadQueue = useRef(new LatestLoadQueue())
@@ -154,7 +158,12 @@ export const MolstarViewer = forwardRef<MolstarViewerHandle, MolstarViewerProps>
 
   useImperativeHandle(ref, () => ({
     fitStructure: () => {
-      if (pluginRef.current) frameScene(pluginRef.current, sceneRef.current, 250)
+      if (!pluginRef.current) return
+      if (isNativeProjectScene(sceneRef.current)) {
+        pluginRef.current.managers.camera.reset(undefined, 250)
+      } else {
+        frameScene(pluginRef.current, sceneRef.current, 250)
+      }
     },
     resetCamera: () => {
       pluginRef.current?.managers.camera.reset(undefined, 250)
@@ -188,7 +197,17 @@ export const MolstarViewer = forwardRef<MolstarViewerHandle, MolstarViewerProps>
           const location = StructureElement.Loci.getFirstLocation(loci)
           if (!location) return
           const sourceIndex = StructureProperties.atom.sourceIndex(location)
-          onAtomSelected(adapterRef.current?.atomIdsBySourceIndex[sourceIndex] ?? null)
+          const nativeLookup = nativeModelLookupRef.current.get(location.unit.model)
+          if (nativeLookup) {
+            const atomIdentifier = nativeLookup.atomIdsBySourceIndex[sourceIndex]
+            onAtomSelected(atomIdentifier ? {
+              structureIdentifier: nativeLookup.structureIdentifier,
+              atomIdentifier,
+            } : null)
+          } else {
+            const atomIdentifier = adapterRef.current?.atomIdsBySourceIndex[sourceIndex]
+            onAtomSelected(atomIdentifier ? { structureIdentifier: null, atomIdentifier } : null)
+          }
         })
         resizeObserver = new ResizeObserver(() => plugin.handleResize())
         resizeObserver.observe(host!)
@@ -215,10 +234,20 @@ export const MolstarViewer = forwardRef<MolstarViewerHandle, MolstarViewerProps>
     onRenderingStateChange({ loading: true, error: null })
     loadQueue.current.enqueue(
       async (isLatest) => {
-        const adapted = sceneToMolstarStructure(scene)
-        const loaded = await loadMolstarScene(plugin, scene, adapted, isLatest)
-        if (loaded && isLatest()) {
-          adapterRef.current = adapted
+        if (isNativeProjectScene(scene)) {
+          const modelLookup = new WeakMap<object, NativeAtomLookup>()
+          const loaded = await loadNativeProjectScene(plugin, scene, modelLookup, isLatest)
+          if (loaded && isLatest()) {
+            adapterRef.current = null
+            nativeModelLookupRef.current = modelLookup
+          }
+        } else {
+          const adapted = sceneToMolstarStructure(scene)
+          const loaded = await loadMolstarScene(plugin, scene, adapted, isLatest)
+          if (loaded && isLatest()) {
+            nativeModelLookupRef.current = new WeakMap()
+            adapterRef.current = adapted
+          }
         }
       },
       () => onRenderingStateChange({ loading: false, error: null }),

@@ -66,11 +66,39 @@ raw API contracts
   → isolated Mol* plugin state
 ```
 
+Two rendering sources share the same controlled Mol* `PluginContext` without
+sharing scientific adapters. Presets, planned experiments, active runs, and
+persisted runs retain the coordinate-scene normalization and in-memory MOL2
+path. The read-only **Open molecular project** control instead loads projected
+scene metadata followed by every declared native structure and canonical
+topology resource. Native PDB, mmCIF, MOL, SDF, and XYZ bytes go directly to
+their allow-listed Mol* parsers; proteins and other native structures are not
+converted to MOL2.
+
+Project resources are accepted only after their relative URL identities,
+declared browser size bound, byte size, SHA-256, media type,
+`X-Content-SHA256`, and optional ETag agree. The primary structure loads first,
+then remaining structures retain declared order. Canonical topology maps Mol*
+source indices to structure-scoped stable atom identifiers and resolves the
+project's declared components, selections, and regions. Any required resource
+or mapping failure rejects the replacement scene atomically.
+
+One project scene may contain multiple independent native structures. Each
+current component, selection, and region remains scoped to its one declared
+structure. Native resources declaring multiple models or frames fail closed;
+trajectory and frame streaming remain later Phase 2 work.
+
+Opening a molecular project uses GET requests only. It never creates, resumes,
+or executes a scientific run and never submits work to IBM Quantum. A project
+or persisted run replaces the currently valid source only after its complete
+read-only load succeeds. Choosing a preset remains an explicit source change;
+clearing the project returns to the ordinary coordinate workspace.
+
 - `src/api/` owns raw backend response types, runtime response checks, cancellation, and transport errors.
 - `src/scene/types.ts` defines the renderer-independent scene: arbitrary atom and bond arrays, selections, regions, measurements, provenance references, warnings, and scientific metadata.
 - `src/scene/normalize.ts` is the only place that interprets the current endpoint's diatomic-oriented bond distance fields. A measurement keeps its declared value, backend-derived value, and independently calculated viewer geometry separate, with differences where available.
 - Provenance identity is lossless: `structureId`, backend-only `structureHash`, `experimentFingerprint`, and manifest `expectedExperimentSha256` are independent fields. An experiment fingerprint is never used as a structure-hash fallback.
-- `src/scene/molstar-adapter.ts` serializes current coordinate scenes to in-memory MOL2. Original coordinates and their declared unit remain unchanged in the normalized scene; only the Mol* boundary converts coordinates to angstrom. Unknown connection order is written as MOL2 `un`, rather than inventing a chemical bond order. When the backend later supplies standard mmCIF, SDF, MOL, XYZ, trajectory, or volume artifacts, format routing can be added at this adapter boundary.
+- `src/scene/molstar-adapter.ts` serializes current coordinate scenes to in-memory MOL2. Original coordinates and their declared unit remain unchanged in the normalized scene; only the Mol* boundary converts coordinates to angstrom. Unknown connection order is written as MOL2 `un`, rather than inventing a chemical bond order. Native project structures bypass this serializer and retain their server-supplied standard format.
 - `src/components/MolstarViewer.tsx` owns one `PluginContext`, cleans it up on unmount, maps Mol* atom picks back to stable Pulsate atom identifiers, uses generic bounds-derived fitting, adds Mol* distance and atom-label representations, and creates translucent Mol* representations for declared regions. A latest-scene queue serializes plugin mutations so rapid preset changes converge on the newest accepted scene.
 - The rest of the product UI remains normal React and never receives Mol* objects.
 

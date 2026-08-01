@@ -88,6 +88,9 @@ function api(overrides: Partial<PulsateApi> = {}): PulsateApi {
     getRunResults: vi.fn().mockResolvedValue(results),
     getRunVerification: vi.fn().mockResolvedValue(verification),
     getRunReceipt: vi.fn().mockResolvedValue(receipt),
+    getProjectedMolecularScene: vi.fn(),
+    getNativeMolecularStructure: vi.fn(),
+    getMolecularTopology: vi.fn(),
     ...overrides,
   }
 }

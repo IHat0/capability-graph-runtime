@@ -13,6 +13,10 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cgr.molecular import (
+    MolecularArtifactRepository,
+    MolecularProjectRepository,
+)
 from cgr.quantum_preflight.contracts import ManifestEnvelope
 from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
@@ -276,6 +280,30 @@ def create_app(
     natural_language_store: NaturalLanguageInterpretationStore | None = None,
     molecular_scene_service: NativeMolecularSceneService | None = None,
 ) -> FastAPI:
+    molecular_project_repository: MolecularProjectRepository | None = None
+    molecular_artifact_repository: MolecularArtifactRepository | None = None
+    if molecular_scene_service is None:
+        project_root = os.environ.get("PULSATE_MOLECULAR_PROJECT_ROOT")
+        artifact_root = os.environ.get("PULSATE_MOLECULAR_ARTIFACT_ROOT")
+        if (project_root is None) != (artifact_root is None):
+            raise ValueError(
+                "Molecular project and artifact roots must be configured together."
+            )
+        if project_root is not None and artifact_root is not None:
+            if not project_root.strip() or not artifact_root.strip():
+                raise ValueError(
+                    "Molecular project and artifact roots cannot be empty."
+                )
+            molecular_project_repository = MolecularProjectRepository(
+                Path(project_root)
+            )
+            molecular_artifact_repository = MolecularArtifactRepository(
+                Path(artifact_root)
+            )
+            molecular_scene_service = NativeMolecularSceneService(
+                project_resolver=molecular_project_repository.resolve,
+                repository=molecular_artifact_repository,
+            )
     if experiment_store is None:
         if coordinator is not None:
             experiment_root = coordinator.configured_run_root.parent / "experiments"
@@ -311,6 +339,8 @@ def create_app(
             experiment_store.start()
             natural_language_store.start()
             run_coordinator.start()
+            if molecular_project_repository is not None:
+                molecular_project_repository.start()
             if molecular_scene_service is not None:
                 molecular_scene_service.start()
             yield
@@ -320,12 +350,16 @@ def create_app(
                     molecular_scene_service.close()
             finally:
                 try:
-                    run_coordinator.close()
+                    if molecular_project_repository is not None:
+                        molecular_project_repository.close()
                 finally:
                     try:
-                        natural_language_store.close()
+                        run_coordinator.close()
                     finally:
-                        experiment_store.close()
+                        try:
+                            natural_language_store.close()
+                        finally:
+                            experiment_store.close()
 
     application = FastAPI(
         title="Pulsate Labs API",
@@ -340,6 +374,8 @@ def create_app(
     application.state.experiment_store = experiment_store
     application.state.natural_language_store = natural_language_store
     application.state.molecular_scene_service = molecular_scene_service
+    application.state.molecular_project_repository = molecular_project_repository
+    application.state.molecular_artifact_repository = molecular_artifact_repository
 
     def require_molecular_scene_service() -> NativeMolecularSceneService:
         if molecular_scene_service is None:

@@ -247,8 +247,10 @@ describe('read-only existing run loading', () => {
     const { result } = renderHook(() => useExistingRun())
 
     act(() => result.current.setRunIdentifierInput(`  ${runIdentifier}  `))
-    await act(async () => result.current.openRun())
+    let accepted = false
+    await act(async () => { accepted = await result.current.openRun() })
 
+    expect(accepted).toBe(true)
     expect(result.current.runIdentifierInput).toBe(runIdentifier)
     expect(result.current.run?.status).toBe('rejected')
     expect(result.current.scene?.atoms.map((atom) => atom.element)).toEqual(['Li', 'H'])
@@ -276,6 +278,30 @@ describe('read-only existing run loading', () => {
     expect(screen.getByText('IBM execution integrity').parentElement?.textContent).toContain('Passed')
     expect(screen.getByText('IBM scientific quality').parentElement?.textContent).toContain('Rejected')
     expect(screen.getByText('Authorization').parentElement?.textContent).toContain('rejected')
+  })
+
+  it('preserves previously accepted run evidence when a replacement fails', async () => {
+    const replacementIdentifier = `run-${'8'.repeat(32)}`
+    const api: ExistingRunApi = {
+      getRun: vi.fn().mockResolvedValueOnce(run).mockRejectedValueOnce(new Error('replacement failed')),
+      getRunScene: vi.fn().mockResolvedValue(scene),
+      getRunResults: vi.fn().mockResolvedValue(results),
+      getRunVerification: vi.fn().mockResolvedValue(verification),
+      getRunReceipt: vi.fn().mockResolvedValue(receipt),
+    }
+    const { result } = renderHook(() => useExistingRun(api))
+    act(() => result.current.setRunIdentifierInput(runIdentifier))
+    await act(async () => { expect(await result.current.openRun()).toBe(true) })
+    const acceptedScene = result.current.scene
+
+    act(() => result.current.setRunIdentifierInput(replacementIdentifier))
+    await act(async () => { expect(await result.current.openRun()).toBe(false) })
+
+    expect(result.current.run?.run_identifier).toBe(runIdentifier)
+    expect(result.current.scene).toBe(acceptedScene)
+    expect(result.current.results).toBe(results)
+    expect(result.current.verification).toBe(verification)
+    expect(result.current.receipt).toBe(receipt)
   })
 
   it('enters read-only mode while a valid lookup is unresolved and remains read-only after loading', async () => {

@@ -18,6 +18,7 @@ from cgr.molecular import (
     MolecularArtifactRepositoryError,
     MolecularComponent,
     MolecularMemberReference,
+    MolecularProjectRepository,
     MolecularRegion,
     MolecularSelection,
 )
@@ -244,7 +245,11 @@ def _contains_forbidden_key(value: Any) -> bool:
     return False
 
 
-def test_default_app_constructs_without_native_service_and_routes_return_503() -> None:
+def test_default_app_constructs_without_native_service_and_routes_return_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PULSATE_MOLECULAR_PROJECT_ROOT", raising=False)
+    monkeypatch.delenv("PULSATE_MOLECULAR_ARTIFACT_ROOT", raising=False)
     application = create_app()
     client = TestClient(application)
 
@@ -309,6 +314,136 @@ def test_injected_service_state_and_lifespan_start_and_close(
     with pytest.raises(MolecularArtifactRepositoryError, match="not started"):
         repository.read(fixture.topology_artifact)
     assert executor.calls == 0
+
+
+def test_environment_repositories_are_constructed_only_at_lifespan_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project-repository"
+    artifact_root = tmp_path / "artifact-repository"
+    monkeypatch.setenv("PULSATE_MOLECULAR_PROJECT_ROOT", str(project_root))
+    monkeypatch.setenv("PULSATE_MOLECULAR_ARTIFACT_ROOT", str(artifact_root))
+    application, _, executor = _application(tmp_path / "application")
+
+    assert isinstance(
+        application.state.molecular_project_repository,
+        MolecularProjectRepository,
+    )
+    assert isinstance(
+        application.state.molecular_artifact_repository,
+        MolecularArtifactRepository,
+    )
+    assert isinstance(
+        application.state.molecular_scene_service,
+        NativeMolecularSceneService,
+    )
+    assert not project_root.exists()
+    assert not artifact_root.exists()
+
+    with TestClient(application):
+        assert project_root.is_dir()
+        assert artifact_root.is_dir()
+
+    with pytest.raises(MolecularArtifactRepositoryError, match="not started"):
+        application.state.molecular_artifact_repository.read(
+            _structure_fixture("never-written").source_artifact
+        )
+    assert executor.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("project_root", "artifact_root"),
+    [("configured", None), (None, "configured")],
+)
+def test_one_environment_repository_root_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: str | None,
+    artifact_root: str | None,
+) -> None:
+    monkeypatch.delenv("PULSATE_MOLECULAR_PROJECT_ROOT", raising=False)
+    monkeypatch.delenv("PULSATE_MOLECULAR_ARTIFACT_ROOT", raising=False)
+    if project_root is not None:
+        monkeypatch.setenv("PULSATE_MOLECULAR_PROJECT_ROOT", str(tmp_path / project_root))
+    if artifact_root is not None:
+        monkeypatch.setenv("PULSATE_MOLECULAR_ARTIFACT_ROOT", str(tmp_path / artifact_root))
+
+    with pytest.raises(ValueError, match="configured together"):
+        create_app()
+
+
+def test_environment_lifecycle_order_is_project_then_service_and_reverse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PULSATE_MOLECULAR_PROJECT_ROOT",
+        str(tmp_path / "projects"),
+    )
+    monkeypatch.setenv(
+        "PULSATE_MOLECULAR_ARTIFACT_ROOT",
+        str(tmp_path / "artifacts"),
+    )
+    application, _, _ = _application(tmp_path / "application")
+    project_repository = application.state.molecular_project_repository
+    service = application.state.molecular_scene_service
+    events: list[str] = []
+    project_start = project_repository.start
+    project_close = project_repository.close
+    service_start = service.start
+    service_close = service.close
+    monkeypatch.setattr(
+        project_repository,
+        "start",
+        lambda: (events.append("project-start"), project_start())[1],
+    )
+    monkeypatch.setattr(
+        service,
+        "start",
+        lambda: (events.append("service-start"), service_start())[1],
+    )
+    monkeypatch.setattr(
+        service,
+        "close",
+        lambda: (events.append("service-close"), service_close())[1],
+    )
+    monkeypatch.setattr(
+        project_repository,
+        "close",
+        lambda: (events.append("project-close"), project_close())[1],
+    )
+
+    with TestClient(application):
+        assert events[:2] == ["project-start", "service-start"]
+
+    assert events == [
+        "project-start",
+        "service-start",
+        "service-close",
+        "project-close",
+    ]
+
+
+def test_explicit_service_precedes_incomplete_environment_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _structure_fixture("structure-injected-precedence")
+    project = _project((fixture,))
+    repository = _persist(tmp_path, (fixture,))
+    service = _service(project, repository)
+    monkeypatch.setenv(
+        "PULSATE_MOLECULAR_PROJECT_ROOT",
+        str(tmp_path / "unused-project-root"),
+    )
+    monkeypatch.delenv("PULSATE_MOLECULAR_ARTIFACT_ROOT", raising=False)
+
+    application, _, _ = _application(tmp_path / "application", service=service)
+
+    assert application.state.molecular_scene_service is service
+    assert application.state.molecular_project_repository is None
+    assert application.state.molecular_artifact_repository is None
 
 
 def test_service_start_and_close_are_idempotent(tmp_path: Path) -> None:

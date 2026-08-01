@@ -14,7 +14,14 @@ import type {
   RunStateResponse,
   RunStatus,
   RunVerificationResponse,
+  FetchedMolecularResource,
+  ProjectedMolecularSceneMetadata,
+  ProjectedMolecularStructureMetadata,
 } from './types'
+import {
+  MOLECULAR_RESOURCE_MAXIMUM_BYTES,
+  parseProjectedMolecularScene,
+} from '../scene/native-project'
 
 export class ApiError extends Error {
   constructor(
@@ -411,6 +418,101 @@ async function requestJson<T>(path: string, parser: (value: unknown) => T, signa
   }
 }
 
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('')
+}
+
+async function readBoundedMolecularResource(
+  response: Response,
+  maximumBytes: number,
+): Promise<Uint8Array> {
+  if (!response.body) {
+    throw new ApiError('The molecular resource response body is unavailable.', response.status)
+  }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let receivedBytes = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      receivedBytes += value.byteLength
+      if (receivedBytes > maximumBytes) {
+        await reader.cancel()
+        throw new ApiError('The molecular resource exceeded its declared byte size.', response.status)
+      }
+      chunks.push(value)
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    if (error instanceof ApiError) throw error
+    throw new ApiError('The molecular resource could not be read.', response.status, error)
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(receivedBytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return bytes
+}
+
+async function requestMolecularResource(
+  path: string,
+  artifact: ProjectedMolecularStructureMetadata['source_artifact'],
+  signal?: AbortSignal,
+): Promise<FetchedMolecularResource> {
+  if (artifact.byte_size > MOLECULAR_RESOURCE_MAXIMUM_BYTES) {
+    throw new ApiError('The molecular resource exceeds the browser rendering limit.')
+  }
+  let response: Response
+  try {
+    response = await fetch(path, { method: 'GET', signal, headers: { Accept: artifact.media_type } })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw new ApiError('Unable to reach the Pulsate API.', undefined, error)
+  }
+  if (!response.ok) throw new ApiError(`Molecular resource request failed (${response.status}).`, response.status)
+  const declaredLength = response.headers.get('Content-Length')
+  if (declaredLength === null || !/^\d+$/.test(declaredLength) || Number(declaredLength) !== artifact.byte_size) {
+    throw new ApiError('The molecular resource byte-size evidence is inconsistent.')
+  }
+  const contentType = response.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase()
+  if (contentType !== artifact.media_type.toLowerCase()) {
+    throw new ApiError('The molecular resource media type is inconsistent.')
+  }
+  const contentHash = response.headers.get('X-Content-SHA256')
+  if (contentHash !== artifact.content_sha256) {
+    throw new ApiError('The molecular resource identity header is inconsistent.')
+  }
+  const etag = response.headers.get('ETag')
+  if (etag !== null && etag !== `"${artifact.content_sha256}"`) {
+    throw new ApiError('The molecular resource ETag is inconsistent.')
+  }
+  const bytes = await readBoundedMolecularResource(response, artifact.byte_size)
+  if (bytes.byteLength !== artifact.byte_size) {
+    throw new ApiError('The molecular resource byte size is inconsistent.')
+  }
+  let computedHash: string
+  try {
+    computedHash = await sha256Hex(bytes)
+  } catch (error) {
+    throw new ApiError('The molecular resource content identity could not be verified.', response.status, error)
+  }
+  if (computedHash !== artifact.content_sha256) {
+    throw new ApiError('The molecular resource content hash is inconsistent.')
+  }
+  return {
+    bytes,
+    mediaType: artifact.media_type,
+    contentSha256: artifact.content_sha256,
+    artifactIdentifier: artifact.artifact_identifier,
+  }
+}
+
 export interface PulsateApi {
   getHealth(signal?: AbortSignal): Promise<HealthResponse>
   getPresets(signal?: AbortSignal): Promise<PresetListResponse>
@@ -427,6 +529,9 @@ export interface PulsateApi {
   getRunResults(runIdentifier: string, signal?: AbortSignal): Promise<RunResultsResponse>
   getRunVerification(runIdentifier: string, signal?: AbortSignal): Promise<RunVerificationResponse>
   getRunReceipt(runIdentifier: string, signal?: AbortSignal): Promise<RunReceiptResponse>
+  getProjectedMolecularScene(projectIdentifier: string, sceneIdentifier: string, signal?: AbortSignal): Promise<ProjectedMolecularSceneMetadata>
+  getNativeMolecularStructure(structure: ProjectedMolecularStructureMetadata, signal?: AbortSignal): Promise<FetchedMolecularResource>
+  getMolecularTopology(structure: ProjectedMolecularStructureMetadata, signal?: AbortSignal): Promise<FetchedMolecularResource>
 }
 
 export type WorkspaceApi = Pick<PulsateApi, 'getHealth' | 'getPresets' | 'getPreset' | 'getScene'>
@@ -477,4 +582,19 @@ export const pulsateApi: PulsateApi = {
   getRunResults: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/results`, parseRunResults, signal),
   getRunVerification: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/verification`, parseVerification, signal),
   getRunReceipt: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/receipt`, parseReceipt, signal),
+  getProjectedMolecularScene: (projectIdentifier, sceneIdentifier, signal) => requestJson(
+    `/api/v1/molecular/scenes/projected?project_identifier=${encodeURIComponent(projectIdentifier)}&scene_identifier=${encodeURIComponent(sceneIdentifier)}`,
+    parseProjectedMolecularScene,
+    signal,
+  ),
+  getNativeMolecularStructure: (structure, signal) => requestMolecularResource(
+    structure.native_structure_url,
+    structure.source_artifact,
+    signal,
+  ),
+  getMolecularTopology: (structure, signal) => requestMolecularResource(
+    structure.topology_url,
+    structure.topology_artifact,
+    signal,
+  ),
 }

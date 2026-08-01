@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, pulsateApi } from './client'
 import { currentFixtureDetail, currentFixtureScene, naturalLanguageInterpretation } from '../test/fixtures'
+import { projectedMolecularSceneFixture } from '../test/molecular-project-fixtures'
+import { MOLECULAR_RESOURCE_MAXIMUM_BYTES } from '../scene/native-project'
 
 function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -172,5 +174,122 @@ describe('Pulsate API client failure handling', () => {
       },
     })))
     await expect(pulsateApi.getRunCapability()).rejects.toBeInstanceOf(ApiError)
+  })
+
+  it('accepts strict multi-structure projected molecular metadata', async () => {
+    const metadata = projectedMolecularSceneFixture()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(metadata)))
+
+    const result = await pulsateApi.getProjectedMolecularScene('project-native', 'scene-native')
+
+    expect(result.structures.map((item) => item.structure_identifier)).toEqual(['structure-b', 'structure-a'])
+    expect(result.primary_structure_identifier).toBe('structure-a')
+  })
+
+  it.each([
+    ['duplicate structures', (metadata: Record<string, unknown>) => { metadata.structures = [projectedMolecularSceneFixture().structures[0], projectedMolecularSceneFixture().structures[0]] }],
+    ['absolute URL', (metadata: Record<string, unknown>) => { (metadata.structures as Array<Record<string, unknown>>)[0].native_structure_url = 'https://other.invalid/resource' }],
+    ['mismatched URL identity', (metadata: Record<string, unknown>) => { (metadata.structures as Array<Record<string, unknown>>)[0].topology_url = '/api/v1/molecular/scenes/topology?project_identifier=wrong&scene_identifier=scene-native&structure_identifier=structure-b' }],
+    ['credential field', (metadata: Record<string, unknown>) => { metadata.api_token = 'secret' }],
+    ['missing primary', (metadata: Record<string, unknown>) => { metadata.primary_structure_identifier = 'missing-structure' }],
+    ['unsupported native format', (metadata: Record<string, unknown>) => { (metadata.structures as Array<Record<string, unknown>>)[0].native_format = 'unknown' }],
+  ])('rejects projected molecular metadata with %s', async (_label, mutate) => {
+    const metadata = structuredClone(projectedMolecularSceneFixture()) as unknown as Record<string, unknown>
+    mutate(metadata)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(metadata)))
+
+    await expect(pulsateApi.getProjectedMolecularScene('project-native', 'scene-native')).rejects.toBeInstanceOf(ApiError)
+  })
+
+  it('verifies exact molecular resource size, hash, media type, ETag, and identity header', async () => {
+    const metadata = projectedMolecularSceneFixture().structures[0]
+    const structure = {
+      ...metadata,
+      source_artifact: {
+        ...metadata.source_artifact,
+        media_type: 'text/plain',
+        byte_size: 3,
+        content_sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new TextEncoder().encode('abc'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain',
+        'Content-Length': '3',
+        'X-Content-SHA256': structure.source_artifact.content_sha256,
+        ETag: `"${structure.source_artifact.content_sha256}"`,
+      },
+    })))
+
+    const resource = await pulsateApi.getNativeMolecularStructure(structure)
+
+    expect(new TextDecoder().decode(resource.bytes)).toBe('abc')
+  })
+
+  it.each([
+    ['declared size', { 'Content-Length': '4' }],
+    ['media type', { 'Content-Type': 'application/json' }],
+    ['identity header', { 'X-Content-SHA256': '0'.repeat(64) }],
+    ['ETag', { ETag: `"${'0'.repeat(64)}"` }],
+  ])('rejects molecular resource %s mismatches', async (_label, replacement) => {
+    const metadata = projectedMolecularSceneFixture().structures[0]
+    const hash = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+    const structure = { ...metadata, source_artifact: { ...metadata.source_artifact, media_type: 'text/plain', byte_size: 3, content_sha256: hash } }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new TextEncoder().encode('abc'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain', 'Content-Length': '3',
+        'X-Content-SHA256': hash, ETag: `"${hash}"`, ...replacement,
+      },
+    })))
+
+    await expect(pulsateApi.getNativeMolecularStructure(structure)).rejects.toBeInstanceOf(ApiError)
+  })
+
+  it('stops reading when molecular resource bytes exceed the declared bound', async () => {
+    const metadata = projectedMolecularSceneFixture().structures[0]
+    const hash = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+    const structure = { ...metadata, source_artifact: { ...metadata.source_artifact, media_type: 'text/plain', byte_size: 3, content_sha256: hash } }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new TextEncoder().encode('abcd'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain', 'Content-Length': '3',
+        'X-Content-SHA256': hash, ETag: `"${hash}"`,
+      },
+    })))
+
+    await expect(pulsateApi.getNativeMolecularStructure(structure)).rejects.toThrow('exceeded')
+  })
+
+  it('rejects oversized molecular resources before fetching', async () => {
+    const metadata = projectedMolecularSceneFixture().structures[0]
+    const structure = { ...metadata, source_artifact: { ...metadata.source_artifact, byte_size: MOLECULAR_RESOURCE_MAXIMUM_BYTES + 1 } }
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(pulsateApi.getNativeMolecularStructure(structure)).rejects.toBeInstanceOf(ApiError)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects molecular resource bytes whose computed hash disagrees', async () => {
+    const metadata = projectedMolecularSceneFixture().structures[0]
+    const declaredHash = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+    const structure = { ...metadata, source_artifact: { ...metadata.source_artifact, media_type: 'text/plain', byte_size: 3, content_sha256: declaredHash } }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new TextEncoder().encode('xyz'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain', 'Content-Length': '3',
+        'X-Content-SHA256': declaredHash, ETag: `"${declaredHash}"`,
+      },
+    })))
+
+    await expect(pulsateApi.getNativeMolecularStructure(structure)).rejects.toThrow('content hash')
+  })
+
+  it('preserves AbortError for native molecular resource requests', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new DOMException('aborted', 'AbortError')))
+
+    await expect(pulsateApi.getNativeMolecularStructure(projectedMolecularSceneFixture().structures[0])).rejects.toMatchObject({ name: 'AbortError' })
   })
 })

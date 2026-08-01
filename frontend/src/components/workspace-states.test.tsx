@@ -14,6 +14,7 @@ import { EmptyInspector } from './EmptyInspector'
 import { EmptyWorkspace } from './EmptyWorkspace'
 import { Header } from './Header'
 import { ResultSummary } from './ResultSummary'
+import { MolecularProjectInput } from './MolecularProjectInput'
 
 const genericPreset: PresetSummaryResponse = {
   preset_identifier: 'generic-preset-v1',
@@ -214,5 +215,39 @@ describe('progressive workspace disclosure', () => {
     expect(screen.getByText('ibm-job-test')).toBeTruthy()
     expect(screen.getByText('ibm_backend_test')).toBeTruthy()
     expect(document.body.textContent).not.toMatch(/token|credential/i)
+  })
+
+  it('opens and clears a molecular project only through explicit read-only controls', () => {
+    const onOpen = vi.fn()
+    const onClear = vi.fn()
+    const onProjectChange = vi.fn()
+    const onSceneChange = vi.fn()
+    const { rerender } = render(<MolecularProjectInput
+      projectIdentifier="project-native"
+      sceneIdentifier="scene-native"
+      loading={false}
+      active={false}
+      onProjectChange={onProjectChange}
+      onSceneChange={onSceneChange}
+      onOpen={onOpen}
+      onClear={onClear}
+    />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open project' }))
+    expect(onOpen).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('button', { name: 'Clear project' })).toBeNull()
+
+    rerender(<MolecularProjectInput
+      projectIdentifier="project-native"
+      sceneIdentifier="scene-native"
+      loading={false}
+      active
+      onProjectChange={onProjectChange}
+      onSceneChange={onSceneChange}
+      onOpen={onOpen}
+      onClear={onClear}
+    />)
+    fireEvent.click(screen.getByRole('button', { name: 'Clear project' }))
+    expect(onClear).toHaveBeenCalledTimes(1)
   })
 })

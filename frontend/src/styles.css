@@ -40,6 +40,11 @@ a { color: inherit; }
 .existing-run-form button { height: 32px; padding: 0 11px; border: 1px solid #252524; border-radius: 0 6px 6px 0; color: white; background: #252524; font-size: 10px; font-weight: 600; white-space: nowrap; }
 .existing-run-form button:disabled { border-color: var(--border-strong); color: var(--muted); background: var(--subtle); }
 .header-status { display: flex; align-items: center; justify-content: flex-end; gap: 18px; color: var(--secondary); font-size: 12px; }
+.read-only-open-controls { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.molecular-project-form { display: flex; align-items: center; gap: 5px; }
+.molecular-project-form input { width: 120px; height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; background: white; font-size: 10px; }
+.molecular-project-form button { height: 30px; padding: 0 9px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); background: white; font-size: 10px; white-space: nowrap; }
+.molecular-project-form button:disabled { color: var(--muted); background: var(--subtle); }
 .header-status-item { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .neutral-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
 
@@ -224,6 +229,7 @@ a { color: inherit; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; } }
 
 @media (max-width: 1080px) {
+  .molecular-project-form input { width: 100px; }
   .workspace-name { display: none; }
   html, body, #root { height: auto; min-height: 100%; }
   body { overflow: auto; }
@@ -243,6 +249,8 @@ a { color: inherit; }
   .header-status { display: none; }
   .existing-run-form { width: min(100%, 360px); }
   .existing-run-form input { width: 100%; }
+  .read-only-open-controls { width: 100%; overflow-x: auto; }
+  .molecular-project-form { display: none; }
   .header-status { gap: 10px; font-size: 10px; }
   .header-status-item:last-child { display: none; }
   .workspace-frame { min-height: calc(100dvh - 54px); display: block; }
