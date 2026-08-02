@@ -6,13 +6,19 @@ import pytest
 from pydantic import ValidationError
 
 from cgr.kernel.contracts import CapabilityVersion
-from cgr.science.artifacts import CreationProvenance
+from cgr.science.artifacts import ArtifactPointer, CreationProvenance
 from cgr.science.capabilities import (
     CapabilityFidelityLevel,
     CapabilityVerificationRequirement,
 )
 from cgr.science.contracts import ApprovalStatus, AssumptionSource, ScientificAssumption
-from cgr.science.planning import PlanningConstraints, ScientificObjective
+from cgr.science.planning import (
+    CandidateResearchPlan,
+    PlanningConstraints,
+    PlanningFact,
+    PlanningFactSet,
+    ScientificObjective,
+)
 from cgr.science.resources import ResourceQuantity
 from cgr.science.verification import ScientificVerificationOutcome
 
@@ -22,6 +28,8 @@ PROVENANCE = CreationProvenance(
     producer_version=VERSION,
     execution_identifier="planning.fixture-001",
 )
+POINTER_A = ArtifactPointer(artifact_identifier="artifact.a", content_sha256="a" * 64)
+POINTER_B = ArtifactPointer(artifact_identifier="artifact.b", content_sha256="b" * 64)
 
 
 def _assumption(identifier: str) -> ScientificAssumption:
@@ -189,3 +197,62 @@ def test_objective_and_constraints_have_stable_identity_without_authorization() 
     assert "execution_allowed" not in PlanningConstraints.model_fields
     assert not hasattr(first, "execute")
     assert not hasattr(constraints, "authorize")
+
+
+def _fact(identifier: str = "fact.atom-count", **updates: object) -> PlanningFact:
+    values: dict[str, object] = {
+        "fact_identifier": identifier,
+        "schema_version": VERSION,
+        "subject_identifier": "structure.one",
+        "dimension": "structure.atom_count",
+        "unit": "count",
+        "value": 12,
+        "evidence_artifacts": (POINTER_B, POINTER_A),
+        "derivation_identifier": "molecular-planning-projection-v1",
+    }
+    values.update(updates)
+    return PlanningFact.model_validate(values)
+
+
+def test_planning_fact_is_strict_finite_and_orders_evidence() -> None:
+    fact = _fact()
+    assert fact.evidence_artifacts == (POINTER_A, POINTER_B)
+    assert fact.semantic_address == (
+        "structure.one",
+        "structure.atom_count",
+        "count",
+    )
+    for invalid in ("12", None, {}, [], float("nan"), float("inf")):
+        with pytest.raises(ValidationError):
+            _fact(value=invalid)
+
+
+def test_planning_fact_set_rejects_duplicate_identifiers_and_addresses() -> None:
+    first = _fact()
+    with pytest.raises(ValidationError, match="identifiers must be unique"):
+        PlanningFactSet(facts=(first, first))
+    with pytest.raises(ValidationError, match="semantic addresses must be unique"):
+        PlanningFactSet(facts=(first, _fact("fact.other", value=13)))
+
+
+def test_planning_fact_set_is_stable_ordered_and_exactly_lookupable() -> None:
+    atom = _fact()
+    bond = _fact(
+        "fact.bond-count",
+        dimension="structure.bond_count",
+        value=11,
+        evidence_artifacts=(POINTER_A,),
+    )
+    first = PlanningFactSet(facts=(atom, bond))
+    second = PlanningFactSet(facts=(bond, atom))
+    assert first.to_canonical_json() == second.to_canonical_json()
+    assert first.fingerprint == second.fingerprint
+    assert first.lookup("structure.one", "structure.atom_count", "count") == atom
+    assert first.lookup("structure.one", "structure.atom_count", "boolean") is None
+
+
+def test_candidate_plan_contract_has_no_execution_or_authorization_surface() -> None:
+    assert "execution_allowed" not in CandidateResearchPlan.model_fields
+    assert not hasattr(CandidateResearchPlan, "execute")
+    assert not hasattr(CandidateResearchPlan, "authorize")
+    assert not hasattr(CandidateResearchPlan, "submit")

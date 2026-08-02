@@ -29,6 +29,10 @@ from .project_repository import (
     MolecularProjectRepository,
     MolecularProjectRepositoryError,
 )
+from .planning import (
+    MolecularPlanningProjectionError,
+    project_molecular_planning_facts,
+)
 from .scene_projection import (
     MolecularSceneProjection,
     MolecularSceneProjectionError,
@@ -60,6 +64,7 @@ __all__ = [
     "MolecularProjectNotFoundError",
     "MolecularProjectRepository",
     "MolecularProjectRepositoryError",
+    "MolecularPlanningProjectionError",
     "MolecularRegion",
     "MolecularSceneProjection",
     "MolecularSceneProjectionError",
@@ -78,6 +83,7 @@ __all__ = [
     "StructureIngestionError",
     "StructureIngestionResult",
     "ingest_structure_bytes",
+    "project_molecular_planning_facts",
     "project_molecular_scene",
     "read_projected_structure_bytes",
 ]

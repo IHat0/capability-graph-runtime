@@ -42,6 +42,10 @@ from .contracts import (
     ScientificAssumption,
     ScientificExperiment,
 )
+from .feasibility import (
+    construct_candidate_research_plan,
+    evaluate_capability_feasibility,
+)
 from .molecular import (
     MolecularAtomReference,
     MolecularCameraState,
@@ -53,7 +57,17 @@ from .molecular import (
     MolecularSelection,
     MolecularStructure,
 )
-from .planning import PlanningConstraints, ScientificObjective
+from .planning import (
+    CandidatePlanAssignment,
+    CandidateResearchPlan,
+    CapabilityFeasibilityResult,
+    FeasibilityFinding,
+    FeasibilityStatus,
+    PlanningFact,
+    PlanningFactSet,
+    RejectedCapabilityAlternative,
+    ScientificObjective,
+)
 from .resources import ResourceAvailabilitySnapshot, ResourceQuantity
 from .verification import (
     FindingSeverity,
@@ -96,11 +110,16 @@ __all__ = [
     "CapabilityPrerequisiteType",
     "CapabilityResult",
     "CapabilityVerificationRequirement",
+    "CandidatePlanAssignment",
+    "CandidateResearchPlan",
+    "CapabilityFeasibilityResult",
     "CreationProvenance",
     "DeterminismClassification",
     "DuplicateScientificCapabilityError",
     "ExecutionEvidence",
     "ExperimentExecutionPolicy",
+    "FeasibilityFinding",
+    "FeasibilityStatus",
     "FailureInformation",
     "FindingSeverity",
     "MolecularAtomReference",
@@ -113,6 +132,9 @@ __all__ = [
     "MolecularSelection",
     "MolecularStructure",
     "PlanningConstraints",
+    "PlanningFact",
+    "PlanningFactSet",
+    "RejectedCapabilityAlternative",
     "ResourceAvailabilitySnapshot",
     "ResourceQuantity",
     "ScientificAssumption",
@@ -133,6 +155,8 @@ __all__ = [
     "WorkflowTransitionRecord",
     "WorkflowVerificationRequirement",
     "canonical_json",
+    "construct_candidate_research_plan",
+    "evaluate_capability_feasibility",
     "sha256_fingerprint",
     "transition_workflow",
     "validate_workflow_transition",
