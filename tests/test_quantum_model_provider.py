@@ -467,6 +467,8 @@ def test_provider_config_references_but_never_persists_api_key(tmp_path: Path) -
     assert "do-not-persist" not in config.model_dump_json()
 
 
+@pytest.mark.swe_agent_integration
+@pytest.mark.external_infrastructure
 def test_agent_descriptor_verifies_real_pristine_checkout() -> None:
     config = SWEAgentProviderConfig(
         sweagent_source=SWE_SOURCE, sweagent_executable=str(SWE_EXECUTABLE)
@@ -1493,6 +1495,8 @@ def test_proxy_exit_during_official_stop_is_detected_and_never_passes() -> None:
     assert health.proxy_cleanup_passed is True
 
 
+@pytest.mark.swe_agent_integration
+@pytest.mark.external_infrastructure
 def test_pinned_deployment_stop_is_idempotent_after_runtime_close() -> None:
     from swerex.deployment.config import DockerDeploymentConfig
 
@@ -2256,6 +2260,7 @@ def test_provider_contains_no_benchmark_specific_repair_logic() -> None:
 
 
 @pytest.mark.quantum_container
+@pytest.mark.external_infrastructure
 def test_real_offline_tool_deployment_when_docker_is_available() -> None:
     docker = shutil.which("docker")
     if docker is None:

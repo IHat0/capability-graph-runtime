@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cgr.molecular import (
@@ -21,6 +22,7 @@ from cgr.quantum_preflight.contracts import ManifestEnvelope
 from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
 from cgr.quantum_preflight.manifests import load_manifest
+from cgr.science import ScientificCapabilityCatalog
 
 from .approved_experiments import (
     ApprovedExperimentExecutionResolver,
@@ -53,6 +55,18 @@ from .molecular_scenes import (
     NativeMolecularSceneService,
     NativeMolecularSceneUnavailableError,
     NativeMolecularResource,
+)
+from .molecular_planning import (
+    MolecularPlanningCapabilityNotFoundError,
+    MolecularPlanningError,
+    MolecularPlanningIntegrityError,
+    MolecularPlanningProjectNotFoundError,
+    MolecularPlanningRequest,
+    MolecularPlanningRequestError,
+    MolecularPlanningResponse,
+    MolecularPlanningService,
+    MolecularPlanningUnavailableError,
+    MOLECULAR_PLANNING_REQUEST_MAXIMUM_BYTES,
 )
 from .runs import (
     ArtifactUnavailableError,
@@ -216,6 +230,55 @@ def _typed_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
 
 
+async def _read_bounded_json_object(
+    request: Request,
+    *,
+    maximum_bytes: int,
+    error_code: str,
+    error_message: str,
+    too_large_code: str,
+    too_large_message: str,
+) -> dict[str, Any]:
+    """Read one bounded JSON object without echoing invalid request content."""
+
+    media_type = request.headers.get("content-type", "").split(";", 1)[0]
+    if media_type.strip().lower() != "application/json":
+        raise _typed_error(415, error_code, error_message)
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError:
+            raise _typed_error(422, error_code, error_message) from None
+        if declared_bytes < 0:
+            raise _typed_error(422, error_code, error_message)
+        if declared_bytes > maximum_bytes:
+            raise _typed_error(
+                413,
+                too_large_code,
+                too_large_message,
+            )
+
+    payload = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(payload) + len(chunk) > maximum_bytes:
+                raise _typed_error(
+                    413,
+                    too_large_code,
+                    too_large_message,
+                )
+            payload.extend(chunk)
+        value = json.loads(payload)
+    except HTTPException:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise _typed_error(422, error_code, error_message) from None
+    if not isinstance(value, dict):
+        raise _typed_error(422, error_code, error_message)
+    return value
+
+
 def _configured_coordinator(experiment_store: ExperimentStore) -> RunCoordinator:
     run_root = Path(os.environ.get("PULSATE_RUN_ROOT", str(REPO_ROOT / ".pulsate-runs")))
     enabled = os.environ.get("PULSATE_EXECUTION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
@@ -279,7 +342,12 @@ def create_app(
     experiment_store: ExperimentStore | None = None,
     natural_language_store: NaturalLanguageInterpretationStore | None = None,
     molecular_scene_service: NativeMolecularSceneService | None = None,
+    molecular_planning_service: MolecularPlanningService | None = None,
+    scientific_capability_catalogue: ScientificCapabilityCatalog | None = None,
 ) -> FastAPI:
+    scientific_capability_catalogue = (
+        scientific_capability_catalogue or ScientificCapabilityCatalog()
+    )
     molecular_project_repository: MolecularProjectRepository | None = None
     molecular_artifact_repository: MolecularArtifactRepository | None = None
     if molecular_scene_service is None:
@@ -304,6 +372,12 @@ def create_app(
                 project_resolver=molecular_project_repository.resolve,
                 repository=molecular_artifact_repository,
             )
+            if molecular_planning_service is None:
+                molecular_planning_service = MolecularPlanningService(
+                    project_resolver=molecular_project_repository.resolve,
+                    artifact_repository=molecular_artifact_repository,
+                    catalogue=scientific_capability_catalogue,
+                )
     if experiment_store is None:
         if coordinator is not None:
             experiment_root = coordinator.configured_run_root.parent / "experiments"
@@ -343,23 +417,29 @@ def create_app(
                 molecular_project_repository.start()
             if molecular_scene_service is not None:
                 molecular_scene_service.start()
+            if molecular_planning_service is not None:
+                molecular_planning_service.start()
             yield
         finally:
             try:
-                if molecular_scene_service is not None:
-                    molecular_scene_service.close()
+                if molecular_planning_service is not None:
+                    molecular_planning_service.close()
             finally:
                 try:
-                    if molecular_project_repository is not None:
-                        molecular_project_repository.close()
+                    if molecular_scene_service is not None:
+                        molecular_scene_service.close()
                 finally:
                     try:
-                        run_coordinator.close()
+                        if molecular_project_repository is not None:
+                            molecular_project_repository.close()
                     finally:
                         try:
-                            natural_language_store.close()
+                            run_coordinator.close()
                         finally:
-                            experiment_store.close()
+                            try:
+                                natural_language_store.close()
+                            finally:
+                                experiment_store.close()
 
     application = FastAPI(
         title="Pulsate Labs API",
@@ -376,6 +456,12 @@ def create_app(
     application.state.molecular_scene_service = molecular_scene_service
     application.state.molecular_project_repository = molecular_project_repository
     application.state.molecular_artifact_repository = molecular_artifact_repository
+    application.state.molecular_planning_service = molecular_planning_service
+    application.state.scientific_capability_catalogue = (
+        molecular_planning_service.catalogue
+        if molecular_planning_service is not None
+        else scientific_capability_catalogue
+    )
 
     def require_molecular_scene_service() -> NativeMolecularSceneService:
         if molecular_scene_service is None:
@@ -403,6 +489,52 @@ def create_app(
             409,
             "molecular_scene_unavailable",
             "Native molecular scene evidence is unavailable or invalid.",
+        )
+
+    def require_molecular_planning_service() -> MolecularPlanningService:
+        if molecular_planning_service is None:
+            raise _typed_error(
+                503,
+                "molecular_planning_service_unavailable",
+                "Molecular planning service is unavailable.",
+            )
+        return molecular_planning_service
+
+    def map_molecular_planning_error(exc: MolecularPlanningError) -> HTTPException:
+        if isinstance(exc, MolecularPlanningProjectNotFoundError):
+            return _typed_error(
+                404,
+                "molecular_project_not_found",
+                "Requested molecular project was not found.",
+            )
+        if isinstance(exc, MolecularPlanningCapabilityNotFoundError):
+            return _typed_error(
+                404,
+                "scientific_capability_not_found",
+                "Requested scientific capability was not found.",
+            )
+        if isinstance(exc, MolecularPlanningRequestError):
+            return _typed_error(
+                422,
+                "invalid_molecular_planning_request",
+                str(exc),
+            )
+        if isinstance(exc, MolecularPlanningUnavailableError):
+            return _typed_error(
+                503,
+                "molecular_planning_service_unavailable",
+                "Molecular planning service is unavailable.",
+            )
+        if isinstance(exc, MolecularPlanningIntegrityError):
+            return _typed_error(
+                409,
+                "molecular_planning_evidence_invalid",
+                "Molecular planning evidence is unavailable or invalid.",
+            )
+        return _typed_error(
+            409,
+            "molecular_planning_failed",
+            "Molecular planning could not be completed safely.",
         )
 
     def molecular_resource_response(resource: NativeMolecularResource) -> Response:
@@ -509,6 +641,59 @@ def create_app(
             return molecular_resource_response(resource)
         except NativeMolecularSceneError as exc:
             raise map_molecular_scene_error(exc) from None
+
+    @application.post(
+        "/api/v1/molecular/projects/{project_identifier}/planning/evaluate",
+        response_model=MolecularPlanningResponse,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": MolecularPlanningRequest.model_json_schema()
+                    }
+                },
+            }
+        },
+    )
+    async def evaluate_molecular_project_plan(
+        project_identifier: str,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        try:
+            request_payload = await _read_bounded_json_object(
+                http_request,
+                maximum_bytes=MOLECULAR_PLANNING_REQUEST_MAXIMUM_BYTES,
+                error_code="invalid_molecular_planning_request",
+                error_message="Molecular planning request is invalid.",
+                too_large_code="molecular_planning_request_too_large",
+                too_large_message=(
+                    "Molecular planning request exceeds its size limit."
+                ),
+            )
+            try:
+                request = MolecularPlanningRequest.model_validate(request_payload)
+            except (TypeError, ValueError):
+                raise _typed_error(
+                    422,
+                    "invalid_molecular_planning_request",
+                    "Molecular planning request is invalid.",
+                ) from None
+            response = require_molecular_planning_service().evaluate(
+                project_identifier=project_identifier,
+                request=request,
+            )
+            payload = response.model_dump(mode="json")
+            assert_public_response_safe(payload)
+            return payload
+        except MolecularPlanningError as exc:
+            raise map_molecular_planning_error(exc) from None
+        except (TypeError, ValueError):
+            raise _typed_error(
+                409,
+                "molecular_planning_failed",
+                "Molecular planning could not be completed safely.",
+            ) from None
 
     @application.get("/api/v1/runs/capability")
     def run_capability() -> dict[str, Any]:

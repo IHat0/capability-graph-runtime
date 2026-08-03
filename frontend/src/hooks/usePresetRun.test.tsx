@@ -91,6 +91,7 @@ function api(overrides: Partial<PulsateApi> = {}): PulsateApi {
     getProjectedMolecularScene: vi.fn(),
     getNativeMolecularStructure: vi.fn(),
     getMolecularTopology: vi.fn(),
+    evaluateMolecularProjectPlan: vi.fn(),
     ...overrides,
   }
 }

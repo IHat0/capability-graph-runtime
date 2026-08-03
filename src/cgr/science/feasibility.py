@@ -711,7 +711,7 @@ def _evaluate_verifications_and_approvals(
     return unresolved, tuple(requirements_by_identity[key] for key in sorted(requirements_by_identity)), approvals
 
 
-def evaluate_capability_feasibility(
+def _evaluate_capability_feasibility(
     *,
     objective: ScientificObjective,
     constraints: PlanningConstraints,
@@ -719,8 +719,8 @@ def evaluate_capability_feasibility(
     resources: ResourceAvailabilitySnapshot,
     envelope: CapabilityExecutionEnvelope,
     execution_target: str | None = None,
+    identity_fingerprints: tuple[str, str, str, str],
 ) -> CapabilityFeasibilityResult:
-    """Evaluate one immutable capability declaration without probing or execution."""
     findings = _FindingCollector(envelope)
     if (
         envelope.supported_objective_types
@@ -802,10 +802,10 @@ def evaluate_capability_feasibility(
         default=FeasibilityStatus.FEASIBLE,
     )
     identity = {
-        "objective": objective.fingerprint,
-        "constraints": constraints.fingerprint,
-        "facts": facts.fingerprint,
-        "resources": resources.fingerprint,
+        "objective": identity_fingerprints[0],
+        "constraints": identity_fingerprints[1],
+        "facts": identity_fingerprints[2],
+        "resources": identity_fingerprints[3],
         "envelope": envelope.fingerprint,
         "execution_target": selected_target,
     }
@@ -835,6 +835,33 @@ def evaluate_capability_feasibility(
         required_verifications=verifications,
         required_approvals=approvals,
         evidence_artifacts=evidence,
+    )
+
+
+def evaluate_capability_feasibility(
+    *,
+    objective: ScientificObjective,
+    constraints: PlanningConstraints,
+    facts: PlanningFactSet,
+    resources: ResourceAvailabilitySnapshot,
+    envelope: CapabilityExecutionEnvelope,
+    execution_target: str | None = None,
+) -> CapabilityFeasibilityResult:
+    """Evaluate one immutable capability declaration without probing or execution."""
+
+    return _evaluate_capability_feasibility(
+        objective=objective,
+        constraints=constraints,
+        facts=facts,
+        resources=resources,
+        envelope=envelope,
+        execution_target=execution_target,
+        identity_fingerprints=(
+            objective.fingerprint,
+            constraints.fingerprint,
+            facts.fingerprint,
+            resources.fingerprint,
+        ),
     )
 
 
@@ -962,13 +989,24 @@ def construct_candidate_research_plan(
     provenance: CreationProvenance,
 ) -> CandidateResearchPlan:
     """Evaluate every declared alternative and select at most one objective capability."""
+    objective_fingerprint = objective.fingerprint
+    constraints_fingerprint = constraints.fingerprint
+    facts_fingerprint = facts.fingerprint
+    resources_fingerprint = resources.fingerprint
+    identity_fingerprints = (
+        objective_fingerprint,
+        constraints_fingerprint,
+        facts_fingerprint,
+        resources_fingerprint,
+    )
     evaluated = tuple(
-        evaluate_capability_feasibility(
+        _evaluate_capability_feasibility(
             objective=objective,
             constraints=constraints,
             facts=facts,
             resources=resources,
             envelope=envelope,
+            identity_fingerprints=identity_fingerprints,
         )
         for envelope in catalogue.envelopes()
     )
@@ -1005,7 +1043,7 @@ def construct_candidate_research_plan(
             )
         ]
         assignment_identity = {
-            "objective": objective.fingerprint,
+            "objective": objective_fingerprint,
             "evaluation": selected_result.fingerprint,
         }
         assignments = (
@@ -1038,7 +1076,7 @@ def construct_candidate_research_plan(
                 alternative_identifier=_stable_identifier(
                     "alternative",
                     {
-                        "objective": objective.fingerprint,
+                        "objective": objective_fingerprint,
                         "evaluation": result.fingerprint,
                     },
                 ),
@@ -1081,10 +1119,10 @@ def construct_candidate_research_plan(
         )
     )
     plan_identity = {
-        "objective": objective.fingerprint,
-        "constraints": constraints.fingerprint,
-        "facts": facts.fingerprint,
-        "resources": resources.fingerprint,
+        "objective": objective_fingerprint,
+        "constraints": constraints_fingerprint,
+        "facts": facts_fingerprint,
+        "resources": resources_fingerprint,
         "evaluations": tuple(item.fingerprint for item in evaluated),
         "assignments": tuple(item.fingerprint for item in assignments),
     }
@@ -1092,12 +1130,12 @@ def construct_candidate_research_plan(
         plan_identifier=_stable_identifier("plan", plan_identity),
         schema_version=objective.schema_version,
         objective_identifier=objective.objective_identifier,
-        objective_fingerprint=objective.fingerprint,
+        objective_fingerprint=objective_fingerprint,
         project_identifier=objective.project_identifier,
         molecular_system_identifiers=objective.molecular_system_identifiers,
-        planning_constraints_fingerprint=constraints.fingerprint,
+        planning_constraints_fingerprint=constraints_fingerprint,
         resource_snapshot_identifier=resources.snapshot_identifier,
-        resource_snapshot_fingerprint=resources.fingerprint,
+        resource_snapshot_fingerprint=resources_fingerprint,
         planning_facts=facts,
         selected_assignments=assignments,
         rejected_alternatives=tuple(rejected),

@@ -1,10 +1,12 @@
+import type { MolecularPlanningState } from '../hooks/useMolecularPlanning'
 import type { LoadedMolecularProjectScene } from '../scene/native-project'
+import { MolecularPlanningPanel } from './MolecularPlanningPanel'
 
 function Rows({ rows }: { rows: Array<[string, string | number]> }) {
   return <dl className="property-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
 }
 
-export function MolecularProjectPanel({ scene }: { scene: LoadedMolecularProjectScene }) {
+export function MolecularProjectPanel({ scene, planning }: { scene: LoadedMolecularProjectScene; planning: MolecularPlanningState }) {
   const totalAtoms = scene.metadata.structures.reduce((sum, structure) => sum + structure.atom_count, 0)
   return <aside className="science-panel" aria-label="Molecular project inspector">
     <section className="inspector-section">
@@ -41,5 +43,6 @@ export function MolecularProjectPanel({ scene }: { scene: LoadedMolecularProject
       <strong>Read-only project scene</strong>
       <p>Opening this scene did not create, resume, or execute a scientific run.</p>
     </section>
+    <MolecularPlanningPanel key={`${scene.metadata.project_identifier}:${scene.metadata.scene_identifier}`} scene={scene} planning={planning} />
   </aside>
 }

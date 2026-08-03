@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import ctypes
-import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
-import sys
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -17,6 +14,10 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from ._publication import (
+    _publication_failure_diagnostic,
+    _rename_directory_no_replace,
+)
 from .contracts import MolecularProject
 
 _PROJECT_JSON_MAXIMUM_BYTES = 64 * 1024 * 1024
@@ -27,8 +28,6 @@ _PROJECT_FILENAME = "project.json"
 _RECORD_FORMAT = "cgr.molecular-project-record.v1"
 _SHA256_LENGTH = 64
 _READ_CHUNK_BYTES = 1024 * 1024
-_AT_FDCWD = -100
-_RENAME_NOREPLACE = 1
 
 
 class MolecularProjectRepositoryError(ValueError):
@@ -247,11 +246,15 @@ class MolecularProjectRepository:
                 try:
                     _rename_directory_no_replace(temporary, final_directory)
                     published = True
-                except OSError:
+                except OSError as error:
                     if not self._entry_exists(final_directory):
                         raise MolecularProjectRepositoryError(
                             "Molecular project publication failed safely."
-                        ) from None
+                        ) from _publication_failure_diagnostic(
+                            error,
+                            temporary,
+                            final_directory,
+                        )
                     self._require_idempotent_existing(
                         identifier,
                         project_bytes,
@@ -887,61 +890,6 @@ def _is_sha256(value: str) -> bool:
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
-
-
-def _rename_directory_no_replace(source: Path, destination: Path) -> None:
-    """Atomically rename a directory while refusing an existing destination."""
-
-    if sys.platform == "win32":
-        # Windows rename is documented to fail when the destination exists.
-        os.rename(source, destination)
-        return
-    if not sys.platform.startswith("linux"):
-        raise MolecularProjectRepositoryError(
-            "Atomic no-replace project publication is unavailable."
-        )
-    try:
-        standard_library = ctypes.CDLL(None, use_errno=True)
-        renameat2 = standard_library.renameat2
-    except (AttributeError, OSError):
-        raise MolecularProjectRepositoryError(
-            "Atomic no-replace project publication is unavailable."
-        ) from None
-
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    try:
-        encoded_source = os.fsencode(source)
-        encoded_destination = os.fsencode(destination)
-    except (TypeError, UnicodeError):
-        raise MolecularProjectRepositoryError(
-            "Atomic no-replace project publication is unavailable."
-        ) from None
-
-    ctypes.set_errno(0)
-    result = renameat2(
-        _AT_FDCWD,
-        encoded_source,
-        _AT_FDCWD,
-        encoded_destination,
-        _RENAME_NOREPLACE,
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno() or errno.EIO
-    if error_number == errno.EEXIST:
-        raise FileExistsError(error_number, os.strerror(error_number))
-    if error_number == errno.ENOSYS:
-        raise MolecularProjectRepositoryError(
-            "Atomic no-replace project publication is unavailable."
-        )
-    raise OSError(error_number, os.strerror(error_number))
 
 
 __all__ = [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import subprocess
@@ -758,3 +759,46 @@ def test_no_chemistry_or_quantum_dependency_was_added() -> None:
     project = (root / "pyproject.toml").read_text(encoding="utf-8").lower()
     for dependency in ("qiskit", "rdkit", "pyscf", "openmm", "molstar", "three"):
         assert dependency not in project
+
+
+def test_phase_one_to_three_dependency_direction_is_mechanically_protected() -> None:
+    root = Path(__file__).resolve().parents[1] / "src" / "cgr"
+
+    def imported_modules(path: Path) -> set[str]:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules.add(node.module)
+        return modules
+
+    for path in (root / "science").glob("*.py"):
+        forbidden = {
+            module
+            for module in imported_modules(path)
+            if module == "cgr.molecular"
+            or module.startswith("cgr.molecular.")
+            or module == "cgr.pulsate_api"
+            or module.startswith("cgr.pulsate_api.")
+        }
+        assert forbidden == set(), f"{path.name} imports {sorted(forbidden)}"
+
+    for path in (root / "molecular").glob("*.py"):
+        forbidden = {
+            module
+            for module in imported_modules(path)
+            if module == "cgr.pulsate_api"
+            or module.startswith("cgr.pulsate_api.")
+        }
+        assert forbidden == set(), f"{path.name} imports {sorted(forbidden)}"
+
+    planning_sources = (
+        root / "molecular" / "planning.py",
+        root / "pulsate_api" / "molecular_planning.py",
+    )
+    assert all(
+        "cgr.science.workflow" not in path.read_text(encoding="utf-8")
+        for path in planning_sources
+    )

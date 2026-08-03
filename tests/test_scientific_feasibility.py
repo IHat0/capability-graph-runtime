@@ -21,6 +21,7 @@ from cgr.science.capabilities import (
     CapabilityVerificationRequirement,
     ScientificCapabilityCatalog,
 )
+from cgr.science.canonical import CanonicalModel
 from cgr.science.contracts import CapabilityDescriptor, DeterminismClassification
 from cgr.science.feasibility import (
     construct_candidate_research_plan,
@@ -489,6 +490,47 @@ def test_candidate_plan_is_stable_selects_ranked_candidate_and_preserves_alterna
     assert "guarantees" in first.aggregate_estimates[0].estimation_basis
     assert not hasattr(first, "execute")
     assert not hasattr(first, "authorize")
+
+
+def test_candidate_plan_reuses_large_fact_fingerprint_across_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_fingerprint = CanonicalModel.fingerprint.fget
+    assert original_fingerprint is not None
+    fact_fingerprint_calls = 0
+
+    def tracked_fingerprint(self: CanonicalModel) -> str:
+        nonlocal fact_fingerprint_calls
+        if isinstance(self, PlanningFactSet):
+            fact_fingerprint_calls += 1
+        return original_fingerprint(self)
+
+    monkeypatch.setattr(
+        CanonicalModel,
+        "fingerprint",
+        property(tracked_fingerprint),
+    )
+    facts = PlanningFactSet(
+        facts=tuple(
+            _fact(f"structure.atom_count.{index}", index)
+            for index in range(100)
+        )
+    )
+    catalogue = ScientificCapabilityCatalog(
+        tuple(_envelope(f"capability-{index}") for index in range(16))
+    )
+
+    plan = construct_candidate_research_plan(
+        objective=_objective(),
+        constraints=PlanningConstraints(),
+        facts=facts,
+        resources=_resources(),
+        catalogue=catalogue,
+        provenance=PROVENANCE,
+    )
+
+    assert plan.selected_assignments
+    assert fact_fingerprint_calls == 1
 
 
 def test_missing_quantum_usage_metadata_does_not_claim_nonquantum_preference() -> None:

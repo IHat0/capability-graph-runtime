@@ -122,6 +122,8 @@ def test_windowed_without_window_fails_before_launch_with_zero_consumption(
     )
 
 
+@pytest.mark.swe_agent_integration
+@pytest.mark.external_infrastructure
 def test_real_overlay_resolves_every_bundle_and_upstream_command_docs() -> None:
     config = SWEAgentProviderConfig(
         sweagent_source=SWE_SOURCE,
@@ -190,6 +192,8 @@ def test_unknown_missing_malformed_and_unbounded_template_values_fail_closed(
         ToolTemplateVariables(WINDOW="100")
 
 
+@pytest.mark.swe_agent_integration
+@pytest.mark.external_infrastructure
 def test_window_changes_overlay_agent_request_and_validation_identity() -> None:
     default = SWEAgentProviderConfig(
         sweagent_source=SWE_SOURCE,
@@ -215,6 +219,8 @@ def test_window_changes_overlay_agent_request_and_validation_identity() -> None:
     )
 
 
+@pytest.mark.swe_agent_integration
+@pytest.mark.external_infrastructure
 def test_replay_rejects_substituted_template_values(tmp_path: Path) -> None:
     original = _validation(100)
     substituted = _validation(80)
@@ -223,6 +229,8 @@ def test_replay_rejects_substituted_template_values(tmp_path: Path) -> None:
         _verify_provider_tool_templates(tmp_path, original.validation_sha256)
 
 
+@pytest.mark.swe_agent_integration
+@pytest.mark.external_infrastructure
 def test_pristine_sweagent_checkout_remains_unmodified() -> None:
     result = subprocess.run(
         [

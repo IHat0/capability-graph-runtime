@@ -46,7 +46,11 @@ swebench=["datasets>=3.0","swebench==3.0.17"]
 [tool.pytest.ini_options]
 testpaths=["tests"]
 markers=[
+  "core: deterministic tests requiring only repository-declared dependencies",
+  "backend_core: frontend-independent Phase 1-3 backend release-gate tests",
   "quantum_unit: pure preflight tests without heavy scientific dependencies",
   "quantum_integration: scientific integration tests in the pinned Linux image",
   "quantum_container: isolated runtime security tests",
+  "swe_agent_integration: tests requiring the pinned official SWE-agent checkout or executable",
+  "external_infrastructure: tests requiring provisioned external tools, containers, or checkouts",
 ]

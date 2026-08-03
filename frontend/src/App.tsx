@@ -12,6 +12,7 @@ import { deriveExistingRunHeaderStatus } from './existingRunHeaderStatus'
 import { useExistingRun } from './hooks/useExistingRun'
 import { useExperimentWorkspace } from './hooks/useExperimentWorkspace'
 import { useMolecularProjectScene } from './hooks/useMolecularProjectScene'
+import { useMolecularPlanning } from './hooks/useMolecularPlanning'
 import { useNaturalLanguageExperiment } from './hooks/useNaturalLanguageExperiment'
 import { usePresetRun } from './hooks/usePresetRun'
 
@@ -19,6 +20,7 @@ export function App() {
   const workspace = useExperimentWorkspace()
   const existingRun = useExistingRun()
   const molecularProject = useMolecularProjectScene()
+  const molecularPlanning = useMolecularPlanning(molecularProject.scene?.metadata.project_identifier ?? null)
   const naturalLanguage = useNaturalLanguageExperiment()
   const coordinateScene = existingRun.scene ?? workspace.scene
   const displayedScene = molecularProject.scene ?? coordinateScene
@@ -104,7 +106,7 @@ export function App() {
         ) : displayedScene ? (
           <main className="loaded-workspace" id="workspace-home">
             <MolecularViewer scene={displayedScene} loading={workspace.presetLoading || existingRun.loading || molecularProject.loading} />
-            {molecularProject.scene ? <MolecularProjectPanel scene={molecularProject.scene} /> : <ScientificPanel
+            {molecularProject.scene ? <MolecularProjectPanel scene={molecularProject.scene} planning={molecularPlanning} /> : <ScientificPanel
               scene={coordinateScene!}
               presets={workspace.presets}
               selectedPresetId={workspace.selectedPresetId}

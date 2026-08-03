@@ -12,6 +12,7 @@ const hooks = vi.hoisted(() => ({
   workspace: vi.fn(),
   existingRun: vi.fn(),
   molecularProject: vi.fn(),
+  molecularPlanning: vi.fn(),
   naturalLanguage: vi.fn(),
   presetRun: vi.fn(),
 }))
@@ -19,6 +20,7 @@ const hooks = vi.hoisted(() => ({
 vi.mock('./hooks/useExperimentWorkspace', () => ({ useExperimentWorkspace: hooks.workspace }))
 vi.mock('./hooks/useExistingRun', () => ({ useExistingRun: hooks.existingRun }))
 vi.mock('./hooks/useMolecularProjectScene', () => ({ useMolecularProjectScene: hooks.molecularProject }))
+vi.mock('./hooks/useMolecularPlanning', () => ({ useMolecularPlanning: hooks.molecularPlanning }))
 vi.mock('./hooks/useNaturalLanguageExperiment', () => ({ useNaturalLanguageExperiment: hooks.naturalLanguage }))
 vi.mock('./hooks/usePresetRun', () => ({ usePresetRun: hooks.presetRun }))
 vi.mock('./components/Header', () => ({ Header: ({ runControl }: { runControl: React.ReactNode }) => <header>{runControl}</header> }))
@@ -94,6 +96,7 @@ function states() {
   hooks.workspace.mockImplementation(() => workspace)
   hooks.existingRun.mockImplementation(() => existing)
   hooks.molecularProject.mockImplementation(() => project)
+  hooks.molecularPlanning.mockReturnValue({ result: null, loading: false, error: null, evaluate: vi.fn() })
   hooks.naturalLanguage.mockReturnValue({})
   hooks.presetRun.mockReturnValue({ error: null })
   return { workspace, existing, project }

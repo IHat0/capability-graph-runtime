@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import cgr.molecular._publication as publication_module
+import cgr.molecular.artifact_repository as artifact_repository_module
 from cgr.kernel.contracts import CapabilityVersion
 from cgr.molecular import (
     MolecularArtifactConflictError,
@@ -371,6 +374,68 @@ def test_idempotent_second_put_does_not_mutate_object(tmp_path: Path) -> None:
     assert _tree_snapshot(object_directory) == before
 
 
+def test_repeated_independent_artifact_publication(tmp_path: Path) -> None:
+    repository = MolecularArtifactRepository(tmp_path / "repository")
+    repository.start()
+    published: list[tuple[ArtifactReference, bytes]] = []
+    for index in range(32):
+        payload = f"independent-artifact-{index}".encode()
+        reference = _reference(
+            payload,
+            artifact_identifier=f"artifact-independent-{index}",
+        )
+        repository.put(reference, payload)
+        published.append((reference, payload))
+
+    for reference, payload in published:
+        assert repository.read(reference) == payload
+
+
+def test_concurrent_identical_artifact_publication_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    payload = b"concurrent-identical-artifact"
+    reference = _reference(payload)
+    repository = MolecularArtifactRepository(tmp_path / "repository")
+    repository.start()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(lambda _: repository.put(reference, payload), range(2)))
+
+    assert results == (reference, reference)
+    assert repository.read(reference) == payload
+
+
+def test_concurrent_conflicting_artifact_publication_fails_closed(
+    tmp_path: Path,
+) -> None:
+    payload = b"concurrent-conflicting-artifact"
+    original = _reference(payload, metadata={"variant": "original"})
+    conflicting = _replace_reference(
+        original,
+        media_type="application/x-conflicting",
+        metadata={"variant": "conflicting"},
+    )
+    repository = MolecularArtifactRepository(tmp_path / "repository")
+    repository.start()
+    repository.put(original, payload)
+
+    def publish(
+        reference: ArtifactReference,
+    ) -> type[MolecularArtifactConflictError] | None:
+        try:
+            repository.put(reference, payload)
+        except MolecularArtifactConflictError as error:
+            return type(error)
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(publish, (original, conflicting)))
+
+    assert results == (None, MolecularArtifactConflictError)
+    assert repository.read(original) == payload
+
+
 def test_failed_publication_removes_only_its_temporary_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -398,6 +463,41 @@ def test_failed_publication_removes_only_its_temporary_directory(
     shard = tmp_path / "repository" / "objects" / key[:2]
     assert shard.is_dir()
     assert list(shard.iterdir()) == []
+
+
+def test_failed_rename_exposes_only_path_free_internal_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"diagnostic-artifact-publication"
+    reference = _reference(payload)
+    repository = MolecularArtifactRepository(tmp_path / "private-repository")
+    repository.start()
+    error = PermissionError(13, "Access is denied")
+    error.winerror = 5  # type: ignore[attr-defined]
+
+    def fail_rename(source: Path, destination: Path) -> None:
+        raise error
+
+    monkeypatch.setattr(
+        artifact_repository_module,
+        "_rename_directory_no_replace",
+        fail_rename,
+    )
+    with pytest.raises(MolecularArtifactRepositoryError) as captured:
+        repository.put(reference, payload)
+
+    diagnostic = captured.value.__cause__
+    assert diagnostic is not None
+    assert diagnostic.exception_type == "PermissionError"
+    assert diagnostic.errno == 13
+    assert diagnostic.winerror == 5
+    assert diagnostic.source_exists is True
+    assert diagnostic.destination_exists is False
+    assert diagnostic.temporary_entries == ("payload.bin", "reference.json")
+    assert diagnostic.writers_closed is True
+    assert str(tmp_path) not in str(captured.value)
+    assert str(tmp_path) not in str(diagnostic)
 
 
 @pytest.mark.parametrize(
@@ -587,7 +687,7 @@ def test_symlinked_shard_is_rejected(tmp_path: Path) -> None:
     repository, reference, object_directory = _repository_with_object(tmp_path)
     shard = object_directory.parent
     saved_shard = tmp_path / "saved-shard"
-    shard.rename(saved_shard)
+    publication_module._rename_directory_no_replace(shard, saved_shard)
     _create_symlink(shard, saved_shard, target_is_directory=True)
 
     with pytest.raises(MolecularArtifactIntegrityError, match="shard"):
@@ -597,7 +697,7 @@ def test_symlinked_shard_is_rejected(tmp_path: Path) -> None:
 def test_symlinked_object_directory_is_rejected(tmp_path: Path) -> None:
     repository, reference, object_directory = _repository_with_object(tmp_path)
     saved_object = tmp_path / "saved-object"
-    object_directory.rename(saved_object)
+    publication_module._rename_directory_no_replace(object_directory, saved_object)
     _create_symlink(
         object_directory,
         saved_object,

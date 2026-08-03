@@ -6,11 +6,13 @@ import json
 import shutil
 import socket
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+import cgr.molecular._publication as publication_module
 import cgr.molecular.project_repository as repository_module
 from cgr.kernel.contracts import CapabilityVersion
 from cgr.molecular import (
@@ -397,12 +399,48 @@ def test_resolve_propagates_integrity_failure(tmp_path: Path) -> None:
 
 def test_different_identifiers_store_independently(tmp_path: Path) -> None:
     repository = _started_repository(tmp_path / "repository")
-    first = _project("project/first:1")
-    second = _project("project/second:1")
-    repository.put(first)
-    repository.put(second)
-    assert repository.read(first.project_identifier) == first
-    assert repository.read(second.project_identifier) == second
+    projects = tuple(_project(f"project/independent:{index}") for index in range(32))
+    for project in projects:
+        repository.put(project)
+    for project in projects:
+        assert repository.read(project.project_identifier) == project
+
+
+def test_concurrent_identical_project_publication_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    repository = _started_repository(tmp_path / "repository")
+    project = _project()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(lambda _: repository.put(project), range(2)))
+
+    assert results == (None, None)
+    assert repository.read(project.project_identifier) == project
+
+
+def test_concurrent_conflicting_project_publication_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repository = _started_repository(tmp_path / "repository")
+    original = _project()
+    conflicting = _project(label="Concurrent conflicting project")
+    repository.put(original)
+
+    def publish(
+        project: MolecularProject,
+    ) -> type[MolecularProjectConflictError] | None:
+        try:
+            repository.put(project)
+        except MolecularProjectConflictError as error:
+            return type(error)
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(publish, (original, conflicting)))
+
+    assert results == (None, MolecularProjectConflictError)
+    assert repository.read(original.project_identifier) == original
 
 
 @pytest.mark.parametrize("invalid", [None, {}, "project", 42])
@@ -647,7 +685,7 @@ def test_symlinked_project_directory_is_rejected(tmp_path: Path) -> None:
     prefix, record_path, _ = _object_paths(root, project.project_identifier)
     directory = record_path.parent
     moved = tmp_path / "moved-project"
-    directory.rename(moved)
+    publication_module._rename_directory_no_replace(directory, moved)
     _make_symlink(prefix / directory.name, moved, directory=True)
     with pytest.raises(MolecularProjectIntegrityError):
         repository.read(project.project_identifier)
@@ -662,7 +700,7 @@ def test_symlinked_evidence_file_is_rejected(tmp_path: Path, target: str) -> Non
     _, record_path, project_path = _object_paths(root, project.project_identifier)
     selected = record_path if target == "record" else project_path
     moved = tmp_path / f"moved-{target}"
-    selected.rename(moved)
+    publication_module._rename_directory_no_replace(selected, moved)
     _make_symlink(selected, moved, directory=False)
     with pytest.raises(MolecularProjectIntegrityError, match="regular file"):
         repository.read(project.project_identifier)
@@ -752,6 +790,40 @@ def test_temporary_directory_creation_failure_is_controlled(
     assert str(root) not in str(error.value)
 
 
+def test_failed_rename_exposes_only_path_free_internal_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "private-repository"
+    project = _project("private/project:identifier")
+    repository = _started_repository(root)
+    error = PermissionError(13, "Access is denied")
+    error.winerror = 5  # type: ignore[attr-defined]
+
+    def fail_rename(source: Path, destination: Path) -> None:
+        raise error
+
+    monkeypatch.setattr(
+        repository_module,
+        "_rename_directory_no_replace",
+        fail_rename,
+    )
+    with pytest.raises(MolecularProjectRepositoryError) as captured:
+        repository.put(project)
+
+    diagnostic = captured.value.__cause__
+    assert diagnostic is not None
+    assert diagnostic.exception_type == "PermissionError"
+    assert diagnostic.errno == 13
+    assert diagnostic.winerror == 5
+    assert diagnostic.source_exists is True
+    assert diagnostic.destination_exists is False
+    assert diagnostic.temporary_entries == ("project.json", "record.json")
+    assert diagnostic.writers_closed is True
+    assert str(root) not in str(captured.value)
+    assert str(root) not in str(diagnostic)
+
+
 def test_no_replace_helper_publishes_when_destination_is_absent(
     tmp_path: Path,
 ) -> None:
@@ -760,7 +832,7 @@ def test_no_replace_helper_publishes_when_destination_is_absent(
     source.mkdir()
     (source / "evidence").write_bytes(b"complete")
 
-    repository_module._rename_directory_no_replace(source, destination)
+    publication_module._rename_directory_no_replace(source, destination)
 
     assert not source.exists()
     assert (destination / "evidence").read_bytes() == b"complete"
@@ -777,7 +849,7 @@ def test_no_replace_helper_preserves_existing_empty_destination(
     original_identity = destination.stat().st_ino
 
     with pytest.raises(FileExistsError):
-        repository_module._rename_directory_no_replace(source, destination)
+        publication_module._rename_directory_no_replace(source, destination)
 
     assert source.is_dir()
     assert (source / "evidence").read_bytes() == b"complete"
@@ -801,27 +873,27 @@ def test_linux_no_replace_helper_uses_renameat2_and_preserves_eexist(
 
         def __call__(self, *args: object) -> int:
             calls.append(args)
-            repository_module.ctypes.set_errno(repository_module.errno.EEXIST)
+            publication_module.ctypes.set_errno(publication_module.errno.EEXIST)
             return -1
 
     class FakeStandardLibrary:
         renameat2 = FakeRenameAt2()
 
-    monkeypatch.setattr(repository_module.sys, "platform", "linux")
+    monkeypatch.setattr(publication_module.sys, "platform", "linux")
     monkeypatch.setattr(
-        repository_module.ctypes,
+        publication_module.ctypes,
         "CDLL",
         lambda *args, **kwargs: FakeStandardLibrary(),
     )
 
     with pytest.raises(FileExistsError) as error:
-        repository_module._rename_directory_no_replace(source, destination)
+        publication_module._rename_directory_no_replace(source, destination)
 
-    assert error.value.errno == repository_module.errno.EEXIST
+    assert error.value.errno == publication_module.errno.EEXIST
     assert len(calls) == 1
-    assert calls[0][-1] == repository_module._RENAME_NOREPLACE
-    assert calls[0][0] == repository_module._AT_FDCWD
-    assert calls[0][2] == repository_module._AT_FDCWD
+    assert calls[0][-1] == publication_module._RENAME_NOREPLACE
+    assert calls[0][0] == publication_module._AT_FDCWD
+    assert calls[0][2] == publication_module._AT_FDCWD
     assert source.is_dir()
     assert destination.is_dir()
 
@@ -833,16 +905,132 @@ def test_no_replace_helper_fails_closed_when_primitive_is_unavailable(
     source = tmp_path / "source"
     destination = tmp_path / "destination"
     source.mkdir()
-    monkeypatch.setattr(repository_module.sys, "platform", "linux")
+    monkeypatch.setattr(publication_module.sys, "platform", "linux")
     monkeypatch.setattr(
-        repository_module.ctypes,
+        publication_module.ctypes,
         "CDLL",
         lambda *args, **kwargs: object(),
     )
 
-    with pytest.raises(MolecularProjectRepositoryError, match="unavailable"):
-        repository_module._rename_directory_no_replace(source, destination)
+    with pytest.raises(OSError, match="unavailable"):
+        publication_module._rename_directory_no_replace(source, destination)
 
+    assert source.is_dir()
+    assert not destination.exists()
+
+
+def _windows_access_denied() -> PermissionError:
+    error = PermissionError(13, "Access is denied")
+    error.winerror = 5  # type: ignore[attr-defined]
+    return error
+
+
+def test_windows_access_denied_is_retried_after_state_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "evidence").write_bytes(b"complete")
+    attempts = 0
+    actual_rename = publication_module.os.rename
+
+    def transient_rename(current: Path, final: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise _windows_access_denied()
+        actual_rename(current, final)
+
+    monkeypatch.setattr(publication_module.sys, "platform", "win32")
+    monkeypatch.setattr(publication_module, "_windows_rename", transient_rename)
+
+    publication_module._rename_directory_no_replace(source, destination)
+
+    assert attempts == 3
+    assert not source.exists()
+    assert (destination / "evidence").read_bytes() == b"complete"
+
+
+def test_windows_retry_refuses_destination_created_after_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "evidence").write_bytes(b"complete")
+    attempts = 0
+
+    def competing_rename(current: Path, final: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        final.mkdir()
+        raise _windows_access_denied()
+
+    monkeypatch.setattr(publication_module.sys, "platform", "win32")
+    monkeypatch.setattr(publication_module, "_windows_rename", competing_rename)
+
+    with pytest.raises(FileExistsError):
+        publication_module._rename_directory_no_replace(source, destination)
+
+    assert attempts == 1
+    assert source.is_dir()
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+
+
+def test_windows_access_denied_exhaustion_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    attempts = 0
+
+    def persistent_rename(current: Path, final: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise _windows_access_denied()
+
+    monkeypatch.setattr(publication_module.sys, "platform", "win32")
+    monkeypatch.setattr(publication_module, "_windows_rename", persistent_rename)
+
+    with pytest.raises(PermissionError) as captured:
+        publication_module._rename_directory_no_replace(source, destination)
+
+    assert captured.value.winerror == 5
+    assert attempts == publication_module._WINDOWS_PUBLICATION_ATTEMPTS
+    assert source.is_dir()
+    assert not destination.exists()
+
+
+def test_windows_unobserved_error_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    attempts = 0
+    error = PermissionError(13, "Sharing violation")
+    error.winerror = 32  # type: ignore[attr-defined]
+
+    def fail_rename(current: Path, final: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise error
+
+    monkeypatch.setattr(publication_module.sys, "platform", "win32")
+    monkeypatch.setattr(publication_module, "_windows_rename", fail_rename)
+
+    with pytest.raises(PermissionError) as captured:
+        publication_module._rename_directory_no_replace(source, destination)
+
+    assert captured.value.winerror == 32
+    assert attempts == 1
     assert source.is_dir()
     assert not destination.exists()
 

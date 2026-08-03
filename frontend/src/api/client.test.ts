@@ -186,6 +186,58 @@ describe('Pulsate API client failure handling', () => {
     expect(result.primary_structure_identifier).toBe('structure-a')
   })
 
+  it('posts read-only molecular planning inputs and validates response identity', async () => {
+    const fingerprint = 'a'.repeat(64)
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      project_identifier: 'project-native', objective_identifier: 'objective.workspace',
+      plan_identifier: 'plan.workspace', plan_fingerprint: fingerprint,
+      planning_facts_fingerprint: 'b'.repeat(64),
+      capability_declarations: [],
+      plan: {
+        plan_identifier: 'plan.workspace', objective_identifier: 'objective.workspace',
+        project_identifier: 'project-native',
+        selected_assignments: [], rejected_alternatives: [],
+        unresolved_requirement_identifiers: [], unresolved_goal_identifiers: ['objective.workspace'],
+        aggregate_estimates: [], verification_requirements: [], approval_requirements: [],
+        evidence_artifacts: [], planning_facts: { facts: [] },
+      },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const request = {
+      objective: { objective_identifier: 'objective.workspace' }, constraints: {}, resources: {},
+      requested_execution_target: null, selected_capabilities: [],
+    }
+
+    const result = await pulsateApi.evaluateMolecularProjectPlan('project-native', request)
+
+    expect(result.plan_fingerprint).toBe(fingerprint)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/molecular/projects/project-native/planning/evaluate')
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'POST' })
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(request)
+  })
+
+  it('rejects mismatched or credential-bearing molecular planning responses', async () => {
+    const fingerprint = 'a'.repeat(64)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      project_identifier: 'project-other', objective_identifier: 'objective.workspace',
+      plan_identifier: 'plan.workspace', plan_fingerprint: fingerprint,
+      planning_facts_fingerprint: 'b'.repeat(64),
+      capability_declarations: [], access_token: 'prohibited',
+      plan: {
+        plan_identifier: 'plan.workspace', objective_identifier: 'objective.workspace',
+        project_identifier: 'project-native',
+        selected_assignments: [], rejected_alternatives: [],
+        unresolved_requirement_identifiers: [], unresolved_goal_identifiers: [],
+        aggregate_estimates: [], verification_requirements: [], approval_requirements: [],
+        evidence_artifacts: [], planning_facts: { facts: [] },
+      },
+    })))
+
+    await expect(pulsateApi.evaluateMolecularProjectPlan('project-native', {
+      objective: {}, constraints: {}, resources: {}, requested_execution_target: null, selected_capabilities: [],
+    })).rejects.toBeInstanceOf(ApiError)
+  })
+
   it.each([
     ['duplicate structures', (metadata: Record<string, unknown>) => { metadata.structures = [projectedMolecularSceneFixture().structures[0], projectedMolecularSceneFixture().structures[0]] }],
     ['absolute URL', (metadata: Record<string, unknown>) => { (metadata.structures as Array<Record<string, unknown>>)[0].native_structure_url = 'https://other.invalid/resource' }],

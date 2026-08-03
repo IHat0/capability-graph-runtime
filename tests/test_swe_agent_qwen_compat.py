@@ -45,6 +45,8 @@ def test_overlay_has_complete_qwen_bash_contract() -> None:
     assert isinstance(parse_function["error_message"], str)
 
 
+@pytest.mark.swe_agent_integration
+@pytest.mark.external_infrastructure
 def test_submission_command_matches_pinned_official_tool_configuration() -> None:
     source = Path(".sandbox-sweagent-src")
     tool_config = yaml.safe_load(

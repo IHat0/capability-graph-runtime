@@ -22,6 +22,11 @@ import {
   MOLECULAR_RESOURCE_MAXIMUM_BYTES,
   parseProjectedMolecularScene,
 } from '../scene/native-project'
+import {
+  parseMolecularPlanningResponse,
+  type CandidateResearchPlanResponse,
+  type MolecularPlanningRequest,
+} from './planning'
 
 export class ApiError extends Error {
   constructor(
@@ -532,6 +537,7 @@ export interface PulsateApi {
   getProjectedMolecularScene(projectIdentifier: string, sceneIdentifier: string, signal?: AbortSignal): Promise<ProjectedMolecularSceneMetadata>
   getNativeMolecularStructure(structure: ProjectedMolecularStructureMetadata, signal?: AbortSignal): Promise<FetchedMolecularResource>
   getMolecularTopology(structure: ProjectedMolecularStructureMetadata, signal?: AbortSignal): Promise<FetchedMolecularResource>
+  evaluateMolecularProjectPlan(projectIdentifier: string, request: MolecularPlanningRequest, signal?: AbortSignal): Promise<CandidateResearchPlanResponse>
 }
 
 export type WorkspaceApi = Pick<PulsateApi, 'getHealth' | 'getPresets' | 'getPreset' | 'getScene'>
@@ -596,5 +602,15 @@ export const pulsateApi: PulsateApi = {
     structure.topology_url,
     structure.topology_artifact,
     signal,
+  ),
+  evaluateMolecularProjectPlan: (projectIdentifier, request, signal) => requestJson(
+    `/api/v1/molecular/projects/${encodeURIComponent(projectIdentifier)}/planning/evaluate`,
+    parseMolecularPlanningResponse,
+    signal,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    },
   ),
 }

@@ -198,6 +198,30 @@ a { color: inherit; }
 .execution-control p { margin: 9px 0 0; color: var(--secondary); font-size: 11px; text-align: center; }
 .execution-control--read-only { text-align: center; }
 .execution-control--read-only strong { font-size: 12px; font-weight: 600; }
+.molecular-planning-workspace { border-top: 1px solid var(--border); }
+.molecular-planning-form, .molecular-planning-results { padding: 22px 20px; border-bottom: 1px solid var(--border); }
+.molecular-planning-form h2, .molecular-planning-results h2 { margin: 7px 0 16px; font-size: 16px; font-weight: 560; }
+.molecular-planning-form label { display: grid; gap: 6px; margin: 11px 0; color: var(--secondary); font-size: 11px; font-weight: 550; }
+.molecular-planning-form input, .molecular-planning-form select, .molecular-planning-form textarea { width: 100%; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); background: white; font: inherit; }
+.molecular-planning-form select[multiple] { min-height: 72px; }
+.molecular-planning-form textarea { min-height: 68px; resize: vertical; }
+.molecular-planning-form details { margin: 14px 0; }
+.molecular-planning-form summary { cursor: pointer; color: var(--secondary); font-size: 11px; }
+.planning-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 10px; }
+.planning-form-error { color: var(--error); font-size: 11px; line-height: 1.45; }
+.molecular-planning-results h3 { margin: 20px 0 9px; font-size: 12px; font-weight: 650; }
+.planning-capability { margin: 10px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--subtle); }
+.planning-capability__heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.planning-capability__heading strong { min-width: 0; overflow-wrap: anywhere; }
+.planning-capability > small { display: block; margin-top: 5px; color: var(--muted); font-size: 9px; }
+.planning-capability ul { margin: 8px 0 0; padding-left: 18px; color: var(--secondary); font-size: 10px; line-height: 1.5; }
+.planning-capability li small { display: block; overflow-wrap: anywhere; }
+.planning-capability details { margin-top: 9px; font-size: 10px; }
+.planning-capability p { color: var(--secondary); font-size: 10px; }
+.planning-estimates { margin: 8px 0 0; }
+.planning-estimates > div { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 9px; }
+.planning-estimates dd { margin: 0; text-align: right; }
+.molecular-planning-results .supporting-copy { overflow-wrap: anywhere; }
 .receipt-action { width: 100%; min-height: 36px; margin-top: 13px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--text); background: white; font-size: 11px; }
 .receipt-action:hover { background: var(--subtle); }
 .receipt-panel { margin-top: 13px; padding: 13px; border: 1px solid var(--border); border-radius: 8px; background: var(--subtle); }

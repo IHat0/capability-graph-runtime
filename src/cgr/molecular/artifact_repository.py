@@ -15,6 +15,11 @@ from pydantic import ValidationError
 
 from cgr.science.artifacts import ArtifactReference
 
+from ._publication import (
+    _publication_failure_diagnostic,
+    _rename_directory_no_replace,
+)
+
 _REFERENCE_JSON_MAXIMUM_BYTES = 1 * 1024 * 1024
 _REFERENCE_FILENAME = "reference.json"
 _PAYLOAD_FILENAME = "payload.bin"
@@ -139,13 +144,17 @@ class MolecularArtifactRepository:
                         )
                     return reference
                 try:
-                    os.rename(temporary, object_directory)
+                    _rename_directory_no_replace(temporary, object_directory)
                     published = True
-                except OSError:
+                except OSError as error:
                     if not self._entry_exists(object_directory):
                         raise MolecularArtifactRepositoryError(
                             "Artifact publication failed safely."
-                        ) from None
+                        ) from _publication_failure_diagnostic(
+                            error,
+                            temporary,
+                            object_directory,
+                        )
                     persisted_reference, persisted_payload = (
                         self._read_existing_object(
                             reference,
