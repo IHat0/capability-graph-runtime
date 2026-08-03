@@ -32,11 +32,11 @@ principal containing bounded subject, tenant, authentication-method, scope,
 role, and audit identities. Raw bearer credentials are never part of the
 principal, request context, audit schema, log fields, or metrics.
 
-No suitable JWT/OIDC verification dependency is declared in the production
-HTTP application lock. The IBM-specific runtime lock is not an API dependency
-and must not be coupled into this boundary. The production default is therefore
-an unavailable authenticator: liveness remains
-available, readiness fails, and a supplied credential cannot authorize access.
+E3A found PyJWT 2.13.0 and cryptography 49.0.0 already hash-pinned in the
+IBM Runtime extension lock, but not installed by the production HTTP lock or
+the local validation environment. The production authenticator is implemented
+against PyJWT and fails closed when that declared verifier is unavailable.
+No custom signature, JWK, ASN.1, RSA, ECDSA, or EdDSA implementation is used.
 An explicitly enabled development bearer authenticator exists only when
 `PULSATE_ENVIRONMENT=development`; enabling it in production is a configuration
 error and emits a startup warning when used. Startup-loaded OIDC key material,
@@ -107,10 +107,145 @@ frontend API-client regression covers token placement and distinct controlled
 HTTP states. Exact post-change local execution results must be recorded in the
 change review; this document does not treat an unexecuted command as evidence.
 
-E3 must still provide and validate external OIDC cryptographic verification,
-durable audit persistence, metrics export/alerting, browser session integration,
-production grant storage, key rotation, operational recovery, and production
-load/concurrency evidence. E4 remains the explicit final readiness gate.
+E3 must still provision the declared verifier in the HTTP runtime and complete
+deployment evidence, metrics export/alerting, browser session integration,
+operational recovery, and production load/concurrency evidence. E4 remains the
+explicit final readiness gate.
+
+## Enterprise Foundation E3A production security providers
+
+E3A converts the injectable E2 boundary into a validated production composition
+without changing scientific behavior. It does not declare E3, a scientific
+phase, or Pulsate enterprise-ready.
+
+### Configuration and secret model
+
+`PulsateRuntimeConfiguration` is frozen and extra-forbid. Production must be
+selected explicitly and validates service identity, authentication trust,
+authorization/audit stores, observability identity, trusted roots, resource
+limits, and readiness requirements before provider construction. Relative key
+and database paths resolve only beneath their explicit trusted configuration or
+application-data root. Roots must already be real non-symlink directories;
+key files must be bounded ordinary non-symlink files whose resolved identity
+remains under the trusted root. Configuration failures use a path-free field
+category and never reproduce the rejected value.
+
+The supported production environment names, without values, are:
+
+```text
+PULSATE_ENVIRONMENT
+PULSATE_SERVICE_IDENTITY
+PULSATE_APPLICATION_DATA_ROOT
+PULSATE_TRUSTED_CONFIGURATION_ROOT
+PULSATE_AUTH_ISSUER
+PULSATE_AUTH_AUDIENCES
+PULSATE_AUTH_ALGORITHMS
+PULSATE_AUTH_JWKS_FILE
+PULSATE_AUTH_SUBJECT_CLAIM
+PULSATE_AUTH_TENANT_CLAIM
+PULSATE_AUTH_SCOPE_CLAIM
+PULSATE_AUTH_ROLES_CLAIM
+PULSATE_AUTH_CLOCK_SKEW_SECONDS
+PULSATE_AUTH_MAXIMUM_TOKEN_BYTES
+PULSATE_GRANT_DATABASE_FILE
+PULSATE_GRANT_BUSY_TIMEOUT_MS
+PULSATE_GRANT_ALLOW_WILDCARDS
+PULSATE_AUDIT_DATABASE_FILE
+PULSATE_AUDIT_MANDATORY
+PULSATE_AUDIT_READ_FAIL_CLOSED
+PULSATE_AUDIT_BUSY_TIMEOUT_MS
+PULSATE_AUDIT_VERIFICATION_MAXIMUM_RECORDS
+```
+
+Secrets use a bounded redacting wrapper when a secret-bearing deployment
+adapter needs one. Its `str` and `repr` never reveal the value. Runtime
+configuration canonical serialization contains no bearer credentials, private
+key material, or environment secret values; only its safe deterministic
+SHA-256 fingerprint may enter startup logs. Environment secrets are never
+written to disk by E3A.
+
+### JWT and offline JWKS trust
+
+The production authenticator accepts only configured asymmetric RS/ES
+algorithms and validates compact-token size, signature, exact algorithm, key
+identifier, issuer, audience, subject, tenant, expiration, issued-at sanity,
+optional not-before, and configured clock skew. It rejects `alg=none`, unknown
+algorithms or keys, malformed/oversized tokens, empty identities, invalid claim
+shapes, and algorithm/key-type or EC-curve conflicts. Scope and role mapping is
+sorted and deterministic. The audit identity is derived only after successful
+verification and no token or raw claim set is logged or audited.
+
+JWKS is loaded only at startup from the configured local file. The document is
+bounded to 256 KiB and 32 signing keys. Duplicate/missing key identifiers,
+non-signing use or operations, unsupported key types, and inconsistent
+algorithms fail startup. Requests use an immutable in-memory snapshot and never
+perform key discovery or network retrieval. Explicit internal reload validates
+the complete replacement before atomically swapping it, preserves the last
+valid snapshot on failure, and emits only a safe success/failure event. E3A
+adds no administrative reload endpoint.
+
+### Durable grants and audit
+
+`SQLiteGrantProvider` implements the E2 provider contract with a versioned,
+transactionally initialized schema. It stores explicit subject-or-role grants,
+tenant and resource identities, sorted actions, validity interval, creation
+time, and revocation state. Revocation is retained rather than deleted.
+Database busy timeouts are bounded, foreign keys are enabled, writes are
+transactional, duplicate identifiers are idempotent only for identical
+evidence, and connections are serialized for deterministic thread-safe access.
+Provider or schema failure is a controlled path-free authorization
+unavailability and readiness failure. No default production users or grants
+exist.
+
+`SQLiteAuditSink` appends immutable canonical E2 audit records with a monotonic
+sequence, previous-record fingerprint, record fingerprint, schema version, and
+persisted head. Startup and explicit bounded verification detect content
+modification, sequence gaps/deletion, invalid links, and head mismatch.
+Appending a record and advancing the head occur in one immediate transaction;
+the sink API exposes no update/delete operation. Mandatory security audit
+failure remains fail-closed, and read-audit behavior remains explicitly
+configurable.
+
+A local hash-chained SQLite audit store is integrity-evident against accidental
+or unsophisticated mutation, but is not equivalent to externally anchored WORM
+or independently administered audit storage. External anchoring, independent
+retention, backup, and recovery remain deployment blockers.
+
+### Lifecycle, readiness, and configuration check
+
+`ProductionSecurityServices` composes the offline authenticator, SQLite grants,
+SQLite audit, bounded metrics, and structured logger from one validated
+configuration. Authentication, authorization, and audit must all initialize
+before readiness. A partial startup closes providers already opened; repeated
+startup is idempotent and shutdown is safe. Tests may still inject the E2
+deterministic providers. Development authentication remains explicitly enabled
+only in `development`; production rejects it.
+
+`/live` remains independent. `/ready` returns only the coarse application,
+security, and repository categories and requires lifecycle, production security,
+and configured repository services. Detailed provider readiness and the safe
+configuration fingerprint are available only from the injected internal
+diagnostic snapshot, not a public endpoint.
+
+`cgr-pulsate-config-check` loads production configuration, validates roots and
+limits, initializes offline keys and both durable schemas, reports only coarse
+component status plus the safe configuration fingerprint, closes every provider,
+and exits nonzero on any failure. It does not start an HTTP listener or invoke
+scientific or IBM execution.
+
+### Remaining E3B blockers
+
+- Deployment artifact and hardened runtime, including provision of the declared
+  PyJWT/cryptography verifier in the HTTP image.
+- TLS termination and network controls.
+- Externally anchored or WORM audit retention.
+- Backup, restore, rollback, and disaster-recovery evidence.
+- Production load, soak, latency, and resource evidence.
+- Metrics exporter and alerting integration.
+- SBOM, vulnerability, dependency, and container scanning gates.
+- Secret-manager integration.
+- Browser OIDC session integration.
+- Operational runbooks and remote CI evidence.
 
 ## Implemented planning boundary
 

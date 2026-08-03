@@ -293,8 +293,14 @@ async def _read_bounded_json_object(
     return value
 
 
-def _configured_coordinator(experiment_store: ExperimentStore) -> RunCoordinator:
-    run_root = Path(os.environ.get("PULSATE_RUN_ROOT", str(REPO_ROOT / ".pulsate-runs")))
+def _configured_coordinator(
+    experiment_store: ExperimentStore,
+    *,
+    configured_run_root: Path | None = None,
+) -> RunCoordinator:
+    run_root = configured_run_root or Path(
+        os.environ.get("PULSATE_RUN_ROOT", str(REPO_ROOT / ".pulsate-runs"))
+    )
     enabled = os.environ.get("PULSATE_EXECUTION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
     lock_path = REPO_ROOT / "requirements" / "quantum-preflight.lock"
 
@@ -361,14 +367,24 @@ def create_app(
     security_services: SecurityServices | None = None,
 ) -> FastAPI:
     security_services = security_services or SecurityServices.from_environment()
+    runtime_configuration = getattr(security_services, "configuration", None)
+    application_data_root = (
+        runtime_configuration.repositories.application_data_root
+        if runtime_configuration is not None
+        else None
+    )
     scientific_capability_catalogue = (
         scientific_capability_catalogue or ScientificCapabilityCatalog()
     )
     molecular_project_repository: MolecularProjectRepository | None = None
     molecular_artifact_repository: MolecularArtifactRepository | None = None
     if molecular_scene_service is None:
-        project_root = os.environ.get("PULSATE_MOLECULAR_PROJECT_ROOT")
-        artifact_root = os.environ.get("PULSATE_MOLECULAR_ARTIFACT_ROOT")
+        if application_data_root is not None:
+            project_root = str(application_data_root / "molecular-projects")
+            artifact_root = str(application_data_root / "molecular-artifacts")
+        else:
+            project_root = os.environ.get("PULSATE_MOLECULAR_PROJECT_ROOT")
+            artifact_root = os.environ.get("PULSATE_MOLECULAR_ARTIFACT_ROOT")
         if (project_root is None) != (artifact_root is None):
             raise ValueError(
                 "Molecular project and artifact roots must be configured together."
@@ -399,20 +415,36 @@ def create_app(
             experiment_root = coordinator.configured_run_root.parent / "experiments"
         else:
             experiment_root = Path(
-                os.environ.get(
-                    "PULSATE_EXPERIMENT_ROOT", str(REPO_ROOT / ".pulsate-experiments")
+                (
+                    str(application_data_root / "experiments")
+                    if application_data_root is not None
+                    else os.environ.get(
+                        "PULSATE_EXPERIMENT_ROOT",
+                        str(REPO_ROOT / ".pulsate-experiments"),
+                    )
                 )
             )
         experiment_store = ExperimentStore(experiment_root)
-    run_coordinator = coordinator or _configured_coordinator(experiment_store)
+    run_coordinator = coordinator or _configured_coordinator(
+        experiment_store,
+        configured_run_root=(
+            application_data_root / "runs"
+            if application_data_root is not None
+            else None
+        ),
+    )
     if run_coordinator.experiment_resolver is None:
         run_coordinator.experiment_resolver = experiment_store.resolve_for_targeted_run
     experiment_store.ibm_capability = lambda: run_coordinator.capability()["ibm_quantum"]
     if natural_language_store is None:
         interpretation_root = Path(
-            os.environ.get(
-                "PULSATE_INTERPRETATION_ROOT",
-                str(REPO_ROOT / ".pulsate-interpretations"),
+            (
+                str(application_data_root / "interpretations")
+                if application_data_root is not None
+                else os.environ.get(
+                    "PULSATE_INTERPRETATION_ROOT",
+                    str(REPO_ROOT / ".pulsate-interpretations"),
+                )
             )
         )
         natural_language_store = NaturalLanguageInterpretationStore.from_environment(
@@ -792,7 +824,7 @@ def create_app(
         return {"status": "alive"}
 
     @application.get("/ready")
-    def readiness() -> dict[str, str]:
+    def readiness() -> dict[str, object]:
         configured_services = (
             experiment_store,
             natural_language_store,
@@ -816,7 +848,14 @@ def create_app(
                 "service_not_ready",
                 "The service is not ready.",
             )
-        return {"status": "ready"}
+        return {
+            "status": "ready",
+            "components": {
+                "application": "ready",
+                "security": "ready",
+                "repositories": "ready",
+            },
+        }
 
     @application.get("/api/v1/molecular/scenes/projected")
     def read_projected_molecular_scene(

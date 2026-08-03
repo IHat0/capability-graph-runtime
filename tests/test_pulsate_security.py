@@ -349,7 +349,8 @@ def test_development_authentication_is_explicit_and_forbidden_in_production(
     with pytest.raises(ValueError, match="forbidden"):
         SecurityServices.from_environment()
     monkeypatch.setenv("PULSATE_DEVELOPMENT_AUTH_ENABLED", "false")
-    assert not SecurityServices.from_environment().authenticator.ready()
+    with pytest.raises(ValueError, match="PULSATE_APPLICATION_DATA_ROOT"):
+        SecurityServices.from_environment()
 
 
 def test_correlation_identifiers_are_propagated_or_safely_replaced(

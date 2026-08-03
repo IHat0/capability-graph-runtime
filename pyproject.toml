@@ -38,6 +38,7 @@ cgr-quantum-candidate-repair-benchmark = "cgr.quantum_repair.cli:benchmark_main"
 cgr-quantum-candidate-repair-verify = "cgr.quantum_repair.cli:verify_main"
 cgr-quantum-sweagent-qwen-acceptance = "cgr.quantum_repair.cli:model_acceptance_main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
+cgr-pulsate-config-check = "cgr.pulsate_api.config_check:main"
 
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]

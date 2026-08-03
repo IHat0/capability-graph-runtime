@@ -65,6 +65,7 @@ PHASE_1_3_BACKEND_CORE_FILES = frozenset(
         "test_scientific_planning.py",
         "test_scientific_resources.py",
         "test_pulsate_security.py",
+        "test_pulsate_production_security.py",
     }
 )
 

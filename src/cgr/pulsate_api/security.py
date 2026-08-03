@@ -551,9 +551,14 @@ class SecurityServices:
 
     @classmethod
     def from_environment(cls) -> SecurityServices:
+        configured_environment = os.environ.get("PULSATE_ENVIRONMENT")
         environment = (
-            os.environ.get("PULSATE_ENVIRONMENT", "production").strip().lower()
+            configured_environment.strip().lower()
+            if configured_environment is not None
+            else "unconfigured"
         )
+        if environment not in {"unconfigured", "test", "development", "production"}:
+            raise ValueError("Pulsate environment configuration is invalid.")
         enabled = (
             os.environ.get("PULSATE_DEVELOPMENT_AUTH_ENABLED", "false")
             .strip()
@@ -611,6 +616,17 @@ class SecurityServices:
                 grant_provider=InMemoryGrantProvider(grants, allow_wildcards=True),
                 audit_sink=InMemoryAuditSink(),
             )
+        if environment == "production":
+            from .production_configuration import (
+                EnvironmentConfigurationSource,
+                load_production_configuration,
+            )
+            from .production_security import create_production_security_services
+
+            configuration = load_production_configuration(
+                EnvironmentConfigurationSource()
+            )
+            return create_production_security_services(configuration)
         return cls(
             authenticator=UnavailableAuthenticator(),
             grant_provider=InMemoryGrantProvider(),
@@ -619,14 +635,25 @@ class SecurityServices:
         )
 
     def start(self) -> None:
+        if self._started:
+            return
         self.events.emit("application.startup")
+        started: list[object] = []
         try:
             self.authenticator.start()
+            started.append(self.authenticator)
             self.grant_provider.start()
+            started.append(self.grant_provider)
             self.audit_sink.start()
+            started.append(self.audit_sink)
             self._started = True
         except Exception:
             self._started = False
+            for service in reversed(started):
+                try:
+                    service.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             raise
 
     def close(self) -> None:
@@ -647,6 +674,16 @@ class SecurityServices:
             and self.grant_provider.ready()
             and self.audit_sink.ready()
         )
+
+    def diagnostic_snapshot(self) -> Mapping[str, bool]:
+        """Internal coarse readiness state; never exposed as an unrestricted route."""
+
+        return {
+            "authenticator": self.authenticator.ready(),
+            "grant_store": self.grant_provider.ready(),
+            "audit_store": self.audit_sink.ready(),
+            "services": self.ready(),
+        }
 
     def authenticate(
         self,
