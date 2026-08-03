@@ -70,6 +70,7 @@ from .molecular_planning import (
     MolecularPlanningUnavailableError,
     MOLECULAR_PLANNING_REQUEST_MAXIMUM_BYTES,
 )
+from .production_catalogue import ProductionCapabilityCatalogue
 from .runs import (
     ArtifactUnavailableError,
     ExistingQuantumPreflightExecutor,
@@ -373,9 +374,18 @@ def create_app(
         if runtime_configuration is not None
         else None
     )
-    scientific_capability_catalogue = (
-        scientific_capability_catalogue or ScientificCapabilityCatalog()
-    )
+    production_capability_catalogue: ProductionCapabilityCatalogue | None = None
+    if scientific_capability_catalogue is None and runtime_configuration is not None:
+        production_capability_catalogue = ProductionCapabilityCatalogue(
+            runtime_configuration.catalogue,
+            trusted_configuration_root=(
+                runtime_configuration.repositories.trusted_configuration_root
+            ),
+            event_logger=security_services.events,
+        )
+        scientific_capability_catalogue = production_capability_catalogue
+    elif scientific_capability_catalogue is None:
+        scientific_capability_catalogue = ScientificCapabilityCatalog()
     molecular_project_repository: MolecularProjectRepository | None = None
     molecular_artifact_repository: MolecularArtifactRepository | None = None
     if molecular_scene_service is None:
@@ -465,6 +475,15 @@ def create_app(
                 security_services.events.emit(
                     "repository.unavailable", category="security_startup"
                 )
+            if production_capability_catalogue is not None:
+                try:
+                    production_capability_catalogue.start()
+                except Exception:
+                    security_services.events.emit(
+                        "repository.unavailable", category="catalogue_startup"
+                    )
+                    if runtime_configuration.catalogue.required:
+                        security_services.close()
             try:
                 experiment_store.start()
                 natural_language_store.start()
@@ -510,7 +529,11 @@ def create_app(
                                 try:
                                     experiment_store.close()
                                 finally:
-                                    security_services.close()
+                                    try:
+                                        if production_capability_catalogue is not None:
+                                            production_capability_catalogue.close()
+                                    finally:
+                                        security_services.close()
 
     async def enforce_security(request: Request) -> None:
         route = request.scope.get("route")
@@ -578,6 +601,9 @@ def create_app(
         molecular_planning_service.catalogue
         if molecular_planning_service is not None
         else scientific_capability_catalogue
+    )
+    application.state.production_capability_catalogue = (
+        production_capability_catalogue
     )
     application.state.security_services = security_services
     application.state.lifecycle_ready = False
@@ -842,6 +868,10 @@ def create_app(
             not application.state.lifecycle_ready
             or not security_services.ready()
             or not repositories_ready
+            or (
+                production_capability_catalogue is not None
+                and not production_capability_catalogue.ready()
+            )
         ):
             raise _typed_error(
                 503,
@@ -854,6 +884,7 @@ def create_app(
                 "application": "ready",
                 "security": "ready",
                 "repositories": "ready",
+                "catalogue": "ready",
             },
         }
 

@@ -12,6 +12,7 @@ from .production_configuration import (
     PulsateRuntimeConfiguration,
     load_production_configuration,
 )
+from .production_catalogue import ProductionCapabilityCatalogue
 from .production_security import ProductionSecurityServices, create_production_security_services
 
 
@@ -22,22 +23,42 @@ def validate_configuration(
 ) -> dict[str, object]:
     configuration = load_production_configuration(source)
     services = services_factory(configuration)
+    catalogue = ProductionCapabilityCatalogue(
+        configuration.catalogue,
+        trusted_configuration_root=(
+            configuration.repositories.trusted_configuration_root
+        ),
+        event_logger=services.events,
+    )
     try:
         services.start()
-        if not services.ready():
-            raise RuntimeError("Production security services are unavailable.")
+        catalogue.start()
+        if not services.ready() or not catalogue.ready():
+            raise RuntimeError("Production runtime services are unavailable.")
+        catalogue_status = catalogue.diagnostic_snapshot()
         return {
             "status": "ready",
             "configuration_fingerprint": configuration.fingerprint,
+            "catalogue": {
+                "status": "ready",
+                "identifier": catalogue_status["catalogue_identifier"],
+                "version": catalogue_status["catalogue_version"],
+                "fingerprint": catalogue_status["catalogue_fingerprint"],
+                "entry_count": catalogue_status["entry_count"],
+            },
             "components": {
                 "configuration": "ready",
                 "authentication": "ready",
                 "authorization": "ready",
                 "audit": "ready",
+                "catalogue": "ready",
             },
         }
     finally:
-        services.close()
+        try:
+            catalogue.close()
+        finally:
+            services.close()
 
 
 def main(

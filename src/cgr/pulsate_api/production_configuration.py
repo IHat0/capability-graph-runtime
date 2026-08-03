@@ -12,6 +12,8 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from cgr.kernel.contracts import CapabilityVersion
+
 
 CONFIGURATION_SCHEMA_VERSION = "cgr.pulsate-runtime-configuration/1.0.0"
 CONFIGURATION_INPUT_MAXIMUM_BYTES = 64 * 1024
@@ -100,6 +102,43 @@ class RepositoryConfiguration(_ConfigurationContract):
     trusted_configuration_root: Path
 
 
+class CapabilityCatalogueConfiguration(_ConfigurationContract):
+    enabled: bool
+    required: bool
+    catalogue_file: Path | None = None
+    expected_identifier: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+    )
+    expected_version: CapabilityVersion | None = None
+    expected_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    maximum_bytes: int = Field(ge=1024, le=16 * 1024 * 1024)
+    maximum_entries: int = Field(ge=1, le=256)
+    allow_empty: bool
+
+    @model_validator(mode="after")
+    def validate_state(self) -> CapabilityCatalogueConfiguration:
+        expectations = (
+            self.catalogue_file,
+            self.expected_identifier,
+            self.expected_version,
+            self.expected_fingerprint,
+        )
+        if self.enabled and any(item is None for item in expectations):
+            raise ValueError("Enabled production catalogue configuration is incomplete.")
+        if not self.enabled and any(item is not None for item in expectations):
+            raise ValueError("Disabled production catalogue cannot declare source expectations.")
+        if self.required and not self.enabled:
+            raise ValueError("A required production catalogue must be enabled.")
+        if not self.enabled and not self.allow_empty:
+            raise ValueError("A disabled production catalogue must explicitly allow empty state.")
+        return self
+
+
 class SecurityLimitConfiguration(_ConfigurationContract):
     configuration_maximum_bytes: int = Field(
         default=CONFIGURATION_INPUT_MAXIMUM_BYTES,
@@ -125,6 +164,7 @@ class PulsateRuntimeConfiguration(_ConfigurationContract):
     audit: AuditConfiguration
     observability: ObservabilityConfiguration
     repositories: RepositoryConfiguration
+    catalogue: CapabilityCatalogueConfiguration
     limits: SecurityLimitConfiguration = SecurityLimitConfiguration()
     readiness: ReadinessConfiguration = ReadinessConfiguration()
 
@@ -137,7 +177,27 @@ class PulsateRuntimeConfiguration(_ConfigurationContract):
         return self
 
     def safe_dict(self) -> dict[str, object]:
-        return self.model_dump(mode="json")
+        safe = self.model_dump(mode="json")
+        authentication = dict(safe["authentication"])
+        authentication["jwks_file"] = "configured-path"
+        authorization = dict(safe["authorization"])
+        authorization["database_file"] = "configured-path"
+        audit = dict(safe["audit"])
+        audit["database_file"] = "configured-path"
+        repositories = dict(safe["repositories"])
+        repositories["application_data_root"] = "configured-path"
+        repositories["trusted_configuration_root"] = "configured-path"
+        catalogue = dict(safe["catalogue"])
+        if catalogue["catalogue_file"] is not None:
+            catalogue["catalogue_file"] = "configured-path"
+        safe.update(
+            authentication=authentication,
+            authorization=authorization,
+            audit=audit,
+            repositories=repositories,
+            catalogue=catalogue,
+        )
+        return safe
 
     def canonical_safe_json(self) -> str:
         return json.dumps(self.safe_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -190,6 +250,15 @@ PRODUCTION_ENVIRONMENT_VARIABLES = (
     "PULSATE_AUDIT_READ_FAIL_CLOSED",
     "PULSATE_AUDIT_BUSY_TIMEOUT_MS",
     "PULSATE_AUDIT_VERIFICATION_MAXIMUM_RECORDS",
+    "PULSATE_CATALOGUE_ENABLED",
+    "PULSATE_CATALOGUE_REQUIRED",
+    "PULSATE_CATALOGUE_FILE",
+    "PULSATE_CATALOGUE_EXPECTED_IDENTIFIER",
+    "PULSATE_CATALOGUE_EXPECTED_VERSION",
+    "PULSATE_CATALOGUE_EXPECTED_FINGERPRINT",
+    "PULSATE_CATALOGUE_MAXIMUM_BYTES",
+    "PULSATE_CATALOGUE_MAXIMUM_ENTRIES",
+    "PULSATE_CATALOGUE_ALLOW_EMPTY",
 )
 
 
@@ -295,8 +364,78 @@ def load_production_configuration(source: ConfigurationSource) -> PulsateRuntime
             ),
             observability=ObservabilityConfiguration(service_name=_required(values, "PULSATE_SERVICE_IDENTITY")),
             repositories=RepositoryConfiguration(application_data_root=data_root, trusted_configuration_root=config_root),
+            catalogue=_catalogue_configuration(values, config_root),
         )
     except ProductionConfigurationError:
         raise
     except Exception:
         raise ProductionConfigurationError("configuration") from None
+
+
+def _catalogue_configuration(
+    values: Mapping[str, str],
+    trusted_root: Path,
+) -> CapabilityCatalogueConfiguration:
+    enabled = _boolean(
+        _required(values, "PULSATE_CATALOGUE_ENABLED"),
+        "PULSATE_CATALOGUE_ENABLED",
+    )
+    required = _boolean(
+        _required(values, "PULSATE_CATALOGUE_REQUIRED"),
+        "PULSATE_CATALOGUE_REQUIRED",
+    )
+    allow_empty = _boolean(
+        _required(values, "PULSATE_CATALOGUE_ALLOW_EMPTY"),
+        "PULSATE_CATALOGUE_ALLOW_EMPTY",
+    )
+    expected_identifier = values.get("PULSATE_CATALOGUE_EXPECTED_IDENTIFIER")
+    expected_version = values.get("PULSATE_CATALOGUE_EXPECTED_VERSION")
+    expected_fingerprint = values.get("PULSATE_CATALOGUE_EXPECTED_FINGERPRINT")
+    try:
+        return CapabilityCatalogueConfiguration(
+            enabled=enabled,
+            required=required,
+            catalogue_file=(
+                _controlled_path(
+                    _required(values, "PULSATE_CATALOGUE_FILE"),
+                    trusted_root,
+                    "PULSATE_CATALOGUE_FILE",
+                )
+                if enabled
+                else None
+            ),
+            expected_identifier=(
+                _required(values, "PULSATE_CATALOGUE_EXPECTED_IDENTIFIER")
+                if enabled
+                else expected_identifier
+            ),
+            expected_version=(
+                CapabilityVersion.parse(
+                    _required(values, "PULSATE_CATALOGUE_EXPECTED_VERSION")
+                )
+                if enabled
+                else (
+                    CapabilityVersion.parse(expected_version)
+                    if expected_version is not None
+                    else None
+                )
+            ),
+            expected_fingerprint=(
+                _required(values, "PULSATE_CATALOGUE_EXPECTED_FINGERPRINT")
+                if enabled
+                else expected_fingerprint
+            ),
+            maximum_bytes=_integer(
+                _required(values, "PULSATE_CATALOGUE_MAXIMUM_BYTES"),
+                "PULSATE_CATALOGUE_MAXIMUM_BYTES",
+            ),
+            maximum_entries=_integer(
+                _required(values, "PULSATE_CATALOGUE_MAXIMUM_ENTRIES"),
+                "PULSATE_CATALOGUE_MAXIMUM_ENTRIES",
+            ),
+            allow_empty=allow_empty,
+        )
+    except ProductionConfigurationError:
+        raise
+    except Exception:
+        raise ProductionConfigurationError("catalogue") from None

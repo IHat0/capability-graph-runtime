@@ -34,13 +34,17 @@ jobs:
             src/cgr/pulsate_api/app.py
             src/cgr/pulsate_api/config_check.py
             src/cgr/pulsate_api/molecular_planning.py
+            src/cgr/pulsate_api/production_catalogue.py
             src/cgr/pulsate_api/production_configuration.py
             src/cgr/pulsate_api/production_security.py
             src/cgr/pulsate_api/security.py
             src/cgr/pulsate_api/security_contracts.py
+            src/cgr/science/__init__.py
+            src/cgr/science/catalogue.py
             src/cgr/science/feasibility.py
             tests/conftest.py
             tests/test_pulsate_molecular_planning.py
+            tests/test_pulsate_production_catalogue.py
             tests/test_pulsate_production_security.py
             tests/test_pulsate_security.py
             tests/test_scientific_feasibility.py
@@ -67,6 +71,7 @@ jobs:
             tests/test_pulsate_experiments.py \
             tests/test_pulsate_molecular_scenes.py \
             tests/test_pulsate_molecular_planning.py \
+            tests/test_pulsate_production_catalogue.py \
             tests/test_pulsate_production_security.py \
             tests/test_pulsate_security.py \
             -m "core and backend_core" \

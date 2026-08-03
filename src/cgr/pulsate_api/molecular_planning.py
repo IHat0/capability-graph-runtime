@@ -304,10 +304,11 @@ class MolecularPlanningService:
     ) -> None:
         self._project_resolver = project_resolver
         self._artifact_repository = artifact_repository
+        catalogue_ready = getattr(catalogue, "ready", None)
         if (
-            len(catalogue.envelopes())
-            > MOLECULAR_PLANNING_CATALOGUE_MAXIMUM_CAPABILITIES
-        ):
+            not callable(catalogue_ready)
+            or catalogue_ready()
+        ) and len(catalogue.envelopes()) > MOLECULAR_PLANNING_CATALOGUE_MAXIMUM_CAPABILITIES:
             raise ValueError("Molecular planning catalogue exceeds its safe limit.")
         self._catalogue = catalogue
         self._lock = threading.RLock()

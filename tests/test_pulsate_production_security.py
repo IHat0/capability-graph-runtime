@@ -80,6 +80,11 @@ def _values(tmp_path: Path) -> dict[str, str]:
         "PULSATE_AUTH_JWKS_FILE": "jwks.json",
         "PULSATE_GRANT_DATABASE_FILE": "security/grants.sqlite3",
         "PULSATE_AUDIT_DATABASE_FILE": "security/audit.sqlite3",
+        "PULSATE_CATALOGUE_ENABLED": "false",
+        "PULSATE_CATALOGUE_REQUIRED": "false",
+        "PULSATE_CATALOGUE_MAXIMUM_BYTES": str(1024 * 1024),
+        "PULSATE_CATALOGUE_MAXIMUM_ENTRIES": "256",
+        "PULSATE_CATALOGUE_ALLOW_EMPTY": "true",
     }
 
 
@@ -744,6 +749,7 @@ def test_liveness_remains_healthy_and_readiness_is_coarse_and_path_free(tmp_path
             "application": "ready",
             "security": "ready",
             "repositories": "ready",
+            "catalogue": "ready",
         },
     }
     assert str(tmp_path) not in ready.text

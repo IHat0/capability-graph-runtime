@@ -13,7 +13,7 @@ and the non-executing capability/resource planner.
 | --- | --- | --- |
 | Phase 1 — universal scientific contracts | BLOCKED | Not enterprise-ready. Local dependency-vulnerability evidence remains incomplete. |
 | Phase 2 — universal molecular project and workspace | BLOCKED | Not enterprise-ready. Caller authorization, production recovery/deployment evidence, and production-scale performance evidence are absent. |
-| Phase 3 — capability and resource planner | BLOCKED | Not enterprise-ready. Caller authorization, operational observability, and production catalogue provisioning remain incomplete. |
+| Phase 3 — capability and resource planner | BLOCKED | Not enterprise-ready. E4 adds the trusted production catalogue, but deployment/recovery, security-scanning, and final readiness evidence remain incomplete. |
 
 No phase is labelled enterprise-ready while an applicable control is `FAIL` or
 `BLOCKED`.
@@ -109,8 +109,9 @@ change review; this document does not treat an unexecuted command as evidence.
 
 E3 must still provision the declared verifier in the HTTP runtime and complete
 deployment evidence, metrics export/alerting, browser session integration,
-operational recovery, and production load/concurrency evidence. E4 remains the
-explicit final readiness gate.
+operational recovery, and production load/concurrency evidence. E4 is the
+production configuration and catalogue checkpoint; E5, E6, and E7 remain the
+later recovery/deployment, security-evidence, and final-readiness gates.
 
 ## Enterprise Foundation E3A production security providers
 
@@ -221,9 +222,9 @@ startup is idempotent and shutdown is safe. Tests may still inject the E2
 deterministic providers. Development authentication remains explicitly enabled
 only in `development`; production rejects it.
 
-`/live` remains independent. `/ready` returns only the coarse application,
-security, and repository categories and requires lifecycle, production security,
-and configured repository services. Detailed provider readiness and the safe
+`/live` remains independent. `/ready` returns only coarse application,
+security, repository, and catalogue categories and requires lifecycle,
+production security, catalogue, and configured repository services. Detailed provider readiness and the safe
 configuration fingerprint are available only from the injected internal
 diagnostic snapshot, not a public endpoint.
 
@@ -246,6 +247,89 @@ scientific or IBM execution.
 - Secret-manager integration.
 - Browser OIDC session integration.
 - Operational runbooks and remote CI evidence.
+
+## Checkpoint E4 production capability catalogue
+
+E4 adds a non-networked, immutable production catalogue source without changing
+scientific execution or authorization. A frozen, extra-forbid catalogue
+document declares its schema and catalogue identity/version, ordered capability
+entries, release metadata, source fingerprint, and complete catalogue
+fingerprint. Every entry declares an exact capability identity/version, closed
+capability kind, provider and implementation identities, configuration-schema
+version, supported operations, availability classification, limitations,
+evidence pointers, the existing execution envelope, and its own fingerprint.
+
+Entry, source, and complete-catalogue SHA-256 values are calculated from the
+same canonical UTF-8 JSON contract used by the scientific domain. Entries must
+already be in name and semantic-version order. Duplicate exact identities,
+unknown kinds, unsupported schemas, missing fields, inconsistent evidence,
+non-canonical input, or any fingerprint mismatch fail closed. Availability is
+never inferred from imports or probes: only `available` and `conditional`
+evidence-backed entries enter the planner snapshot; `unknown` and `unavailable`
+entries remain documented but cannot be selected. Conditional envelopes keep
+their declared prerequisites, approvals, and verification requirements.
+
+### Catalogue source and configuration
+
+The only E4 production source is one explicitly configured local JSON file
+beneath the trusted configuration root. Startup rejects traversal, unsafe or
+missing roots, symlinks, junctions, reparse escapes, special files, oversized
+documents, excessive entry counts, malformed JSON, and expectation mismatch.
+It neither contacts an external service nor imports or executes an engine.
+Ordinary requests read one immutable in-memory snapshot and never reread the
+file. The internal reload operation validates a full replacement before an
+atomic swap and preserves the previous snapshot on failure; no reload HTTP
+endpoint exists.
+
+The E4 production environment names, without values, are:
+
+```text
+PULSATE_CATALOGUE_ENABLED
+PULSATE_CATALOGUE_REQUIRED
+PULSATE_CATALOGUE_FILE
+PULSATE_CATALOGUE_EXPECTED_IDENTIFIER
+PULSATE_CATALOGUE_EXPECTED_VERSION
+PULSATE_CATALOGUE_EXPECTED_FINGERPRINT
+PULSATE_CATALOGUE_MAXIMUM_BYTES
+PULSATE_CATALOGUE_MAXIMUM_ENTRIES
+PULSATE_CATALOGUE_ALLOW_EMPTY
+```
+
+All values are explicit. Safe configuration serialization redacts the source
+path while retaining only the configured safe identifier, version, and
+fingerprint. A disabled catalogue is valid only when it is not required and
+empty state is explicitly permitted. An enabled empty document is valid only
+when the same empty-state permission is explicit. Empty state produces the
+existing deterministic unassigned plan and never fabricates availability.
+
+### Lifecycle, readiness, planning, and validation
+
+Production composition creates the catalogue from validated runtime
+configuration, loads it during application startup, injects the snapshot into
+the existing molecular planner, and closes it during nested shutdown. Invalid
+mandatory catalogue state leaves `/live` responsive but `/ready` returns the
+existing coarse unavailable response. Successful readiness adds only a
+`catalogue: ready` category; paths, provider configuration, document contents,
+and credentials are not exposed.
+
+`cgr-pulsate-config-check` performs the same source-safety, schema, identity,
+version, entry, duplicate, and fingerprint validation without starting an HTTP
+listener. Its successful output contains only catalogue identifier, semantic
+version, complete fingerprint, entry count, and coarse status. The planning
+boundary remains read-only and non-authorizing, and the `cgr.science` domain
+continues to have no dependency on `cgr.molecular`.
+
+The dedicated E4 regression file is part of the explicit backend-core manifest
+and CI command. It covers deterministic fingerprints, invalid documents and
+paths, bounded input, empty state, readiness, configuration checking,
+snapshot/reload behavior, concurrent readers, selection filtering, and
+non-execution. The scoped CI Ruff step remains pinned to 0.15.20.
+
+E4 does not close the later enterprise gates. E5 still requires deployment,
+recovery, backup/restore, rollback, observability export, and operational
+evidence. E6 still requires pinned SBOM, vulnerability, dependency, container,
+and secret-scanning evidence. E7 still requires final cross-platform,
+production-scale, accessibility, security, and operational-readiness evidence.
 
 ## Implemented planning boundary
 
@@ -318,10 +402,12 @@ only one or setting an empty value fails configuration. Repository `start()`
 validates the controlled roots and shutdown closes planning, scene, project,
 run, interpretation, and experiment services in nested `finally` blocks.
 
-The default scientific capability catalogue is deliberately empty. The current
-repository has no production catalogue loader, signed catalogue source, tenant
-policy, deployment manifest, service-level objective, or backup/restore
-procedure. Those are blockers, not implicit development defaults.
+Non-production composition keeps the explicitly injected or deliberately empty
+scientific catalogue. Production composition uses only the validated E4 local
+catalogue source; it never falls back to development capabilities. A signed or
+remote catalogue service, tenant-specific catalogue policy, deployment
+manifest, service-level objective, and backup/restore procedure remain absent.
+Those are later blockers, not implicit development defaults.
 
 ## Validation classifications
 
@@ -349,6 +435,8 @@ python -m pytest `
     tests/test_pulsate_experiments.py `
     tests/test_pulsate_molecular_scenes.py `
     tests/test_pulsate_molecular_planning.py `
+    tests/test_pulsate_production_catalogue.py `
+    tests/test_pulsate_production_security.py `
     tests/test_pulsate_security.py `
     -m "core and backend_core" `
     --basetemp=".pytest-tmp-e1-phase1-3-core" `
@@ -427,7 +515,7 @@ boundary are not safely available on a generic hosted runner.
 | 9. Observability and auditability | BLOCKED | E2 adds correlation/request identity, bounded JSON events, canonical append-oriented audit records, mandatory write-audit failure policy, and bounded-cardinality in-process metrics. | No durable tamper-evident audit backend, metrics exporter/alerting, production retention, or production operations evidence exists. | Provision and validate durable audit storage, metrics export, alerts, retention, access controls, and recovery. |
 | 10. Performance and scalability | BLOCKED | Local deterministic benchmark documented below; repeated fact fingerprints are now computed once per plan. | No production load, memory, latency percentile, large-topology streaming, or service-level evidence exists. | Establish supported project/catalogue profiles, memory budgets, percentile targets, load tests, and streaming fact projection for topologies above the API-process ceiling. |
 | 11. Frontend reliability and accessibility | BLOCKED | Native labelled controls, keyboard-operable HTML, visible focus, textual status labels, loading/error/empty/no-assignment states, expandable findings, read-only execution notice, Mol* remains mounted. ESLint and both TypeScript checks passed. | Vitest and the Vite production stage were blocked by transient-file sandbox denial. No manual assistive-technology evidence exists. | Complete package validation and perform keyboard/screen-reader/zoom acceptance against production assets. |
-| 12. Configuration and deployment safety | BLOCKED | Paired root validation, controlled repository roots, empty safe catalogue default, no hard-coded Windows production path, no planning credentials, and real Phase 1-3 backend/frontend CI jobs. | Production catalogue/deployment/runtime policy, backup, rollback, and disaster recovery remain absent; the new CI workflow has not yet completed remotely. | Require the CI gate, define the production configuration schema, deployment manifests, health/readiness checks, backup/restore, rollback, and environment promotion evidence. |
+| 12. Configuration and deployment safety | BLOCKED | Paired roots, E3A production configuration, E4 trusted local catalogue loading, coarse readiness, offline configuration validation, no planning credentials, and backend/frontend CI jobs. | Deployment manifests, backup, rollback, and disaster recovery remain absent; the updated CI workflow has not yet completed remotely. | Require the CI gate and define deployment manifests, backup/restore, rollback, and environment-promotion evidence. |
 | 13. Security and dependency evidence | BLOCKED | JSON/Pydantic only, no planning subprocess, content-addressed repository paths, React escaping, no raw HTML rendering, secret-key rejection in portable metadata and public responses. | No installed offline vulnerability scanner, SBOM/provenance gate, or current vulnerability report is available. | Add pinned offline-capable Python/npm vulnerability and SBOM checks, dependency provenance policy, and remediation SLA. |
 | 14. Documentation and operability | PASS | This record documents boundaries, endpoint semantics, status meanings, empty catalogue, errors, limits, configuration, lifecycle, non-execution, limitations, blockers, and gate decision. | No in-scope documentation gap remains for the checkpoint itself. | Keep this record versioned and update it only from a completed gate run. |
 
