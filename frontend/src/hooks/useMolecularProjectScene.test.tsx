@@ -1,5 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
+import { ApiError } from '../api/client'
 import type { ProjectedMolecularSceneMetadata, ProjectedMolecularStructureMetadata } from '../scene/native-project'
 import { fetchedResource, molecularTopologyFixture, projectedMolecularSceneFixture } from '../test/molecular-project-fixtures'
 import { type MolecularProjectSceneApi, useMolecularProjectScene } from './useMolecularProjectScene'
@@ -29,6 +30,21 @@ async function enterAndOpen(result: { current: ReturnType<typeof useMolecularPro
 }
 
 describe('useMolecularProjectScene', () => {
+  it.each([
+    [401, 'Authentication is required to access Pulsate.'],
+    [403, 'Access to the requested Pulsate resource is denied.'],
+  ])('preserves the controlled HTTP %s security state', async (status, message) => {
+    const projectApi = api({
+      getProjectedMolecularScene: vi.fn().mockRejectedValue(new ApiError(message, status)),
+    })
+    const { result } = renderHook(() => useMolecularProjectScene(projectApi))
+
+    await enterAndOpen(result)
+
+    expect(result.current.scene).toBeNull()
+    expect(result.current.error).toBe(message)
+  })
+
   it('loads all resources with one read-only generation and primary structure first', async () => {
     const projectApi = api()
     const { result } = renderHook(() => useMolecularProjectScene(projectApi))

@@ -247,32 +247,38 @@ def _contains_forbidden_key(value: Any) -> bool:
 
 def test_default_app_constructs_without_native_service_and_routes_return_503(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.delenv("PULSATE_MOLECULAR_PROJECT_ROOT", raising=False)
     monkeypatch.delenv("PULSATE_MOLECULAR_ARTIFACT_ROOT", raising=False)
+    monkeypatch.setenv("PULSATE_RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("PULSATE_EXPERIMENT_ROOT", str(tmp_path / "experiments"))
+    monkeypatch.setenv(
+        "PULSATE_INTERPRETATION_ROOT", str(tmp_path / "interpretations")
+    )
     application = create_app()
-    client = TestClient(application)
 
     assert application.state.molecular_scene_service is None
-    for path, parameters in (
-        ("/api/v1/molecular/scenes/projected", _query()),
-        (
-            "/api/v1/molecular/scenes/native-structure",
-            _query(structure="structure-a"),
-        ),
-        (
-            "/api/v1/molecular/scenes/topology",
-            _query(structure="structure-a"),
-        ),
-    ):
-        response = client.get(path, params=parameters)
-        assert response.status_code == 503
-        assert response.json() == {
-            "detail": {
-                "code": "molecular_scene_service_unavailable",
-                "message": "Native molecular scene service is unavailable.",
+    with TestClient(application) as client:
+        for path, parameters in (
+            ("/api/v1/molecular/scenes/projected", _query()),
+            (
+                "/api/v1/molecular/scenes/native-structure",
+                _query(structure="structure-a"),
+            ),
+            (
+                "/api/v1/molecular/scenes/topology",
+                _query(structure="structure-a"),
+            ),
+        ):
+            response = client.get(path, params=parameters)
+            assert response.status_code == 503
+            assert response.json() == {
+                "detail": {
+                    "code": "molecular_scene_service_unavailable",
+                    "message": "Native molecular scene service is unavailable.",
+                }
             }
-        }
 
 
 def test_injected_service_state_and_lifespan_start_and_close(
@@ -950,12 +956,11 @@ def test_query_identifiers_and_generated_relative_urls_round_trip(
 
 def test_health_and_legacy_preset_scene_remain_unchanged(tmp_path: Path) -> None:
     application, _, executor = _application(tmp_path)
-    client = TestClient(application)
-
-    health = client.get("/api/v1/health")
-    preset = client.get(
-        "/api/v1/experiments/presets/h2-ground-state-v1/scene"
-    )
+    with TestClient(application) as client:
+        health = client.get("/api/v1/health")
+        preset = client.get(
+            "/api/v1/experiments/presets/h2-ground-state-v1/scene"
+        )
 
     assert health.status_code == 200
     assert health.json() == {

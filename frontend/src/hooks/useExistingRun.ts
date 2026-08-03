@@ -63,6 +63,9 @@ function controlledError(error: unknown, stage: LoadStage): string {
     if (error.status === undefined && error.cause !== undefined) {
       return 'Unable to reach the Pulsate API.'
     }
+    if (error.status === 401 || error.status === 403 || error.status === 503) {
+      return error.message
+    }
     if (error.code === 'run_not_found' || (stage === 'run' && error.status === 404)) {
       return 'Run not found. Check the run identifier and try again.'
     }

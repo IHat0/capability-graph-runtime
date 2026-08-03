@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, pulsateApi } from './client'
+import { ApiError, createPulsateApi, pulsateApi } from './client'
 import { currentFixtureDetail, currentFixtureScene, naturalLanguageInterpretation } from '../test/fixtures'
 import { projectedMolecularSceneFixture } from '../test/molecular-project-fixtures'
 import { MOLECULAR_RESOURCE_MAXIMUM_BYTES } from '../scene/native-project'
@@ -10,6 +10,46 @@ function jsonResponse(value: unknown): Response {
 
 describe('Pulsate API client failure handling', () => {
   afterEach(() => vi.unstubAllGlobals())
+
+  it('attaches an injected bearer token only to protected API headers', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ presets: [], count: 0 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const api = createPulsateApi({ accessTokenProvider: async () => 'test-access-token' })
+
+    await api.getPresets()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/experiments/presets', expect.objectContaining({
+      headers: expect.any(Headers),
+    }))
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer test-access-token')
+    expect(fetchMock.mock.calls[0][0]).not.toContain('test-access-token')
+  })
+
+  it('does not attach bearer credentials to the public health endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ service: 'pulsate-api', status: 'healthy', version: '0.2.0' }))
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = vi.fn().mockResolvedValue('test-access-token')
+    const api = createPulsateApi({ accessTokenProvider: provider })
+
+    await api.getHealth()
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(new Headers(init.headers).has('Authorization')).toBe(false)
+    expect(provider).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [401, 'Authentication is required to access Pulsate.'],
+    [403, 'Access to the requested Pulsate resource is denied.'],
+    [404, 'The requested Pulsate resource was not found.'],
+    [503, 'The Pulsate service is temporarily unavailable.'],
+  ])('maps HTTP %s to a controlled client state', async (status, message) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status })))
+    const api = createPulsateApi({ accessTokenProvider: async () => 'test-access-token' })
+
+    await expect(api.getPresets()).rejects.toMatchObject({ status, message })
+  })
 
   it('wraps backend connection failures without losing the cause', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('connection refused')))

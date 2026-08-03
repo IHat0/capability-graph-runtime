@@ -392,12 +392,44 @@ function parseApprovedExperiment(value: unknown): ApprovedExperimentResponse {
   return value as unknown as ApprovedExperimentResponse
 }
 
-async function requestJson<T>(path: string, parser: (value: unknown) => T, signal?: AbortSignal, init?: RequestInit): Promise<T> {
+export type AccessTokenProvider = () => Promise<string | null>
+
+const PUBLIC_API_PATHS = new Set(['/api/v1/health', '/live', '/ready'])
+
+async function authenticatedHeaders(
+  path: string,
+  supplied: HeadersInit | undefined,
+  accessTokenProvider: AccessTokenProvider,
+): Promise<Headers> {
+  const headers = new Headers(supplied)
+  if (path.startsWith('/api/v1/') && !PUBLIC_API_PATHS.has(path.split('?', 1)[0])) {
+    const token = await accessTokenProvider()
+    if (token !== null) {
+      if (token.length === 0 || token.length > 8192 || /\s/.test(token)) {
+        throw new ApiError('Authentication is required to access Pulsate.', 401, undefined, 'invalid_access_token')
+      }
+      headers.set('Authorization', `Bearer ${token}`)
+    }
+  }
+  return headers
+}
+
+function controlledHttpError(status: number, message: string, code?: string): ApiError {
+  if (status === 401) return new ApiError('Authentication is required to access Pulsate.', status, undefined, code)
+  if (status === 403) return new ApiError('Access to the requested Pulsate resource is denied.', status, undefined, code)
+  if (status === 404) return new ApiError('The requested Pulsate resource was not found.', status, undefined, code)
+  if (status === 503) return new ApiError('The Pulsate service is temporarily unavailable.', status, undefined, code)
+  return new ApiError(message, status, undefined, code)
+}
+
+async function requestJson<T>(path: string, parser: (value: unknown) => T, accessTokenProvider: AccessTokenProvider, signal?: AbortSignal, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(path, { ...init, signal, headers: { Accept: 'application/json', ...init?.headers } })
+    const headers = await authenticatedHeaders(path, { Accept: 'application/json', ...init?.headers }, accessTokenProvider)
+    response = await fetch(path, { ...init, signal, headers })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
+    if (error instanceof ApiError) throw error
     throw new ApiError('Unable to reach the Pulsate API.', undefined, error)
   }
 
@@ -412,7 +444,7 @@ async function requestJson<T>(path: string, parser: (value: unknown) => T, signa
         if (typeof body.detail.code === 'string') code = body.detail.code
       }
     } catch { /* Preserve the status-based message for non-JSON errors. */ }
-    throw new ApiError(message, response.status, undefined, code)
+    throw controlledHttpError(response.status, message, code)
   }
 
   try {
@@ -468,6 +500,7 @@ async function readBoundedMolecularResource(
 async function requestMolecularResource(
   path: string,
   artifact: ProjectedMolecularStructureMetadata['source_artifact'],
+  accessTokenProvider: AccessTokenProvider,
   signal?: AbortSignal,
 ): Promise<FetchedMolecularResource> {
   if (artifact.byte_size > MOLECULAR_RESOURCE_MAXIMUM_BYTES) {
@@ -475,12 +508,14 @@ async function requestMolecularResource(
   }
   let response: Response
   try {
-    response = await fetch(path, { method: 'GET', signal, headers: { Accept: artifact.media_type } })
+    const headers = await authenticatedHeaders(path, { Accept: artifact.media_type }, accessTokenProvider)
+    response = await fetch(path, { method: 'GET', signal, headers })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
+    if (error instanceof ApiError) throw error
     throw new ApiError('Unable to reach the Pulsate API.', undefined, error)
   }
-  if (!response.ok) throw new ApiError(`Molecular resource request failed (${response.status}).`, response.status)
+  if (!response.ok) throw controlledHttpError(response.status, `Molecular resource request failed (${response.status}).`)
   const declaredLength = response.headers.get('Content-Length')
   if (declaredLength === null || !/^\d+$/.test(declaredLength) || Number(declaredLength) !== artifact.byte_size) {
     throw new ApiError('The molecular resource byte-size evidence is inconsistent.')
@@ -547,22 +582,32 @@ function presetPath(identifier: string, suffix = ''): string {
   return `/api/v1/experiments/presets/${encodeURIComponent(identifier)}${suffix}`
 }
 
-export const pulsateApi: PulsateApi = {
-  getHealth: (signal) => requestJson('/api/v1/health', parseHealth, signal),
-  getPresets: (signal) => requestJson('/api/v1/experiments/presets', parsePresetList, signal),
-  getPreset: (identifier, signal) => requestJson(presetPath(identifier), parsePresetDetail, signal),
-  getScene: (identifier, signal) => requestJson(presetPath(identifier, '/scene'), parseScene, signal),
-  planExperiment: (question, signal) => requestJson('/api/v1/experiments/plan', parseExperimentPlan, signal, {
+export interface PulsateApiConfiguration {
+  accessTokenProvider?: AccessTokenProvider
+}
+
+const noAccessToken: AccessTokenProvider = async () => null
+
+export function createPulsateApi(configuration: PulsateApiConfiguration = {}): PulsateApi {
+  const accessTokenProvider = configuration.accessTokenProvider ?? noAccessToken
+  const json = <T>(path: string, parser: (value: unknown) => T, signal?: AbortSignal, init?: RequestInit) =>
+    requestJson(path, parser, accessTokenProvider, signal, init)
+  return {
+    getHealth: (signal) => json('/api/v1/health', parseHealth, signal),
+    getPresets: (signal) => json('/api/v1/experiments/presets', parsePresetList, signal),
+    getPreset: (identifier, signal) => json(presetPath(identifier), parsePresetDetail, signal),
+    getScene: (identifier, signal) => json(presetPath(identifier, '/scene'), parseScene, signal),
+    planExperiment: (question, signal) => json('/api/v1/experiments/plan', parseExperimentPlan, signal, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question }),
   }),
-  interpretQuestion: (question, signal) => requestJson('/api/v1/experiments/interpret', parseInterpretation, signal, {
+    interpretQuestion: (question, signal) => json('/api/v1/experiments/interpret', parseInterpretation, signal, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question }),
   }),
-  approveInterpretation: (identifier, specification, acceptedAssumptions, signal) => requestJson(
+    approveInterpretation: (identifier, specification, acceptedAssumptions, signal) => json(
     `/api/v1/experiments/${encodeURIComponent(identifier)}/approve`,
     parseApprovedExperiment,
     signal,
@@ -572,38 +617,40 @@ export const pulsateApi: PulsateApi = {
       body: JSON.stringify({ specification, accepted_assumptions: acceptedAssumptions }),
     },
   ),
-  getRunCapability: (signal) => requestJson('/api/v1/runs/capability', parseCapability, signal),
-  createRun: (presetIdentifier, idempotencyKey, signal) => requestJson('/api/v1/runs', parseRunState, signal, {
+    getRunCapability: (signal) => json('/api/v1/runs/capability', parseCapability, signal),
+    createRun: (presetIdentifier, idempotencyKey, signal) => json('/api/v1/runs', parseRunState, signal, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify({ preset_identifier: presetIdentifier, execution_target: 'local_simulator' }),
   }),
-  createExperimentRun: (experimentIdentifier, idempotencyKey, signal, executionTarget = 'local_simulator') => requestJson('/api/v1/runs', parseRunState, signal, {
+    createExperimentRun: (experimentIdentifier, idempotencyKey, signal, executionTarget = 'local_simulator') => json('/api/v1/runs', parseRunState, signal, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify({ experiment_identifier: experimentIdentifier, execution_target: executionTarget }),
   }),
-  getRun: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}`, parseRunState, signal),
-  getRunScene: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/scene`, parseScene, signal),
-  getRunResults: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/results`, parseRunResults, signal),
-  getRunVerification: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/verification`, parseVerification, signal),
-  getRunReceipt: (runIdentifier, signal) => requestJson(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/receipt`, parseReceipt, signal),
-  getProjectedMolecularScene: (projectIdentifier, sceneIdentifier, signal) => requestJson(
+    getRun: (runIdentifier, signal) => json(`/api/v1/runs/${encodeURIComponent(runIdentifier)}`, parseRunState, signal),
+    getRunScene: (runIdentifier, signal) => json(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/scene`, parseScene, signal),
+    getRunResults: (runIdentifier, signal) => json(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/results`, parseRunResults, signal),
+    getRunVerification: (runIdentifier, signal) => json(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/verification`, parseVerification, signal),
+    getRunReceipt: (runIdentifier, signal) => json(`/api/v1/runs/${encodeURIComponent(runIdentifier)}/receipt`, parseReceipt, signal),
+    getProjectedMolecularScene: (projectIdentifier, sceneIdentifier, signal) => json(
     `/api/v1/molecular/scenes/projected?project_identifier=${encodeURIComponent(projectIdentifier)}&scene_identifier=${encodeURIComponent(sceneIdentifier)}`,
     parseProjectedMolecularScene,
     signal,
   ),
-  getNativeMolecularStructure: (structure, signal) => requestMolecularResource(
+    getNativeMolecularStructure: (structure, signal) => requestMolecularResource(
     structure.native_structure_url,
     structure.source_artifact,
+    accessTokenProvider,
     signal,
   ),
-  getMolecularTopology: (structure, signal) => requestMolecularResource(
+    getMolecularTopology: (structure, signal) => requestMolecularResource(
     structure.topology_url,
     structure.topology_artifact,
+    accessTokenProvider,
     signal,
   ),
-  evaluateMolecularProjectPlan: (projectIdentifier, request, signal) => requestJson(
+    evaluateMolecularProjectPlan: (projectIdentifier, request, signal) => json(
     `/api/v1/molecular/projects/${encodeURIComponent(projectIdentifier)}/planning/evaluate`,
     parseMolecularPlanningResponse,
     signal,
@@ -613,4 +660,7 @@ export const pulsateApi: PulsateApi = {
       body: JSON.stringify(request),
     },
   ),
+  }
 }
+
+export const pulsateApi: PulsateApi = createPulsateApi()

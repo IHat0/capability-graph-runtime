@@ -18,6 +18,100 @@ and the non-executing capability/resource planner.
 No phase is labelled enterprise-ready while an applicable control is `FAIL` or
 `BLOCKED`.
 
+## Enterprise Foundation E2 security and operations boundary
+
+E2 adds a single centralized boundary around every implemented Phase 1-3 API
+surface. It does not change scientific behavior or declare any phase
+enterprise-ready.
+
+### Authentication status
+
+Protected requests use a standard `Authorization: Bearer` header through an
+injectable authenticator. Authentication produces an immutable, versioned
+principal containing bounded subject, tenant, authentication-method, scope,
+role, and audit identities. Raw bearer credentials are never part of the
+principal, request context, audit schema, log fields, or metrics.
+
+No suitable JWT/OIDC verification dependency is declared in the production
+HTTP application lock. The IBM-specific runtime lock is not an API dependency
+and must not be coupled into this boundary. The production default is therefore
+an unavailable authenticator: liveness remains
+available, readiness fails, and a supplied credential cannot authorize access.
+An explicitly enabled development bearer authenticator exists only when
+`PULSATE_ENVIRONMENT=development`; enabling it in production is a configuration
+error and emits a startup warning when used. Startup-loaded OIDC key material,
+issuer/audience/algorithm/claim verification, and key rotation remain E3
+deployment blockers.
+
+### Authorization and enumeration policy
+
+One route inventory maps every protected route to distinct `project.read`,
+`artifact.read`, `scene.read`, `planning.evaluate`, `run.read`,
+`experiment.read`, `execution.request`, or `execution.approve` actions. A
+central policy requires both the action scope and a current same-tenant subject
+or role grant for the exact resource. Artifact reads require authorized parent
+project access; planning requires project read plus planning permission.
+Execution request and approval remain separate permissions.
+
+Authentication and authorization run before endpoint handlers and repository
+resolvers. An authenticated caller without a grant receives the same typed 403
+response for an existing or missing identifier, without private metadata or a
+repository lookup. An authorized caller retains the existing controlled 404.
+Production grants are injectable; wildcard grants are accepted only by an
+explicitly configured development/test provider.
+
+### Audit, logging, metrics, and health
+
+Security-relevant decisions use immutable canonical audit records with safe
+digests rather than raw resource or tenant identifiers. Authentication failure,
+authorization denial/allow, protected reads, planning, execution requests, and
+approval actions are append-oriented. Mandatory audit failure blocks planning,
+execution, and approval before the operation. Read audit failure is explicitly
+configurable; the production default fails closed. The in-memory sink is test
+evidence only and is not represented as tamper-proof storage. A durable,
+retained, independently protected audit backend remains an E3 blocker.
+
+The standard logging stack emits bounded JSON events for lifecycle,
+authentication, authorization, planning, repository/service failure, and
+request completion. Fields exclude credentials, molecular payloads, topology,
+absolute paths, and raw internal exceptions. A dependency-free collector keeps
+bounded-cardinality request, duration, authentication, authorization, planning,
+capability-count, and repository-failure metrics for tests. Exporter and
+retention integration remain E3 concerns; no public metrics endpoint is added.
+
+Every response carries a validated or generated `X-Correlation-ID`; an
+independent unpredictable request identifier is held in request-local context.
+`/live` proves process responsiveness. `/ready` also requires successful
+application lifecycle, configured repositories/services, authenticator, grant
+provider, and audit sink. An explicitly empty scientific catalogue remains a
+valid ready scientific configuration.
+
+### Frontend boundary
+
+The TypeScript API client accepts an asynchronous access-token provider and
+places a bearer credential only in headers for protected relative Pulsate API
+paths. It never adds credentials to URLs or the public health endpoint. HTTP
+401, 403, 404, and 503 map to distinct controlled authentication-required,
+access-denied, authorized-not-found, and service-unavailable states while the
+existing molecular and planning components remain unchanged. A real browser
+OIDC session provider and login/logout UX remain E3 blockers.
+
+### E2 validation gate
+
+`tests/test_pulsate_security.py` is explicit `core` and `backend_core` gate
+membership alongside the established 16 Phase 1-3 files. It covers the
+contracts, production/development authentication behavior, tenant-aware grants,
+route completeness, enumeration resistance, correlation identity, safe logs,
+audit policy, metrics, readiness, and concurrent context isolation. The
+frontend API-client regression covers token placement and distinct controlled
+HTTP states. Exact post-change local execution results must be recorded in the
+change review; this document does not treat an unexecuted command as evidence.
+
+E3 must still provide and validate external OIDC cryptographic verification,
+durable audit persistence, metrics export/alerting, browser session integration,
+production grant storage, key rotation, operational recovery, and production
+load/concurrency evidence. E4 remains the explicit final readiness gate.
+
 ## Implemented planning boundary
 
 `POST /api/v1/molecular/projects/{project_identifier}/planning/evaluate`
@@ -120,6 +214,7 @@ python -m pytest `
     tests/test_pulsate_experiments.py `
     tests/test_pulsate_molecular_scenes.py `
     tests/test_pulsate_molecular_planning.py `
+    tests/test_pulsate_security.py `
     -m "core and backend_core" `
     --basetemp=".pytest-tmp-e1-phase1-3-core" `
     -q
@@ -166,7 +261,7 @@ Frontend validation uses the lockfile and the repository's own tools:
 ```powershell
 Set-Location frontend
 npm ci
-npm test -- --run src/api/client.test.ts src/components/MolecularPlanningPanel.test.tsx src/hooks/useMolecularPlanning.test.tsx src/App.test.tsx
+npm test -- --run src/api/client.test.ts src/hooks/useExistingRun.test.tsx src/hooks/useMolecularProjectScene.test.tsx src/components/MolecularPlanningPanel.test.tsx src/hooks/useMolecularPlanning.test.tsx src/App.test.tsx
 npm test -- --run
 npm run lint
 npx tsc --noEmit -p tsconfig.app.json
@@ -189,12 +284,12 @@ boundary are not safely available on a generic hosted runner.
 | 1. Architecture and dependency boundaries | PASS | Source dependency audit; mechanical AST import-boundary regression; Phase 3 API delegates to `cgr.molecular.planning` and `cgr.science.feasibility`. | None found in implemented scope. Phase 4 graph execution is absent. | Keep the boundary regression in the required backend suite. |
 | 2. Contract stability and compatibility | PASS | Frozen extra-forbid canonical models, explicit versions, canonical UTF-8 JSON, stable SHA-256 identities, non-finite rejection, deterministic ordering, OpenAPI request/response schemas, and the 507-test backend-core gate. | None found in implemented Phase 1–3 scope. | Retain the classified gate in required CI. |
 | 3. Input and abuse resistance | PASS | Bounded streaming body, collection/catalogue ceilings, bounded topology reads, strict identifiers/text/numbers, path-free typed errors, and executed oversize/malformed/media-type regressions. | None found in implemented Phase 1–3 scope. | Add production-like ASGI abuse testing when a deployment environment exists. |
-| 4. Authentication and authorization | BLOCKED | No FastAPI authentication dependency, principal, tenant, or project/artifact authorization policy exists. | A project identifier currently implies read/planning access and 404 responses permit project enumeration. | Add an external-identity-backed principal and authorize project, artifact, scene, and planning access before resolution or not-found disclosure. |
+| 4. Authentication and authorization | BLOCKED | E2 adds versioned principals/security contexts, injectable bearer authentication, centralized tenant/grant authorization, exact route coverage, enumeration-safe denials, and OpenAPI security declarations. | No external OIDC verifier, production identity-provider configuration, or durable production grant repository is provisioned. | Add startup-loaded/cached OIDC cryptographic verification, production grant persistence, key rotation, and deployment acceptance. |
 | 5. Read-only and side-effect guarantees | PASS | Persisted project/artifact snapshots, repeated-response equality, no-execution spies, GET-only scene access, and absence of planner persistence APIs all ran in the backend-core gate. | None found in implemented Phase 1–3 scope. | Retain repository/run/store before-and-after checks in required CI. |
 | 6. Integrity and provenance | PASS | Content hashes, canonical topology bytes, exact structure/topology identity and counts, immutable pointers, lineage, project/objective/resource/capability/evidence fingerprints, distinct structural/electronic-region contracts, and tamper regressions all ran. | None found in implemented Phase 1–3 scope. | Retain tamper and atomic-publication regressions in required CI. |
 | 7. Concurrency and lifecycle | BLOCKED | `RLock`-guarded service lifecycle, nested application shutdown, context-managed clients, explicit repository closure, deterministic concurrency regressions, and ten repeated Windows publication runs. | Production-duration ASGI concurrency, Linux parity, and handle-leak evidence remain absent. | Add sustained Windows/Linux ASGI concurrency and handle-leak evidence. |
 | 8. Failure recovery | BLOCKED | Typed missing/corrupt evidence failures, controlled resolver/startup/unexpected-planner errors, fail-then-success regression, atomic temporary cleanup, and path-free internal publication diagnostics all ran. | Repository backup/restore and corruption-isolation operations remain unspecified. | Define and validate immutable repository backup, restore, and corruption isolation procedures. |
-| 9. Observability and auditability | BLOCKED | Deterministic project/objective/plan/fact fingerprints can act as safe correlation identities. | The Pulsate API has no operational logging/metrics foundation for request identity, safe project identity, duration, result counts, failure category, or lifecycle failures. | Add centrally configured structured audit logging and metrics with redaction and retention policy; do not log molecular payloads or secrets. |
+| 9. Observability and auditability | BLOCKED | E2 adds correlation/request identity, bounded JSON events, canonical append-oriented audit records, mandatory write-audit failure policy, and bounded-cardinality in-process metrics. | No durable tamper-evident audit backend, metrics exporter/alerting, production retention, or production operations evidence exists. | Provision and validate durable audit storage, metrics export, alerts, retention, access controls, and recovery. |
 | 10. Performance and scalability | BLOCKED | Local deterministic benchmark documented below; repeated fact fingerprints are now computed once per plan. | No production load, memory, latency percentile, large-topology streaming, or service-level evidence exists. | Establish supported project/catalogue profiles, memory budgets, percentile targets, load tests, and streaming fact projection for topologies above the API-process ceiling. |
 | 11. Frontend reliability and accessibility | BLOCKED | Native labelled controls, keyboard-operable HTML, visible focus, textual status labels, loading/error/empty/no-assignment states, expandable findings, read-only execution notice, Mol* remains mounted. ESLint and both TypeScript checks passed. | Vitest and the Vite production stage were blocked by transient-file sandbox denial. No manual assistive-technology evidence exists. | Complete package validation and perform keyboard/screen-reader/zoom acceptance against production assets. |
 | 12. Configuration and deployment safety | BLOCKED | Paired root validation, controlled repository roots, empty safe catalogue default, no hard-coded Windows production path, no planning credentials, and real Phase 1-3 backend/frontend CI jobs. | Production catalogue/deployment/runtime policy, backup, rollback, and disaster recovery remain absent; the new CI workflow has not yet completed remotely. | Require the CI gate, define the production configuration schema, deployment manifests, health/readiness checks, backup/restore, rollback, and environment promotion evidence. |
@@ -228,6 +323,21 @@ as post-change validation.
 - The production build completed both TypeScript stages, then Vite failed at
   transient configuration-module creation with `EPERM`; no production-build
   success is claimed.
+- The uncommitted E2 focused backend gate completed with 70 passed tests after
+  two narrow pre-execution corrections: the direct audit test now supplies the
+  full Bearer header and resource authorization accepts the repository's
+  bounded namespaced identifier grammar rather than the correlation-ID grammar.
+- The final classified Phase 1-3 plus E2 backend-core gate completed with 527
+  passed and 25 skipped tests. Ruff passed across every Python file changed by
+  E2.
+- Targeted authentication/API/workspace Vitest completed with 78 passed tests;
+  the complete frontend suite completed with 164 passed tests. ESLint and both
+  application and Node TypeScript checks passed.
+- The E2 production Vite build completed after transforming 1,209 modules into
+  a task-owned external output directory. Vite reported the existing large
+  JavaScript chunk warning (2,885.87 kB, 819.69 kB gzip), which remains
+  performance evidence to address before an enterprise-readiness decision.
+- `git diff --check` passed after the final implementation correction.
 - `git diff --check` completed successfully for tracked changes. New-file
   whitespace was checked separately because unstaged untracked files are not
   included by ordinary `git diff --check`.

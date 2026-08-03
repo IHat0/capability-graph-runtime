@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { pulsateApi } from '../api/client'
+import { ApiError, pulsateApi } from '../api/client'
 import type { FetchedMolecularResource, ProjectedMolecularSceneMetadata, ProjectedMolecularStructureMetadata } from '../api/types'
 import {
   parseMolecularTopology,
@@ -17,6 +17,7 @@ export interface MolecularProjectSceneApi {
 
 function controlledMessage(error: unknown): string {
   if (error instanceof DOMException && error.name === 'AbortError') return ''
+  if (error instanceof ApiError && [401, 403, 404, 503].includes(error.status ?? 0)) return error.message
   return 'The molecular project scene is unavailable or failed integrity validation.'
 }
 

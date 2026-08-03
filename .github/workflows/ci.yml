@@ -32,9 +32,12 @@ jobs:
             check
             src/cgr/pulsate_api/app.py
             src/cgr/pulsate_api/molecular_planning.py
+            src/cgr/pulsate_api/security.py
+            src/cgr/pulsate_api/security_contracts.py
             src/cgr/science/feasibility.py
             tests/conftest.py
             tests/test_pulsate_molecular_planning.py
+            tests/test_pulsate_security.py
             tests/test_scientific_feasibility.py
             tests/test_scientific_foundation.py
             tests/test_quantum_model_provider.py
@@ -59,6 +62,7 @@ jobs:
             tests/test_pulsate_experiments.py \
             tests/test_pulsate_molecular_scenes.py \
             tests/test_pulsate_molecular_planning.py \
+            tests/test_pulsate_security.py \
             -m "core and backend_core" \
             --basetemp=.pytest-tmp-ci-phase1-3 \
             -q
@@ -82,7 +86,9 @@ jobs:
           npm test -- --run
           src/api/client.test.ts
           src/components/MolecularPlanningPanel.test.tsx
+          src/hooks/useExistingRun.test.tsx
           src/hooks/useMolecularPlanning.test.tsx
+          src/hooks/useMolecularProjectScene.test.tsx
           src/App.test.tsx
       - name: Run complete frontend tests
         run: npm test -- --run

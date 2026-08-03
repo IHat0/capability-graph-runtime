@@ -1,5 +1,6 @@
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '../api/client'
 import type {
   IBMExecutionEvidence,
   RunReceiptResponse,
@@ -236,6 +237,26 @@ describe('read-only existing run loading', () => {
     expect((screen.getByRole('button', { name: 'Opening...' }) as HTMLButtonElement).disabled).toBe(true)
     expect(document.body.textContent).not.toContain('OpeningÔÇª')
     expect(document.body.textContent).not.toContain('Openingâ€¦')
+  })
+
+  it.each([
+    [401, 'Authentication is required to access Pulsate.'],
+    [403, 'Access to the requested Pulsate resource is denied.'],
+  ])('preserves the controlled HTTP %s security state', async (status, message) => {
+    const api: ExistingRunApi = {
+      getRun: vi.fn().mockRejectedValue(new ApiError(message, status)),
+      getRunScene: vi.fn(),
+      getRunResults: vi.fn(),
+      getRunVerification: vi.fn(),
+      getRunReceipt: vi.fn(),
+    }
+    const { result } = renderHook(() => useExistingRun(api))
+    act(() => result.current.setRunIdentifierInput(runIdentifier))
+
+    await act(async () => { expect(await result.current.openRun()).toBe(false) })
+
+    expect(result.current.error).toBe(message)
+    expect(api.getRunScene).not.toHaveBeenCalled()
   })
 
   it('loads a rejected IBM terminal run and uses only its persisted scene and GET evidence', async () => {

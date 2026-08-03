@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cgr.molecular import (
@@ -77,6 +79,18 @@ from .runs import (
     RunNotFoundError,
     SceneUnavailableError,
     assert_public_response_safe,
+)
+from .security import (
+    CORRELATION_HEADER,
+    PUBLIC_ROUTES,
+    ROUTE_PROTECTIONS,
+    SecurityBoundaryError,
+    SecurityServices,
+    monotonic_time,
+    request_identifier as new_request_identifier,
+    route_resource_identifier,
+    safe_digest,
+    valid_or_generated_correlation,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -344,7 +358,9 @@ def create_app(
     molecular_scene_service: NativeMolecularSceneService | None = None,
     molecular_planning_service: MolecularPlanningService | None = None,
     scientific_capability_catalogue: ScientificCapabilityCatalog | None = None,
+    security_services: SecurityServices | None = None,
 ) -> FastAPI:
+    security_services = security_services or SecurityServices.from_environment()
     scientific_capability_catalogue = (
         scientific_capability_catalogue or ScientificCapabilityCatalog()
     )
@@ -409,18 +425,38 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
+        _application.state.lifecycle_ready = False
         try:
-            experiment_store.start()
-            natural_language_store.start()
-            run_coordinator.start()
-            if molecular_project_repository is not None:
-                molecular_project_repository.start()
-            if molecular_scene_service is not None:
-                molecular_scene_service.start()
-            if molecular_planning_service is not None:
-                molecular_planning_service.start()
+            try:
+                security_services.start()
+            except Exception:
+                security_services.events.emit(
+                    "repository.unavailable", category="security_startup"
+                )
+            try:
+                experiment_store.start()
+                natural_language_store.start()
+                run_coordinator.start()
+                if molecular_project_repository is not None:
+                    molecular_project_repository.start()
+                if molecular_scene_service is not None:
+                    molecular_scene_service.start()
+                if molecular_planning_service is not None:
+                    molecular_planning_service.start()
+            except Exception:
+                security_services.metrics.increment(
+                    "repository_failures", category="repository_startup"
+                )
+                security_services.events.emit(
+                    "repository.unavailable", category="repository_startup"
+                )
+                raise
+            _application.state.lifecycle_ready = True
+            if security_services.ready():
+                security_services.events.emit("application.ready")
             yield
         finally:
+            _application.state.lifecycle_ready = False
             try:
                 if molecular_planning_service is not None:
                     molecular_planning_service.close()
@@ -439,7 +475,55 @@ def create_app(
                             try:
                                 natural_language_store.close()
                             finally:
-                                experiment_store.close()
+                                try:
+                                    experiment_store.close()
+                                finally:
+                                    security_services.close()
+
+    async def enforce_security(request: Request) -> None:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", request.url.path)
+        route_key = (request.method, route_path)
+        if route_key in PUBLIC_ROUTES:
+            return
+        protection = ROUTE_PROTECTIONS.get(route_key)
+        if protection is None:
+            raise _typed_error(
+                503,
+                "route_security_unavailable",
+                "Route security policy is unavailable.",
+            )
+        correlation_identifier = request.state.correlation_identifier
+        generated_request_identifier = request.state.request_identifier
+        try:
+            context = security_services.authenticate(
+                request.headers.get("Authorization"),
+                correlation_identifier,
+                generated_request_identifier,
+            )
+            try:
+                resource_identifier = route_resource_identifier(
+                    protection,
+                    path_params=request.path_params,
+                    query_params=request.query_params,
+                )
+            except SecurityBoundaryError:
+                security_services.audit_invalid_resource_denial(
+                    context, protection
+                )
+                raise
+            security_services.authorize(context, protection, resource_identifier)
+        except SecurityBoundaryError as exc:
+            headers = (
+                {"WWW-Authenticate": "Bearer"}
+                if exc.status_code == 401
+                else None
+            )
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.category, "message": exc.public_message},
+                headers=headers,
+            ) from None
 
     application = FastAPI(
         title="Pulsate Labs API",
@@ -449,6 +533,7 @@ def create_app(
             "or discovered experiments through controlled workflows."
         ),
         lifespan=lifespan,
+        dependencies=[Depends(enforce_security)],
     )
     application.state.run_coordinator = run_coordinator
     application.state.experiment_store = experiment_store
@@ -462,6 +547,101 @@ def create_app(
         if molecular_planning_service is not None
         else scientific_capability_catalogue
     )
+    application.state.security_services = security_services
+    application.state.lifecycle_ready = False
+
+    @application.exception_handler(SecurityBoundaryError)
+    async def controlled_security_failure(
+        _request: Request, exc: SecurityBoundaryError
+    ) -> JSONResponse:
+        headers = (
+            {"WWW-Authenticate": "Bearer"}
+            if exc.status_code == 401
+            else None
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "detail": {
+                    "code": exc.category,
+                    "message": exc.public_message,
+                }
+            },
+            headers=headers,
+        )
+
+    @application.middleware("http")
+    async def security_request_identity(request: Request, call_next):
+        correlation_identifier = valid_or_generated_correlation(
+            request.headers.get(CORRELATION_HEADER)
+        )
+        generated_request_identifier = new_request_identifier()
+        request.state.correlation_identifier = correlation_identifier
+        request.state.request_identifier = generated_request_identifier
+        started = monotonic_time()
+        response: Response | None = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            duration = monotonic_time() - started
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", "unmatched")
+            status_code = response.status_code if response is not None else 500
+            if response is not None:
+                response.headers[CORRELATION_HEADER] = correlation_identifier
+            security_services.metrics.increment(
+                "request_count",
+                method=request.method,
+                route=safe_digest(route_path),
+                status=str(status_code),
+            )
+            security_services.metrics.observe(
+                "request_duration_seconds",
+                duration,
+                method=request.method,
+                route=safe_digest(route_path),
+                status=str(status_code),
+            )
+            security_services.events.emit(
+                "request.completed",
+                correlation_identifier=correlation_identifier,
+                request_identifier=generated_request_identifier,
+                method=request.method,
+                route=safe_digest(route_path),
+                status=status_code,
+                duration_ms=round(duration * 1000, 3),
+            )
+            security_services.clear_context()
+
+    def custom_openapi() -> dict[str, Any]:
+        if application.openapi_schema is not None:
+            return application.openapi_schema
+        schema = get_openapi(
+            title=application.title,
+            version=application.version,
+            description=application.description,
+            routes=application.routes,
+        )
+        components = schema.setdefault("components", {})
+        components.setdefault("securitySchemes", {})["BearerAuth"] = {
+            "type": "http",
+            "scheme": "bearer",
+        }
+        for path, operations in schema.get("paths", {}).items():
+            if not isinstance(operations, dict):
+                continue
+            for method, operation in operations.items():
+                if not isinstance(operation, dict):
+                    continue
+                key = (method.upper(), path)
+                operation["security"] = [] if key in PUBLIC_ROUTES else [
+                    {"BearerAuth": []}
+                ]
+        application.openapi_schema = schema
+        return schema
+
+    application.openapi = custom_openapi
 
     def require_molecular_scene_service() -> NativeMolecularSceneService:
         if molecular_scene_service is None:
@@ -474,6 +654,12 @@ def create_app(
 
     def map_molecular_scene_error(exc: NativeMolecularSceneError) -> HTTPException:
         if isinstance(exc, NativeMolecularSceneUnavailableError):
+            security_services.metrics.increment(
+                "repository_failures", category="scene_service_unavailable"
+            )
+            security_services.events.emit(
+                "repository.unavailable", category="scene_service_unavailable"
+            )
             return _typed_error(
                 503,
                 "molecular_scene_service_unavailable",
@@ -485,6 +671,12 @@ def create_app(
                 "molecular_resource_not_found",
                 "Requested molecular resource was not found.",
             )
+        security_services.metrics.increment(
+            "repository_failures", category="scene_integrity_failure"
+        )
+        security_services.events.emit(
+            "repository.unavailable", category="scene_integrity_failure"
+        )
         return _typed_error(
             409,
             "molecular_scene_unavailable",
@@ -520,6 +712,12 @@ def create_app(
                 str(exc),
             )
         if isinstance(exc, MolecularPlanningUnavailableError):
+            security_services.metrics.increment(
+                "repository_failures", category="planning_service_unavailable"
+            )
+            security_services.events.emit(
+                "repository.unavailable", category="planning_service_unavailable"
+            )
             return _typed_error(
                 503,
                 "molecular_planning_service_unavailable",
@@ -588,6 +786,37 @@ def create_app(
         return {
             "service": "pulsate-api", "status": "healthy", "version": "0.2.0",
         }
+
+    @application.get("/live")
+    def liveness() -> dict[str, str]:
+        return {"status": "alive"}
+
+    @application.get("/ready")
+    def readiness() -> dict[str, str]:
+        configured_services = (
+            experiment_store,
+            natural_language_store,
+            run_coordinator,
+            molecular_project_repository,
+            molecular_artifact_repository,
+            molecular_scene_service,
+            molecular_planning_service,
+        )
+        repositories_ready = all(
+            service is None or bool(getattr(service, "_started", True))
+            for service in configured_services
+        )
+        if (
+            not application.state.lifecycle_ready
+            or not security_services.ready()
+            or not repositories_ready
+        ):
+            raise _typed_error(
+                503,
+                "service_not_ready",
+                "The service is not ready.",
+            )
+        return {"status": "ready"}
 
     @application.get("/api/v1/molecular/scenes/projected")
     def read_projected_molecular_scene(
@@ -660,6 +889,7 @@ def create_app(
         project_identifier: str,
         http_request: Request,
     ) -> dict[str, Any]:
+        security_services.events.emit("planning.started")
         try:
             request_payload = await _read_bounded_json_object(
                 http_request,
@@ -684,11 +914,40 @@ def create_app(
                 request=request,
             )
             payload = response.model_dump(mode="json")
+            security_services.audit_planning_result(response.plan_fingerprint)
+            security_services.metrics.increment("planning_evaluations")
+            security_services.metrics.increment(
+                "selected_capability_count",
+                len(response.plan.selected_assignments),
+                category="selected",
+            )
+            security_services.metrics.increment(
+                "rejected_capability_count",
+                len(response.plan.rejected_alternatives),
+                category="rejected",
+            )
+            security_services.events.emit(
+                "planning.completed",
+                selected_count=len(response.plan.selected_assignments),
+                rejected_count=len(response.plan.rejected_alternatives),
+            )
             assert_public_response_safe(payload)
             return payload
         except MolecularPlanningError as exc:
+            security_services.metrics.increment(
+                "planning_failures", category=type(exc).__name__[:64]
+            )
+            security_services.events.emit(
+                "planning.failed", category="controlled_planning_error"
+            )
             raise map_molecular_planning_error(exc) from None
         except (TypeError, ValueError):
+            security_services.metrics.increment(
+                "planning_failures", category="invalid_planning_evidence"
+            )
+            security_services.events.emit(
+                "planning.failed", category="invalid_planning_evidence"
+            )
             raise _typed_error(
                 409,
                 "molecular_planning_failed",
