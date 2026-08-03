@@ -28,8 +28,9 @@ jobs:
           python -m pip install --no-deps -e .
       - uses: astral-sh/ruff-action@v3
         with:
-          args: >-
-            check
+          version: "0.15.20"
+          args: "check"
+          src: >-
             src/cgr/pulsate_api/app.py
             src/cgr/pulsate_api/config_check.py
             src/cgr/pulsate_api/molecular_planning.py
