@@ -1,0 +1,47 @@
+services:
+  pulsate-api:
+    image: "${PULSATE_IMAGE:?Set PULSATE_IMAGE to an immutable reviewed image reference}"
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --shutdown-timeout
+      - "30"
+    env_file:
+      - "${PULSATE_ENV_FILE:?Set PULSATE_ENV_FILE to a protected production environment file}"
+    ports:
+      - "${PULSATE_HOST_PORT:-8000}:8000"
+    volumes:
+      - "${PULSATE_CONFIGURATION_ROOT:?Set configuration root}:/etc/pulsate:ro"
+      - "${PULSATE_DATA_ROOT:?Set application-data root}:/var/lib/pulsate:rw"
+      - "${PULSATE_RECOVERY_ROOT:?Set backup and receipt root}:/var/lib/pulsate-recovery:rw"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1770,uid=10001,gid=10001
+    user: "10001:10001"
+    init: true
+    stop_grace_period: 40s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: "${PULSATE_MEMORY_LIMIT:-2g}"
+    cpus: "${PULSATE_CPU_LIMIT:-2.0}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/live', timeout=2).read();
+          urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2).read()
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s

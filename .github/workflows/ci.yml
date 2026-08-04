@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -20,12 +21,14 @@ jobs:
           cache-dependency-path: |
             requirements/quantum-preflight.lock
             requirements/pulsate-http-integration.lock
+            requirements/pulsate-production-security.lock
       - name: Install pinned backend validation dependencies
         run: |
           python -m pip install --require-hashes \
             -r requirements/quantum-preflight.lock \
-            -r requirements/pulsate-http-integration.lock
-          python -m pip install --no-deps -e .
+            -r requirements/pulsate-http-integration.lock \
+            -r requirements/pulsate-production-security.lock
+          python -m pip install --no-deps --no-build-isolation -e .
       - uses: astral-sh/ruff-action@v3
         with:
           version: "0.15.20"
@@ -33,10 +36,13 @@ jobs:
           src: >-
             src/cgr/pulsate_api/app.py
             src/cgr/pulsate_api/config_check.py
+            src/cgr/pulsate_api/deployment.py
+            src/cgr/pulsate_api/enterprise_gate.py
             src/cgr/pulsate_api/molecular_planning.py
             src/cgr/pulsate_api/production_catalogue.py
             src/cgr/pulsate_api/production_configuration.py
             src/cgr/pulsate_api/production_security.py
+            src/cgr/pulsate_api/recovery.py
             src/cgr/pulsate_api/security.py
             src/cgr/pulsate_api/security_contracts.py
             src/cgr/science/__init__.py
@@ -44,8 +50,11 @@ jobs:
             src/cgr/science/feasibility.py
             tests/conftest.py
             tests/test_pulsate_molecular_planning.py
+            tests/test_pulsate_deployment.py
+            tests/test_pulsate_enterprise_gate.py
             tests/test_pulsate_production_catalogue.py
             tests/test_pulsate_production_security.py
+            tests/test_pulsate_recovery.py
             tests/test_pulsate_security.py
             tests/test_scientific_feasibility.py
             tests/test_scientific_foundation.py
@@ -69,10 +78,13 @@ jobs:
             tests/test_pulsate_api.py \
             tests/test_pulsate_runs.py \
             tests/test_pulsate_experiments.py \
+            tests/test_pulsate_deployment.py \
+            tests/test_pulsate_enterprise_gate.py \
             tests/test_pulsate_molecular_scenes.py \
             tests/test_pulsate_molecular_planning.py \
             tests/test_pulsate_production_catalogue.py \
             tests/test_pulsate_production_security.py \
+            tests/test_pulsate_recovery.py \
             tests/test_pulsate_security.py \
             -m "core and backend_core" \
             --basetemp=.pytest-tmp-ci-phase1-3 \
@@ -111,3 +123,164 @@ jobs:
         run: npx tsc --noEmit -p tsconfig.node.json
       - name: Build production frontend
         run: npm run build
+
+  backend-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { gate: audit-integrity, tests: tests/test_pulsate_security.py }
+          - { gate: authorization, tests: tests/test_pulsate_security.py }
+          - { gate: catalogue-determinism, tests: tests/test_pulsate_production_catalogue.py }
+          - { gate: correlation-identity, tests: tests/test_pulsate_security.py }
+          - { gate: durable-audit, tests: tests/test_pulsate_security.py }
+          - { gate: durable-grants, tests: tests/test_pulsate_security.py }
+          - { gate: enumeration-resistance, tests: tests/test_pulsate_production_security.py }
+          - { gate: molecular-artifact-integrity, tests: tests/test_molecular_artifact_repository.py }
+          - { gate: molecular-atomic-publication, tests: tests/test_molecular_artifact_repository.py tests/test_molecular_project_repository.py }
+          - { gate: molecular-concurrency, tests: tests/test_molecular_artifact_repository.py tests/test_molecular_project_repository.py }
+          - { gate: molecular-corruption-detection, tests: tests/test_molecular_artifact_repository.py tests/test_molecular_project_repository.py }
+          - { gate: molecular-project-integrity, tests: tests/test_molecular_project_repository.py }
+          - { gate: planning-api, tests: tests/test_pulsate_molecular_planning.py }
+          - { gate: planning-determinism, tests: tests/test_molecular_planning.py tests/test_scientific_planning.py }
+          - { gate: planning-no-execution-authorization, tests: tests/test_pulsate_molecular_planning.py }
+          - { gate: planning-read-only, tests: tests/test_pulsate_molecular_planning.py }
+          - { gate: production-jwt-jwks, tests: tests/test_pulsate_production_security.py }
+          - { gate: readiness-failure, tests: tests/test_pulsate_production_security.py }
+          - { gate: resource-feasibility-contracts, tests: tests/test_scientific_feasibility.py }
+          - { gate: schema-compatibility, tests: tests/test_scientific_foundation.py }
+          - { gate: scientific-canonical-serialization, tests: tests/test_scientific_foundation.py }
+          - { gate: scientific-contract-compatibility, tests: tests/test_scientific_foundation.py tests/test_molecular_contracts.py }
+          - { gate: secret-path-redaction, tests: tests/test_pulsate_production_security.py }
+          - { gate: tenant-isolation, tests: tests/test_pulsate_security.py }
+          - { gate: unassigned-plan, tests: tests/test_molecular_planning.py }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements/quantum-preflight.lock
+            requirements/pulsate-http-integration.lock
+            requirements/pulsate-production-security.lock
+      - name: Install pinned evidence runtime
+        run: |
+          python -m pip install --require-hashes \
+            -r requirements/quantum-preflight.lock \
+            -r requirements/pulsate-http-integration.lock \
+            -r requirements/pulsate-production-security.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+      - name: Run actual backend gate and write canonical evidence
+        run: |
+          mkdir -p "enterprise-evidence/records" "enterprise-evidence/artifacts/${{ matrix.gate }}"
+          cgr-pulsate-evidence-run \
+            --gate "${{ matrix.gate }}" \
+            --producer "ci.yml:backend-evidence" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output "${{ matrix.gate }}.json" \
+            --artifact "artifacts/${{ matrix.gate }}/pytest.xml" \
+            -- python -m pytest ${{ matrix.tests }} -q \
+              --junitxml="enterprise-evidence/artifacts/${{ matrix.gate }}/pytest.xml"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-evidence-backend-${{ matrix.gate }}
+          path: enterprise-evidence/
+
+  frontend-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { gate: frontend-application-typescript, command: app-typescript }
+          - { gate: frontend-authentication-states, command: auth-tests }
+          - { gate: frontend-build, command: build }
+          - { gate: frontend-eslint, command: eslint }
+          - { gate: frontend-node-typescript, command: node-typescript }
+          - { gate: frontend-planning-workspace, command: planning-tests }
+          - { gate: frontend-vitest, command: complete-tests }
+          - { gate: molecular-workspace, command: molecular-tests }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install canonical evidence CLI
+        run: |
+          python -m pip install --require-hashes \
+            -r requirements/pulsate-http-integration.lock
+          python -m pip install --no-deps .
+          npm ci --prefix frontend
+          mkdir -p "enterprise-evidence/records" "enterprise-evidence/artifacts/${{ matrix.gate }}"
+      - name: Record application TypeScript evidence
+        if: matrix.command == 'app-typescript'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm exec --prefix frontend -- tsc --noEmit -p tsconfig.app.json
+      - name: Record Node TypeScript evidence
+        if: matrix.command == 'node-typescript'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm exec --prefix frontend -- tsc --noEmit -p tsconfig.node.json
+      - name: Record ESLint evidence
+        if: matrix.command == 'eslint'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm run --prefix frontend lint
+      - name: Record Vite build evidence
+        if: matrix.command == 'build'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm run --prefix frontend build
+      - name: Record authentication-state Vitest evidence
+        if: matrix.command == 'auth-tests'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm test --prefix frontend -- --run src/App.test.tsx
+      - name: Record planning-workspace Vitest evidence
+        if: matrix.command == 'planning-tests'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm test --prefix frontend -- --run src/components/MolecularPlanningPanel.test.tsx src/hooks/useMolecularPlanning.test.tsx
+      - name: Record molecular-workspace Vitest evidence
+        if: matrix.command == 'molecular-tests'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm test --prefix frontend -- --run src/hooks/useMolecularProjectScene.test.tsx src/App.test.tsx
+      - name: Record complete Vitest evidence
+        if: matrix.command == 'complete-tests'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
+          --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
+          -- npm test --prefix frontend -- --run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-evidence-frontend-${{ matrix.gate }}
+          path: enterprise-evidence/

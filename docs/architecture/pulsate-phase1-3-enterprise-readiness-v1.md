@@ -1,5 +1,31 @@
 # Pulsate Phase 1–3 Enterprise Readiness Gate v1
 
+## E5-E7 coordinated implementation (uncommitted)
+
+Starting checkpoint: `0b4cfff656d4fe0b3c943458c38e9908ec26af83`.
+
+E5 defines one supported single-node container deployment, pre-listener
+production validation, an authoritative persistence inventory, offline
+coordinated backup/verification/restore, one bounded cross-process recovery
+lock, atomic no-replace publication, safe receipts, operator-switched rollback,
+and non-destructive retention. It does not claim online backup consistency,
+high availability, automatic failover, or atomic cross-platform mount switching.
+
+E6 adds connected-CI dependency, SBOM, vulnerability, secret, static-security,
+license, and exact-image scanning jobs. Their implementation is not scan
+evidence. Local scanners without installed tools/current databases are
+`BLOCKED`; connected jobs are `PENDING` until they actually run.
+
+E7 adds canonical evidence/decision contracts, a same-commit artifact-hash
+verifying CLI, and final CI aggregator. The current decision is:
+
+```text
+PENDING_REMOTE_EVIDENCE
+```
+
+Only the actual E7 gate may later produce PASS. Procedures and limitations are
+in `docs/operations/pulsate-*.md`.
+
 ## Decision record
 
 Audit date: 2026-08-02
@@ -623,3 +649,21 @@ operational monitoring, disaster recovery, vulnerability clearance,
 production scalability, or enterprise readiness. Phase 4 workflow graphs,
 scientific-engine adapters, candidate generation, and discovery loops remain
 outside this checkpoint.
+
+## E7 command-derived readiness evidence
+
+E7 retains one registry of 67 mandatory gate producers. CI, supply-chain, and
+deployment jobs invoke `cgr-pulsate-evidence-run` with an explicit registry
+gate and workflow-job identity. The runner executes the real child argv without
+shell interpolation, except for narrowly bounded multi-operation Bash commands
+declared in workflow source. It records real UTC timing and exit status, parses
+declared machine reports, hashes actual bytes, and creates one exclusive
+canonical record. It cannot create `PENDING` or infer `PASS` from a file.
+
+The enterprise workflow calls the CI and supply-chain definitions through
+`workflow_call`, so their artifacts belong to the same workflow run and source
+commit. Final aggregation runs with `if: always()`, rejects stale, unexpected,
+duplicate, contradictory, malformed, or hash-mismatched records, and invokes
+the installed `cgr-pulsate-enterprise-gate`. Failed, blocked, and missing gates
+remain nonzero. Remote execution is still `PENDING`; local workflow inspection
+is not substitute evidence, and no enterprise-readiness claim is made.

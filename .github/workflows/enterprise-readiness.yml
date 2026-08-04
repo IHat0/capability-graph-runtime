@@ -1,0 +1,254 @@
+name: Enterprise readiness evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deployment-and-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PULSATE_IMAGE: cgr-pulsate:${{ github.sha }}
+      PULSATE_ENV_FILE: /tmp/pulsate-e7/runtime.env
+      PULSATE_CONFIGURATION_ROOT: /tmp/pulsate-e7/configuration
+      PULSATE_DATA_ROOT: /tmp/pulsate-e7/data
+      PULSATE_RECOVERY_ROOT: /tmp/pulsate-e7/recovery
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { gate: authentication, kind: shell, command: "docker compose -f compose.production.yml up --detach && curl --retry 30 --retry-delay 1 --retry-connrefused --silent --output /dev/null http://127.0.0.1:8000/ready && test \"$(curl --silent --output /dev/null --write-out '%{http_code}' --header \"Authorization: Bearer $(cat /tmp/pulsate-e7/token.txt)\" http://127.0.0.1:8000/api/v1/molecular-projects/project-00000000000000000000000000)\" = 403" }
+          - { gate: backup, kind: pytest, tests: "tests/test_pulsate_recovery.py::test_backup_manifest_is_deterministic_and_verifies_real_contents" }
+          - { gate: backup-verification, kind: pytest, tests: "tests/test_pulsate_recovery.py::test_backup_verification_rejects_corruption" }
+          - { gate: compose-validation, kind: shell, command: "docker compose -f compose.production.yml config --quiet" }
+          - { gate: container-graceful-shutdown, kind: shell, command: "docker compose -f compose.production.yml up --detach && docker compose -f compose.production.yml stop --timeout 40" }
+          - { gate: container-live-probe, kind: shell, command: "docker compose -f compose.production.yml up --detach && curl --retry 30 --retry-delay 1 --retry-connrefused --fail --silent --show-error http://127.0.0.1:8000/live" }
+          - { gate: container-non-root, kind: shell, command: "docker build --build-arg SOURCE_REVISION=${GITHUB_SHA} --tag cgr-pulsate:${GITHUB_SHA} . && test \"$(docker image inspect --format '{{.Config.User}}' cgr-pulsate:${GITHUB_SHA})\" = '10001:10001'" }
+          - { gate: container-ready-probe, kind: shell, command: "docker compose -f compose.production.yml up --detach && curl --retry 30 --retry-delay 1 --retry-connrefused --fail --silent --show-error http://127.0.0.1:8000/ready" }
+          - { gate: container-startup, kind: shell, command: "docker compose -f compose.production.yml up --detach && test \"$(docker inspect --format '{{.State.Running}}' \"$(docker compose -f compose.production.yml ps --quiet pulsate-api)\")\" = true" }
+          - { gate: container-startup-duration, kind: blocked-shell, command: "start=$(date +%s%N); docker compose -f compose.production.yml up --detach; curl --retry 30 --retry-delay 1 --retry-connrefused --fail --silent --show-error http://127.0.0.1:8000/ready; finish=$(date +%s%N); printf '{\"duration_nanoseconds\":%s}\n' \"$((finish-start))\" > enterprise-evidence/artifacts/container-startup-duration/measurement.json; exit 78" }
+          - { gate: image-build, kind: image, command: "docker build --build-arg SOURCE_REVISION=${GITHUB_SHA} --tag cgr-pulsate:${GITHUB_SHA} . && docker image inspect cgr-pulsate:${GITHUB_SHA} > enterprise-evidence/artifacts/image-build/image-inspect.json && test \"$(docker image inspect --format '{{index .Config.Labels \\\"org.opencontainers.image.revision\\\"}}' cgr-pulsate:${GITHUB_SHA})\" = \"${GITHUB_SHA}\"" }
+          - { gate: lifecycle-stability, kind: shell, command: "docker compose -f compose.production.yml up --detach && docker compose -f compose.production.yml stop --timeout 40 && docker compose -f compose.production.yml up --detach && curl --retry 30 --retry-delay 1 --retry-connrefused --fail --silent --show-error http://127.0.0.1:8000/ready" }
+          - { gate: memory-process-observations, kind: diagnostic-shell, command: "docker compose -f compose.production.yml up --detach && docker stats --no-stream --format '{{json .}}' \"$(docker compose -f compose.production.yml ps --quiet pulsate-api)\" > enterprise-evidence/artifacts/memory-process-observations/measurement.json" }
+          - { gate: performance-acceptance, kind: policy, command: "import os,sys; sys.exit(1 if os.environ.get('PULSATE_APPROVED_PERFORMANCE_POLICY') else 78)" }
+          - { gate: performance-diagnostics, kind: pytest, tests: "tests/test_pulsate_deployment.py tests/test_pulsate_recovery.py" }
+          - { gate: planning-latency, kind: blocked-pytest, tests: "tests/test_pulsate_molecular_planning.py" }
+          - { gate: readiness-transition, kind: shell, command: "docker compose -f compose.production.yml up --detach && curl --retry 30 --retry-delay 1 --retry-connrefused --fail --silent --show-error http://127.0.0.1:8000/ready" }
+          - { gate: recovery-duration, kind: blocked-pytest, tests: "tests/test_pulsate_recovery.py::test_backup_manifest_is_deterministic_and_verifies_real_contents" }
+          - { gate: recovery-stability, kind: pytest, tests: "tests/test_pulsate_recovery.py::test_recovery_lock_excludes_concurrent_owner_and_releases tests/test_pulsate_recovery.py::test_recovery_lock_releases_after_controlled_exception" }
+          - { gate: request-concurrency, kind: blocked-pytest, tests: "tests/test_pulsate_production_security.py::test_concurrent_grant_readers_are_isolated_and_shutdown_is_controlled" }
+          - { gate: restore, kind: pytest, tests: "tests/test_pulsate_recovery.py::test_restore_requires_empty_target_and_initializes_restored_providers" }
+          - { gate: restored-readiness, kind: pytest, tests: "tests/test_pulsate_recovery.py::test_restore_requires_empty_target_and_initializes_restored_providers" }
+          - { gate: rollback-procedure, kind: pytest, tests: "tests/test_pulsate_recovery.py::test_failed_publication_cleans_only_task_owned_staging" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned runtime and test dependencies
+        run: |
+          python -m pip install --require-hashes \
+            -r requirements/quantum-preflight.lock \
+            -r requirements/pulsate-http-integration.lock \
+            -r requirements/pulsate-production-security.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+          mkdir -p "enterprise-evidence/records" "enterprise-evidence/artifacts/${{ matrix.gate }}"
+      - name: Prepare an ephemeral non-secret container environment
+        if: matrix.kind == 'shell' || matrix.kind == 'blocked-shell' || matrix.kind == 'diagnostic-shell'
+        run: |
+          mkdir -p /tmp/pulsate-e7/configuration /tmp/pulsate-e7/data /tmp/pulsate-e7/recovery
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import time
+          from pathlib import Path
+
+          import jwt
+          from cryptography.hazmat.primitives.asymmetric import rsa
+
+          root = Path("/tmp/pulsate-e7")
+          private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+          public = private.public_key().public_numbers()
+
+          def encoded(value: int) -> str:
+              payload = value.to_bytes((value.bit_length() + 7) // 8, "big")
+              return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+          (root / "configuration" / "jwks.json").write_text(
+              json.dumps(
+                  {
+                      "keys": [
+                          {
+                              "alg": "RS256",
+                              "e": encoded(public.e),
+                              "kid": "pulsate-e7-ephemeral",
+                              "kty": "RSA",
+                              "n": encoded(public.n),
+                              "use": "sig",
+                          }
+                      ]
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
+          now = int(time.time())
+          token = jwt.encode(
+              {
+                  "aud": "pulsate-api",
+                  "exp": now + 600,
+                  "iat": now,
+                  "iss": "https://identity.example.test/",
+                  "roles": ["scientist"],
+                  "scope": "project:read",
+                  "sub": "e7-smoke-scientist",
+                  "tenant_id": "e7-smoke-tenant",
+              },
+              private,
+              algorithm="RS256",
+              headers={"kid": "pulsate-e7-ephemeral"},
+          )
+          (root / "token.txt").write_text(token, encoding="utf-8")
+          (root / "runtime.env").write_text(
+              "\n".join(
+                  (
+                      "PULSATE_ENVIRONMENT=production",
+                      "PULSATE_SERVICE_IDENTITY=pulsate-e7-ci",
+                      "PULSATE_APPLICATION_DATA_ROOT=/var/lib/pulsate",
+                      "PULSATE_TRUSTED_CONFIGURATION_ROOT=/etc/pulsate",
+                      "PULSATE_AUTH_ISSUER=https://identity.example.test/",
+                      "PULSATE_AUTH_AUDIENCES=pulsate-api",
+                      "PULSATE_AUTH_ALGORITHMS=RS256",
+                      "PULSATE_AUTH_JWKS_FILE=jwks.json",
+                      "PULSATE_GRANT_DATABASE_FILE=security/grants.sqlite3",
+                      "PULSATE_AUDIT_DATABASE_FILE=security/audit.sqlite3",
+                      "PULSATE_CATALOGUE_ENABLED=false",
+                      "PULSATE_CATALOGUE_REQUIRED=false",
+                      "PULSATE_CATALOGUE_MAXIMUM_BYTES=1048576",
+                      "PULSATE_CATALOGUE_MAXIMUM_ENTRIES=256",
+                      "PULSATE_CATALOGUE_ALLOW_EMPTY=true",
+                  )
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          for directory in (root / "data", root / "recovery"):
+              os.chmod(directory, 0o777)
+          os.chmod(root / "configuration", 0o755)
+          os.chmod(root / "configuration" / "jwks.json", 0o644)
+          os.chmod(root / "runtime.env", 0o600)
+          os.chmod(root / "token.txt", 0o600)
+          PY
+          docker build \
+            --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
+            --tag "cgr-pulsate:${GITHUB_SHA}" .
+      - name: Run actual recovery or diagnostic test command
+        if: matrix.kind == 'pytest' || matrix.kind == 'blocked-pytest'
+        run: |
+          cgr-pulsate-evidence-run \
+            --gate "${{ matrix.gate }}" \
+            --producer "enterprise-readiness.yml:deployment-and-recovery" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output "${{ matrix.gate }}.json" \
+            --artifact "artifacts/${{ matrix.gate }}/pytest.xml" \
+            -- bash -euo pipefail -c \
+              'python -m pytest ${{ matrix.tests }} -q --junitxml="enterprise-evidence/artifacts/${{ matrix.gate }}/pytest.xml"; status=$?; if [[ "${{ matrix.kind }}" == "blocked-pytest" && $status -eq 0 ]]; then exit 78; fi; exit $status'
+      - name: Run actual deployment command
+        if: matrix.kind == 'shell'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "enterprise-readiness.yml:deployment-and-recovery"
+          --source-commit "${GITHUB_SHA}" --evidence-root enterprise-evidence
+          --output "${{ matrix.gate }}.json"
+          -- bash -euo pipefail -c '${{ matrix.command }}'
+      - name: Record bounded performance diagnostic without an invented threshold
+        if: matrix.kind == 'blocked-shell'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "enterprise-readiness.yml:deployment-and-recovery"
+          --source-commit "${GITHUB_SHA}" --evidence-root enterprise-evidence
+          --output "${{ matrix.gate }}.json"
+          --artifact "artifacts/${{ matrix.gate }}/measurement.json"
+          -- bash -euo pipefail -c '${{ matrix.command }}'
+      - name: Record actual container diagnostic
+        if: matrix.kind == 'diagnostic-shell'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "enterprise-readiness.yml:deployment-and-recovery"
+          --source-commit "${GITHUB_SHA}" --evidence-root enterprise-evidence
+          --output "${{ matrix.gate }}.json"
+          --artifact "artifacts/${{ matrix.gate }}/measurement.json"
+          -- bash -euo pipefail -c '${{ matrix.command }}'
+      - name: Build and inspect the exact production image
+        if: matrix.kind == 'image'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "enterprise-readiness.yml:deployment-and-recovery"
+          --source-commit "${GITHUB_SHA}" --evidence-root enterprise-evidence
+          --output "${{ matrix.gate }}.json"
+          --artifact artifacts/image-build/image-inspect.json
+          -- bash -euo pipefail -c '${{ matrix.command }}'
+      - name: Record unavailable performance acceptance policy
+        if: matrix.kind == 'policy'
+        run: >-
+          cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
+          --producer "enterprise-readiness.yml:deployment-and-recovery"
+          --source-commit "${GITHUB_SHA}" --evidence-root enterprise-evidence
+          --output "${{ matrix.gate }}.json"
+          -- python -c "${{ matrix.command }}"
+      - name: Stop the task-owned container environment
+        if: always() && (matrix.kind == 'shell' || matrix.kind == 'blocked-shell' || matrix.kind == 'diagnostic-shell')
+        run: docker compose -f compose.production.yml down --volumes --remove-orphans
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-evidence-deployment-${{ matrix.gate }}
+          path: enterprise-evidence/
+
+  existing-ci-required:
+    uses: ./.github/workflows/ci.yml
+
+  supply-chain-required:
+    uses: ./.github/workflows/supply-chain-security.yml
+
+  final-enterprise-decision:
+    runs-on: ubuntu-latest
+    needs:
+      - deployment-and-recovery
+      - existing-ci-required
+      - supply-chain-required
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install decision CLI
+        run: |
+          python -m pip install --require-hashes \
+            -r requirements/pulsate-http-integration.lock
+          python -m pip install --no-deps .
+      - name: Download evidence from this workflow run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: enterprise-evidence-*
+          path: downloaded-enterprise-evidence
+      - name: Aggregate actual same-commit evidence
+        if: always()
+        run: |
+          mkdir -p downloaded-enterprise-evidence enterprise-decision
+          cgr-pulsate-enterprise-gate \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root downloaded-enterprise-evidence \
+            --output enterprise-decision/decision.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-readiness-decision
+          path: enterprise-decision/

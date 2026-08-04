@@ -1,12 +1,17 @@
 [build-system]
-requires=["setuptools>=68","wheel"]
+requires=["setuptools==83.0.0"]
 build-backend="setuptools.build_meta"
 
 [project]
 name="cgr"
 version="0.1.0"
 requires-python=">=3.12"
-dependencies=["fastapi","pydantic>=2","pluggy","structlog","uvicorn"]
+dependencies=[
+  "fastapi==0.139.0",
+  "pydantic==2.13.4",
+  "pluggy==1.6.0",
+  "uvicorn==0.51.0",
+]
 
 [project.scripts]
 cgr-smoke = "cgr.apps.cli.main:main"
@@ -39,6 +44,12 @@ cgr-quantum-candidate-repair-verify = "cgr.quantum_repair.cli:verify_main"
 cgr-quantum-sweagent-qwen-acceptance = "cgr.quantum_repair.cli:model_acceptance_main"
 cgr-boost-local = "cgr.apps.cli.main:boost_local_main"
 cgr-pulsate-config-check = "cgr.pulsate_api.config_check:main"
+cgr-pulsate-serve = "cgr.pulsate_api.deployment:serve_main"
+cgr-pulsate-backup = "cgr.pulsate_api.recovery:backup_main"
+cgr-pulsate-backup-verify = "cgr.pulsate_api.recovery:verify_main"
+cgr-pulsate-restore = "cgr.pulsate_api.recovery:restore_main"
+cgr-pulsate-evidence-run = "cgr.pulsate_api.enterprise_gate:evidence_run_main"
+cgr-pulsate-enterprise-gate = "cgr.pulsate_api.enterprise_gate:enterprise_gate_main"
 
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]
@@ -54,4 +65,9 @@ markers=[
   "quantum_container: isolated runtime security tests",
   "swe_agent_integration: tests requiring the pinned official SWE-agent checkout or executable",
   "external_infrastructure: tests requiring provisioned external tools, containers, or checkouts",
+  "deployment_integration: tests requiring a built production deployment",
+  "container_integration: tests requiring a local container engine",
+  "security_scan_integration: tests requiring pinned security scanners",
+  "recovery_integration: tests requiring an isolated recovery drill environment",
+  "external_security_database: tests requiring current connected vulnerability data",
 ]

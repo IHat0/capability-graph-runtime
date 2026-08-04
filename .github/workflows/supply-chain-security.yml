@@ -1,0 +1,288 @@
+name: Supply chain and security
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install canonical evidence CLI
+        run: |
+          python -m pip install --require-hashes \
+            -r requirements/pulsate-http-integration.lock
+          python -m pip install --no-deps .
+      - name: Verify actual dependency graphs and lock consistency
+        run: |
+          mkdir -p enterprise-evidence/records
+          cgr-pulsate-evidence-run \
+            --gate lock-consistency \
+            --producer "supply-chain-security.yml:dependency-consistency" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output lock-consistency.json \
+            -- bash -euo pipefail -c \
+              'python -m pip install --require-hashes -r requirements/pulsate-production-quantum.lock -r requirements/pulsate-http-integration.lock -r requirements/pulsate-production-security.lock && python -m pip install --no-deps --no-build-isolation -e . && python -m pip check && npm ci --prefix frontend && git diff --exit-code -- requirements frontend/package-lock.json'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-evidence-lock-consistency
+          path: enterprise-evidence/
+
+  sbom-and-licenses:
+    runs-on: ubuntu-latest
+    needs: dependency-consistency
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install actual application graphs
+        run: |
+          python -m pip install --require-hashes \
+            -r requirements/pulsate-production-quantum.lock \
+            -r requirements/pulsate-http-integration.lock \
+            -r requirements/pulsate-production-security.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+          npm ci --prefix frontend
+      - name: Install pinned SBOM and license tools
+        run: |
+          python -m pip install "cyclonedx-bom==7.1.0" "pip-licenses==5.0.0"
+      - name: Record actual Python SBOM evidence
+        run: |
+          mkdir -p enterprise-evidence/records enterprise-evidence/artifacts/python-sbom
+          cgr-pulsate-evidence-run \
+            --gate python-sbom \
+            --producer "supply-chain-security.yml:sbom-and-licenses" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output python-sbom.json \
+            --artifact artifacts/python-sbom/report.json \
+            -- cyclonedx-py environment --output-format JSON \
+              --output-file enterprise-evidence/artifacts/python-sbom/report.json
+      - name: Record actual Python license evidence
+        run: |
+          mkdir -p enterprise-evidence/artifacts/license-inventory-python
+          cgr-pulsate-evidence-run \
+            --gate license-inventory-python \
+            --producer "supply-chain-security.yml:sbom-and-licenses" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output license-inventory-python.json \
+            --artifact artifacts/license-inventory-python/report.json \
+            -- pip-licenses --format=json --with-system \
+              --output-file=enterprise-evidence/artifacts/license-inventory-python/report.json
+      - name: Record actual Node SBOM evidence
+        run: |
+          mkdir -p enterprise-evidence/artifacts/node-sbom
+          cgr-pulsate-evidence-run \
+            --gate node-sbom \
+            --producer "supply-chain-security.yml:sbom-and-licenses" \
+            --source-commit "${GITHUB_SHA}" \
+            --version-executable node \
+            --evidence-root enterprise-evidence \
+            --output node-sbom.json \
+            --artifact artifacts/node-sbom/report.json \
+            -- bash -euo pipefail -c \
+              'npm sbom --prefix frontend --sbom-format cyclonedx > enterprise-evidence/artifacts/node-sbom/report.json'
+      - name: Record actual Node license evidence
+        run: |
+          mkdir -p enterprise-evidence/artifacts/license-inventory-node
+          cgr-pulsate-evidence-run \
+            --gate license-inventory-node \
+            --producer "supply-chain-security.yml:sbom-and-licenses" \
+            --source-commit "${GITHUB_SHA}" \
+            --version-executable node \
+            --evidence-root enterprise-evidence \
+            --output license-inventory-node.json \
+            --artifact artifacts/license-inventory-node/report.json \
+            -- bash -euo pipefail -c \
+              'npm exec --prefix frontend --yes --package=license-checker@25.0.1 -- license-checker --production --json --start frontend > enterprise-evidence/artifacts/license-inventory-node/report.json'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-sboms-and-licenses
+          path: enterprise-evidence/artifacts/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-evidence-sboms-and-licenses
+          path: enterprise-evidence/
+
+  vulnerability-and-static-security:
+    runs-on: ubuntu-latest
+    needs: dependency-consistency
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install pinned scanners and evidence CLI
+        run: |
+          python -m pip install "pip-audit==2.9.0" "bandit==1.8.6" "ruff==0.15.20"
+          python -m pip install --require-hashes \
+            -r requirements/pulsate-http-integration.lock
+          python -m pip install --no-deps .
+          npm ci --prefix frontend
+          mkdir -p enterprise-evidence/records
+      - name: Run actual Python vulnerability scan
+        run: |
+          mkdir -p enterprise-evidence/artifacts/python-vulnerability-scan
+          cgr-pulsate-evidence-run \
+            --gate python-vulnerability-scan \
+            --producer "supply-chain-security.yml:vulnerability-and-static-security" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output python-vulnerability-scan.json \
+            --artifact artifacts/python-vulnerability-scan/report.json \
+            -- pip-audit \
+            -r requirements/pulsate-production-quantum.lock \
+            -r requirements/pulsate-http-integration.lock \
+            -r requirements/pulsate-production-security.lock \
+            --format json \
+            --output enterprise-evidence/artifacts/python-vulnerability-scan/report.json
+      - name: Run actual Node vulnerability scan
+        run: |
+          mkdir -p enterprise-evidence/artifacts/node-vulnerability-scan
+          cgr-pulsate-evidence-run \
+            --gate node-vulnerability-scan \
+            --producer "supply-chain-security.yml:vulnerability-and-static-security" \
+            --source-commit "${GITHUB_SHA}" \
+            --version-executable node \
+            --evidence-root enterprise-evidence \
+            --output node-vulnerability-scan.json \
+            --artifact artifacts/node-vulnerability-scan/report.json \
+            -- bash -euo pipefail -c \
+              'cd frontend && npm audit --json > ../enterprise-evidence/artifacts/node-vulnerability-scan/report.json'
+      - name: Run actual secret scan
+        run: |
+          mkdir -p enterprise-evidence/artifacts/secret-scan
+          cgr-pulsate-evidence-run \
+            --gate secret-scan \
+            --producer "supply-chain-security.yml:vulnerability-and-static-security" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output secret-scan.json \
+            --artifact artifacts/secret-scan/report.json \
+            -- docker run --rm \
+              -v "${{ github.workspace }}:/repo" \
+              ghcr.io/gitleaks/gitleaks:v8.24.2 \
+              detect --source=/repo --report-format=json \
+              --report-path=/repo/enterprise-evidence/artifacts/secret-scan/report.json \
+              --no-banner
+      - name: Run actual static security scans
+        run: |
+          mkdir -p enterprise-evidence/artifacts/static-security-scan
+          cgr-pulsate-evidence-run \
+            --gate static-security-scan \
+            --producer "supply-chain-security.yml:vulnerability-and-static-security" \
+            --source-commit "${GITHUB_SHA}" \
+            --version-executable ruff \
+            --evidence-root enterprise-evidence \
+            --output static-security-scan.json \
+            --artifact artifacts/static-security-scan/bandit.json \
+            --artifact artifacts/static-security-scan/trivy-configuration.json \
+            -- bash -euo pipefail -c \
+              'python -m ruff check src/cgr/pulsate_api/app.py src/cgr/pulsate_api/config_check.py src/cgr/pulsate_api/deployment.py src/cgr/pulsate_api/enterprise_gate.py src/cgr/pulsate_api/molecular_planning.py src/cgr/pulsate_api/production_catalogue.py src/cgr/pulsate_api/production_configuration.py src/cgr/pulsate_api/production_security.py src/cgr/pulsate_api/recovery.py src/cgr/pulsate_api/security.py src/cgr/pulsate_api/security_contracts.py tests/test_pulsate_deployment.py tests/test_pulsate_enterprise_gate.py tests/test_pulsate_production_security.py tests/test_pulsate_recovery.py tests/test_pulsate_security.py && bandit -r src -f json -o enterprise-evidence/artifacts/static-security-scan/bandit.json && docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:0.58.2 config --format json --output /workspace/enterprise-evidence/artifacts/static-security-scan/trivy-configuration.json --exit-code 1 --severity HIGH,CRITICAL /workspace'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulnerability-and-static-security-reports
+          path: enterprise-evidence/artifacts/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-evidence-vulnerability-and-static-security
+          path: enterprise-evidence/
+
+  container-supply-chain:
+    runs-on: ubuntu-latest
+    needs: dependency-consistency
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install canonical evidence CLI
+        run: |
+          python -m pip install --require-hashes \
+            -r requirements/pulsate-http-integration.lock
+          python -m pip install --no-deps .
+          mkdir -p enterprise-evidence/records \
+            enterprise-evidence/artifacts/container-sbom \
+            enterprise-evidence/artifacts/container-vulnerability-scan
+      - name: Build exact production image
+        run: |
+          docker build \
+            --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
+            --tag "cgr-pulsate:${GITHUB_SHA}" .
+          docker image inspect --format '{{.Id}}' "cgr-pulsate:${GITHUB_SHA}" \
+            > enterprise-evidence/artifacts/container-sbom/image-id.txt
+          cp enterprise-evidence/artifacts/container-sbom/image-id.txt \
+            enterprise-evidence/artifacts/container-vulnerability-scan/image-id.txt
+      - name: Generate and record actual container SBOM
+        run: |
+          cgr-pulsate-evidence-run \
+            --gate container-sbom \
+            --producer "supply-chain-security.yml:container-supply-chain" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output container-sbom.json \
+            --artifact artifacts/container-sbom/image-id.txt \
+            --artifact artifacts/container-sbom/report.json \
+            -- docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "${PWD}:/output" \
+              anchore/syft:v1.18.1 \
+              "cgr-pulsate:${GITHUB_SHA}" \
+              -o cyclonedx-json=/output/enterprise-evidence/artifacts/container-sbom/report.json
+      - name: Scan and record the exact built image
+        run: |
+          cgr-pulsate-evidence-run \
+            --gate container-vulnerability-scan \
+            --producer "supply-chain-security.yml:container-supply-chain" \
+            --source-commit "${GITHUB_SHA}" \
+            --evidence-root enterprise-evidence \
+            --output container-vulnerability-scan.json \
+            --artifact artifacts/container-vulnerability-scan/image-id.txt \
+            --artifact artifacts/container-vulnerability-scan/report.json \
+            -- docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "${PWD}:/output" \
+              aquasec/trivy:0.58.2 image \
+              --format json \
+              --output /output/enterprise-evidence/artifacts/container-vulnerability-scan/report.json \
+              --exit-code 1 --severity HIGH,CRITICAL \
+              "cgr-pulsate:${GITHUB_SHA}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-sbom-and-scan
+          path: enterprise-evidence/artifacts/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-evidence-container-supply-chain
+          path: enterprise-evidence/
