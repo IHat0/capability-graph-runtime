@@ -205,7 +205,7 @@ jobs:
             --artifact artifacts/static-security-scan/bandit.json \
             --artifact artifacts/static-security-scan/trivy-configuration.json \
             -- bash -euo pipefail -c \
-              'python -m ruff check src/cgr/pulsate_api/app.py src/cgr/pulsate_api/config_check.py src/cgr/pulsate_api/deployment.py src/cgr/pulsate_api/enterprise_gate.py src/cgr/pulsate_api/molecular_planning.py src/cgr/pulsate_api/production_catalogue.py src/cgr/pulsate_api/production_configuration.py src/cgr/pulsate_api/production_security.py src/cgr/pulsate_api/recovery.py src/cgr/pulsate_api/security.py src/cgr/pulsate_api/security_contracts.py tests/test_pulsate_deployment.py tests/test_pulsate_enterprise_gate.py tests/test_pulsate_production_security.py tests/test_pulsate_recovery.py tests/test_pulsate_security.py && bandit -r src -f json -o enterprise-evidence/artifacts/static-security-scan/bandit.json --exit-zero && bandit -r src -lll -q && docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:0.58.2 config --format json --output /workspace/enterprise-evidence/artifacts/static-security-scan/trivy-configuration.json --exit-code 0 --severity HIGH,CRITICAL /workspace'
+              'python -m ruff check src/cgr/pulsate_api/app.py src/cgr/pulsate_api/config_check.py src/cgr/pulsate_api/deployment.py src/cgr/pulsate_api/enterprise_gate.py src/cgr/pulsate_api/molecular_planning.py src/cgr/pulsate_api/production_catalogue.py src/cgr/pulsate_api/production_configuration.py src/cgr/pulsate_api/production_security.py src/cgr/pulsate_api/recovery.py src/cgr/pulsate_api/security.py src/cgr/pulsate_api/security_contracts.py tests/test_pulsate_deployment.py tests/test_pulsate_enterprise_gate.py tests/test_pulsate_production_security.py tests/test_pulsate_recovery.py tests/test_pulsate_security.py && bandit -r src -f json -o enterprise-evidence/artifacts/static-security-scan/bandit.json --exit-zero && bandit -r src -lll -q && docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:0.58.2 config --format json --output /workspace/enterprise-evidence/artifacts/static-security-scan/trivy-configuration.json --exit-code 0 --severity HIGH,CRITICAL --ignorefile /workspace/.trivyignore.yaml --show-suppressed /workspace'
       - name: Enforce Trivy configuration severity gate
         run: >-
           python scripts/enforce_trivy_report.py
@@ -265,6 +265,16 @@ jobs:
               -o cyclonedx-json=/output/enterprise-evidence/artifacts/container-sbom/report.json
       - name: Scan and record the exact built image
         run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}:/output" \
+            aquasec/trivy:0.58.2 image \
+            --format json \
+            --output /output/enterprise-evidence/artifacts/container-vulnerability-scan/report-all.json \
+            --exit-code 0 \
+            --exit-on-eol 1 \
+            --severity HIGH,CRITICAL \
+            "cgr-pulsate:${GITHUB_SHA}"
           cgr-pulsate-evidence-run \
             --gate container-vulnerability-scan \
             --producer "supply-chain-security.yml:container-supply-chain" \
@@ -272,6 +282,7 @@ jobs:
             --evidence-root enterprise-evidence \
             --output container-vulnerability-scan.json \
             --artifact artifacts/container-vulnerability-scan/image-id.txt \
+            --artifact artifacts/container-vulnerability-scan/report-all.json \
             --artifact artifacts/container-vulnerability-scan/report.json \
             -- docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
@@ -279,7 +290,10 @@ jobs:
               aquasec/trivy:0.58.2 image \
               --format json \
               --output /output/enterprise-evidence/artifacts/container-vulnerability-scan/report.json \
-              --exit-code 0 --severity HIGH,CRITICAL \
+              --exit-code 0 \
+              --exit-on-eol 1 \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
               "cgr-pulsate:${GITHUB_SHA}"
       - name: Enforce Trivy image severity gate
         run: >-

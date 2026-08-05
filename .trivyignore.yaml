@@ -1,0 +1,10 @@
+misconfigurations:
+  - id: DS002
+    paths:
+      - docker/quantum-sweagent-tool/Dockerfile
+    expired_at: 2026-09-05
+    statement: >-
+      The isolated SWE-ReX tool sandbox currently requires the upstream
+      root-home pipx and swerex-remote layout. This exception does not apply
+      to the production Pulsate API image, which runs as UID 10001. Reassess
+      the sandbox design before this exception expires.

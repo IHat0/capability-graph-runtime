@@ -1,4 +1,12 @@
-FROM python:3.12.11-slim-bookworm AS runtime-dependencies
+FROM python:3.12.13-slim-bookworm AS patched-python
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
+       --no-install-recommends \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM patched-python AS runtime-dependencies
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -21,7 +29,7 @@ RUN python -m pip install --no-deps --no-build-isolation /tmp/application \
     && python -m pip check
 
 
-FROM python:3.12.11-slim-bookworm AS application
+FROM patched-python AS application
 
 ARG SOURCE_REVISION=unknown
 ARG APPLICATION_VERSION=0.1.0
