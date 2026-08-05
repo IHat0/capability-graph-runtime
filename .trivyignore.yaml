@@ -1,5 +1,5 @@
 misconfigurations:
-  - id: DS002
+  - id: AVD-DS-0002
     paths:
       - docker/quantum-sweagent-tool/Dockerfile
     expired_at: 2026-09-05
