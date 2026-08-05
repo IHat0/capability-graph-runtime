@@ -3,7 +3,7 @@
 # Install with --no-deps --require-hashes, then run pip check.
 cffi==2.1.0 --hash=sha256:1e9f50d192a3e525b15a75ab5114e442d83d657b7ec29182a991bc9a88fd3a66
 charset-normalizer==3.4.9 --hash=sha256:5e226f6218febc71f6c1fc2fafb91c226f75bdc1d8fb12d66823716e891608fd
-cryptography==49.0.0 --hash=sha256:0e959b578856a3924bc0cbb710fc12c387b9412a951389f3ca61704a9e25f325
+cryptography==50.0.0 --hash=sha256:06a32a980526a6ab9a4b9bf8f7385800791e2bb960903cb6b530e4817509a3b7
 ibm-cloud-sdk-core==3.26.0 --hash=sha256:e96098cbd7abce67ad856bccf3696443b5ae497dde644cd532d7fc6040db4240
 ibm-platform-services==0.77.0 --hash=sha256:4c580d65af0daade9e875a2dda3d8685aa9c818bc4d57289eca3421f6b356d1b
 ibm-quantum-schemas==0.9.20260612 --hash=sha256:31afc35c15c56d10f4c9c39155478802daaab5baffb4215fbb93d8ddbdf3f285
