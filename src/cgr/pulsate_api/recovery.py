@@ -354,6 +354,16 @@ def production_persistence_inventory() -> tuple[RecoveryComponentRecord, ...]:
             restore_validation_method="bounded-json-tree",
         ),
         RecoveryComponentRecord(
+            component_identifier="workflows",
+            component_type="directory",
+            schema_version="pulsate-workflows/v1",
+            required=True,
+            relative_storage_identity="workflows",
+            validation_provider="workflow-graph-repositories",
+            snapshot_method="deterministic-file-copy",
+            restore_validation_method="bounded-json-tree",
+        ),
+        RecoveryComponentRecord(
             component_identifier="security-audit",
             component_type="sqlite",
             schema_version=f"audit/{AUDIT_SCHEMA_VERSION}",

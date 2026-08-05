@@ -80,6 +80,7 @@ def _values(tmp_path: Path) -> dict[str, str]:
         "PULSATE_AUTH_JWKS_FILE": "jwks.json",
         "PULSATE_GRANT_DATABASE_FILE": "security/grants.sqlite3",
         "PULSATE_AUDIT_DATABASE_FILE": "security/audit.sqlite3",
+        "PULSATE_WORKFLOW_MAX_PARALLELISM": "8",
         "PULSATE_CATALOGUE_ENABLED": "false",
         "PULSATE_CATALOGUE_REQUIRED": "false",
         "PULSATE_CATALOGUE_MAXIMUM_BYTES": str(1024 * 1024),
@@ -145,6 +146,7 @@ def test_explicit_production_configuration_is_immutable_safe_and_deterministic(t
     assert first.fingerprint == second.fingerprint
     assert len(first.fingerprint) == 64
     assert str(first.authorization.database_file).startswith(str(tmp_path.resolve()))
+    assert first.workflow.maximum_parallelism == 8
     with pytest.raises(Exception):
         first.environment = "development"  # type: ignore[misc]
 
@@ -156,6 +158,8 @@ def test_explicit_production_configuration_is_immutable_safe_and_deterministic(t
         ("PULSATE_AUTH_ISSUER", ""),
         ("PULSATE_AUTH_ALGORITHMS", "HS256"),
         ("PULSATE_GRANT_ALLOW_WILDCARDS", "yes"),
+        ("PULSATE_WORKFLOW_MAX_PARALLELISM", "0"),
+        ("PULSATE_WORKFLOW_MAX_PARALLELISM", "65"),
     ),
 )
 def test_invalid_or_missing_production_configuration_fails_closed(

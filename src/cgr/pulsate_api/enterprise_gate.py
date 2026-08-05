@@ -90,6 +90,7 @@ ENTERPRISE_GATE_PRODUCERS = (
     _producer("frontend-node-typescript", "ci.yml:frontend-evidence", "typescript-node"),
     _producer("frontend-planning-workspace", "ci.yml:frontend-evidence", "vitest-planning-workspace"),
     _producer("frontend-vitest", "ci.yml:frontend-evidence", "vitest-complete"),
+    _producer("frontend-workflow-workspace", "ci.yml:frontend-evidence", "vitest-workflow-workspace"),
     _producer("image-build", "enterprise-readiness.yml:deployment-and-recovery", "docker-image-build"),
     _producer("license-inventory-node", "supply-chain-security.yml:sbom-and-licenses", "node-license-inventory"),
     _producer("license-inventory-python", "supply-chain-security.yml:sbom-and-licenses", "python-license-inventory"),
@@ -131,6 +132,9 @@ ENTERPRISE_GATE_PRODUCERS = (
     _producer("static-security-scan", "supply-chain-security.yml:vulnerability-and-static-security", "ruff-0.15.20-bandit-1.8.6-trivy-0.58.2"),
     _producer("tenant-isolation", "ci.yml:backend-evidence", "pytest-tenant-isolation"),
     _producer("unassigned-plan", "ci.yml:backend-evidence", "pytest-unassigned-plan"),
+    _producer("workflow-api-security", "ci.yml:backend-evidence", "pytest-workflow-api-security"),
+    _producer("workflow-graph-backend", "ci.yml:backend-evidence", "pytest-workflow-graph-backend"),
+    _producer("workflow-recovery", "ci.yml:backend-evidence", "pytest-workflow-recovery"),
 )
 
 REQUIRED_ENTERPRISE_GATES = tuple(

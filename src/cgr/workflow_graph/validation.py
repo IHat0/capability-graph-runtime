@@ -466,10 +466,16 @@ class WorkflowGraphValidator:
                     "Parameter sweep references an unknown base node.",
                     sweep.sweep_identifier,
                 )
-            elif node.node_kind is not NodeKind.PARAMETER_SWEEP:
+            elif node.node_kind in {
+                NodeKind.APPROVAL_GATE,
+                NodeKind.CONDITIONAL_BRANCH,
+                NodeKind.COMPARISON,
+                NodeKind.AGGREGATION,
+                NodeKind.DATA_SINK,
+            }:
                 self._error(
                     "INVALID_SWEEP_BASE_KIND",
-                    "Parameter sweeps must reference a parameter-sweep node.",
+                    "Parameter sweeps must reference an executable or data-source node.",
                     sweep.sweep_identifier,
                 )
             prefix = sweep.generated_node_prefix or f"{sweep.base_node_id}.sweep"
@@ -545,13 +551,26 @@ class WorkflowGraphValidator:
                         "A node cannot fall back to itself.",
                         node.node_identifier,
                     )
+                elif not any(
+                    edge.source_node_id == node.node_identifier
+                    and edge.target_node_id == recovery.fallback_node_id
+                    for edge in self.graph.edges
+                ):
+                    self._error(
+                        "UNREACHABLE_FALLBACK_NODE",
+                        "Fallback node must be a direct declared successor of the failing node.",
+                        node.node_identifier,
+                    )
             policy = node.execution_policy
             if policy is not None:
                 for approval in policy.approval_requirements:
                     if (
                         approval.graph_identifier != self.graph.graph_identifier
                         or approval.graph_version != self.graph.version
-                        or approval.graph_definition_fingerprint != graph_fingerprint
+                        or (
+                            approval.graph_definition_fingerprint is not None
+                            and approval.graph_definition_fingerprint != graph_fingerprint
+                        )
                         or approval.node_identifier != node.node_identifier
                     ):
                         self._error(
@@ -584,7 +603,10 @@ class WorkflowGraphValidator:
                 if (
                     approval.graph_identifier != self.graph.graph_identifier
                     or approval.graph_version != self.graph.version
-                    or approval.graph_definition_fingerprint != graph_fingerprint
+                    or (
+                        approval.graph_definition_fingerprint is not None
+                        and approval.graph_definition_fingerprint != graph_fingerprint
+                    )
                 ):
                     self._error(
                         "GLOBAL_APPROVAL_CONTEXT_MISMATCH",

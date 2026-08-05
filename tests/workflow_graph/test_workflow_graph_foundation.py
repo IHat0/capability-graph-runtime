@@ -83,12 +83,13 @@ def linear_graph() -> WorkflowGraphDefinition:
     )
 
 
-def test_package_import_does_not_export_unimplemented_components() -> None:
+def test_package_import_exports_implemented_phase4_components() -> None:
     import cgr.workflow_graph as workflow_graph
 
     assert workflow_graph.WorkflowGraphDefinition is WorkflowGraphDefinition
-    assert not hasattr(workflow_graph, "WorkflowGraphCompiler")
-    assert not hasattr(workflow_graph, "WorkflowOrchestrator")
+    assert workflow_graph.WorkflowGraphCompiler is not None
+    assert workflow_graph.WorkflowGraphRepository is not None
+    assert workflow_graph.WorkflowOrchestrator is not None
 
 
 def test_contracts_use_pydantic_validation_and_are_frozen() -> None:
@@ -169,7 +170,7 @@ def test_conditions_are_bounded_json_and_immutable() -> None:
         source_node_id="node.a",
         target_node_id="node.b",
         condition_kind=ConditionKind.NUMERIC_COMPARE,
-        condition_expression={"operator": "gt", "threshold": 0.5},
+        condition_expression={"source": "output.score", "operator": "gt", "threshold": 0.5},
     )
     assert isinstance(condition.condition_expression, FrozenDict)
     with pytest.raises(TypeError):
@@ -408,9 +409,9 @@ def test_parameter_sweep_and_comparison_validation_are_exact() -> None:
         root_node_ids=("node.sweep",),
         terminal_node_ids=("node.sweep",),
     )
-    assert "INVALID_SWEEP_BASE_KIND" in {
-        item.code for item in WorkflowGraphValidator(sweep_graph).validate().errors
-    }
+    sweep_result = WorkflowGraphValidator(sweep_graph).validate()
+    assert sweep_result.valid
+    assert "INVALID_SWEEP_BASE_KIND" not in {item.code for item in sweep_result.errors}
 
     comparison_graph = WorkflowGraphDefinition(
         graph_identifier="graph.comparison",
@@ -638,3 +639,54 @@ def test_foundation_modules_do_not_import_execution_or_network_stacks() -> None:
             elif isinstance(item, ast.ImportFrom) and item.module:
                 observed.add(item.module.split(".")[0])
     assert observed.isdisjoint(forbidden)
+
+
+def test_condition_kind_schemas_are_closed_and_exact() -> None:
+    success = ConditionalEdge(
+        edge_identifier="condition.success",
+        source_node_id="node-a",
+        target_node_id="node-b",
+        condition_kind=ConditionKind.SUCCESS,
+        condition_expression={},
+    )
+    assert not success.condition_expression
+
+    with pytest.raises(ValueError, match="do not accept parameters"):
+        ConditionalEdge(
+            edge_identifier="condition.bad-success",
+            source_node_id="node-a",
+            target_node_id="node-b",
+            condition_kind=ConditionKind.SUCCESS,
+            condition_expression={"unexpected": True},
+        )
+    with pytest.raises(ValueError, match="operator"):
+        ConditionalEdge(
+            edge_identifier="condition.bad-operator",
+            source_node_id="node-a",
+            target_node_id="node-b",
+            condition_kind=ConditionKind.NUMERIC_COMPARE,
+            condition_expression={"source": "output.score", "operator": "exec", "threshold": 1.0},
+        )
+    with pytest.raises(ValueError, match="approval identity"):
+        ConditionalEdge(
+            edge_identifier="condition.bad-approval",
+            source_node_id="node-a",
+            target_node_id="node-b",
+            condition_kind=ConditionKind.APPROVAL_RESULT,
+            condition_expression={"approval_identifier": "approval.one"},
+        )
+
+
+def test_comparison_selection_criteria_are_closed() -> None:
+    group = ComparisonGroup(
+        group_identifier="comparison.closed",
+        member_node_ids=("node-a", "node-b"),
+        selection_criteria={"metric": "score", "direction": "max"},
+    )
+    assert group.selection_criteria == {"metric": "score", "direction": "max"}
+    with pytest.raises(ValueError, match="metric and direction"):
+        ComparisonGroup(
+            group_identifier="comparison.open",
+            member_node_ids=("node-a", "node-b"),
+            selection_criteria={"metric": "score", "code": "arbitrary"},
+        )

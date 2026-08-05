@@ -23,6 +23,16 @@ import {
   parseProjectedMolecularScene,
 } from '../scene/native-project'
 import {
+  parseWorkflowEvidence,
+  parseWorkflowGraph,
+  parseWorkflowNodes,
+  parseWorkflowRun,
+  type WorkflowEvidenceResponse,
+  type WorkflowGraphDefinitionResponse,
+  type WorkflowNodesResponse,
+  type WorkflowRunSnapshotResponse,
+} from './workflows'
+import {
   parseMolecularPlanningResponse,
   type CandidateResearchPlanResponse,
   type MolecularPlanningRequest,
@@ -573,6 +583,13 @@ export interface PulsateApi {
   getNativeMolecularStructure(structure: ProjectedMolecularStructureMetadata, signal?: AbortSignal): Promise<FetchedMolecularResource>
   getMolecularTopology(structure: ProjectedMolecularStructureMetadata, signal?: AbortSignal): Promise<FetchedMolecularResource>
   evaluateMolecularProjectPlan(projectIdentifier: string, request: MolecularPlanningRequest, signal?: AbortSignal): Promise<CandidateResearchPlanResponse>
+  getWorkflowGraph(graphIdentifier: string, graphVersion: number, signal?: AbortSignal): Promise<WorkflowGraphDefinitionResponse>
+  getWorkflowRun(graphRunIdentifier: string, signal?: AbortSignal): Promise<WorkflowRunSnapshotResponse>
+  getWorkflowNodes(graphRunIdentifier: string, signal?: AbortSignal): Promise<WorkflowNodesResponse>
+  getWorkflowEvidence(graphRunIdentifier: string, signal?: AbortSignal): Promise<WorkflowEvidenceResponse>
+  resumeWorkflowRun(graphRunIdentifier: string, maximumCycles?: number, signal?: AbortSignal): Promise<WorkflowRunSnapshotResponse>
+  cancelWorkflowRun(graphRunIdentifier: string, reason?: string, signal?: AbortSignal): Promise<WorkflowRunSnapshotResponse>
+  decideWorkflowApproval(graphRunIdentifier: string, approvalIdentifier: string, granted: boolean, decisionReason?: string, signal?: AbortSignal): Promise<WorkflowRunSnapshotResponse>
 }
 
 export type WorkspaceApi = Pick<PulsateApi, 'getHealth' | 'getPresets' | 'getPreset' | 'getScene'>
@@ -658,6 +675,56 @@ export function createPulsateApi(configuration: PulsateApiConfiguration = {}): P
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(request),
+    },
+  ),
+    getWorkflowGraph: (graphIdentifier, graphVersion, signal) => json(
+    `/api/v1/workflows/${encodeURIComponent(graphIdentifier)}/versions/${graphVersion}`,
+    parseWorkflowGraph,
+    signal,
+  ),
+    getWorkflowRun: (graphRunIdentifier, signal) => json(
+    `/api/v1/workflow-runs/${encodeURIComponent(graphRunIdentifier)}`,
+    parseWorkflowRun,
+    signal,
+  ),
+    getWorkflowNodes: (graphRunIdentifier, signal) => json(
+    `/api/v1/workflow-runs/${encodeURIComponent(graphRunIdentifier)}/nodes`,
+    parseWorkflowNodes,
+    signal,
+  ),
+    getWorkflowEvidence: (graphRunIdentifier, signal) => json(
+    `/api/v1/workflow-runs/${encodeURIComponent(graphRunIdentifier)}/evidence`,
+    parseWorkflowEvidence,
+    signal,
+  ),
+    resumeWorkflowRun: (graphRunIdentifier, maximumCycles = 1000, signal) => json(
+    `/api/v1/workflow-runs/${encodeURIComponent(graphRunIdentifier)}/resume`,
+    parseWorkflowRun,
+    signal,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ maximum_cycles: maximumCycles }),
+    },
+  ),
+    cancelWorkflowRun: (graphRunIdentifier, reason, signal) => json(
+    `/api/v1/workflow-runs/${encodeURIComponent(graphRunIdentifier)}/cancel`,
+    parseWorkflowRun,
+    signal,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: reason ?? null }),
+    },
+  ),
+    decideWorkflowApproval: (graphRunIdentifier, approvalIdentifier, granted, decisionReason, signal) => json(
+    `/api/v1/workflow-runs/${encodeURIComponent(graphRunIdentifier)}/approvals/${encodeURIComponent(approvalIdentifier)}`,
+    parseWorkflowRun,
+    signal,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ granted, decision_reason: decisionReason ?? null }),
     },
   ),
   }

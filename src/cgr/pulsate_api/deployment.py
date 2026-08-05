@@ -27,6 +27,7 @@ def validate_application_data_layout(data_root: Path) -> None:
         "molecular-projects",
         "runs",
         "security",
+        "workflows",
     )
     try:
         root_metadata = data_root.lstat()

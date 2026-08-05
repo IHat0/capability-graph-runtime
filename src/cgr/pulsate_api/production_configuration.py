@@ -102,6 +102,10 @@ class RepositoryConfiguration(_ConfigurationContract):
     trusted_configuration_root: Path
 
 
+class WorkflowConfiguration(_ConfigurationContract):
+    maximum_parallelism: int = Field(default=8, ge=1, le=64)
+
+
 class CapabilityCatalogueConfiguration(_ConfigurationContract):
     enabled: bool
     required: bool
@@ -164,6 +168,7 @@ class PulsateRuntimeConfiguration(_ConfigurationContract):
     audit: AuditConfiguration
     observability: ObservabilityConfiguration
     repositories: RepositoryConfiguration
+    workflow: WorkflowConfiguration = WorkflowConfiguration()
     catalogue: CapabilityCatalogueConfiguration
     limits: SecurityLimitConfiguration = SecurityLimitConfiguration()
     readiness: ReadinessConfiguration = ReadinessConfiguration()
@@ -250,6 +255,7 @@ PRODUCTION_ENVIRONMENT_VARIABLES = (
     "PULSATE_AUDIT_READ_FAIL_CLOSED",
     "PULSATE_AUDIT_BUSY_TIMEOUT_MS",
     "PULSATE_AUDIT_VERIFICATION_MAXIMUM_RECORDS",
+    "PULSATE_WORKFLOW_MAX_PARALLELISM",
     "PULSATE_CATALOGUE_ENABLED",
     "PULSATE_CATALOGUE_REQUIRED",
     "PULSATE_CATALOGUE_FILE",
@@ -364,6 +370,12 @@ def load_production_configuration(source: ConfigurationSource) -> PulsateRuntime
             ),
             observability=ObservabilityConfiguration(service_name=_required(values, "PULSATE_SERVICE_IDENTITY")),
             repositories=RepositoryConfiguration(application_data_root=data_root, trusted_configuration_root=config_root),
+            workflow=WorkflowConfiguration(
+                maximum_parallelism=_integer(
+                    values.get("PULSATE_WORKFLOW_MAX_PARALLELISM", "8"),
+                    "PULSATE_WORKFLOW_MAX_PARALLELISM",
+                )
+            ),
             catalogue=_catalogue_configuration(values, config_root),
         )
     except ProductionConfigurationError:

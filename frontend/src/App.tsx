@@ -8,6 +8,7 @@ import { MolecularProjectInput } from './components/MolecularProjectInput'
 import { MolecularProjectPanel } from './components/MolecularProjectPanel'
 import { NaturalLanguageWorkspace } from './components/NaturalLanguageWorkspace'
 import { ScientificPanel } from './components/ScientificPanel'
+import { WorkflowWorkspace } from './components/WorkflowWorkspace'
 import { deriveExistingRunHeaderStatus } from './existingRunHeaderStatus'
 import { useExistingRun } from './hooks/useExistingRun'
 import { useExperimentWorkspace } from './hooks/useExperimentWorkspace'
@@ -15,6 +16,7 @@ import { useMolecularProjectScene } from './hooks/useMolecularProjectScene'
 import { useMolecularPlanning } from './hooks/useMolecularPlanning'
 import { useNaturalLanguageExperiment } from './hooks/useNaturalLanguageExperiment'
 import { usePresetRun } from './hooks/usePresetRun'
+import { useWorkflowRun } from './hooks/useWorkflowRun'
 
 export function App() {
   const workspace = useExperimentWorkspace()
@@ -22,6 +24,7 @@ export function App() {
   const molecularProject = useMolecularProjectScene()
   const molecularPlanning = useMolecularPlanning(molecularProject.scene?.metadata.project_identifier ?? null)
   const naturalLanguage = useNaturalLanguageExperiment()
+  const workflow = useWorkflowRun()
   const coordinateScene = existingRun.scene ?? workspace.scene
   const displayedScene = molecularProject.scene ?? coordinateScene
   const hasScene = displayedScene !== null
@@ -95,7 +98,8 @@ export function App() {
         />
       </div>} status={headerStatus} />
       <ErrorNotice errors={errors} />
-      <div className="workspace-frame">
+      <div className="workspace-content">
+        <div className="workspace-frame">
         <ConditionalNavigation hasScene={hasScene} />
         {workspace.initialLoading ? (
           <main className="initial-state" aria-live="polite">
@@ -136,6 +140,8 @@ export function App() {
             <EmptyInspector />
           </div>
         )}
+        </div>
+        <WorkflowWorkspace workflow={workflow} />
       </div>
     </div>
   )

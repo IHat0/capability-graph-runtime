@@ -59,7 +59,7 @@ swebench=["datasets>=3.0","swebench==3.0.17"]
 testpaths=["tests"]
 markers=[
   "core: deterministic tests requiring only repository-declared dependencies",
-  "backend_core: frontend-independent Phase 1-3 backend release-gate tests",
+  "backend_core: frontend-independent Phase 1-4 backend release-gate tests",
   "quantum_unit: pure preflight tests without heavy scientific dependencies",
   "quantum_integration: scientific integration tests in the pinned Linux image",
   "quantum_container: isolated runtime security tests",

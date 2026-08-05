@@ -33,7 +33,7 @@ def _hold_recovery_lock(root: str, ready: object, release: object) -> None:
 
 def _state(root: Path) -> Path:
     root.mkdir()
-    for name in ("experiments", "interpretations", "runs"):
+    for name in ("experiments", "interpretations", "runs", "workflows"):
         directory = root / name
         directory.mkdir()
         (directory / "state.json").write_text(
@@ -69,6 +69,7 @@ def test_inventory_matches_actual_production_data_layout() -> None:
                 "molecular-projects",
                 "runs",
                 "security-audit",
+                "workflows",
             )
         )
     )

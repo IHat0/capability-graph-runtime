@@ -21,16 +21,18 @@ only the data/recovery mounts and bounded `/tmp` tmpfs are writable.
 `cgr-pulsate-serve` runs the existing offline production configuration check
 before Uvicorn may bind, then validates application data storage. Application
 lifespan initializes and closes JWT/JWKS, grants, audit, catalogue, and
-repository services. One worker is supported because the current run
-coordinator is single-process; another count fails closed.
+repository services, including the Phase 4 workflow definition/run repositories.
+One worker is supported because the current run coordinator and workflow
+orchestrator are single-process; another count fails closed.
 
 ## Compose procedure
 
 Create an operator-owned environment file from
 `deployment/production.env.example`, without committing secrets. Set an
 immutable image reference and absolute configuration, data, and recovery mount
-paths. Pre-create the writable roots for UID/GID 10001 with restrictive host
-permissions; the container does not change external ownership. Then run:
+paths. Set `PULSATE_WORKFLOW_MAX_PARALLELISM` to a bounded value from 1 through
+64; it is a safety ceiling rather than a throughput claim. Pre-create the
+writable roots for UID/GID 10001 with restrictive host permissions; the container does not change external ownership. Then run:
 
 ```text
 docker compose -f compose.production.yml config
@@ -40,7 +42,8 @@ docker compose -f compose.production.yml up -d
 The manifest drops all capabilities, enables `no-new-privileges`, bounds
 processes/memory/CPU, has no Docker socket, and gives shutdown 40 seconds. Its
 health command verifies `/live` and `/ready`; the reverse proxy must also use
-`/ready` before traffic. Readiness covers security, catalogue, and repositories.
+`/ready` before traffic. Readiness covers security, catalogue, molecular repositories, and the workflow
+definition/run repositories.
 The manifest's 2 CPU, 2 GiB, and 256-process values are starting operational
 limits, not measured capacity claims.
 

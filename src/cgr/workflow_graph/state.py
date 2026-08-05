@@ -19,6 +19,7 @@ from .contracts import (
     _MAX_RETRY_COUNT,
     _frozen_numeric_map,
     _frozen_string_map,
+    _freeze_json,
 )
 
 
@@ -53,6 +54,7 @@ class NodeStatus(str, Enum):
     RETRY_SCHEDULED = "retry_scheduled"
     BLOCKED = "blocked"
     SKIPPED_BY_CONDITION = "skipped_by_condition"
+    SKIPPED_BY_POLICY = "skipped_by_policy"
     CANCELLED = "cancelled"
     RECOVERED = "recovered"
 
@@ -206,7 +208,9 @@ class NodeState(CanonicalModel):
     started_at_epoch: float | None = None
     completed_at_epoch: float | None = None
     input_bindings: FrozenDict = Field(default_factory=FrozenDict)
+    input_values: FrozenDict = Field(default_factory=FrozenDict)
     output_artifacts: tuple[ArtifactReference, ...] = ()
+    output_values: FrozenDict = Field(default_factory=FrozenDict)
     produced_artifact_types: tuple[str, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
@@ -245,6 +249,14 @@ class NodeState(CanonicalModel):
             )
         return FrozenDict(sorted(normalized.items()))
 
+    @field_validator("input_values", mode="before")
+    @classmethod
+    def validate_input_values(cls, value: object) -> FrozenDict:
+        frozen = _freeze_json(value)
+        if not isinstance(frozen, FrozenDict):
+            raise ValueError("Node input values must be a JSON object.")
+        return frozen
+
     @field_validator("output_artifacts")
     @classmethod
     def order_artifacts(
@@ -254,6 +266,14 @@ class NodeState(CanonicalModel):
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Output artifact identifiers must be unique per node attempt.")
         return tuple(sorted(value, key=lambda item: item.artifact_identifier))
+
+    @field_validator("output_values", mode="before")
+    @classmethod
+    def validate_output_values(cls, value: object) -> FrozenDict:
+        frozen = _freeze_json(value)
+        if not isinstance(frozen, FrozenDict):
+            raise ValueError("Node output values must be a JSON object.")
+        return frozen
 
     @field_validator("produced_artifact_types")
     @classmethod
@@ -295,6 +315,7 @@ class NodeState(CanonicalModel):
             NodeStatus.FAILED,
             NodeStatus.BLOCKED,
             NodeStatus.SKIPPED_BY_CONDITION,
+            NodeStatus.SKIPPED_BY_POLICY,
             NodeStatus.CANCELLED,
         }
         if (self.status in terminal) != (self.completed_at_epoch is not None):
@@ -308,7 +329,9 @@ class NodeState(CanonicalModel):
             NodeStatus.RUNNING,
             NodeStatus.RETRYABLE,
             NodeStatus.RETRY_SCHEDULED,
-            *terminal,
+            NodeStatus.SUCCEEDED,
+            NodeStatus.FAILED,
+            NodeStatus.RECOVERED,
         }
         if self.status in attempted and self.attempt_number < 1:
             raise ValueError("Attempted node states require attempt_number >= 1.")
@@ -604,3 +627,217 @@ class BudgetState(CanonicalModel):
         if self.terminal_over_budget != over_budget:
             raise ValueError("terminal_over_budget is inconsistent with persisted budget.")
         return self
+
+
+class ExternalInputState(CanonicalModel):
+    """Immutable external artifact or scalar supplied to a graph-run port."""
+
+    input_identifier: str
+    graph_run_identifier: str
+    node_id: str
+    port_id: str
+    artifact_reference: ArtifactPointer | None = None
+    value: object | None = None
+
+    @field_validator(
+        "input_identifier", "graph_run_identifier", "node_id", "port_id"
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(value)
+
+    @field_validator("value")
+    @classmethod
+    def validate_value(cls, value: object | None) -> object | None:
+        return _freeze_json(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_exact_value(self) -> Self:
+        if (self.artifact_reference is None) == (self.value is None):
+            raise ValueError(
+                "External workflow inputs require exactly one artifact or scalar value."
+            )
+        return self
+
+
+class DecisionKind(str, Enum):
+    """Closed persisted orchestration-decision kinds."""
+
+    CONDITION = "condition"
+    COMPARISON = "comparison"
+    SWEEP_EXPANSION = "sweep_expansion"
+    FAILURE_PROPAGATION = "failure_propagation"
+    BUDGET = "budget"
+    APPROVAL = "approval"
+    CANCELLATION = "cancellation"
+    RECOVERY = "recovery"
+
+
+class DecisionState(CanonicalModel):
+    """Immutable, attributable branch or scheduling decision."""
+
+    decision_identifier: str
+    graph_run_identifier: str
+    decision_kind: DecisionKind
+    subject_identifier: str
+    input_fingerprint: str
+    outcome: str
+    decided_at_epoch: float = Field(ge=0)
+    related_node_ids: tuple[str, ...] = ()
+    metadata: FrozenDict = Field(default_factory=FrozenDict)
+
+    @field_validator(
+        "decision_identifier",
+        "graph_run_identifier",
+        "subject_identifier",
+        "outcome",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(value)
+
+    @field_validator("input_fingerprint")
+    @classmethod
+    def validate_input_fingerprint(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @field_validator("decided_at_epoch")
+    @classmethod
+    def validate_decided_at(cls, value: float) -> float:
+        normalized = _validate_epoch(value, label="Decision timestamp")
+        assert normalized is not None
+        return normalized
+
+    @field_validator("related_node_ids")
+    @classmethod
+    def order_related_nodes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(validate_identifier(item) for item in value)
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Decision related node identifiers must be unique.")
+        return tuple(sorted(normalized))
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: FrozenDict) -> FrozenDict:
+        return _frozen_string_map(value, label="decision metadata")
+
+
+class WorkflowRunSnapshot(CanonicalModel):
+    """Complete integrity-checked persisted snapshot of one graph run."""
+
+    revision: int = Field(ge=0)
+    graph_state: GraphState
+    node_states: tuple[NodeState, ...]
+    edge_states: tuple[EdgeState, ...] = ()
+    binding_states: tuple[BindingState, ...] = ()
+    approval_states: tuple[ApprovalState, ...] = ()
+    retry_states: tuple[RetryState, ...] = ()
+    decision_states: tuple[DecisionState, ...] = ()
+    external_inputs: tuple[ExternalInputState, ...] = ()
+    budget_state: BudgetState
+    snapshot_fingerprint: str | None = None
+
+    @field_validator("node_states")
+    @classmethod
+    def order_node_states(cls, value: tuple[NodeState, ...]) -> tuple[NodeState, ...]:
+        identities = [(item.node_id, item.attempt_number) for item in value]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Node-state identities must be unique per attempt.")
+        return tuple(sorted(value, key=lambda item: (item.node_id, item.attempt_number)))
+
+    @field_validator("edge_states")
+    @classmethod
+    def order_edge_states(cls, value: tuple[EdgeState, ...]) -> tuple[EdgeState, ...]:
+        identifiers = [item.edge_id for item in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Edge-state identifiers must be unique.")
+        return tuple(sorted(value, key=lambda item: item.edge_id))
+
+    @field_validator("binding_states")
+    @classmethod
+    def order_binding_states(
+        cls, value: tuple[BindingState, ...]
+    ) -> tuple[BindingState, ...]:
+        identifiers = [item.binding_id for item in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Binding-state identifiers must be unique.")
+        return tuple(sorted(value, key=lambda item: item.binding_id))
+
+    @field_validator("approval_states")
+    @classmethod
+    def order_approval_states(
+        cls, value: tuple[ApprovalState, ...]
+    ) -> tuple[ApprovalState, ...]:
+        identifiers = [item.approval_id for item in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Approval-state identifiers must be unique.")
+        return tuple(sorted(value, key=lambda item: item.approval_id))
+
+    @field_validator("retry_states")
+    @classmethod
+    def order_retry_states(cls, value: tuple[RetryState, ...]) -> tuple[RetryState, ...]:
+        identifiers = [item.retry_id for item in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Retry-state identifiers must be unique.")
+        return tuple(sorted(value, key=lambda item: item.retry_id))
+
+    @field_validator("decision_states")
+    @classmethod
+    def order_decisions(
+        cls, value: tuple[DecisionState, ...]
+    ) -> tuple[DecisionState, ...]:
+        identifiers = [item.decision_identifier for item in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Decision-state identifiers must be unique.")
+        return tuple(sorted(value, key=lambda item: item.decision_identifier))
+
+    @field_validator("external_inputs")
+    @classmethod
+    def order_external_inputs(
+        cls, value: tuple[ExternalInputState, ...]
+    ) -> tuple[ExternalInputState, ...]:
+        identifiers = [item.input_identifier for item in value]
+        ports = [(item.node_id, item.port_id) for item in value]
+        if len(identifiers) != len(set(identifiers)) or len(ports) != len(set(ports)):
+            raise ValueError("External workflow inputs must be unique by identity and port.")
+        return tuple(sorted(value, key=lambda item: item.input_identifier))
+
+    @field_validator("snapshot_fingerprint")
+    @classmethod
+    def validate_snapshot_fingerprint(cls, value: str | None) -> str | None:
+        return validate_sha256(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> Self:
+        run_id = self.graph_state.graph_run_identifier
+        graph_fingerprint = self.graph_state.graph_definition_fingerprint
+        for state in self.node_states:
+            if (
+                state.graph_run_identifier != run_id
+                or state.graph_definition_fingerprint != graph_fingerprint
+            ):
+                raise ValueError("Node state does not belong to the graph run.")
+        for collection in (
+            self.edge_states,
+            self.binding_states,
+            self.approval_states,
+            self.retry_states,
+            self.decision_states,
+            self.external_inputs,
+        ):
+            if any(item.graph_run_identifier != run_id for item in collection):
+                raise ValueError("Persisted workflow state crosses graph-run identity.")
+        if self.budget_state.graph_run_identifier != run_id:
+            raise ValueError("Budget state does not belong to the graph run.")
+        expected = self.fingerprint_without_receipt()
+        if self.snapshot_fingerprint is not None and self.snapshot_fingerprint != expected:
+            raise ValueError("Workflow run snapshot fingerprint does not match content.")
+        object.__setattr__(self, "snapshot_fingerprint", expected)
+        return self
+
+    def fingerprint_without_receipt(self) -> str:
+        from cgr.science.canonical import sha256_fingerprint
+
+        return sha256_fingerprint(
+            self.model_dump(mode="json", exclude={"snapshot_fingerprint"})
+        )

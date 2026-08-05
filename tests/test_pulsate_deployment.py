@@ -39,6 +39,7 @@ def test_production_startup_validates_before_listener(tmp_path: Path) -> None:
     ) == 0
     assert events == ["validate", "listen"]
     assert (data / "molecular-artifacts").is_dir()
+    assert (data / "workflows").is_dir()
 
 
 def test_invalid_configuration_never_opens_listener(tmp_path: Path) -> None:

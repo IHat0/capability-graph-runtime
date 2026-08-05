@@ -461,6 +461,83 @@ ROUTE_PROTECTIONS: dict[tuple[str, str], RouteProtection] = {
     ("GET", "/api/v1/runs/{run_identifier}/receipt"): RouteProtection(
         (ProtectedAction.RUN_READ,), "run", "path:run_identifier"
     ),
+    ("POST", "/api/v1/workflows/compile"): RouteProtection(
+        (ProtectedAction.WORKFLOW_CREATE,),
+        "workflow",
+        "static:collection",
+        True,
+    ),
+    (
+        "GET",
+        "/api/v1/workflows/{graph_identifier}/versions/{graph_version}",
+    ): RouteProtection(
+        (ProtectedAction.WORKFLOW_READ,),
+        "workflow",
+        "path:graph_identifier",
+    ),
+    (
+        "POST",
+        "/api/v1/workflows/{graph_identifier}/versions/{graph_version}/validate",
+    ): RouteProtection(
+        (ProtectedAction.WORKFLOW_READ,),
+        "workflow",
+        "path:graph_identifier",
+        True,
+    ),
+    ("POST", "/api/v1/workflow-runs"): RouteProtection(
+        (ProtectedAction.WORKFLOW_EXECUTE,),
+        "workflow-run",
+        "static:collection",
+        True,
+    ),
+    ("GET", "/api/v1/workflow-runs/{graph_run_identifier}"): RouteProtection(
+        (ProtectedAction.WORKFLOW_READ,),
+        "workflow-run",
+        "path:graph_run_identifier",
+    ),
+    (
+        "POST",
+        "/api/v1/workflow-runs/{graph_run_identifier}/approvals/{approval_identifier}",
+    ): RouteProtection(
+        (ProtectedAction.WORKFLOW_APPROVE,),
+        "workflow-run",
+        "path:graph_run_identifier",
+        True,
+    ),
+    (
+        "POST",
+        "/api/v1/workflow-runs/{graph_run_identifier}/resume",
+    ): RouteProtection(
+        (ProtectedAction.WORKFLOW_EXECUTE,),
+        "workflow-run",
+        "path:graph_run_identifier",
+        True,
+    ),
+    (
+        "POST",
+        "/api/v1/workflow-runs/{graph_run_identifier}/cancel",
+    ): RouteProtection(
+        (ProtectedAction.WORKFLOW_CANCEL,),
+        "workflow-run",
+        "path:graph_run_identifier",
+        True,
+    ),
+    (
+        "GET",
+        "/api/v1/workflow-runs/{graph_run_identifier}/nodes",
+    ): RouteProtection(
+        (ProtectedAction.WORKFLOW_READ,),
+        "workflow-run",
+        "path:graph_run_identifier",
+    ),
+    (
+        "GET",
+        "/api/v1/workflow-runs/{graph_run_identifier}/evidence",
+    ): RouteProtection(
+        (ProtectedAction.WORKFLOW_READ,),
+        "workflow-run",
+        "path:graph_run_identifier",
+    ),
 }
 
 

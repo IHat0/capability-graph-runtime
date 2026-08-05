@@ -8,8 +8,8 @@ Backup and restore use the same bounded cross-process lock under the backup
 root, so they cannot overlap.
 
 `production_persistence_inventory()` is authoritative. It includes molecular
-artifacts/projects, runs, experiments, interpretations, grants, and audit
-records. Configuration, JWKS, credentials, and catalogues are excluded.
+artifacts/projects, runs, experiments, interpretations, workflow graph
+definitions and run snapshots, grants, and audit records. Configuration, JWKS, credentials, and catalogues are excluded.
 The local SQLite audit hash chain is integrity-evident, not externally anchored
 or WORM storage; backup retention does not change that limitation.
 
@@ -39,8 +39,9 @@ cgr-pulsate-restore --backup-root <backup-root> \
 ```
 
 The target must be absent or explicitly empty. Restore uses task-owned staging,
-validates every repository and SQLite provider, then publishes with atomic
-no-replace semantics. There is no merge or overwrite mode. Its receipt contains
+validates every repository and SQLite provider, including the required
+`workflows/` component with schema identity `pulsate-workflows/v1`, then
+publishes with atomic no-replace semantics. There is no merge or overwrite mode. Its receipt contains
 safe identities and hashes, never a target path or payload.
 
 ## Operator-controlled rollback
@@ -50,7 +51,10 @@ safe identities and hashes, never a target path or payload.
 3. Back up and verify the current live root separately.
 4. Explicitly change the deployment mount/reference to the new root.
 5. Run configuration check; start; require `/live` and `/ready`.
-6. Retain the previous root for the approved rollback window.
+6. Confirm restored workflow snapshots retain successful-node and external
+   invocation identities before any run is resumed; this prevents silent
+   duplication of completed external work.
+7. Retain the previous root for the approved rollback window.
 
 Cross-platform atomic mount switching is not claimed. The software never
 switches mounts or automatically deletes old roots.

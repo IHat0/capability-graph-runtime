@@ -92,6 +92,13 @@ function api(overrides: Partial<PulsateApi> = {}): PulsateApi {
     getNativeMolecularStructure: vi.fn(),
     getMolecularTopology: vi.fn(),
     evaluateMolecularProjectPlan: vi.fn(),
+    getWorkflowGraph: vi.fn(),
+    getWorkflowRun: vi.fn(),
+    getWorkflowNodes: vi.fn(),
+    getWorkflowEvidence: vi.fn(),
+    resumeWorkflowRun: vi.fn(),
+    cancelWorkflowRun: vi.fn(),
+    decideWorkflowApproval: vi.fn(),
     ...overrides,
   }
 }

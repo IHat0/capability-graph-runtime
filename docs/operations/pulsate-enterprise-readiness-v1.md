@@ -40,13 +40,13 @@ not copied into records.
 
 ## Authoritative producer map
 
-The 67 mandatory gates are derived from `ENTERPRISE_GATE_PRODUCERS`; there is
+The 71 mandatory gates are derived from `ENTERPRISE_GATE_PRODUCERS`; there is
 no independent gate list.
 
 | Workflow job | Actual command families | Mandatory evidence |
 | --- | --- | --- |
-| `ci.yml:backend-evidence` | Focused pytest with JUnit | audit, authorization, catalogue, durable security, molecular integrity/publication/concurrency, planning, JWT/JWKS, readiness-failure, scientific-contract, redaction, tenant, and unassigned-plan gates |
-| `ci.yml:frontend-evidence` | Vitest, ESLint, both TypeScript checks, Vite | all frontend and molecular-workspace gates |
+| `ci.yml:backend-evidence` | Focused pytest with JUnit | audit, authorization, catalogue, durable security, molecular integrity/publication/concurrency, planning, workflow graph/API/recovery, JWT/JWKS, readiness-failure, scientific-contract, redaction, tenant, and unassigned-plan gates |
+| `ci.yml:frontend-evidence` | Vitest, ESLint, both TypeScript checks, Vite | all frontend, molecular-workspace, and workflow-workspace gates |
 | `supply-chain-security.yml:dependency-consistency` | Hashed installs, `npm ci`, `pip check`, final lock diff | lock consistency |
 | `supply-chain-security.yml:sbom-and-licenses` | CycloneDX/license tools and JSON validation | Python/Node SBOM and license gates |
 | `supply-chain-security.yml:vulnerability-and-static-security` | Pinned pip-audit, npm audit, Bandit, Gitleaks, Trivy config | vulnerability, secret, and static-security gates |

@@ -1,4 +1,3 @@
-import { stat } from 'node:fs/promises'
 import { expect, test } from '@playwright/test'
 
 const runIdentifier = `run-${'1'.repeat(32)}`
@@ -335,12 +334,80 @@ test('opens rejected IBM evidence read-only and renders its Mol* scene', async (
   expect(renderer).toContain('SwiftShader')
 
   const canvasScreenshot = testInfo.outputPath('molstar-canvas.png')
-  await canvas.screenshot({
+  const canvasImage = await canvas.screenshot({
     path: canvasScreenshot,
   })
 
-  const canvasFile = await stat(canvasScreenshot)
-  expect(canvasFile.size).toBeGreaterThan(10_000)
+  const canvasAnalysis = await page.evaluate(async (encodedPng) => {
+    const image = new Image()
+    image.src = `data:image/png;base64,${encodedPng}`
+    await image.decode()
+
+    const probe = document.createElement('canvas')
+    probe.width = image.naturalWidth
+    probe.height = image.naturalHeight
+
+    const context = probe.getContext('2d', {
+      willReadFrequently: true,
+    })
+
+    if (!context) {
+      return null
+    }
+
+    context.drawImage(image, 0, 0)
+
+    const pixels = context.getImageData(
+      0,
+      0,
+      probe.width,
+      probe.height,
+    ).data
+
+    const background = pixels.slice(0, 4)
+    const colours = new Set<string>()
+    let nonBackgroundPixels = 0
+
+    for (let index = 0; index < pixels.length; index += 4) {
+      const red = pixels[index]
+      const green = pixels[index + 1]
+      const blue = pixels[index + 2]
+      const alpha = pixels[index + 3]
+
+      colours.add(`${red},${green},${blue},${alpha}`)
+
+      if (
+        red !== background[0]
+        || green !== background[1]
+        || blue !== background[2]
+        || alpha !== background[3]
+      ) {
+        nonBackgroundPixels += 1
+      }
+    }
+
+    const totalPixels = probe.width * probe.height
+
+    return {
+      width: probe.width,
+      height: probe.height,
+      uniqueColours: colours.size,
+      nonBackgroundPixels,
+      nonBackgroundRatio: nonBackgroundPixels / totalPixels,
+    }
+  }, canvasImage.toString('base64'))
+
+  expect(canvasAnalysis).not.toBeNull()
+
+  if (!canvasAnalysis) {
+    throw new Error('Mol* canvas analysis was unavailable.')
+  }
+
+  expect(canvasAnalysis.width).toBeGreaterThan(400)
+  expect(canvasAnalysis.height).toBeGreaterThan(300)
+  expect(canvasAnalysis.uniqueColours).toBeGreaterThan(64)
+  expect(canvasAnalysis.nonBackgroundPixels).toBeGreaterThan(1_000)
+  expect(canvasAnalysis.nonBackgroundRatio).toBeGreaterThan(0.005)
 
   expect(
     persistedRunRequests.map((request) => request.path).sort(),

@@ -27,6 +27,11 @@ os.environ["PULSATE_DEVELOPMENT_AUTH_SCOPES"] = ",".join(
         "project.read",
         "run.read",
         "scene.read",
+        "workflow.read",
+        "workflow.create",
+        "workflow.execute",
+        "workflow.approve",
+        "workflow.cancel",
     )
 )
 
@@ -46,7 +51,7 @@ def _authenticated_test_client_init(
 TestClient.__init__ = _authenticated_test_client_init  # type: ignore[method-assign]
 
 
-PHASE_1_3_BACKEND_CORE_FILES = frozenset(
+PHASE_1_4_BACKEND_CORE_FILES = frozenset(
     {
         "test_molecular_artifact_repository.py",
         "test_molecular_contracts.py",
@@ -70,14 +75,18 @@ PHASE_1_3_BACKEND_CORE_FILES = frozenset(
         "test_pulsate_security.py",
         "test_pulsate_production_security.py",
         "test_pulsate_recovery.py",
+        "test_workflow_graph_foundation.py",
+        "test_workflow_graph_runtime.py",
+        "test_workflow_quantum_adapter.py",
+        "test_workflow_api.py",
     }
 )
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Apply core markers only to the explicit Phase 1-3 file manifest."""
+    """Apply core markers only to the explicit Phase 1-4 file manifest."""
 
     for item in items:
-        if Path(str(item.path)).name in PHASE_1_3_BACKEND_CORE_FILES:
+        if Path(str(item.path)).name in PHASE_1_4_BACKEND_CORE_FILES:
             item.add_marker(pytest.mark.core)
             item.add_marker(pytest.mark.backend_core)

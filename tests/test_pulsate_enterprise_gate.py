@@ -254,7 +254,7 @@ def _prepare_runner_root(tmp_path: Path) -> Path:
 def test_producer_registry_is_the_authoritative_complete_gate_set() -> None:
     gates = tuple(item.gate_identifier for item in ENTERPRISE_GATE_PRODUCERS)
     assert gates == REQUIRED_ENTERPRISE_GATES
-    assert len(gates) == 67
+    assert len(gates) == 71
     assert len({item.workflow_job for item in ENTERPRISE_GATE_PRODUCERS}) == 7
 
 

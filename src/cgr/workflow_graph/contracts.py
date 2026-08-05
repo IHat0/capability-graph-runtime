@@ -390,7 +390,7 @@ class ApprovalRequirement(CanonicalModel):
     approval_identifier: str
     graph_identifier: str
     graph_version: int = Field(ge=1)
-    graph_definition_fingerprint: str
+    graph_definition_fingerprint: str | None = None
     node_identifier: str | None = None
     operation_identity: str | None = None
     capability_identity: str | None = None
@@ -413,8 +413,8 @@ class ApprovalRequirement(CanonicalModel):
 
     @field_validator("graph_definition_fingerprint")
     @classmethod
-    def validate_graph_fingerprint(cls, value: str) -> str:
-        return validate_sha256(value)
+    def validate_graph_fingerprint(cls, value: str | None) -> str | None:
+        return validate_sha256(value) if value is not None else None
 
     @field_validator("cost_ceiling")
     @classmethod
@@ -454,6 +454,7 @@ class ExecutionPolicy(CanonicalModel):
     timeout_seconds: float | None = Field(default=None, gt=0)
     priority: int = Field(default=0, ge=-100, le=100)
     isolated: bool = False
+    require_known_consumption: bool = False
     requires_approval: bool = False
     approval_requirements: tuple[ApprovalRequirement, ...] = ()
 
@@ -664,9 +665,72 @@ class ConditionalEdge(CanonicalModel):
     @classmethod
     def validate_expression(cls, value: Any) -> FrozenDict:
         frozen = _freeze_json(value)
-        if not isinstance(frozen, FrozenDict) or not frozen:
-            raise ValueError("Condition expressions must be nonempty JSON objects.")
+        if not isinstance(frozen, FrozenDict):
+            raise ValueError("Condition expressions must be JSON objects.")
         return frozen
+
+    @model_validator(mode="after")
+    def validate_condition_schema(self) -> Self:
+        expression = self.condition_expression
+        keys = set(expression)
+        if self.condition_kind in {ConditionKind.SUCCESS, ConditionKind.FAILURE}:
+            if keys:
+                raise ValueError("Success and failure conditions do not accept parameters.")
+            return self
+        if self.condition_kind is ConditionKind.ARTIFACT_PRESENT:
+            allowed = {"artifact_identifier", "artifact_type"}
+            if not keys or not keys.issubset(allowed):
+                raise ValueError("Artifact-presence conditions require a bounded artifact selector.")
+            for value in expression.values():
+                validate_identifier(value, label="artifact condition identifier")
+            return self
+        if self.condition_kind in {
+            ConditionKind.VERIFICATION_CLASS,
+            ConditionKind.FEASIBILITY_CLASS,
+        }:
+            if keys != {"equals"}:
+                raise ValueError("Classification conditions require exactly one equals value.")
+            validate_identifier(expression["equals"], label="classification condition")
+            return self
+        if self.condition_kind in {
+            ConditionKind.NUMERIC_COMPARE,
+            ConditionKind.BUDGET_REMAINING,
+        }:
+            subject_key = (
+                "source"
+                if self.condition_kind is ConditionKind.NUMERIC_COMPARE
+                else "dimension"
+            )
+            if keys != {subject_key, "operator", "threshold"}:
+                raise ValueError("Numeric conditions require a subject, operator, and threshold.")
+            validate_identifier(expression[subject_key], label="numeric condition subject")
+            try:
+                ComparisonOperator(str(expression["operator"]))
+            except ValueError:
+                raise ValueError("Numeric condition operator is unsupported.") from None
+            threshold = expression["threshold"]
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(float(threshold))
+            ):
+                raise ValueError("Numeric condition threshold must be finite.")
+            return self
+        if self.condition_kind is ConditionKind.APPROVAL_RESULT:
+            if keys != {"approval_identifier", "status"}:
+                raise ValueError("Approval-result conditions require approval identity and status.")
+            validate_identifier(expression["approval_identifier"], label="approval condition")
+            try:
+                ApprovalStatus(str(expression["status"]))
+            except ValueError:
+                raise ValueError("Approval-result condition status is unsupported.") from None
+            return self
+        if self.condition_kind is ConditionKind.CANDIDATE_SELECTED:
+            if keys != {"node_identifier"}:
+                raise ValueError("Candidate-selection conditions require one node identity.")
+            validate_identifier(expression["node_identifier"], label="candidate condition")
+            return self
+        raise ValueError("Condition kind is unsupported.")
 
 
 class ComparisonGroup(CanonicalModel):
@@ -704,7 +768,21 @@ class ComparisonGroup(CanonicalModel):
         frozen = _freeze_json(value)
         if not isinstance(frozen, FrozenDict):
             raise ValueError("Selection criteria must be a JSON object.")
+        if set(frozen) != {"metric", "direction"}:
+            raise ValueError("Selection criteria require exactly metric and direction.")
+        validate_identifier(frozen["metric"], label="comparison metric")
+        if frozen["direction"] not in {"min", "max"}:
+            raise ValueError("Comparison direction must be min or max.")
         return frozen
+
+    @model_validator(mode="after")
+    def validate_selection_semantics(self) -> Self:
+        if (
+            self.comparison_kind is not ComparisonKind.BEST_SUCCESS
+            and self.selection_criteria is not None
+        ):
+            raise ValueError("Only best-success comparisons accept selection criteria.")
+        return self
 
 
 class ParameterSweep(CanonicalModel):
@@ -745,18 +823,47 @@ class WorkflowNode(CanonicalModel):
     node_identifier: str
     node_kind: NodeKind
     capability_identity: str | None = None
+    molecular_project_identifier: str | None = None
+    molecular_system_identifiers: tuple[str, ...] = ()
+    molecular_region_identifiers: tuple[str, ...] = ()
     input_ports: tuple[InputPort, ...] = ()
     output_ports: tuple[OutputPort, ...] = ()
     execution_policy: ExecutionPolicy | None = None
     retry_policy: RetryPolicy | None = None
     failure_recovery_policy: FailureRecoveryPolicy | None = None
     quantum_escalation_policy: QuantumEscalationPolicy | None = None
+    execution_target: str | None = None
+    parameters: FrozenDict = Field(default_factory=FrozenDict)
+    estimated_cost: float | None = None
+    estimated_cost_currency: str | None = None
+    estimated_resources: FrozenDict = Field(default_factory=FrozenDict)
+    verification_requirements: tuple[str, ...] = ()
     metadata: FrozenDict = Field(default_factory=FrozenDict)
 
-    @field_validator("node_identifier", "capability_identity")
+    @field_validator(
+        "node_identifier",
+        "capability_identity",
+        "molecular_project_identifier",
+        "execution_target",
+        "estimated_cost_currency",
+    )
     @classmethod
     def validate_identifiers(cls, value: str | None) -> str | None:
         return validate_identifier(value) if value is not None else None
+
+
+    @field_validator(
+        "molecular_system_identifiers", "molecular_region_identifiers"
+    )
+    @classmethod
+    def order_molecular_context(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return _identifier_tuple(
+            value,
+            label="workflow node molecular context",
+            maximum=_MAX_METADATA_KEYS,
+        )
 
     @field_validator("input_ports")
     @classmethod
@@ -779,6 +886,41 @@ class WorkflowNode(CanonicalModel):
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Output-port identifiers must be unique per node.")
         return tuple(sorted(value, key=lambda item: item.port_identifier))
+
+    @field_validator("parameters", mode="before")
+    @classmethod
+    def validate_parameters(cls, value: Any) -> FrozenDict:
+        frozen = _freeze_json(value)
+        if not isinstance(frozen, FrozenDict):
+            raise ValueError("Workflow node parameters must be a JSON object.")
+        return frozen
+
+    @field_validator("estimated_cost")
+    @classmethod
+    def validate_estimated_cost(cls, value: float | None) -> float | None:
+        return _finite_nonnegative(value, label="workflow node estimated cost")
+
+    @model_validator(mode="after")
+    def validate_cost_currency(self) -> Self:
+        if (self.estimated_cost is None) != (self.estimated_cost_currency is None):
+            raise ValueError(
+                "Workflow node estimated cost and currency must be declared together."
+            )
+        return self
+
+    @field_validator("estimated_resources")
+    @classmethod
+    def validate_estimated_resources(cls, value: FrozenDict) -> FrozenDict:
+        return _frozen_numeric_map(value, label="workflow node estimated resources")
+
+    @field_validator("verification_requirements")
+    @classmethod
+    def order_verification_requirements(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _identifier_tuple(
+            value,
+            label="workflow node verification requirement",
+            maximum=_MAX_METADATA_KEYS,
+        )
 
     @field_validator("metadata")
     @classmethod
@@ -843,21 +985,43 @@ class WorkflowEdge(CanonicalModel):
 class WorkflowGraphMetadata(CanonicalModel):
     """Bounded scientific references and non-authorizing planning estimates."""
 
+    tenant_identifier: str | None = None
     objective_identifier: str | None = None
     molecular_project_identifier: str | None = None
-    system_identifier: str | None = None
+    molecular_system_identifiers: tuple[str, ...] = ()
     candidate_plan_fingerprint: str | None = None
+    rejected_alternative_identifiers: tuple[str, ...] = ()
+    unresolved_requirement_identifiers: tuple[str, ...] = ()
+    unresolved_goal_identifiers: tuple[str, ...] = ()
     estimated_cost: float | None = None
     estimated_runtime_seconds: float | None = None
     verification_requirements: tuple[str, ...] = ()
     scientific_provenance: FrozenDict = Field(default_factory=FrozenDict)
 
     @field_validator(
-        "objective_identifier", "molecular_project_identifier", "system_identifier"
+        "tenant_identifier",
+        "objective_identifier",
+        "molecular_project_identifier",
     )
     @classmethod
     def validate_identifiers(cls, value: str | None) -> str | None:
         return validate_identifier(value) if value is not None else None
+
+    @field_validator(
+        "molecular_system_identifiers",
+        "rejected_alternative_identifiers",
+        "unresolved_requirement_identifiers",
+        "unresolved_goal_identifiers",
+    )
+    @classmethod
+    def order_reference_identifiers(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return _identifier_tuple(
+            value,
+            label="workflow metadata reference",
+            maximum=_MAX_METADATA_KEYS,
+        )
 
     @field_validator("candidate_plan_fingerprint")
     @classmethod

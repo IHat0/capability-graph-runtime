@@ -51,6 +51,11 @@ class ProtectedAction(StrEnum):
     EXPERIMENT_READ = "experiment.read"
     EXECUTION_REQUEST = "execution.request"
     EXECUTION_APPROVE = "execution.approve"
+    WORKFLOW_READ = "workflow.read"
+    WORKFLOW_CREATE = "workflow.create"
+    WORKFLOW_EXECUTE = "workflow.execute"
+    WORKFLOW_APPROVE = "workflow.approve"
+    WORKFLOW_CANCEL = "workflow.cancel"
     ADMINISTRATION = "administration"
 
 

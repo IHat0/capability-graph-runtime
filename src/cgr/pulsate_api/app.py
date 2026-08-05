@@ -25,6 +25,7 @@ from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
 from cgr.quantum_preflight.manifests import load_manifest
 from cgr.science import ScientificCapabilityCatalog
+from cgr.workflow_graph import CapabilityAdapterRegistry
 
 from .approved_experiments import (
     ApprovedExperimentExecutionResolver,
@@ -81,6 +82,12 @@ from .runs import (
     SceneUnavailableError,
     assert_public_response_safe,
 )
+from .workflow_quantum import (
+    RunCoordinatorWorkflowAdapter,
+    WorkflowCapabilityRouter,
+)
+from .workflow_routes import install_workflow_routes
+from .workflows import WorkflowService
 from .security import (
     CORRELATION_HEADER,
     PUBLIC_ROUTES,
@@ -366,6 +373,7 @@ def create_app(
     molecular_planning_service: MolecularPlanningService | None = None,
     scientific_capability_catalogue: ScientificCapabilityCatalog | None = None,
     security_services: SecurityServices | None = None,
+    workflow_service: WorkflowService | None = None,
 ) -> FastAPI:
     security_services = security_services or SecurityServices.from_environment()
     runtime_configuration = getattr(security_services, "configuration", None)
@@ -465,6 +473,50 @@ def create_app(
             ApprovedExperimentExecutionResolver(natural_language_store)
         )
 
+    if workflow_service is None:
+        configured_workflow_root = (
+            application_data_root / "workflows"
+            if application_data_root is not None
+            else Path(
+                os.environ.get(
+                    "PULSATE_WORKFLOW_ROOT",
+                    str(REPO_ROOT / ".pulsate-workflows"),
+                )
+            )
+        )
+        if runtime_configuration is not None:
+            maximum_parallelism = runtime_configuration.workflow.maximum_parallelism
+        else:
+            maximum_parallelism_raw = os.environ.get(
+                "PULSATE_WORKFLOW_MAX_PARALLELISM", "8"
+            )
+            try:
+                maximum_parallelism = int(maximum_parallelism_raw)
+            except ValueError:
+                raise ValueError(
+                    "Workflow maximum parallelism configuration is invalid."
+                ) from None
+            if not 1 <= maximum_parallelism <= 64:
+                raise ValueError(
+                    "Workflow maximum parallelism configuration is invalid."
+                )
+        workflow_adapter = WorkflowCapabilityRouter(
+            classical_adapter=CapabilityAdapterRegistry(),
+            quantum_adapter=RunCoordinatorWorkflowAdapter(run_coordinator),
+        )
+
+        def workflow_observer(
+            event: str, fields: dict[str, str | int | float | bool]
+        ) -> None:
+            security_services.events.emit(event, **fields)
+
+        workflow_service = WorkflowService(
+            root=configured_workflow_root,
+            capability_adapter=workflow_adapter,
+            maximum_parallelism=maximum_parallelism,
+            observer=workflow_observer,
+        )
+
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         _application.state.lifecycle_ready = False
@@ -488,6 +540,7 @@ def create_app(
                 experiment_store.start()
                 natural_language_store.start()
                 run_coordinator.start()
+                workflow_service.start()
                 if molecular_project_repository is not None:
                     molecular_project_repository.start()
                 if molecular_scene_service is not None:
@@ -521,19 +574,22 @@ def create_app(
                             molecular_project_repository.close()
                     finally:
                         try:
-                            run_coordinator.close()
+                            workflow_service.close()
                         finally:
                             try:
-                                natural_language_store.close()
+                                run_coordinator.close()
                             finally:
                                 try:
-                                    experiment_store.close()
+                                    natural_language_store.close()
                                 finally:
                                     try:
-                                        if production_capability_catalogue is not None:
-                                            production_capability_catalogue.close()
+                                        experiment_store.close()
                                     finally:
-                                        security_services.close()
+                                        try:
+                                            if production_capability_catalogue is not None:
+                                                production_capability_catalogue.close()
+                                        finally:
+                                            security_services.close()
 
     async def enforce_security(request: Request) -> None:
         route = request.scope.get("route")
@@ -591,6 +647,7 @@ def create_app(
         dependencies=[Depends(enforce_security)],
     )
     application.state.run_coordinator = run_coordinator
+    application.state.workflow_service = workflow_service
     application.state.experiment_store = experiment_store
     application.state.natural_language_store = natural_language_store
     application.state.molecular_scene_service = molecular_scene_service
@@ -859,6 +916,7 @@ def create_app(
             molecular_artifact_repository,
             molecular_scene_service,
             molecular_planning_service,
+            workflow_service,
         )
         repositories_ready = all(
             service is None or bool(getattr(service, "_started", True))
@@ -1206,6 +1264,10 @@ def create_app(
     @application.get("/api/v1/runs/{run_identifier}/receipt")
     def read_receipt(run_identifier: str) -> dict[str, Any]:
         return read_artifact(run_identifier, "receipt")
+
+    install_workflow_routes(
+        application, service=workflow_service, security_services=security_services
+    )
 
     return application
 
