@@ -254,14 +254,14 @@ jobs:
           cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
           --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
           --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
-          -- npm exec --prefix frontend -- tsc --noEmit -p tsconfig.app.json
+          -- npm exec --prefix frontend -- tsc --noEmit -p frontend/tsconfig.app.json
       - name: Record Node TypeScript evidence
         if: matrix.command == 'node-typescript'
         run: >-
           cgr-pulsate-evidence-run --gate "${{ matrix.gate }}"
           --producer "ci.yml:frontend-evidence" --source-commit "${GITHUB_SHA}"
           --evidence-root enterprise-evidence --output "${{ matrix.gate }}.json"
-          -- npm exec --prefix frontend -- tsc --noEmit -p tsconfig.node.json
+          -- npm exec --prefix frontend -- tsc --noEmit -p frontend/tsconfig.node.json
       - name: Record ESLint evidence
         if: matrix.command == 'eslint'
         run: >-
