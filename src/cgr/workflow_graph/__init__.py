@@ -61,6 +61,13 @@ from .repository import (
     WorkflowRepositoryIntegrityError,
     WorkflowRepositoryNotFoundError,
 )
+from .scientific_engine_adapter import (
+    ArtifactReferenceResolver,
+    ScientificEngineRegistrationError,
+    ScientificInvocationBuilder,
+    ScientificWorkflowAdapter,
+    register_scientific_engine_adapter,
+)
 from .state import (
     ApprovalState,
     BindingState,
@@ -87,6 +94,7 @@ from .validation import (
 
 __all__ = [
     "ApprovalRequirement",
+    "ArtifactReferenceResolver",
     "ApprovalState",
     "ApprovalStatus",
     "AssignmentOrdering",
@@ -154,6 +162,10 @@ __all__ = [
     "WorkflowRepositoryNotFoundError",
     "WorkflowRunSnapshot",
     "WorkflowRunTerminalError",
+    "ScientificEngineRegistrationError",
+    "ScientificInvocationBuilder",
+    "ScientificWorkflowAdapter",
     "WorkflowStateIntegrityError",
     "WorkflowEdge",
+    "register_scientific_engine_adapter",
 ]

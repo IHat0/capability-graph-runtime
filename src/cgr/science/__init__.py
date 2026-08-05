@@ -52,6 +52,12 @@ from .contracts import (
     ScientificAssumption,
     ScientificExperiment,
 )
+from .engine_adapters import (
+    ScientificEngineAdapter,
+    ScientificEngineAdapterDeclaration,
+    ScientificEngineHealthReport,
+    ScientificEngineIdentity,
+)
 from .feasibility import (
     construct_candidate_research_plan,
     evaluate_capability_feasibility,
@@ -152,6 +158,10 @@ __all__ = [
     "RejectedCapabilityAlternative",
     "ResourceAvailabilitySnapshot",
     "ResourceQuantity",
+    "ScientificEngineAdapter",
+    "ScientificEngineAdapterDeclaration",
+    "ScientificEngineHealthReport",
+    "ScientificEngineIdentity",
     "ScientificAssumption",
     "ScientificCapabilityCatalog",
     "ScientificCapabilityCatalogError",

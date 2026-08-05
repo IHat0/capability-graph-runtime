@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from enum import Enum
 from typing import Protocol, Self
 
@@ -13,7 +13,13 @@ from pydantic import Field, field_validator, model_validator
 from cgr.science.artifacts import ArtifactPointer, ArtifactReference
 from cgr.science.canonical import CanonicalModel, validate_identifier, validate_sha256
 
-from .contracts import FrozenDict, NodeKind, _freeze_json, _frozen_numeric_map, _frozen_string_map
+from .contracts import (
+    FrozenDict,
+    NodeKind,
+    _freeze_json,
+    _frozen_numeric_map,
+    _frozen_string_map,
+)
 
 
 class CapabilityInvocationStatus(str, Enum):
@@ -62,17 +68,14 @@ class CapabilityInvocation(CanonicalModel):
     def validate_identifiers(cls, value: str | None) -> str | None:
         return validate_identifier(value) if value is not None else None
 
-
-    @field_validator(
-        "molecular_system_identifiers", "molecular_region_identifiers"
-    )
+    @field_validator("molecular_system_identifiers", "molecular_region_identifiers")
     @classmethod
-    def order_molecular_context(
-        cls, value: tuple[str, ...]
-    ) -> tuple[str, ...]:
+    def order_molecular_context(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         normalized = tuple(validate_identifier(item) for item in value)
         if len(normalized) != len(set(normalized)):
-            raise ValueError("Capability invocation molecular identities must be unique.")
+            raise ValueError(
+                "Capability invocation molecular identities must be unique."
+            )
         if len(normalized) > 100:
             raise ValueError("Capability invocation molecular context is too large.")
         return tuple(sorted(normalized))
@@ -91,7 +94,9 @@ class CapabilityInvocation(CanonicalModel):
         if len(identities) != len(set(identities)):
             raise ValueError("Capability invocation input artifacts must be unique.")
         return tuple(
-            sorted(value, key=lambda item: (item.artifact_identifier, item.content_sha256))
+            sorted(
+                value, key=lambda item: (item.artifact_identifier, item.content_sha256)
+            )
         )
 
     @field_validator("input_values", "parameters", mode="before")
@@ -159,7 +164,9 @@ class CapabilityInvocationResult(CanonicalModel):
         if value is None:
             return None
         if not math.isfinite(value) or value < 0:
-            raise ValueError("Capability result actual cost must be finite and non-negative.")
+            raise ValueError(
+                "Capability result actual cost must be finite and non-negative."
+            )
         return value
 
     @field_validator("resources_consumed")
@@ -193,7 +200,9 @@ class CapabilityInvocationResult(CanonicalModel):
     @model_validator(mode="after")
     def validate_outcome(self) -> Self:
         successful = self.status is CapabilityInvocationStatus.SUCCEEDED
-        if successful and (self.error_code is not None or self.error_message is not None):
+        if successful and (
+            self.error_code is not None or self.error_message is not None
+        ):
             raise ValueError("Successful capability results cannot carry an error.")
         if not successful and (self.error_code is None or self.error_message is None):
             raise ValueError("Unsuccessful capability results require a safe error.")
@@ -205,8 +214,9 @@ class CapabilityInvocationResult(CanonicalModel):
 class CapabilityAdapter(Protocol):
     """Stable adapter boundary implemented by Phase 5 engines and existing runtimes."""
 
-    def invoke(self, invocation: CapabilityInvocation) -> CapabilityInvocationResult:
-        ...
+    def invoke(
+        self, invocation: CapabilityInvocation
+    ) -> CapabilityInvocationResult: ...
 
 
 CapabilityHandler = Callable[[CapabilityInvocation], CapabilityInvocationResult]
@@ -218,17 +228,49 @@ class CapabilityAdapterRegistry:
     def __init__(self, handlers: Mapping[str, CapabilityHandler] | None = None) -> None:
         self._handlers: dict[str, CapabilityHandler] = {}
         self._lock = threading.RLock()
-        for identity, handler in (handlers or {}).items():
-            self.register(identity, handler)
+        self.register_many(handlers or {})
 
     def register(self, capability_identity: str, handler: CapabilityHandler) -> None:
-        identity = validate_identifier(capability_identity, label="capability identity")
-        if not callable(handler):
-            raise TypeError("Capability handlers must be callable.")
-        with self._lock:
-            if identity in self._handlers:
+        self.register_many({capability_identity: handler})
+
+    def register_many(self, handlers: Mapping[str, CapabilityHandler]) -> None:
+        """Atomically register multiple exact workflow capability handlers."""
+
+        pending: dict[str, CapabilityHandler] = {}
+        for capability_identity, handler in handlers.items():
+            identity = validate_identifier(
+                capability_identity,
+                label="capability identity",
+            )
+            if not callable(handler):
+                raise TypeError("Capability handlers must be callable.")
+            if identity in pending:
                 raise ValueError("Capability identity is already registered.")
-            self._handlers[identity] = handler
+            pending[identity] = handler
+
+        with self._lock:
+            if set(pending).intersection(self._handlers):
+                raise ValueError("Capability identity is already registered.")
+            self._handlers.update(pending)
+
+    def unregister_many(
+        self,
+        capability_identities: Iterable[str],
+    ) -> None:
+        """Atomically remove exact identities during controlled rollback."""
+
+        identities = tuple(
+            validate_identifier(identity, label="capability identity")
+            for identity in capability_identities
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("Capability identities to remove must be unique.")
+
+        with self._lock:
+            if any(identity not in self._handlers for identity in identities):
+                raise ValueError("Capability identity is not registered.")
+            for identity in identities:
+                del self._handlers[identity]
 
     def identities(self) -> tuple[str, ...]:
         with self._lock:
@@ -246,7 +288,11 @@ class CapabilityAdapterRegistry:
             )
         result = handler(invocation)
         if not isinstance(result, CapabilityInvocationResult):
-            raise TypeError("Capability handlers must return CapabilityInvocationResult.")
+            raise TypeError(
+                "Capability handlers must return CapabilityInvocationResult."
+            )
         if result.invocation_identifier != invocation.invocation_identifier:
-            raise ValueError("Capability result does not match its invocation identity.")
+            raise ValueError(
+                "Capability result does not match its invocation identity."
+            )
         return result
