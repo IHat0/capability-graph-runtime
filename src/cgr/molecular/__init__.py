@@ -7,6 +7,19 @@ from .artifact_repository import (
     MolecularArtifactRepository,
     MolecularArtifactRepositoryError,
 )
+from .cheminformatics import (
+    MolecularConformer,
+    MolecularConformerSet,
+    MolecularCoordinate,
+    MolecularFragment,
+    MolecularFragmentSet,
+    MolecularGeometryFinding,
+    MolecularGeometryValidation,
+    MolecularGraph,
+    MolecularGraphAtom,
+    MolecularGraphBond,
+    MolecularScaffold,
+)
 from .contracts import (
     MolecularComponent,
     MolecularMemberReference,
@@ -33,6 +46,19 @@ from .planning import (
     MolecularPlanningProjectionError,
     project_molecular_planning_facts,
 )
+from .rdkit_adapter import (
+    CONFORMER_GENERATION,
+    FRAGMENT,
+    GEOMETRY_VALIDATION,
+    PREPARE,
+    SCAFFOLD,
+    SMILES_PARSE,
+    STRUCTURE_INGESTION,
+    MolecularArtifactPayloadStore,
+    RDKitAdapterConfigurationError,
+    RDKitCheminformaticsAdapter,
+    rdkit_capability_envelopes,
+)
 from .scene_projection import (
     MolecularSceneProjection,
     MolecularSceneProjectionError,
@@ -51,6 +77,28 @@ from .topology import (
 )
 
 __all__ = [
+    "CONFORMER_GENERATION",
+    "FRAGMENT",
+    "GEOMETRY_VALIDATION",
+    "PREPARE",
+    "SCAFFOLD",
+    "SMILES_PARSE",
+    "STRUCTURE_INGESTION",
+    "MolecularArtifactPayloadStore",
+    "MolecularConformer",
+    "MolecularConformerSet",
+    "MolecularCoordinate",
+    "MolecularFragment",
+    "MolecularFragmentSet",
+    "MolecularGeometryFinding",
+    "MolecularGeometryValidation",
+    "MolecularGraph",
+    "MolecularGraphAtom",
+    "MolecularGraphBond",
+    "MolecularScaffold",
+    "RDKitAdapterConfigurationError",
+    "RDKitCheminformaticsAdapter",
+    "rdkit_capability_envelopes",
     "MolecularArtifactConflictError",
     "MolecularArtifactIntegrityError",
     "MolecularArtifactNotFoundError",
