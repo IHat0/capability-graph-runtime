@@ -1,4 +1,4 @@
-"""Phase 5A generic Hamiltonian, mapping and exact-solver regressions."""
+"""Phase 5 generic Hamiltonian, variational and statevector regressions."""
 
 from __future__ import annotations
 
@@ -17,16 +17,24 @@ from cgr.kernel.contracts import (
     HealthStatus,
 )
 from cgr.quantum_workflow import (
+    ANSATZ_CONSTRUCT,
     EXACT_DIAGONALIZE,
     FERMION_TO_QUBIT_MAP,
     HAMILTONIAN_CONSTRUCT,
+    STATEVECTOR_SIMULATE,
+    VQE_EXECUTE,
     ExactDiagonalizationResult,
     FermionicHamiltonianTerm,
     MappedQubitHamiltonian,
+    OptimizationEvaluation,
     PauliHamiltonianTerm,
     QiskitQuantumWorkflowAdapter,
     QuantumComplexCoefficient,
+    QuantumRealParameter,
     SecondQuantizedHamiltonian,
+    StatevectorSimulationResult,
+    VariationalAnsatz,
+    VariationalGroundStateResult,
     quantum_workflow_capability_envelopes,
 )
 from cgr.science import (
@@ -199,17 +207,22 @@ def test_public_declaration_does_not_import_qiskit() -> None:
     envelopes = quantum_workflow_capability_envelopes()
     after = set(sys.modules)
 
-    assert len(envelopes) == 3
+    assert len(envelopes) == 6
     assert {envelope.descriptor.capability_name for envelope in envelopes} == {
         HAMILTONIAN_CONSTRUCT,
         FERMION_TO_QUBIT_MAP,
         EXACT_DIAGONALIZE,
+        ANSATZ_CONSTRUCT,
+        VQE_EXECUTE,
+        STATEVECTOR_SIMULATE,
     }
     assert not any(
         name == "qiskit"
         or name.startswith("qiskit.")
         or name == "qiskit_nature"
         or name.startswith("qiskit_nature.")
+        or name == "qiskit_algorithms"
+        or name.startswith("qiskit_algorithms.")
         for name in after - before
     )
     assert all(
@@ -300,6 +313,38 @@ def test_hamiltonian_contracts_reject_inconsistent_quantum_identity() -> None:
         )
 
 
+def test_variational_contracts_reject_inconsistent_parameter_identity() -> None:
+    parameter = QuantumRealParameter.from_value(0, 0.0)
+    with pytest.raises(ValidationError, match="parameter count"):
+        VariationalAnsatz(
+            schema_version=VERSION,
+            ansatz_identifier="ansatz.invalid",
+            mapped_hamiltonian_identifier="mapping.invalid",
+            mapped_hamiltonian_sha256="a" * 64,
+            active_space_identifier="active.invalid",
+            active_space_sha256="b" * 64,
+            molecule_identifier="molecule.invalid",
+            mapper="jordan_wigner",
+            number_of_qubits=4,
+            active_spatial_orbital_count=2,
+            active_electron_count=2,
+            alpha_electron_count=1,
+            beta_electron_count=1,
+            ansatz="uccsd",
+            initial_state="hartree_fock",
+            initial_point_policy="all_zeros",
+            number_of_parameters=2,
+            initial_parameters=(parameter,),
+        )
+
+    evaluation = OptimizationEvaluation(
+        evaluation=1,
+        raw_active_space_energy_hartree=-1.0,
+        parameter_sha256="c" * 64,
+    )
+    assert evaluation.evaluation == 1
+
+
 def test_missing_qiskit_dependencies_fail_without_native_output() -> None:
     adapter = QiskitQuantumWorkflowAdapter(MemoryPayloadStore())
     if adapter.health().status is HealthStatus.HEALTHY:
@@ -335,6 +380,7 @@ def test_missing_qiskit_dependencies_fail_without_native_output() -> None:
 def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
     pytest.importorskip("qiskit")
     pytest.importorskip("qiskit_nature")
+    pytest.importorskip("qiskit_algorithms")
 
     store = MemoryPayloadStore()
     adapter = QiskitQuantumWorkflowAdapter(store)
@@ -354,7 +400,7 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
             HAMILTONIAN_CONSTRUCT,
             inputs=(active_reference,),
             parameters={"integral_symmetry_tolerance": 1e-9},
-            execution_identifier="execution.phase5a-hamiltonian",
+            execution_identifier="execution.phase5b-hamiltonian",
         )
     )
     assert hamiltonian_result.status is ExecutionStatus.SUCCESS
@@ -376,7 +422,7 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
                 "mapper": "jordan_wigner",
                 "hermiticity_tolerance": 1e-10,
             },
-            execution_identifier="execution.phase5a-mapping",
+            execution_identifier="execution.phase5b-mapping",
         )
     )
     assert mapping_result.status is ExecutionStatus.SUCCESS
@@ -397,13 +443,12 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
                 "particle_number_tolerance": 1e-10,
                 "hermiticity_tolerance": 1e-10,
             },
-            execution_identifier="execution.phase5a-exact",
+            execution_identifier="execution.phase5b-exact",
         )
     )
     assert exact_result.status is ExecutionStatus.SUCCESS
-    exact = ExactDiagonalizationResult.model_validate_json(
-        store.read(exact_result.output_artifacts[0])
-    )
+    exact_reference = exact_result.output_artifacts[0]
+    exact = ExactDiagonalizationResult.model_validate_json(store.read(exact_reference))
     assert exact.particle_sector_filter_applied
     assert exact.full_hilbert_space_dimension == 16
     assert exact.particle_sector_dimension == 4
@@ -415,6 +460,110 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
         rel_tol=1e-8,
         abs_tol=1e-8,
     )
-    assert exact.total_energy_hartree < -1.0
-    assert exact_result.execution_evidence is not None
-    assert exact_result.execution_evidence.details["ibm_submission_performed"] is False
+
+    ansatz_result = adapter.invoke(
+        _invocation(
+            adapter,
+            ANSATZ_CONSTRUCT,
+            inputs=(mapped_reference,),
+            parameters={
+                "ansatz": "uccsd",
+                "initial_state": "hartree_fock",
+                "initial_point_policy": "all_zeros",
+                "repetitions": 1,
+                "generalized": False,
+                "preserve_spin": True,
+                "include_imaginary": False,
+            },
+            execution_identifier="execution.phase5b-ansatz",
+        )
+    )
+    assert ansatz_result.status is ExecutionStatus.SUCCESS
+    ansatz_reference = ansatz_result.output_artifacts[0]
+    ansatz = VariationalAnsatz.model_validate_json(store.read(ansatz_reference))
+    assert ansatz.number_of_qubits == 4
+    assert ansatz.number_of_parameters > 0
+    assert all(parameter.value == 0.0 for parameter in ansatz.initial_parameters)
+    assert "qiskit" not in ansatz.to_canonical_json().lower()
+
+    vqe_parameters = {
+        "optimizer": "slsqp",
+        "estimator": "exact_statevector_expectation",
+        "maximum_iterations": 200,
+        "convergence_threshold": 1e-10,
+        "random_seed": 17,
+    }
+    with pytest.raises(ValidationError, match="unsupported artifact type"):
+        _invocation(
+            adapter,
+            VQE_EXECUTE,
+            inputs=(mapped_reference, ansatz_reference, exact_reference),
+            parameters=vqe_parameters,
+            execution_identifier="execution.phase5b-vqe-reference-rejected",
+        )
+
+    vqe_result = adapter.invoke(
+        _invocation(
+            adapter,
+            VQE_EXECUTE,
+            inputs=(mapped_reference, ansatz_reference),
+            parameters=vqe_parameters,
+            execution_identifier="execution.phase5b-vqe",
+        )
+    )
+    assert vqe_result.status is ExecutionStatus.SUCCESS
+    vqe_reference = vqe_result.output_artifacts[0]
+    vqe = VariationalGroundStateResult.model_validate_json(store.read(vqe_reference))
+    assert vqe.reference_energy_used is False
+    assert vqe.converged
+    assert vqe.optimizer_evaluations >= len(vqe.trace) >= 1
+    assert len(vqe.optimized_parameters) == ansatz.number_of_parameters
+    assert math.isclose(
+        vqe.total_energy_hartree,
+        expected_total,
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    )
+    assert math.isclose(
+        vqe.total_energy_hartree,
+        exact.total_energy_hartree,
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    )
+    assert "qiskit" not in vqe.to_canonical_json().lower()
+
+    statevector_result = adapter.invoke(
+        _invocation(
+            adapter,
+            STATEVECTOR_SIMULATE,
+            inputs=(mapped_reference, ansatz_reference, vqe_reference),
+            parameters={
+                "normalization_tolerance": 1e-10,
+                "particle_sector_tolerance": 1e-10,
+                "energy_consistency_tolerance": 1e-8,
+                "global_phase_tolerance": 1e-14,
+            },
+            execution_identifier="execution.phase5b-statevector",
+        )
+    )
+    assert statevector_result.status is ExecutionStatus.SUCCESS
+    statevector = StatevectorSimulationResult.model_validate_json(
+        store.read(statevector_result.output_artifacts[0])
+    )
+    assert statevector.state_dimension == 16
+    assert len(statevector.amplitudes) == 16
+    assert statevector.normalization_residual < 1e-10
+    assert statevector.particle_sector_leakage_probability < 1e-10
+    assert statevector.vqe_energy_difference_hartree < 1e-8
+    assert math.isclose(
+        statevector.total_energy_hartree,
+        expected_total,
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    )
+    assert "qiskit" not in statevector.to_canonical_json().lower()
+    assert statevector_result.execution_evidence is not None
+    assert (
+        statevector_result.execution_evidence.details["ibm_submission_performed"]
+        is False
+    )

@@ -1,4 +1,4 @@
-"""Phase 5A Qiskit discovery through the existing scientific workflow bridge."""
+"""Phase 5 Qiskit discovery through the existing scientific workflow bridge."""
 
 from __future__ import annotations
 
@@ -9,7 +9,10 @@ import pytest
 from cgr.electronic_structure import ElectronicActiveSpace, ElectronicTensor
 from cgr.kernel.contracts import CapabilityVersion, ExecutionContext, HealthStatus
 from cgr.quantum_workflow import (
+    ANSATZ_CONSTRUCT,
     HAMILTONIAN_CONSTRUCT,
+    STATEVECTOR_SIMULATE,
+    VQE_EXECUTE,
     QiskitQuantumWorkflowAdapter,
 )
 from cgr.science import (
@@ -146,6 +149,7 @@ def _source(store: MemoryPayloadStore) -> ArtifactReference:
 def test_qiskit_adapter_is_discoverable_and_executes_through_workflow() -> None:
     pytest.importorskip("qiskit")
     pytest.importorskip("qiskit_nature")
+    pytest.importorskip("qiskit_algorithms")
 
     payload_store = MemoryPayloadStore()
     source = _source(payload_store)
@@ -162,14 +166,24 @@ def test_qiskit_adapter_is_discoverable_and_executes_through_workflow() -> None:
         invocation_builder=InvocationBuilder(),
     )
 
-    assert len(bridges) == 3
+    assert len(bridges) == 6
     assert HAMILTONIAN_CONSTRUCT in registry.identities()
+    assert ANSATZ_CONSTRUCT in registry.identities()
+    assert VQE_EXECUTE in registry.identities()
+    assert STATEVECTOR_SIMULATE in registry.identities()
     discovered = catalogue.find(
         objective_type="second_quantized_hamiltonian_construction",
         execution_target="local_cpu",
     )
     assert len(discovered) == 1
     assert discovered[0].descriptor.capability_name == HAMILTONIAN_CONSTRUCT
+
+    variational = catalogue.find(
+        objective_type="variational_ground_state",
+        execution_target="local_cpu",
+    )
+    assert len(variational) == 1
+    assert variational[0].descriptor.capability_name == VQE_EXECUTE
 
     result = registry.invoke(
         CapabilityInvocation(

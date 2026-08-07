@@ -1,4 +1,4 @@
-"""Qiskit Nature-backed Phase 5A Hamiltonian and exact-solver capabilities."""
+"""Pinned local Qiskit adapters for generic Phase 5 quantum workflows."""
 
 from __future__ import annotations
 
@@ -31,15 +31,21 @@ from cgr.science import (
     ScientificEngineAdapterDeclaration,
     ScientificEngineHealthReport,
     ScientificEngineIdentity,
+    sha256_fingerprint,
 )
 
 from .contracts import (
     ExactDiagonalizationResult,
     FermionicHamiltonianTerm,
     MappedQubitHamiltonian,
+    OptimizationEvaluation,
     PauliHamiltonianTerm,
     QuantumComplexCoefficient,
+    QuantumRealParameter,
     SecondQuantizedHamiltonian,
+    StatevectorSimulationResult,
+    VariationalAnsatz,
+    VariationalGroundStateResult,
 )
 
 _SCHEMA_VERSION = CapabilityVersion(major=1, minor=0, patch=0)
@@ -47,14 +53,20 @@ _ADAPTER_VERSION = CapabilityVersion(major=1, minor=0, patch=0)
 _EXPECTED_VERSIONS = {
     "qiskit": "2.3.1",
     "qiskit-nature": "0.8.0",
+    "qiskit-algorithms": "0.4.0",
 }
 _MAXIMUM_PAYLOAD_BYTES = 256 * 1024 * 1024
 _MAXIMUM_EXACT_QUBITS = 12
 _MAXIMUM_EXACT_MATRIX_DIMENSION = 1 << _MAXIMUM_EXACT_QUBITS
+_MAXIMUM_STATEVECTOR_QUBITS = 16
+_MAXIMUM_OPTIMIZATION_EVALUATIONS = 100_000
 
 HAMILTONIAN_CONSTRUCT = "quantum.hamiltonian_construct"
 FERMION_TO_QUBIT_MAP = "quantum.fermion_to_qubit_map"
 EXACT_DIAGONALIZE = "quantum.exact_diagonalize"
+ANSATZ_CONSTRUCT = "quantum.ansatz_construct"
+VQE_EXECUTE = "quantum.vqe_execute"
+STATEVECTOR_SIMULATE = "quantum.statevector_simulate"
 
 
 @runtime_checkable
@@ -107,6 +119,30 @@ def _qiskit_modules() -> tuple[object, object, object, object, object]:
     )
 
 
+def _variational_modules() -> tuple[object, ...]:
+    import numpy
+    from qiskit.primitives import StatevectorEstimator
+    from qiskit.quantum_info import SparsePauliOp, Statevector
+    from qiskit_algorithms import VQE
+    from qiskit_algorithms.optimizers import SLSQP
+    from qiskit_algorithms.utils import algorithm_globals
+    from qiskit_nature.second_q.circuit.library import HartreeFock, UCCSD
+    from qiskit_nature.second_q.mappers import JordanWignerMapper
+
+    return (
+        numpy,
+        SparsePauliOp,
+        Statevector,
+        StatevectorEstimator,
+        VQE,
+        SLSQP,
+        algorithm_globals,
+        HartreeFock,
+        UCCSD,
+        JordanWignerMapper,
+    )
+
+
 def _descriptor(
     capability_name: str,
     *,
@@ -131,7 +167,7 @@ def _descriptor(
 
 
 def quantum_workflow_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
-    """Return planner declarations for the generic Phase 5A capabilities."""
+    """Return planner declarations for the generic Phase 5 capabilities."""
 
     definitions = (
         (
@@ -181,6 +217,61 @@ def quantum_workflow_capability_envelopes() -> tuple[CapabilityExecutionEnvelope
                 (
                     "The solver restricts the matrix to the declared alpha/beta "
                     "particle sector before diagonalization."
+                ),
+            ),
+        ),
+        (
+            ANSATZ_CONSTRUCT,
+            ("mapped_qubit_hamiltonian",),
+            ("variational_ansatz",),
+            ("qiskit", "qiskit_nature"),
+            ("variational_ansatz_construction",),
+            True,
+            (
+                (
+                    "Version 1 supports a one-repetition particle-conserving "
+                    "UCCSD ansatz with a Hartree-Fock initial state."
+                ),
+                "Version 1 requires an explicit all-zero initial point.",
+                "Version 1 supports Jordan-Wigner mapped active spaces only.",
+            ),
+        ),
+        (
+            VQE_EXECUTE,
+            ("mapped_qubit_hamiltonian", "variational_ansatz"),
+            ("variational_ground_state_result",),
+            ("qiskit", "qiskit_nature", "qiskit_algorithms"),
+            ("variational_ground_state", "molecular_ground_state"),
+            True,
+            (
+                (
+                    "Version 1 uses exact local statevector expectation values "
+                    "and the SLSQP optimizer."
+                ),
+                (
+                    "The VQE capability cannot consume an exact-diagonalization "
+                    "result or reference energy."
+                ),
+                "Optimizer evaluations and variational parameters are bounded.",
+            ),
+        ),
+        (
+            STATEVECTOR_SIMULATE,
+            (
+                "mapped_qubit_hamiltonian",
+                "variational_ansatz",
+                "variational_ground_state_result",
+            ),
+            ("statevector_simulation_result",),
+            ("qiskit", "qiskit_nature"),
+            ("statevector_simulation", "variational_state_reconstruction"),
+            True,
+            (
+                "Version 1 reconstructs the optimized variational state locally.",
+                "Canonical amplitude emission is bounded to 16 qubits.",
+                (
+                    "The result must pass normalization, particle-sector, "
+                    "and VQE-energy consistency checks."
                 ),
             ),
         ),
@@ -278,8 +369,83 @@ def _maximum_antihermitian_coefficient(operator: object) -> float:
     return float(maximum)
 
 
+def _real_parameters(values: Iterable[float]) -> tuple[QuantumRealParameter, ...]:
+    return tuple(
+        QuantumRealParameter.from_value(index, float(value))
+        for index, value in enumerate(values)
+    )
+
+
+def _parameter_hash(values: tuple[QuantumRealParameter, ...]) -> str:
+    return sha256_fingerprint([item.value_hex for item in values])
+
+
+def _native_mapped_operator(
+    mapped: MappedQubitHamiltonian, sparse_pauli_type: object
+) -> object:
+    operator = sparse_pauli_type.from_list(
+        [(term.label, term.coefficient.value) for term in mapped.terms]
+    )
+    if int(operator.num_qubits) != mapped.number_of_qubits:
+        raise ValueError("Reconstructed qubit count differs from the artifact.")
+    return operator
+
+
+def _native_variational_ansatz(
+    mapped: MappedQubitHamiltonian,
+    *,
+    hartree_fock_type: object,
+    uccsd_type: object,
+    mapper_type: object,
+) -> tuple[object, object]:
+    if mapped.mapper != "jordan_wigner":
+        raise ValueError(
+            "Version 1 variational execution requires Jordan-Wigner mapping."
+        )
+    mapper = mapper_type()
+    particles = (mapped.alpha_electron_count, mapped.beta_electron_count)
+    initial_state = hartree_fock_type(
+        num_spatial_orbitals=mapped.active_spatial_orbital_count,
+        num_particles=particles,
+        qubit_mapper=mapper,
+    )
+    ansatz = uccsd_type(
+        num_spatial_orbitals=mapped.active_spatial_orbital_count,
+        num_particles=particles,
+        qubit_mapper=mapper,
+        reps=1,
+        initial_state=initial_state,
+        generalized=False,
+        preserve_spin=True,
+        include_imaginary=False,
+    )
+    if int(ansatz.num_qubits) != mapped.number_of_qubits:
+        raise ValueError("Variational ansatz qubit count differs from the Hamiltonian.")
+    return initial_state, ansatz
+
+
+def _canonical_statevector(
+    values: Iterable[complex],
+    *,
+    phase_tolerance: float,
+) -> tuple[int, tuple[QuantumComplexCoefficient, ...]]:
+    data = tuple(complex(value) for value in values)
+    anchor = next(
+        (index for index, value in enumerate(data) if abs(value) > phase_tolerance),
+        None,
+    )
+    if anchor is None:
+        raise ValueError("Statevector has no nonzero amplitude.")
+    phase = data[anchor] / abs(data[anchor])
+    canonical = [value / phase for value in data]
+    canonical[anchor] = complex(abs(data[anchor]), 0.0)
+    return anchor, tuple(
+        QuantumComplexCoefficient.from_value(value) for value in canonical
+    )
+
+
 class QiskitQuantumWorkflowAdapter:
-    """Execute generic Phase 5A capabilities through pinned Qiskit boundaries."""
+    """Execute generic Phase 5 capabilities through pinned local boundaries."""
 
     def __init__(
         self,
@@ -406,6 +572,12 @@ class QiskitQuantumWorkflowAdapter:
                 return self._map_hamiltonian(invocation)
             if capability_name == EXACT_DIAGONALIZE:
                 return self._exact_diagonalize(invocation)
+            if capability_name == ANSATZ_CONSTRUCT:
+                return self._construct_ansatz(invocation)
+            if capability_name == VQE_EXECUTE:
+                return self._execute_vqe(invocation)
+            if capability_name == STATEVECTOR_SIMULATE:
+                return self._simulate_statevector(invocation)
         except (ValidationError, ValueError, KeyError, IndexError):
             return self._failure(
                 "quantum_input_invalid",
@@ -520,6 +692,9 @@ class QiskitQuantumWorkflowAdapter:
                     "qiskit_nature_version": versions.get(
                         "qiskit-nature", "unavailable"
                     ),
+                    "qiskit_algorithms_version": versions.get(
+                        "qiskit-algorithms", "unavailable"
+                    ),
                     "native_objects_public": False,
                     "ibm_submission_performed": False,
                 },
@@ -588,6 +763,33 @@ class QiskitQuantumWorkflowAdapter:
         if not math.isfinite(normalized) or not minimum <= normalized <= maximum:
             raise ValueError(f"Quantum parameter {name} is outside its allowed range.")
         return normalized
+
+    @classmethod
+    def _integer_parameter(
+        cls,
+        invocation: CapabilityInvocation,
+        name: str,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        value = cls._parameter(invocation, name, required=True)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Quantum parameter {name} must be an integer.")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"Quantum parameter {name} is outside its allowed range.")
+        return value
+
+    @classmethod
+    def _boolean_parameter(
+        cls,
+        invocation: CapabilityInvocation,
+        name: str,
+    ) -> bool:
+        value = cls._parameter(invocation, name, required=True)
+        if not isinstance(value, bool):
+            raise ValueError(f"Quantum parameter {name} must be boolean.")
+        return value
 
     @staticmethod
     def _inputs_by_type(
@@ -1011,5 +1213,543 @@ class QiskitQuantumWorkflowAdapter:
                 "total_energy_hartree": total_energy,
                 "maximum_eigenpair_residual_hartree": maximum_residual,
                 "particle_sector_leakage_hartree": particle_sector_leakage_hartree,
+            },
+        )
+
+    def _construct_ansatz(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        mapped_reference = self._require_input(inputs, "mapped_qubit_hamiltonian")
+        if len(inputs) != 1:
+            raise ValueError("Ansatz construction requires one mapped Hamiltonian.")
+        mapped = self._load_model(mapped_reference, MappedQubitHamiltonian)
+
+        ansatz_name = self._string_parameter(invocation, "ansatz")
+        initial_state_name = self._string_parameter(invocation, "initial_state")
+        initial_point_policy = self._string_parameter(
+            invocation, "initial_point_policy"
+        )
+        repetitions = self._integer_parameter(
+            invocation, "repetitions", minimum=1, maximum=1
+        )
+        generalized = self._boolean_parameter(invocation, "generalized")
+        preserve_spin = self._boolean_parameter(invocation, "preserve_spin")
+        include_imaginary = self._boolean_parameter(invocation, "include_imaginary")
+        if ansatz_name != "uccsd":
+            raise ValueError("Version 1 supports only the UCCSD ansatz.")
+        if initial_state_name != "hartree_fock":
+            raise ValueError("Version 1 supports only the Hartree-Fock initial state.")
+        if initial_point_policy != "all_zeros":
+            raise ValueError("Version 1 supports only an all-zero initial point.")
+        if repetitions != 1 or generalized or not preserve_spin or include_imaginary:
+            raise ValueError("The requested ansatz settings are unsupported.")
+
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            hartree_fock_type,
+            uccsd_type,
+            mapper_type,
+        ) = _variational_modules()
+        _, native_ansatz = _native_variational_ansatz(
+            mapped,
+            hartree_fock_type=hartree_fock_type,
+            uccsd_type=uccsd_type,
+            mapper_type=mapper_type,
+        )
+        number_of_parameters = int(native_ansatz.num_parameters)
+        if number_of_parameters <= 0:
+            raise ValueError("The constructed ansatz has no variational parameters.")
+        initial_parameters = _real_parameters((0.0,) * number_of_parameters)
+
+        ansatz = VariationalAnsatz(
+            schema_version=_SCHEMA_VERSION,
+            ansatz_identifier=_stable_identifier(
+                "variational-ansatz",
+                mapped.mapping_identifier,
+                mapped_reference.content_sha256,
+                ansatz_name,
+                initial_state_name,
+                repetitions,
+                generalized,
+                preserve_spin,
+                include_imaginary,
+                initial_point_policy,
+            ),
+            mapped_hamiltonian_identifier=mapped.mapping_identifier,
+            mapped_hamiltonian_sha256=mapped_reference.content_sha256,
+            active_space_identifier=mapped.active_space_identifier,
+            active_space_sha256=mapped.active_space_sha256,
+            molecule_identifier=mapped.molecule_identifier,
+            mapper=mapped.mapper,
+            number_of_qubits=mapped.number_of_qubits,
+            active_spatial_orbital_count=mapped.active_spatial_orbital_count,
+            active_electron_count=mapped.active_electron_count,
+            alpha_electron_count=mapped.alpha_electron_count,
+            beta_electron_count=mapped.beta_electron_count,
+            ansatz="uccsd",
+            initial_state="hartree_fock",
+            repetitions=1,
+            generalized=False,
+            preserve_spin=True,
+            include_imaginary=False,
+            initial_point_policy="all_zeros",
+            number_of_parameters=number_of_parameters,
+            initial_parameters=initial_parameters,
+        )
+        parents = (mapped_reference,)
+        output = self._write_model(
+            invocation,
+            model=ansatz,
+            artifact_type="variational_ansatz",
+            identifier_prefix="variational-ansatz",
+            parents=parents,
+            metadata={
+                "ansatz": ansatz.ansatz,
+                "initial_state": ansatz.initial_state,
+                "number_of_qubits": ansatz.number_of_qubits,
+                "number_of_parameters": ansatz.number_of_parameters,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="constructs_variational_ansatz",
+            ),
+            diagnostics={
+                "ansatz": ansatz.ansatz,
+                "initial_state": ansatz.initial_state,
+                "number_of_qubits": ansatz.number_of_qubits,
+                "number_of_parameters": ansatz.number_of_parameters,
+            },
+        )
+
+    def _execute_vqe(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        mapped_reference = self._require_input(inputs, "mapped_qubit_hamiltonian")
+        ansatz_reference = self._require_input(inputs, "variational_ansatz")
+        if len(inputs) != 2:
+            raise ValueError(
+                "VQE requires exactly one mapped Hamiltonian and one ansatz."
+            )
+        mapped = self._load_model(mapped_reference, MappedQubitHamiltonian)
+        ansatz_spec = self._load_model(ansatz_reference, VariationalAnsatz)
+        if (
+            ansatz_spec.mapped_hamiltonian_identifier != mapped.mapping_identifier
+            or ansatz_spec.mapped_hamiltonian_sha256 != mapped_reference.content_sha256
+            or ansatz_spec.active_space_sha256 != mapped.active_space_sha256
+        ):
+            raise ValueError("VQE ansatz lineage does not match the Hamiltonian.")
+
+        optimizer_name = self._string_parameter(invocation, "optimizer")
+        estimator_name = self._string_parameter(invocation, "estimator")
+        maximum_iterations = self._integer_parameter(
+            invocation, "maximum_iterations", minimum=1, maximum=10_000
+        )
+        convergence_threshold = self._float_parameter(
+            invocation,
+            "convergence_threshold",
+            minimum=1e-12,
+            maximum=1e-2,
+        )
+        random_seed = self._integer_parameter(
+            invocation, "random_seed", minimum=0, maximum=2**32 - 1
+        )
+        if optimizer_name != "slsqp":
+            raise ValueError("Version 1 supports only the SLSQP optimizer.")
+        if estimator_name != "exact_statevector_expectation":
+            raise ValueError(
+                "Version 1 supports only exact statevector expectation values."
+            )
+
+        (
+            numpy,
+            sparse_pauli_type,
+            _,
+            estimator_type,
+            vqe_type,
+            optimizer_type,
+            algorithm_globals,
+            hartree_fock_type,
+            uccsd_type,
+            mapper_type,
+        ) = _variational_modules()
+        native_qubit = _native_mapped_operator(mapped, sparse_pauli_type)
+        _, native_ansatz = _native_variational_ansatz(
+            mapped,
+            hartree_fock_type=hartree_fock_type,
+            uccsd_type=uccsd_type,
+            mapper_type=mapper_type,
+        )
+        if int(native_ansatz.num_parameters) != ansatz_spec.number_of_parameters:
+            raise ValueError("Reconstructed ansatz parameter count is inconsistent.")
+        initial_point = numpy.asarray(
+            [parameter.value for parameter in ansatz_spec.initial_parameters],
+            dtype=float,
+        )
+        if len(initial_point) != ansatz_spec.number_of_parameters:
+            raise ValueError("VQE initial point has an invalid length.")
+
+        trace: list[OptimizationEvaluation] = []
+
+        def callback(
+            evaluation: int,
+            parameters: object,
+            mean: object,
+            metadata: object,
+        ) -> None:
+            del metadata
+            if len(trace) >= _MAXIMUM_OPTIMIZATION_EVALUATIONS:
+                raise ValueError("VQE optimization trace exceeds its bound.")
+            parameter_values = _real_parameters(float(value) for value in parameters)
+            energy = complex(mean)
+            if abs(energy.imag) > mapped.hermiticity_tolerance:
+                raise ValueError("VQE evaluation energy has an imaginary component.")
+            trace.append(
+                OptimizationEvaluation(
+                    evaluation=int(evaluation),
+                    raw_active_space_energy_hartree=float(energy.real),
+                    parameter_sha256=_parameter_hash(parameter_values),
+                )
+            )
+
+        algorithm_globals.random_seed = random_seed
+        optimizer = optimizer_type(
+            maxiter=maximum_iterations,
+            ftol=convergence_threshold,
+            disp=False,
+        )
+        solver = vqe_type(
+            estimator=estimator_type(seed=random_seed),
+            ansatz=native_ansatz,
+            optimizer=optimizer,
+            initial_point=initial_point,
+            callback=callback,
+        )
+        raw = solver.compute_minimum_eigenvalue(native_qubit)
+        raw_energy = complex(raw.eigenvalue)
+        if abs(raw_energy.imag) > mapped.hermiticity_tolerance:
+            raise ValueError("VQE result energy has an imaginary component.")
+
+        optimized = _real_parameters(
+            float(value) for value in getattr(raw, "optimal_point", ())
+        )
+        if len(optimized) != ansatz_spec.number_of_parameters:
+            raise ValueError("VQE optimized parameter count is inconsistent.")
+        if not trace:
+            raise ValueError("VQE produced no optimization trace.")
+
+        optimizer_result = getattr(raw, "optimizer_result", None)
+        success = getattr(optimizer_result, "success", None)
+        if success is False:
+            raise ValueError("VQE optimizer did not converge.")
+        status = getattr(optimizer_result, "status", None)
+        status_identifier = "completed" if status is None else f"status_{int(status)}"
+        evaluations = max(
+            int(getattr(raw, "cost_function_evals", len(trace))),
+            len(trace),
+            1,
+        )
+        if evaluations > _MAXIMUM_OPTIMIZATION_EVALUATIONS:
+            raise ValueError("VQE optimizer evaluation count exceeds its bound.")
+
+        total_energy = float(raw_energy.real + mapped.constant_energy_hartree)
+        result = VariationalGroundStateResult(
+            schema_version=_SCHEMA_VERSION,
+            result_identifier=_stable_identifier(
+                "variational-ground-state",
+                mapped.mapping_identifier,
+                mapped_reference.content_sha256,
+                ansatz_spec.ansatz_identifier,
+                ansatz_reference.content_sha256,
+                optimizer_name,
+                estimator_name,
+                maximum_iterations,
+                convergence_threshold,
+                random_seed,
+                _parameter_hash(optimized),
+            ),
+            mapped_hamiltonian_identifier=mapped.mapping_identifier,
+            mapped_hamiltonian_sha256=mapped_reference.content_sha256,
+            ansatz_identifier=ansatz_spec.ansatz_identifier,
+            ansatz_sha256=ansatz_reference.content_sha256,
+            active_space_identifier=mapped.active_space_identifier,
+            active_space_sha256=mapped.active_space_sha256,
+            algorithm_identifier="variational_quantum_eigensolver",
+            estimator_identifier="exact_statevector_expectation",
+            optimizer_identifier="slsqp",
+            optimizer_version=_installed_version("qiskit-algorithms") or "unavailable",
+            optimizer_status=status_identifier,
+            maximum_iterations=maximum_iterations,
+            convergence_threshold=convergence_threshold,
+            random_seed=random_seed,
+            number_of_qubits=mapped.number_of_qubits,
+            number_of_parameters=ansatz_spec.number_of_parameters,
+            optimizer_evaluations=evaluations,
+            initial_point_sha256=_parameter_hash(ansatz_spec.initial_parameters),
+            optimized_parameters=optimized,
+            optimized_parameters_sha256=_parameter_hash(optimized),
+            raw_active_space_energy_hartree=float(raw_energy.real),
+            constant_energy_hartree=mapped.constant_energy_hartree,
+            total_energy_hartree=total_energy,
+            reference_energy_used=False,
+            converged=True,
+            trace=tuple(trace),
+        )
+        parents = (mapped_reference, ansatz_reference)
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type="variational_ground_state_result",
+            identifier_prefix="variational-ground-state-result",
+            parents=parents,
+            metadata={
+                "optimizer": result.optimizer_identifier,
+                "estimator": result.estimator_identifier,
+                "number_of_qubits": result.number_of_qubits,
+                "number_of_parameters": result.number_of_parameters,
+                "optimizer_evaluations": result.optimizer_evaluations,
+                "total_energy_hartree": result.total_energy_hartree,
+                "reference_energy_used": False,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="optimizes_variational_ground_state",
+            ),
+            diagnostics={
+                "optimizer": result.optimizer_identifier,
+                "estimator": result.estimator_identifier,
+                "optimizer_evaluations": result.optimizer_evaluations,
+                "total_energy_hartree": result.total_energy_hartree,
+                "reference_energy_used": False,
+            },
+        )
+
+    def _simulate_statevector(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        mapped_reference = self._require_input(inputs, "mapped_qubit_hamiltonian")
+        ansatz_reference = self._require_input(inputs, "variational_ansatz")
+        vqe_reference = self._require_input(inputs, "variational_ground_state_result")
+        if len(inputs) != 3:
+            raise ValueError(
+                "Statevector simulation requires one Hamiltonian, ansatz and VQE result."
+            )
+        mapped = self._load_model(mapped_reference, MappedQubitHamiltonian)
+        ansatz_spec = self._load_model(ansatz_reference, VariationalAnsatz)
+        vqe = self._load_model(vqe_reference, VariationalGroundStateResult)
+        if mapped.number_of_qubits > _MAXIMUM_STATEVECTOR_QUBITS:
+            raise ValueError("Variational state exceeds the statevector qubit bound.")
+        if (
+            ansatz_spec.mapped_hamiltonian_sha256 != mapped_reference.content_sha256
+            or vqe.mapped_hamiltonian_sha256 != mapped_reference.content_sha256
+            or vqe.ansatz_sha256 != ansatz_reference.content_sha256
+            or vqe.active_space_sha256 != mapped.active_space_sha256
+        ):
+            raise ValueError("Statevector input lineage is inconsistent.")
+
+        normalization_tolerance = self._float_parameter(
+            invocation,
+            "normalization_tolerance",
+            minimum=1e-14,
+            maximum=1e-4,
+        )
+        particle_sector_tolerance = self._float_parameter(
+            invocation,
+            "particle_sector_tolerance",
+            minimum=1e-14,
+            maximum=1e-4,
+        )
+        energy_consistency_tolerance = self._float_parameter(
+            invocation,
+            "energy_consistency_tolerance",
+            minimum=1e-12,
+            maximum=1e-3,
+        )
+        phase_tolerance = self._float_parameter(
+            invocation,
+            "global_phase_tolerance",
+            minimum=1e-16,
+            maximum=1e-6,
+        )
+
+        (
+            numpy,
+            sparse_pauli_type,
+            statevector_type,
+            _,
+            _,
+            _,
+            _,
+            hartree_fock_type,
+            uccsd_type,
+            mapper_type,
+        ) = _variational_modules()
+        native_qubit = _native_mapped_operator(mapped, sparse_pauli_type)
+        _, native_ansatz = _native_variational_ansatz(
+            mapped,
+            hartree_fock_type=hartree_fock_type,
+            uccsd_type=uccsd_type,
+            mapper_type=mapper_type,
+        )
+        if int(native_ansatz.num_parameters) != vqe.number_of_parameters:
+            raise ValueError("Statevector ansatz parameter count is inconsistent.")
+        point = numpy.asarray(
+            [parameter.value for parameter in vqe.optimized_parameters],
+            dtype=float,
+        )
+        bound = native_ansatz.assign_parameters(point, inplace=False)
+        state = statevector_type.from_instruction(bound)
+        data = numpy.asarray(state.data, dtype=complex)
+        state_dimension = 1 << mapped.number_of_qubits
+        if data.shape != (state_dimension,):
+            raise ValueError("Statevector has an invalid dimension.")
+
+        norm = float(numpy.vdot(data, data).real)
+        normalization_residual = abs(norm - 1.0)
+        if (
+            not math.isfinite(normalization_residual)
+            or normalization_residual > normalization_tolerance
+        ):
+            raise ValueError("Statevector fails its normalization tolerance.")
+
+        expectation = complex(state.expectation_value(native_qubit))
+        if abs(expectation.imag) > mapped.hermiticity_tolerance:
+            raise ValueError(
+                "Statevector Hamiltonian expectation has an imaginary component."
+            )
+        total_energy = float(expectation.real + mapped.constant_energy_hartree)
+        energy_difference = abs(total_energy - vqe.total_energy_hartree)
+        if energy_difference > energy_consistency_tolerance:
+            raise ValueError("Statevector energy differs from the VQE result.")
+
+        n = mapped.active_spatial_orbital_count
+        alpha_mask = (1 << n) - 1
+        beta_mask = alpha_mask << n
+        probabilities = numpy.abs(data) ** 2
+        sector_probability = 0.0
+        observed_alpha = 0.0
+        observed_beta = 0.0
+        for index, probability_value in enumerate(probabilities):
+            probability = float(probability_value)
+            alpha_count = (index & alpha_mask).bit_count()
+            beta_count = ((index & beta_mask) >> n).bit_count()
+            observed_alpha += probability * alpha_count
+            observed_beta += probability * beta_count
+            if (
+                alpha_count == mapped.alpha_electron_count
+                and beta_count == mapped.beta_electron_count
+            ):
+                sector_probability += probability
+        sector_probability = min(1.0, max(0.0, sector_probability))
+        leakage_probability = max(0.0, 1.0 - sector_probability)
+        if leakage_probability > particle_sector_tolerance:
+            raise ValueError("Statevector leaks outside the declared particle sector.")
+
+        anchor, amplitudes = _canonical_statevector(
+            data,
+            phase_tolerance=phase_tolerance,
+        )
+        result = StatevectorSimulationResult(
+            schema_version=_SCHEMA_VERSION,
+            result_identifier=_stable_identifier(
+                "statevector-simulation",
+                mapped.mapping_identifier,
+                mapped_reference.content_sha256,
+                ansatz_spec.ansatz_identifier,
+                ansatz_reference.content_sha256,
+                vqe.result_identifier,
+                vqe_reference.content_sha256,
+                normalization_tolerance,
+                particle_sector_tolerance,
+                energy_consistency_tolerance,
+                phase_tolerance,
+            ),
+            mapped_hamiltonian_identifier=mapped.mapping_identifier,
+            mapped_hamiltonian_sha256=mapped_reference.content_sha256,
+            ansatz_identifier=ansatz_spec.ansatz_identifier,
+            ansatz_sha256=ansatz_reference.content_sha256,
+            vqe_result_identifier=vqe.result_identifier,
+            vqe_result_sha256=vqe_reference.content_sha256,
+            active_space_identifier=mapped.active_space_identifier,
+            active_space_sha256=mapped.active_space_sha256,
+            simulator_identifier="exact_statevector",
+            number_of_qubits=mapped.number_of_qubits,
+            active_spatial_orbital_count=mapped.active_spatial_orbital_count,
+            active_electron_count=mapped.active_electron_count,
+            alpha_electron_count=mapped.alpha_electron_count,
+            beta_electron_count=mapped.beta_electron_count,
+            state_dimension=state_dimension,
+            global_phase_anchor_index=anchor,
+            amplitudes=amplitudes,
+            normalization_tolerance=normalization_tolerance,
+            normalization_residual=normalization_residual,
+            particle_sector_tolerance=particle_sector_tolerance,
+            particle_sector_probability=sector_probability,
+            particle_sector_leakage_probability=leakage_probability,
+            observed_alpha_electron_count=observed_alpha,
+            observed_beta_electron_count=observed_beta,
+            raw_active_space_expectation_hartree=float(expectation.real),
+            constant_energy_hartree=mapped.constant_energy_hartree,
+            total_energy_hartree=total_energy,
+            vqe_total_energy_hartree=vqe.total_energy_hartree,
+            vqe_energy_difference_hartree=energy_difference,
+            energy_consistency_tolerance=energy_consistency_tolerance,
+        )
+        parents = (mapped_reference, ansatz_reference, vqe_reference)
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type="statevector_simulation_result",
+            identifier_prefix="statevector-simulation-result",
+            parents=parents,
+            metadata={
+                "number_of_qubits": result.number_of_qubits,
+                "state_dimension": result.state_dimension,
+                "particle_sector_probability": result.particle_sector_probability,
+                "total_energy_hartree": result.total_energy_hartree,
+                "vqe_energy_difference_hartree": result.vqe_energy_difference_hartree,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="simulates_optimized_statevector",
+            ),
+            diagnostics={
+                "number_of_qubits": result.number_of_qubits,
+                "state_dimension": result.state_dimension,
+                "normalization_residual": result.normalization_residual,
+                "particle_sector_leakage_probability": (
+                    result.particle_sector_leakage_probability
+                ),
+                "total_energy_hartree": result.total_energy_hartree,
+                "vqe_energy_difference_hartree": result.vqe_energy_difference_hartree,
             },
         )
