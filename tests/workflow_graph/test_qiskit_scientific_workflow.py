@@ -11,6 +11,7 @@ from cgr.kernel.contracts import CapabilityVersion, ExecutionContext, HealthStat
 from cgr.quantum_workflow import (
     ANSATZ_CONSTRUCT,
     HAMILTONIAN_CONSTRUCT,
+    NOISY_SIMULATE,
     STATEVECTOR_SIMULATE,
     VQE_EXECUTE,
     QiskitQuantumWorkflowAdapter,
@@ -150,6 +151,7 @@ def test_qiskit_adapter_is_discoverable_and_executes_through_workflow() -> None:
     pytest.importorskip("qiskit")
     pytest.importorskip("qiskit_nature")
     pytest.importorskip("qiskit_algorithms")
+    pytest.importorskip("qiskit_aer")
 
     payload_store = MemoryPayloadStore()
     source = _source(payload_store)
@@ -166,11 +168,12 @@ def test_qiskit_adapter_is_discoverable_and_executes_through_workflow() -> None:
         invocation_builder=InvocationBuilder(),
     )
 
-    assert len(bridges) == 6
+    assert len(bridges) == 7
     assert HAMILTONIAN_CONSTRUCT in registry.identities()
     assert ANSATZ_CONSTRUCT in registry.identities()
     assert VQE_EXECUTE in registry.identities()
     assert STATEVECTOR_SIMULATE in registry.identities()
+    assert NOISY_SIMULATE in registry.identities()
     discovered = catalogue.find(
         objective_type="second_quantized_hamiltonian_construction",
         execution_target="local_cpu",
@@ -184,6 +187,13 @@ def test_qiskit_adapter_is_discoverable_and_executes_through_workflow() -> None:
     )
     assert len(variational) == 1
     assert variational[0].descriptor.capability_name == VQE_EXECUTE
+
+    noisy = catalogue.find(
+        objective_type="noisy_simulation",
+        execution_target="local_cpu",
+    )
+    assert len(noisy) == 1
+    assert noisy[0].descriptor.capability_name == NOISY_SIMULATE
 
     result = registry.invoke(
         CapabilityInvocation(

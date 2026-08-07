@@ -21,6 +21,7 @@ _MAXIMUM_EXACT_QUBITS = 12
 _MAXIMUM_VQE_PARAMETERS = 100_000
 _MAXIMUM_OPTIMIZATION_EVALUATIONS = 100_000
 _MAXIMUM_STATEVECTOR_QUBITS = 16
+_MAXIMUM_NOISY_SIMULATION_QUBITS = 16
 
 
 def _validate_schema_version(value: CapabilityVersion) -> CapabilityVersion:
@@ -827,4 +828,146 @@ class StatevectorSimulationResult(CanonicalModel):
             raise ValueError("Statevector VQE energy difference is inconsistent.")
         if self.vqe_energy_difference_hartree > self.energy_consistency_tolerance:
             raise ValueError("Statevector energy differs from the VQE result.")
+        return self
+
+
+class NoisySimulationResult(CanonicalModel):
+    """Noisy local variational-energy estimate with explicit stochastic controls."""
+
+    schema_version: CapabilityVersion
+    result_identifier: str
+    mapped_hamiltonian_identifier: str
+    mapped_hamiltonian_sha256: str
+    ansatz_identifier: str
+    ansatz_sha256: str
+    vqe_result_identifier: str
+    vqe_result_sha256: str
+    active_space_identifier: str
+    active_space_sha256: str
+    simulator_identifier: Literal["noise_aware_expectation_simulator"]
+    simulation_method: Literal["density_matrix"] = "density_matrix"
+    noise_model_identifier: Literal["explicit_depolarizing_gate_noise"]
+    sampling_model: Literal["gaussian_target_precision"] = "gaussian_target_precision"
+    shot_count: None = None
+    number_of_qubits: int = Field(gt=0, le=_MAXIMUM_NOISY_SIMULATION_QUBITS)
+    one_qubit_depolarizing_probability: float = Field(ge=0, le=0.5)
+    two_qubit_depolarizing_probability: float = Field(ge=0, le=0.5)
+    one_qubit_noisy_operations: tuple[str, ...] = ("rz", "sx", "x")
+    two_qubit_noisy_operations: tuple[str, ...] = ("cx",)
+    transpilation_basis_gates: tuple[str, ...] = ("rz", "sx", "x", "cx")
+    transpilation_optimization_level: int = Field(ge=0, le=3)
+    seed_transpiler: int = Field(ge=0, le=2**32 - 1)
+    transpiled_circuit_depth: int = Field(ge=0)
+    target_precision_hartree: float = Field(gt=0, le=0.25)
+    seed_simulator: int = Field(ge=0, le=2**32 - 1)
+    raw_active_space_expectation_hartree: float
+    reported_standard_error_hartree: float = Field(ge=0)
+    constant_energy_hartree: float
+    total_energy_hartree: float
+    vqe_total_energy_hartree: float
+    vqe_energy_difference_hartree: float = Field(ge=0)
+    completed: Literal[True] = True
+
+    @field_validator("schema_version")
+    @classmethod
+    def validate_schema_version(cls, value: CapabilityVersion) -> CapabilityVersion:
+        return _validate_schema_version(value)
+
+    @field_validator(
+        "result_identifier",
+        "mapped_hamiltonian_identifier",
+        "ansatz_identifier",
+        "vqe_result_identifier",
+        "active_space_identifier",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(value, label="noisy-simulation identifier")
+
+    @field_validator(
+        "mapped_hamiltonian_sha256",
+        "ansatz_sha256",
+        "vqe_result_sha256",
+        "active_space_sha256",
+    )
+    @classmethod
+    def validate_hashes(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @field_validator(
+        "one_qubit_depolarizing_probability",
+        "two_qubit_depolarizing_probability",
+        "target_precision_hartree",
+        "raw_active_space_expectation_hartree",
+        "reported_standard_error_hartree",
+        "constant_energy_hartree",
+        "total_energy_hartree",
+        "vqe_total_energy_hartree",
+        "vqe_energy_difference_hartree",
+    )
+    @classmethod
+    def validate_finite_scalars(cls, value: float) -> float:
+        return _finite(value, label="Noisy-simulation scalar")
+
+    @field_validator(
+        "one_qubit_noisy_operations",
+        "two_qubit_noisy_operations",
+        "transpilation_basis_gates",
+    )
+    @classmethod
+    def validate_operations(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or len(value) != len(set(value)):
+            raise ValueError(
+                "Noisy-simulation operation sets must be non-empty and unique."
+            )
+        return tuple(
+            validate_identifier(item, label="noisy operation") for item in value
+        )
+
+    @model_validator(mode="after")
+    def validate_noisy_result(self) -> Self:
+        if (
+            self.one_qubit_depolarizing_probability == 0.0
+            and self.two_qubit_depolarizing_probability == 0.0
+        ):
+            raise ValueError(
+                "Noisy simulation requires at least one non-zero error probability."
+            )
+        if self.one_qubit_noisy_operations != ("rz", "sx", "x"):
+            raise ValueError(
+                "Version 1 noisy simulation has a fixed one-qubit noisy gate set."
+            )
+        if self.two_qubit_noisy_operations != ("cx",):
+            raise ValueError(
+                "Version 1 noisy simulation has a fixed two-qubit noisy gate set."
+            )
+        if self.transpilation_basis_gates != ("rz", "sx", "x", "cx"):
+            raise ValueError(
+                "Version 1 noisy simulation has a fixed transpilation basis."
+            )
+        if not math.isclose(
+            self.reported_standard_error_hartree,
+            self.target_precision_hartree,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            raise ValueError(
+                "Noisy-simulation standard error must match its target precision."
+            )
+        if not math.isclose(
+            self.raw_active_space_expectation_hartree + self.constant_energy_hartree,
+            self.total_energy_hartree,
+            rel_tol=1e-10,
+            abs_tol=1e-10,
+        ):
+            raise ValueError(
+                "Noisy-simulation energy components do not sum to total energy."
+            )
+        if not math.isclose(
+            self.vqe_energy_difference_hartree,
+            abs(self.total_energy_hartree - self.vqe_total_energy_hartree),
+            rel_tol=1e-10,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("Noisy-simulation VQE energy difference is inconsistent.")
         return self

@@ -1,4 +1,4 @@
-"""Adapter from Phase 4 workflow nodes to the existing verified run coordinator."""
+"""Adapters from Phase 5 quantum workflow nodes to the verified run coordinator."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ from cgr.workflow_graph import (
 )
 
 
+IBM_QUANTUM_EXECUTE = "quantum.ibm_execute"
+
+
 class WorkflowRunCoordinator(Protocol):
     """Narrow existing-execution-spine interface used by the workflow adapter."""
 
@@ -27,16 +30,11 @@ class WorkflowRunCoordinator(Protocol):
         *,
         experiment_identifier: str | None = None,
         approved_experiment_identifier: str | None = None,
-    ) -> tuple[dict[str, Any], bool]:
-        ...
+    ) -> tuple[dict[str, Any], bool]: ...
 
-    def get(self, run_identifier: str) -> dict[str, Any]:
-        ...
+    def get(self, run_identifier: str) -> dict[str, Any]: ...
 
-    def artifact(
-        self, run_identifier: str, name: str
-    ) -> dict[str, Any]:
-        ...
+    def artifact(self, run_identifier: str, name: str) -> dict[str, Any]: ...
 
 
 class RunCoordinatorWorkflowAdapter:
@@ -89,7 +87,10 @@ class RunCoordinatorWorkflowAdapter:
             if invocation.node_kind is NodeKind.QUANTUM_IBM
             else "local_simulator"
         )
-        if invocation.execution_target is not None and invocation.execution_target != target:
+        if (
+            invocation.execution_target is not None
+            and invocation.execution_target != target
+        ):
             return self._failure(
                 invocation,
                 status=CapabilityInvocationStatus.BLOCKED,
@@ -235,6 +236,71 @@ class RunCoordinatorWorkflowAdapter:
         )
 
 
+class IBMQuantumExecutionAdapter:
+    """Explicit IBM-only capability wrapper around the verified run spine.
+
+    The wrapper imports no provider SDK and cannot bypass the existing bound
+    workflow approval or approved-experiment checks. Actual provider submission
+    remains delegated to the server-controlled run coordinator.
+    """
+
+    capability_identity = IBM_QUANTUM_EXECUTE
+
+    def __init__(
+        self,
+        coordinator: WorkflowRunCoordinator,
+        *,
+        poll_interval_seconds: float = 0.05,
+        default_timeout_seconds: float = 180.0,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._delegate = RunCoordinatorWorkflowAdapter(
+            coordinator,
+            poll_interval_seconds=poll_interval_seconds,
+            default_timeout_seconds=default_timeout_seconds,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+
+    @staticmethod
+    def capability_metadata() -> FrozenDict:
+        """Return the fail-closed declaration for the optional hardware path."""
+
+        return FrozenDict(
+            {
+                "capability_identity": IBM_QUANTUM_EXECUTE,
+                "execution_target": "ibm_quantum",
+                "default_execution": False,
+                "explicit_approval_required": True,
+                "approved_experiment_required": True,
+                "provider_submission_owned_by_run_coordinator": True,
+            }
+        )
+
+    def invoke(self, invocation: CapabilityInvocation) -> CapabilityInvocationResult:
+        if invocation.capability_identity != IBM_QUANTUM_EXECUTE:
+            return RunCoordinatorWorkflowAdapter._failure(
+                invocation,
+                status=CapabilityInvocationStatus.BLOCKED,
+                code="ibm_capability_identity_mismatch",
+                message=(
+                    "IBM Quantum execution requires the explicit IBM "
+                    "capability identity."
+                ),
+            )
+        if invocation.node_kind is not NodeKind.QUANTUM_IBM:
+            return RunCoordinatorWorkflowAdapter._failure(
+                invocation,
+                status=CapabilityInvocationStatus.BLOCKED,
+                code="ibm_node_kind_required",
+                message=(
+                    "The IBM Quantum execution adapter accepts IBM workflow nodes only."
+                ),
+            )
+        return self._delegate.invoke(invocation)
+
+
 class WorkflowCapabilityRouter:
     """Route existing quantum nodes to the verified spine and all others generically."""
 
@@ -254,7 +320,11 @@ class WorkflowCapabilityRouter:
         )
         result = adapter.invoke(invocation)
         if not isinstance(result, CapabilityInvocationResult):
-            raise TypeError("Workflow capability adapters must return a capability result.")
+            raise TypeError(
+                "Workflow capability adapters must return a capability result."
+            )
         if result.invocation_identifier != invocation.invocation_identifier:
-            raise ValueError("Workflow capability result identity does not match its request.")
+            raise ValueError(
+                "Workflow capability result identity does not match its request."
+            )
         return result

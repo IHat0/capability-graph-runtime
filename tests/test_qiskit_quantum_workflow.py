@@ -21,11 +21,13 @@ from cgr.quantum_workflow import (
     EXACT_DIAGONALIZE,
     FERMION_TO_QUBIT_MAP,
     HAMILTONIAN_CONSTRUCT,
+    NOISY_SIMULATE,
     STATEVECTOR_SIMULATE,
     VQE_EXECUTE,
     ExactDiagonalizationResult,
     FermionicHamiltonianTerm,
     MappedQubitHamiltonian,
+    NoisySimulationResult,
     OptimizationEvaluation,
     PauliHamiltonianTerm,
     QiskitQuantumWorkflowAdapter,
@@ -207,7 +209,7 @@ def test_public_declaration_does_not_import_qiskit() -> None:
     envelopes = quantum_workflow_capability_envelopes()
     after = set(sys.modules)
 
-    assert len(envelopes) == 6
+    assert len(envelopes) == 7
     assert {envelope.descriptor.capability_name for envelope in envelopes} == {
         HAMILTONIAN_CONSTRUCT,
         FERMION_TO_QUBIT_MAP,
@@ -215,6 +217,7 @@ def test_public_declaration_does_not_import_qiskit() -> None:
         ANSATZ_CONSTRUCT,
         VQE_EXECUTE,
         STATEVECTOR_SIMULATE,
+        NOISY_SIMULATE,
     }
     assert not any(
         name == "qiskit"
@@ -223,6 +226,10 @@ def test_public_declaration_does_not_import_qiskit() -> None:
         or name.startswith("qiskit_nature.")
         or name == "qiskit_algorithms"
         or name.startswith("qiskit_algorithms.")
+        or name == "qiskit_aer"
+        or name.startswith("qiskit_aer.")
+        or name == "qiskit_ibm_runtime"
+        or name.startswith("qiskit_ibm_runtime.")
         for name in after - before
     )
     assert all(
@@ -381,6 +388,7 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
     pytest.importorskip("qiskit")
     pytest.importorskip("qiskit_nature")
     pytest.importorskip("qiskit_algorithms")
+    pytest.importorskip("qiskit_aer")
 
     store = MemoryPayloadStore()
     adapter = QiskitQuantumWorkflowAdapter(store)
@@ -567,3 +575,59 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
         statevector_result.execution_evidence.details["ibm_submission_performed"]
         is False
     )
+
+    noisy_result = adapter.invoke(
+        _invocation(
+            adapter,
+            NOISY_SIMULATE,
+            inputs=(mapped_reference, ansatz_reference, vqe_reference),
+            parameters={
+                "noise_model": "depolarizing_gate",
+                "one_qubit_depolarizing_probability": 0.001,
+                "two_qubit_depolarizing_probability": 0.01,
+                "transpilation_optimization_level": 1,
+                "seed_transpiler": 31,
+                "target_precision_hartree": 0.001,
+                "seed_simulator": 29,
+            },
+            execution_identifier="execution.phase5-noisy",
+        )
+    )
+    assert noisy_result.status is ExecutionStatus.SUCCESS
+    noisy = NoisySimulationResult.model_validate_json(
+        store.read(noisy_result.output_artifacts[0])
+    )
+    assert noisy.number_of_qubits == 4
+    assert noisy.noise_model_identifier == "explicit_depolarizing_gate_noise"
+    assert noisy.simulation_method == "density_matrix"
+    assert noisy.sampling_model == "gaussian_target_precision"
+    assert noisy.shot_count is None
+    assert noisy.one_qubit_depolarizing_probability == 0.001
+    assert noisy.two_qubit_depolarizing_probability == 0.01
+    assert noisy.transpilation_basis_gates == ("rz", "sx", "x", "cx")
+    assert noisy.transpilation_optimization_level == 1
+    assert noisy.seed_transpiler == 31
+    assert noisy.transpiled_circuit_depth > 0
+    assert noisy.target_precision_hartree == 0.001
+    assert noisy.seed_simulator == 29
+    assert math.isfinite(noisy.total_energy_hartree)
+    assert math.isfinite(noisy.reported_standard_error_hartree)
+    assert math.isclose(
+        noisy.reported_standard_error_hartree,
+        noisy.target_precision_hartree,
+        rel_tol=1e-12,
+        abs_tol=1e-15,
+    )
+    assert math.isclose(
+        noisy.vqe_energy_difference_hartree,
+        abs(noisy.total_energy_hartree - vqe.total_energy_hartree),
+        rel_tol=1e-10,
+        abs_tol=1e-12,
+    )
+    canonical_noisy = noisy.to_canonical_json().lower()
+    assert "qiskit" not in canonical_noisy
+    assert "aer" not in canonical_noisy
+    assert noisy_result.execution_evidence is not None
+    assert noisy_result.execution_evidence.runtime_identifier == "qiskit_aer.local"
+    assert noisy_result.execution_evidence.details["qiskit_aer_version"] == "0.17.1"
+    assert noisy_result.execution_evidence.details["ibm_submission_performed"] is False

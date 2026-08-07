@@ -38,6 +38,7 @@ from .contracts import (
     ExactDiagonalizationResult,
     FermionicHamiltonianTerm,
     MappedQubitHamiltonian,
+    NoisySimulationResult,
     OptimizationEvaluation,
     PauliHamiltonianTerm,
     QuantumComplexCoefficient,
@@ -54,11 +55,13 @@ _EXPECTED_VERSIONS = {
     "qiskit": "2.3.1",
     "qiskit-nature": "0.8.0",
     "qiskit-algorithms": "0.4.0",
+    "qiskit-aer": "0.17.1",
 }
 _MAXIMUM_PAYLOAD_BYTES = 256 * 1024 * 1024
 _MAXIMUM_EXACT_QUBITS = 12
 _MAXIMUM_EXACT_MATRIX_DIMENSION = 1 << _MAXIMUM_EXACT_QUBITS
 _MAXIMUM_STATEVECTOR_QUBITS = 16
+_MAXIMUM_NOISY_SIMULATION_QUBITS = 16
 _MAXIMUM_OPTIMIZATION_EVALUATIONS = 100_000
 
 HAMILTONIAN_CONSTRUCT = "quantum.hamiltonian_construct"
@@ -67,6 +70,7 @@ EXACT_DIAGONALIZE = "quantum.exact_diagonalize"
 ANSATZ_CONSTRUCT = "quantum.ansatz_construct"
 VQE_EXECUTE = "quantum.vqe_execute"
 STATEVECTOR_SIMULATE = "quantum.statevector_simulate"
+NOISY_SIMULATE = "quantum.noisy_simulate"
 
 
 @runtime_checkable
@@ -141,6 +145,14 @@ def _variational_modules() -> tuple[object, ...]:
         UCCSD,
         JordanWignerMapper,
     )
+
+
+def _noisy_modules() -> tuple[object, object, object, object]:
+    from qiskit import transpile
+    from qiskit_aer.noise import NoiseModel, depolarizing_error
+    from qiskit_aer.primitives import EstimatorV2
+
+    return EstimatorV2, NoiseModel, depolarizing_error, transpile
 
 
 def _descriptor(
@@ -273,6 +285,30 @@ def quantum_workflow_capability_envelopes() -> tuple[CapabilityExecutionEnvelope
                     "The result must pass normalization, particle-sector, "
                     "and VQE-energy consistency checks."
                 ),
+            ),
+        ),
+        (
+            NOISY_SIMULATE,
+            (
+                "mapped_qubit_hamiltonian",
+                "variational_ansatz",
+                "variational_ground_state_result",
+            ),
+            ("noisy_simulation_result",),
+            ("qiskit", "qiskit_nature", "qiskit_aer"),
+            ("noisy_simulation", "variational_state_reconstruction"),
+            False,
+            (
+                (
+                    "Version 1 uses an explicit depolarizing gate-noise model "
+                    "with density-matrix simulation."
+                ),
+                (
+                    "Noise strength, target precision and simulator seed must be "
+                    "provided explicitly."
+                ),
+                "Version 1 noisy execution is bounded to 16 qubits.",
+                "No noisy-simulator result is treated as IBM hardware evidence.",
             ),
         ),
     )
@@ -578,6 +614,8 @@ class QiskitQuantumWorkflowAdapter:
                 return self._execute_vqe(invocation)
             if capability_name == STATEVECTOR_SIMULATE:
                 return self._simulate_statevector(invocation)
+            if capability_name == NOISY_SIMULATE:
+                return self._simulate_noisy(invocation)
         except (ValidationError, ValueError, KeyError, IndexError):
             return self._failure(
                 "quantum_input_invalid",
@@ -683,7 +721,11 @@ class QiskitQuantumWorkflowAdapter:
             lineage=lineage,
             diagnostics=dict(diagnostics or {}),
             execution_evidence=ExecutionEvidence(
-                runtime_identifier="qiskit_nature.local",
+                runtime_identifier=(
+                    "qiskit_aer.local"
+                    if invocation.capability.capability_name == NOISY_SIMULATE
+                    else "qiskit_nature.local"
+                ),
                 exit_code=0,
                 evidence_artifacts=tuple(artifact.pointer for artifact in artifacts),
                 details={
@@ -695,6 +737,7 @@ class QiskitQuantumWorkflowAdapter:
                     "qiskit_algorithms_version": versions.get(
                         "qiskit-algorithms", "unavailable"
                     ),
+                    "qiskit_aer_version": versions.get("qiskit-aer", "unavailable"),
                     "native_objects_public": False,
                     "ibm_submission_performed": False,
                 },
@@ -1750,6 +1793,276 @@ class QiskitQuantumWorkflowAdapter:
                     result.particle_sector_leakage_probability
                 ),
                 "total_energy_hartree": result.total_energy_hartree,
+                "vqe_energy_difference_hartree": result.vqe_energy_difference_hartree,
+            },
+        )
+
+    def _simulate_noisy(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        mapped_reference = self._require_input(inputs, "mapped_qubit_hamiltonian")
+        ansatz_reference = self._require_input(inputs, "variational_ansatz")
+        vqe_reference = self._require_input(inputs, "variational_ground_state_result")
+        if len(inputs) != 3:
+            raise ValueError(
+                "Noisy simulation requires one Hamiltonian, ansatz and VQE result."
+            )
+        mapped = self._load_model(mapped_reference, MappedQubitHamiltonian)
+        ansatz_spec = self._load_model(ansatz_reference, VariationalAnsatz)
+        vqe = self._load_model(vqe_reference, VariationalGroundStateResult)
+        if mapped.number_of_qubits > _MAXIMUM_NOISY_SIMULATION_QUBITS:
+            raise ValueError(
+                "Variational state exceeds the noisy-simulation qubit bound."
+            )
+        if (
+            ansatz_spec.mapped_hamiltonian_sha256 != mapped_reference.content_sha256
+            or vqe.mapped_hamiltonian_sha256 != mapped_reference.content_sha256
+            or vqe.ansatz_sha256 != ansatz_reference.content_sha256
+            or vqe.active_space_sha256 != mapped.active_space_sha256
+        ):
+            raise ValueError("Noisy-simulation input lineage is inconsistent.")
+
+        noise_model_name = self._string_parameter(invocation, "noise_model")
+        one_qubit_probability = self._float_parameter(
+            invocation,
+            "one_qubit_depolarizing_probability",
+            minimum=0.0,
+            maximum=0.5,
+        )
+        two_qubit_probability = self._float_parameter(
+            invocation,
+            "two_qubit_depolarizing_probability",
+            minimum=0.0,
+            maximum=0.5,
+        )
+        transpilation_optimization_level = self._integer_parameter(
+            invocation,
+            "transpilation_optimization_level",
+            minimum=0,
+            maximum=3,
+        )
+        seed_transpiler = self._integer_parameter(
+            invocation,
+            "seed_transpiler",
+            minimum=0,
+            maximum=2**32 - 1,
+        )
+        target_precision_hartree = self._float_parameter(
+            invocation,
+            "target_precision_hartree",
+            minimum=1e-6,
+            maximum=0.25,
+        )
+        seed_simulator = self._integer_parameter(
+            invocation,
+            "seed_simulator",
+            minimum=0,
+            maximum=2**32 - 1,
+        )
+        if noise_model_name != "depolarizing_gate":
+            raise ValueError(
+                "Version 1 supports only the explicit depolarizing gate-noise model."
+            )
+        if one_qubit_probability == 0.0 and two_qubit_probability == 0.0:
+            raise ValueError("Noisy simulation requires a non-zero error probability.")
+
+        (
+            numpy,
+            sparse_pauli_type,
+            _,
+            _,
+            _,
+            _,
+            _,
+            hartree_fock_type,
+            uccsd_type,
+            mapper_type,
+        ) = _variational_modules()
+        (
+            estimator_type,
+            noise_model_type,
+            depolarizing_error,
+            transpile,
+        ) = _noisy_modules()
+        native_qubit = _native_mapped_operator(mapped, sparse_pauli_type)
+        _, native_ansatz = _native_variational_ansatz(
+            mapped,
+            hartree_fock_type=hartree_fock_type,
+            uccsd_type=uccsd_type,
+            mapper_type=mapper_type,
+        )
+        if int(native_ansatz.num_parameters) != vqe.number_of_parameters:
+            raise ValueError("Noisy-simulation ansatz parameter count is inconsistent.")
+        point = numpy.asarray(
+            [parameter.value for parameter in vqe.optimized_parameters],
+            dtype=float,
+        )
+        bound = native_ansatz.assign_parameters(point, inplace=False)
+
+        noise_model = noise_model_type()
+        one_qubit_operations = ("rz", "sx", "x")
+        two_qubit_operations = ("cx",)
+        if one_qubit_probability > 0.0:
+            noise_model.add_all_qubit_quantum_error(
+                depolarizing_error(one_qubit_probability, 1),
+                list(one_qubit_operations),
+            )
+        if two_qubit_probability > 0.0:
+            noise_model.add_all_qubit_quantum_error(
+                depolarizing_error(two_qubit_probability, 2),
+                list(two_qubit_operations),
+            )
+        if bool(noise_model.is_ideal()):
+            raise ValueError("Configured noisy-simulation model is unexpectedly ideal.")
+
+        basis_gates = ("rz", "sx", "x", "cx")
+        transpiled = transpile(
+            bound,
+            basis_gates=list(basis_gates),
+            optimization_level=transpilation_optimization_level,
+            seed_transpiler=seed_transpiler,
+        )
+        if int(transpiled.num_qubits) != mapped.number_of_qubits:
+            raise ValueError("Noisy transpilation changed the declared qubit count.")
+        circuit_depth = int(transpiled.depth() or 0)
+
+        estimator = estimator_type(
+            options={
+                "backend_options": {
+                    "noise_model": noise_model,
+                    "method": "density_matrix",
+                },
+                "run_options": {"seed_simulator": seed_simulator},
+            }
+        )
+        publication = estimator.run(
+            [(transpiled, native_qubit)],
+            precision=target_precision_hartree,
+        ).result()[0]
+        expectation_values = numpy.asarray(publication.data.evs, dtype=float).reshape(
+            -1
+        )
+        standard_errors = numpy.asarray(publication.data.stds, dtype=float).reshape(-1)
+        if expectation_values.size != 1 or standard_errors.size != 1:
+            raise ValueError("Noisy estimator returned an unexpected result shape.")
+        raw_energy = float(expectation_values[0])
+        standard_error = float(standard_errors[0])
+        if (
+            not math.isfinite(raw_energy)
+            or not math.isfinite(standard_error)
+            or standard_error < 0.0
+        ):
+            raise ValueError("Noisy estimator returned invalid numerical evidence.")
+
+        total_energy = float(raw_energy + mapped.constant_energy_hartree)
+        energy_difference = abs(total_energy - vqe.total_energy_hartree)
+        result = NoisySimulationResult(
+            schema_version=_SCHEMA_VERSION,
+            result_identifier=_stable_identifier(
+                "noisy-simulation",
+                mapped.mapping_identifier,
+                mapped_reference.content_sha256,
+                ansatz_spec.ansatz_identifier,
+                ansatz_reference.content_sha256,
+                vqe.result_identifier,
+                vqe_reference.content_sha256,
+                noise_model_name,
+                one_qubit_probability,
+                two_qubit_probability,
+                basis_gates,
+                transpilation_optimization_level,
+                seed_transpiler,
+                circuit_depth,
+                target_precision_hartree,
+                seed_simulator,
+                raw_energy,
+                standard_error,
+            ),
+            mapped_hamiltonian_identifier=mapped.mapping_identifier,
+            mapped_hamiltonian_sha256=mapped_reference.content_sha256,
+            ansatz_identifier=ansatz_spec.ansatz_identifier,
+            ansatz_sha256=ansatz_reference.content_sha256,
+            vqe_result_identifier=vqe.result_identifier,
+            vqe_result_sha256=vqe_reference.content_sha256,
+            active_space_identifier=mapped.active_space_identifier,
+            active_space_sha256=mapped.active_space_sha256,
+            simulator_identifier="noise_aware_expectation_simulator",
+            simulation_method="density_matrix",
+            noise_model_identifier="explicit_depolarizing_gate_noise",
+            sampling_model="gaussian_target_precision",
+            shot_count=None,
+            number_of_qubits=mapped.number_of_qubits,
+            one_qubit_depolarizing_probability=one_qubit_probability,
+            two_qubit_depolarizing_probability=two_qubit_probability,
+            one_qubit_noisy_operations=one_qubit_operations,
+            two_qubit_noisy_operations=two_qubit_operations,
+            transpilation_basis_gates=basis_gates,
+            transpilation_optimization_level=transpilation_optimization_level,
+            seed_transpiler=seed_transpiler,
+            transpiled_circuit_depth=circuit_depth,
+            target_precision_hartree=target_precision_hartree,
+            seed_simulator=seed_simulator,
+            raw_active_space_expectation_hartree=raw_energy,
+            reported_standard_error_hartree=standard_error,
+            constant_energy_hartree=mapped.constant_energy_hartree,
+            total_energy_hartree=total_energy,
+            vqe_total_energy_hartree=vqe.total_energy_hartree,
+            vqe_energy_difference_hartree=energy_difference,
+        )
+        parents = (mapped_reference, ansatz_reference, vqe_reference)
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type="noisy_simulation_result",
+            identifier_prefix="noisy-simulation-result",
+            parents=parents,
+            metadata={
+                "number_of_qubits": result.number_of_qubits,
+                "noise_model": result.noise_model_identifier,
+                "transpilation_optimization_level": (
+                    result.transpilation_optimization_level
+                ),
+                "seed_transpiler": result.seed_transpiler,
+                "transpiled_circuit_depth": result.transpiled_circuit_depth,
+                "target_precision_hartree": result.target_precision_hartree,
+                "seed_simulator": result.seed_simulator,
+                "total_energy_hartree": result.total_energy_hartree,
+                "reported_standard_error_hartree": (
+                    result.reported_standard_error_hartree
+                ),
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="simulates_variational_state_with_noise",
+            ),
+            diagnostics={
+                "number_of_qubits": result.number_of_qubits,
+                "noise_model": result.noise_model_identifier,
+                "one_qubit_depolarizing_probability": (
+                    result.one_qubit_depolarizing_probability
+                ),
+                "two_qubit_depolarizing_probability": (
+                    result.two_qubit_depolarizing_probability
+                ),
+                "transpilation_optimization_level": (
+                    result.transpilation_optimization_level
+                ),
+                "seed_transpiler": result.seed_transpiler,
+                "transpiled_circuit_depth": result.transpiled_circuit_depth,
+                "target_precision_hartree": result.target_precision_hartree,
+                "seed_simulator": result.seed_simulator,
+                "total_energy_hartree": result.total_energy_hartree,
+                "reported_standard_error_hartree": (
+                    result.reported_standard_error_hartree
+                ),
                 "vqe_energy_difference_hartree": result.vqe_energy_difference_hartree,
             },
         )

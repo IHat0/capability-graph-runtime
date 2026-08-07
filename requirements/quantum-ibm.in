@@ -1,0 +1,4 @@
+# Optional Phase 5 IBM Quantum execution dependencies.
+# Local quantum workflow remains usable without this file.
+-r quantum-workflow.in
+qiskit-ibm-runtime==0.45.1
