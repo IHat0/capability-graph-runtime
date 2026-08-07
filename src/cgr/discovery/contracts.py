@@ -573,7 +573,7 @@ class CandidateVerificationRecord(CanonicalModel):
     objective_family: str
     subject_identifier: str
     request_sha256: str
-    overall_outcome: str
+    overall_outcome: Literal["passed", "failed"]
     execution_integrity_passed: bool
     scientific_quality_passed: bool
     authorization_passed: bool
@@ -593,6 +593,20 @@ class CandidateVerificationRecord(CanonicalModel):
     @classmethod
     def validate_hashes(cls, value: str) -> str:
         return validate_sha256(value)
+
+    @model_validator(mode="after")
+    def validate_summary_flags(self) -> Self:
+        all_dimensions_pass = (
+            self.execution_integrity_passed
+            and self.scientific_quality_passed
+            and self.authorization_passed
+        )
+        if (self.overall_outcome == "passed") != all_dimensions_pass:
+            raise ValueError(
+                "Candidate verification outcome must agree with execution, "
+                "scientific-quality and authorization summary flags."
+            )
+        return self
 
 
 class CandidateConstraintResult(CanonicalModel):
@@ -1030,6 +1044,7 @@ class CandidateGenerationRequest(CanonicalModel):
     campaign_sha256: str
     generation: int = Field(ge=0)
     parent_candidates: tuple[DiscoveryCandidate, ...] = ()
+    parent_assessments: tuple[CandidateAssessment, ...] = ()
     objective_identifiers: tuple[str, ...] = ()
     diagnosis_references: tuple[DiscoveryDiagnosisReference, ...] = ()
     replanning_references: tuple[DiscoveryReplanningReference, ...] = ()
@@ -1060,6 +1075,16 @@ class CandidateGenerationRequest(CanonicalModel):
         identifiers = [item.candidate_identifier for item in value]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Candidate generation parents must be unique.")
+        return tuple(sorted(value, key=lambda item: item.candidate_identifier))
+
+    @field_validator("parent_assessments")
+    @classmethod
+    def order_parent_assessments(
+        cls, value: tuple[CandidateAssessment, ...]
+    ) -> tuple[CandidateAssessment, ...]:
+        identifiers = [item.candidate_identifier for item in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Candidate-generation parent assessments must be unique.")
         return tuple(sorted(value, key=lambda item: item.candidate_identifier))
 
     @field_validator("diagnosis_references")
@@ -1097,6 +1122,23 @@ class CandidateGenerationRequest(CanonicalModel):
             parent.generation >= self.generation for parent in self.parent_candidates
         ):
             raise ValueError("Parent candidates must precede the requested generation.")
+        if self.parent_assessments:
+            parents = {
+                item.candidate_identifier: item for item in self.parent_candidates
+            }
+            assessment_ids = {
+                item.candidate_identifier for item in self.parent_assessments
+            }
+            if assessment_ids != set(parents):
+                raise ValueError(
+                    "Supplied parent assessments must cover exactly the parent candidates."
+                )
+            for assessment in self.parent_assessments:
+                parent = parents[assessment.candidate_identifier]
+                if assessment.candidate_sha256 != parent.fingerprint:
+                    raise ValueError(
+                        "Parent assessment identity must match its immutable parent candidate."
+                    )
         diagnosis_ids = {
             item.diagnosis_identifier for item in self.diagnosis_references
         }

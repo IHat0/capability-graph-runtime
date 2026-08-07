@@ -136,7 +136,7 @@ def _verification(
         overall_outcome="passed" if passed else "failed",
         execution_integrity_passed=True,
         scientific_quality_passed=passed,
-        authorization_passed=False,
+        authorization_passed=True,
     )
 
 

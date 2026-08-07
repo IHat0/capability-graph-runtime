@@ -115,6 +115,14 @@ def _eligible(
 ) -> tuple[bool, str]:
     if assessment.has_hard_constraint_failure:
         return False, "Candidate failed at least one explicit hard constraint."
+    if assessment.verification_records and not all(
+        item.execution_integrity_passed for item in assessment.verification_records
+    ):
+        return False, "Candidate has failed Phase 6 execution-integrity evidence."
+    if assessment.verification_records and not all(
+        item.authorization_passed for item in assessment.verification_records
+    ):
+        return False, "Candidate has failed Phase 6 authorization evidence."
     if policy.require_scientific_quality and not assessment.scientific_quality_passed:
         return False, "Candidate lacks passing Phase 6 scientific-quality evidence."
 
