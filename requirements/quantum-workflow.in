@@ -1,0 +1,6 @@
+# Direct Phase 5 quantum-workflow runtime dependencies.
+# Keep synchronized with requirements/quantum-preflight.in until one shared lock is introduced.
+qiskit==2.3.1
+qiskit-nature==0.8.0
+qiskit-algorithms==0.4.0
+qiskit-aer==0.17.1
