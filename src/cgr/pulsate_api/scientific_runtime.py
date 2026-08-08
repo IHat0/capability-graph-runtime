@@ -101,6 +101,45 @@ class ScientistCapabilityRegistry:
         return tuple(sorted(self._handlers))
 
 
+def scientific_engine_registry(
+    adapters: tuple[ScientificEngineAdapter, ...],
+    *,
+    parameter_providers: Mapping[
+        str, Mapping[str, object] | ScientificParameterProvider
+    ] | None = None,
+    additional_handlers: Mapping[str, ScientistCapabilityHandler] | None = None,
+) -> ScientistCapabilityRegistry:
+    """Build one exact registry from declared native scientific adapters.
+
+    Capability identity collisions fail closed: silently selecting one of two
+    engines would make the executed method depend on import order.  Semantic,
+    verification, campaign, and scene handlers remain explicit additions.
+    """
+
+    registry = ScientistCapabilityRegistry(additional_handlers)
+    parameters = dict(parameter_providers or {})
+    for adapter in adapters:
+        if not isinstance(adapter, ScientificEngineAdapter):
+            raise TypeError("Scientific engine registries require declared adapters.")
+        for envelope in adapter.declaration.capabilities:
+            capability_name = envelope.descriptor.capability_name
+            registry.register(
+                capability_name,
+                ScientificEngineHandler(
+                    adapter,
+                    capability_name,
+                    parameters=parameters.get(capability_name),
+                ),
+            )
+    unknown_parameters = set(parameters) - set(registry.identities())
+    if unknown_parameters:
+        raise ValueError(
+            "Scientific parameters reference undeclared capabilities: "
+            + ", ".join(sorted(unknown_parameters))
+        )
+    return registry
+
+
 @runtime_checkable
 class ScientificEngineAdapter(Protocol):
     @property
@@ -221,13 +260,13 @@ def scientific_plan_graph(record: ScientificExecutionRecord) -> WorkflowGraphDef
             node_identifier=step.step_identifier,
             node_kind=(
                 NodeKind.QUANTUM_LOCAL
-                if step.capability_name.startswith("quantum_workflow.")
+                if step.capability_name.startswith(("quantum.", "quantum_workflow."))
                 else NodeKind.CLASSICAL
             ),
             capability_identity=step.capability_name,
             execution_target=(
                 "local_simulator"
-                if step.capability_name.startswith("quantum_workflow.")
+                if step.capability_name.startswith(("quantum.", "quantum_workflow."))
                 else "local_scientific_runtime"
             ),
             verification_requirements=(

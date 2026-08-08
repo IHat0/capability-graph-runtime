@@ -32,7 +32,7 @@ def _input(identifier: str, kind: str) -> ScientificInputReference:
             "Study the metal-centred active site of this enzyme with an automatically selected active space and run the appropriate VQE workflow locally.",
             (_input("protein-1", "protein_structure"),),
             "metal_active_site_quantum",
-            {"electronic.active_space_select", "quantum_workflow.vqe"},
+            {"electronic.active_space_select", "quantum.vqe_execute"},
         ),
         (
             "Calculate a 15-point potential-energy scan for this bond from 1.2 Angstrom to 2.8 Angstrom and use an active space appropriate for bond breaking.",

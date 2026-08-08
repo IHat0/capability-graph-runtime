@@ -14,8 +14,21 @@ from cgr.pulsate_api.scientific_runtime import (
     ScientificCapabilityOutcome,
     ScientificObjectiveRuntime,
     ScientistCapabilityRegistry,
+    scientific_engine_registry,
 )
 from cgr.science import ArtifactReference, CreationProvenance
+from cgr.electronic_structure import PySCFElectronicStructureAdapter
+
+
+class PayloadStore:
+    def __init__(self) -> None:
+        self.payloads = {}
+
+    def read(self, reference):
+        return self.payloads[reference.artifact_identifier]
+
+    def write(self, reference, payload):
+        self.payloads[reference.artifact_identifier] = bytes(payload)
 
 
 class EvidenceHandler:
@@ -52,6 +65,17 @@ class EvidenceHandler:
                 "scientific-scene-runtime" if invocation.capability_identity == "molecular.scene_project" else None
             ),
         )
+
+
+def test_native_adapter_declarations_build_exact_scientist_registry() -> None:
+    adapter = PySCFElectronicStructureAdapter(PayloadStore())
+    registry = scientific_engine_registry((adapter,))
+
+    assert set(registry.identities()) == {
+        envelope.descriptor.capability_name
+        for envelope in adapter.declaration.capabilities
+    }
+    assert registry.get("electronic.implicit_solvent_hartree_fock") is not None
 
 
 def test_runtime_executes_composed_plan_through_persisted_cgr_graph(tmp_path) -> None:
