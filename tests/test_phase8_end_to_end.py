@@ -12,6 +12,7 @@ from cgr.electronic_structure import (
     ElectronicQMMMHybridResult,
     ElectronicQMRegionPreparation,
     ElectronicReactionPathResult,
+    ElectronicTransitionStateSearch,
     PySCFElectronicStructureAdapter,
 )
 from cgr.kernel.contracts import CapabilityVersion
@@ -410,17 +411,56 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
     hybrid = ElectronicQMMMHybridResult.model_validate_json(store.read(hybrid_reference))
     assert hybrid.no_double_counting_verified
     assert hybrid.link_atom_gradient_projected
+    search_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "electronic_transition_state_search"
+    )
+    search = ElectronicTransitionStateSearch.model_validate_json(
+        store.read(search_reference)
+    )
+    assert search.optimization_surface == "hybrid_qmmm"
+    assert search.hybrid_formulation_identifier == hybrid.formulation
+    assert search.hybrid_gradient_evaluation_count > 1
+    assert len(search.energy_history_hartree) == search.hybrid_gradient_evaluation_count
+    assert search.final_energy_hartree == search.energy_history_hartree[-1]
+    assert search.full_particle_count == hybrid.particle_count
+    assert search.optimized_full_geometry_angstrom.shape == (hybrid.particle_count, 3)
+    assert search.final_full_gradient_hartree_per_bohr.shape == (hybrid.particle_count, 3)
+    assert len(search.movable_particle_indices) == 3
+    assert not search.restrained_particle_indices
+    assert search.frozen_particle_indices
+    assert set(search.movable_particle_indices) | set(search.frozen_particle_indices) == set(
+        range(hybrid.particle_count)
+    )
+    assert search.region_selection_method == (
+        "semantic_reacting_triad_movable_full_environment_frozen"
+    )
     frequency_reference = next(
         item for item in completed.artifact_references
         if item.artifact_type == "electronic_frequency_analysis"
     )
     frequency = ElectronicFrequencyAnalysis.model_validate_json(store.read(frequency_reference))
+    assert frequency.characterization_surface == "hybrid_qmmm"
+    assert frequency.hessian_method == "finite_difference_hybrid_gradients"
+    assert frequency.hybrid_gradient_evaluation_count == 6 * len(
+        search.movable_particle_indices
+    )
     assert frequency.exactly_one_significant_imaginary_mode
+    imaginary = next(mode for mode in frequency.modes if mode.significant_imaginary)
+    assert imaginary.reaction_coordinate_participation is not None
+    assert imaginary.reaction_coordinate_participation > 0.1
     path_reference = next(
         item for item in completed.artifact_references
         if item.artifact_type == "electronic_reaction_path_result"
     )
     path = ElectronicReactionPathResult.model_validate_json(store.read(path_reference))
+    assert path.path_surface == "hybrid_qmmm"
+    assert path.method == "hybrid_qmmm_mass_weighted_steepest_descent"
+    assert path.hybrid_gradient_evaluation_count >= len(path.points)
+    assert path.forward_endpoint_hybrid_energy_hartree < search.final_energy_hartree
+    assert path.reverse_endpoint_hybrid_energy_hartree < search.final_energy_hartree
+    assert all(point.hybrid_energy_hartree == point.energy_hartree for point in path.points)
+    assert all(point.full_geometry_angstrom is not None for point in path.points)
     assert path.path_confirmation_passed
     assert all(
         forbidden not in record.objective.model_dump_json()

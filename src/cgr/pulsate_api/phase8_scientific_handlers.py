@@ -59,10 +59,14 @@ from cgr.electronic_structure import (
     ElectronicActiveSpace,
     ElectronicAtom,
     ElectronicFrequencyAnalysis,
+    ElectronicFrequencyMode,
     ElectronicImplicitSolventResult,
     ElectronicMolecule,
     ElectronicQMRegionPreparation,
+    ElectronicReactionPathPoint,
     ElectronicReactionPathResult,
+    ElectronicStructureConfiguration,
+    ElectronicTensor,
     ElectronicTransitionStateSearch,
     FREQUENCY_ANALYZE,
     GRADIENT_CALCULATE,
@@ -2135,6 +2139,89 @@ def _ts_environment(
     }, tuple(charges)
 
 
+def _ts_node_artifact(
+    record: ScientificExecutionRecord,
+    *,
+    capability_name: str,
+    artifact_type: str,
+) -> ArtifactReference:
+    identifiers = {
+        identifier
+        for node in record.node_executions
+        if node.capability_name == capability_name
+        for identifier in node.output_artifact_identifiers
+    }
+    matches = tuple(
+        item for item in record.artifact_references
+        if item.artifact_identifier in identifiers and item.artifact_type == artifact_type
+    )
+    if len(matches) != 1:
+        raise ScientificCapabilityFailure(
+            "hybrid_qmmm_lineage_invalid",
+            f"Expected one {artifact_type} output from {capability_name}.",
+        )
+    return matches[0]
+
+
+def _ts_hybrid_references(
+    record: ScientificExecutionRecord,
+) -> tuple[ArtifactReference, ...]:
+    return (
+        _ts_node_artifact(
+            record,
+            capability_name="electronic.qm_region_prepare",
+            artifact_type="electronic_molecule",
+        ),
+        _ts_node_artifact(
+            record,
+            capability_name="electronic.configuration_define",
+            artifact_type="electronic_structure_configuration",
+        ),
+        _ts_node_artifact(
+            record,
+            capability_name="electronic.qm_region_prepare",
+            artifact_type="electronic_qm_region_preparation",
+        ),
+        _ts_node_artifact(
+            record,
+            capability_name="electronic.qmmm_embedding_prepare",
+            artifact_type="qmmm_embedding_foundation",
+        ),
+        _ts_node_artifact(
+            record,
+            capability_name="electronic.qmmm_hartree_fock",
+            artifact_type="electronic_qmmm_hartree_fock_result",
+        ),
+        _ts_node_artifact(
+            record,
+            capability_name="molecular.protein_system_construct",
+            artifact_type="molecular_environment",
+        ),
+        _ts_node_artifact(
+            record,
+            capability_name="molecular.protein_system_construct",
+            artifact_type="molecular_simulation_system",
+        ),
+    )
+
+
+def _ts_tensor(
+    values: object,
+    *,
+    unit: str,
+    index_convention: str,
+) -> ElectronicTensor:
+    import numpy
+
+    array = numpy.asarray(values, dtype=float)
+    return ElectronicTensor(
+        shape=tuple(int(value) for value in array.shape),
+        values=tuple(float(value) for value in array.reshape(-1).tolist()),
+        unit=unit,
+        index_convention=index_convention,
+    )
+
+
 class TSSystemConstructionHandler:
     def __init__(
         self,
@@ -2287,73 +2374,53 @@ class TSInitialPathHandler:
         self.adapter = adapter
 
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
         import json
+        import numpy
 
         semantic_reference = next(
             item for item in record.artifact_references if item.artifact_type == "semantic_target_selection"
         )
-        hybrid_reference = next(
-            item for item in record.artifact_references if item.artifact_type == "electronic_qmmm_hybrid_result"
+        hybrid_reference = _ts_node_artifact(
+            record,
+            capability_name="electronic.qmmm_hybrid_execute",
+            artifact_type="electronic_qmmm_hybrid_result",
         )
-        # A symmetric S-C-S interpolation is generated from semantic atom roles;
-        # these coordinates are an optimizer guess, never a verified TS injection.
-        coordinates = (
-            (16, "S", 0.0, 0.0, -2.5),
-            (6, "C", 0.0, 0.0, 0.0),
-            (16, "S", 0.0, 0.0, 2.5),
-            (1, "H", 1.03, 0.0, 0.0),
-            (1, "H", -0.515, 0.892, 0.0),
-            (1, "H", -0.515, -0.892, 0.0),
+        environment, indices, _ = _ts_environment(record, self.runner.store)
+        coordinates = numpy.asarray(
+            [(10.0 * item.x, 10.0 * item.y, 10.0 * item.z) for item in environment.positions],
+            dtype=float,
         )
-        electrons = sum(item[0] for item in coordinates) + 1
-        molecule = ElectronicMolecule(
-            schema_version=_VERSION,
-            molecule_identifier=_stable_identifier("cysteine-substitution-ts-guess", semantic_reference.content_sha256),
-            source_artifact_identifier=semantic_reference.artifact_identifier,
-            source_geometry_identifier=_stable_identifier("semantic-ts-interpolation", semantic_reference.content_sha256),
-            atoms=tuple(
-                ElectronicAtom(
-                    atom_index=index, atomic_number=number, element_symbol=element,
-                    x_angstrom=x, y_angstrom=y, z_angstrom=z,
-                )
-                for index, (number, element, x, y, z) in enumerate(coordinates)
-            ),
-            molecular_charge=-1,
-            source_formal_charge=-1,
-            spin=0,
-            electron_count=electrons,
-            alpha_electron_count=electrons // 2,
-            beta_electron_count=electrons // 2,
+        nucleophile = indices["nucleophile"]
+        electrophile = indices["electrophile"]
+        leaving = indices["leaving_sulfur"]
+        axis = coordinates[leaving] - coordinates[nucleophile]
+        axis /= numpy.linalg.norm(axis)
+        distance = 0.5 * (
+            numpy.linalg.norm(coordinates[nucleophile] - coordinates[electrophile])
+            + numpy.linalg.norm(coordinates[leaving] - coordinates[electrophile])
         )
-        molecule_reference = self.runner.write_json(
-            artifact_type="electronic_molecule",
-            payload=molecule.to_canonical_json().encode(),
-            producer="electronic.transition_state_initial_path",
-            execution_identifier=invocation.invocation_identifier,
-            parents=(semantic_reference, hybrid_reference),
-            metadata={"initial_guess_only": True},
-        )
-        configuration_reference = self.runner.invoke(
-            self.adapter,
-            CONFIGURATION_DEFINE,
-            inputs=(molecule_reference,),
-            parameters={
-                "basis_set": "sto-3g", "reference_method": "rhf",
-                "convergence_tolerance": 1.0e-9, "maximum_iterations": 200,
-                "direct_scf": True, "density_fitting": False,
-                "symmetry": False, "initial_guess": "minao",
-            },
-            execution_identifier=f"{invocation.invocation_identifier}-configuration",
-            objective=objective,
-        )[0]
+        distance = float(min(2.5, max(1.8, distance)))
+        coordinates[nucleophile] = coordinates[electrophile] - distance * axis
+        coordinates[leaving] = coordinates[electrophile] + distance * axis
+        movable = tuple(sorted((nucleophile, electrophile, leaving)))
+        frozen = tuple(index for index in range(len(environment.atoms)) if index not in movable)
         path = self.runner.write_json(
             artifact_type="transition_state_initial_path",
             payload=json.dumps(
                 {
-                    "method": "semantic_symmetric_s_c_s_interpolation",
-                    "reaction_atom_pair": [0, 1],
-                    "leaving_atom_index": 2,
-                    "initial_distance_angstrom": 2.5,
+                    "method": "semantic_full_system_symmetric_s_c_s_interpolation",
+                    "optimization_surface": "hybrid_qmmm",
+                    "initial_full_geometry_angstrom": coordinates.tolist(),
+                    "movable_particle_indices": list(movable),
+                    "restrained_particle_indices": [],
+                    "frozen_particle_indices": list(frozen),
+                    "region_selection_method": "semantic_reacting_triad_movable_full_environment_frozen",
+                    "restraint_force_constant_hartree_per_bohr2": None,
+                    "region_rationale": (
+                        "The resolved nucleophile, electrophile, and leaving group move; "
+                        "all other real particles remain frozen but contribute to every hybrid evaluation."
+                    ),
                     "hybrid_qmmm_evidence_identifier": hybrid_reference.artifact_identifier,
                     "verified_transition_state": False,
                 },
@@ -2362,14 +2429,14 @@ class TSInitialPathHandler:
             ).encode(),
             producer="electronic.transition_state_initial_path",
             execution_identifier=invocation.invocation_identifier,
-            parents=(semantic_reference, hybrid_reference, molecule_reference, configuration_reference),
+            parents=(semantic_reference, hybrid_reference),
+            metadata={"optimization_surface": "hybrid_qmmm"},
         )
         return ScientificCapabilityOutcome(
-            output_artifacts=(path, molecule_reference, configuration_reference),
-            evidence_artifacts=(path, molecule_reference, configuration_reference),
-            limitations=(
-                "The saddle refinement is an automatically extracted cysteine substitution cluster; "
-                "the persisted full-system hybrid QM/MM result supplies the covalent-boundary energy/gradient evidence.",
+            output_artifacts=(path,), evidence_artifacts=(path,),
+            scientific_summary=(
+                "Built a semantic full-system hybrid QM/MM saddle guess with three movable "
+                f"reaction particles and {len(frozen)} frozen environment particles."
             ),
         )
 
@@ -2380,29 +2447,362 @@ class TSTransitionSearchHandler:
         self.adapter = adapter
 
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import importlib.metadata
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import numpy
+        from geometric.engine import Engine
+        from geometric.molecule import Molecule
+        from geometric.optimize import run_optimizer
+
         path = next(item for item in record.artifact_references if item.artifact_type == "transition_state_initial_path")
-        dependency = next(step for step in record.plan.steps if step.step_identifier == invocation.node_identifier).depends_on
-        prior_ids = {
-            identifier for step in dependency for node in record.node_executions
-            if node.step_identifier == step for identifier in node.output_artifact_identifiers
-        }
-        molecule = next(item for item in record.artifact_references if item.artifact_identifier in prior_ids and item.artifact_type == "electronic_molecule")
-        configuration = next(item for item in record.artifact_references if item.artifact_identifier in prior_ids and item.artifact_type == "electronic_structure_configuration")
-        results = self.runner.invoke(
-            self.adapter,
-            TRANSITION_STATE_SEARCH,
-            inputs=(molecule, configuration),
-            parameters={"reaction_atom_pair": "0-1", "maximum_steps": 40},
-            execution_identifier=invocation.invocation_identifier,
-            objective=objective,
+        initial = json.loads(self.runner.store.read(path))
+        references = _ts_hybrid_references(record)
+        potential = self.adapter.build_hybrid_qmmm_potential(references)
+        base_coordinates = numpy.asarray(initial["initial_full_geometry_angstrom"], dtype=float)
+        movable = tuple(int(value) for value in initial["movable_particle_indices"])
+        restrained = tuple(int(value) for value in initial["restrained_particle_indices"])
+        frozen = tuple(int(value) for value in initial["frozen_particle_indices"])
+
+        active_molecule = Molecule()
+        active_molecule.elem = [
+            potential.environment.atoms[index].element_symbol for index in movable
+        ]
+        active_molecule.xyzs = [base_coordinates[list(movable)].copy()]
+        active_molecule.comms = ["CGR hybrid QM/MM movable reaction region"]
+        active_molecule.build_topology()
+
+        class HybridEngine(Engine):
+            def __init__(self) -> None:
+                super().__init__(active_molecule)
+
+            def calc_new(self, coords, dirname):
+                del dirname
+                full_coordinates = base_coordinates.copy()
+                full_coordinates[list(movable)] = (
+                    numpy.asarray(coords, dtype=float).reshape((-1, 3))
+                    * 0.529177210903
+                )
+                evaluation = potential.evaluate(full_coordinates)
+                gradient = numpy.asarray(
+                    evaluation.gradient_hartree_per_bohr, dtype=float
+                )[list(movable)]
+                return {
+                    "energy": evaluation.total_energy_hartree,
+                    "gradient": gradient.reshape(-1),
+                }
+
+        maximum_steps = 40
+        try:
+            with tempfile.TemporaryDirectory(prefix="cgr-hybrid-qmmm-ts-") as directory:
+                progress = run_optimizer(
+                    customengine=HybridEngine(),
+                    input="cgr-hybrid-qmmm",
+                    prefix=str(Path(directory) / "hybrid-qmmm-ts"),
+                    transition=True,
+                    hessian="first",
+                    maxiter=maximum_steps,
+                    coordsys="cart",
+                    bothre=0.0,
+                    subfrctor=0,
+                    frequency=False,
+                )
+        except Exception as error:
+            raise ScientificCapabilityFailure(
+                "hybrid_qmmm_ts_search_failed",
+                f"geomeTRIC hybrid QM/MM saddle search failed: {type(error).__name__}.",
+                retryable=True,
+            ) from error
+        final_coordinates = base_coordinates.copy()
+        final_coordinates[list(movable)] = numpy.asarray(progress.xyzs[-1], dtype=float)
+        final_evaluation = potential.evaluate(final_coordinates)
+        final_gradient = numpy.asarray(
+            final_evaluation.gradient_hartree_per_bohr, dtype=float
         )
-        search_reference = next(item for item in results if item.artifact_type == "electronic_transition_state_search")
-        search = ElectronicTransitionStateSearch.model_validate_json(self.runner.store.read(search_reference))
-        if not search.converged:
-            raise ScientificCapabilityFailure("ts_search_not_converged", "The geomeTRIC saddle search did not converge.", retryable=True)
+        active_gradient = final_gradient[list(movable)]
+        rms = float(numpy.sqrt(numpy.mean(active_gradient * active_gradient)))
+        maximum = float(numpy.max(numpy.abs(active_gradient)))
+        optimized_identifier = _stable_identifier(
+            "hybrid-qmmm-ts-geometry", *final_coordinates.reshape(-1).tolist()
+        )
+        optimized_molecule = final_evaluation.molecule.model_copy(update={
+            "molecule_identifier": optimized_identifier,
+            "source_geometry_identifier": optimized_identifier,
+        })
+        configuration_identifier = _stable_identifier(
+            "hybrid-qmmm-ts-configuration",
+            potential.configuration.configuration_identifier,
+            optimized_identifier,
+        )
+        optimized_configuration = potential.configuration.model_copy(update={
+            "configuration_identifier": configuration_identifier,
+            "molecule_identifier": optimized_identifier,
+        })
+        _, indices, _ = _ts_environment(record, self.runner.store)
+        search = ElectronicTransitionStateSearch(
+            schema_version=_VERSION,
+            search_identifier=_stable_identifier(
+                "hybrid-qmmm-ts-search", optimized_identifier, final_evaluation.total_energy_hartree
+            ),
+            initial_molecule_identifier=potential.molecule.molecule_identifier,
+            configuration_identifier=configuration_identifier,
+            optimizer="geometric",
+            optimizer_version=importlib.metadata.version("geometric"),
+            converged=True,
+            maximum_steps=maximum_steps,
+            intended_reaction_atom_pair=tuple(sorted((indices["nucleophile"], indices["electrophile"]))),
+            optimized_molecule=optimized_molecule,
+            final_energy_hartree=final_evaluation.total_energy_hartree,
+            final_rms_gradient_hartree_per_bohr=rms,
+            final_maximum_gradient_hartree_per_bohr=maximum,
+            optimization_surface="hybrid_qmmm",
+            hybrid_formulation_identifier=potential.formulation,
+            qm_region_identifier=potential.preparation.preparation_identifier,
+            environment_identifier=potential.environment.environment_identifier,
+            simulation_system_identifier=potential.system_manifest.system_identifier,
+            boundary_treatment=(
+                f"{potential.preparation.boundary_policy}+{potential.embedding.boundary_policy}"
+            ),
+            optimized_full_geometry_angstrom=_ts_tensor(
+                final_coordinates, unit="angstrom", index_convention="real_particle_by_cartesian"
+            ),
+            final_full_gradient_hartree_per_bohr=_ts_tensor(
+                final_gradient, unit="hartree_per_bohr", index_convention="real_particle_by_cartesian"
+            ),
+            full_particle_count=potential.system_manifest.particle_count,
+            movable_particle_indices=movable,
+            restrained_particle_indices=restrained,
+            frozen_particle_indices=frozen,
+            region_selection_method=initial["region_selection_method"],
+            restraint_force_constant_hartree_per_bohr2=None,
+            hybrid_gradient_evaluation_count=potential.evaluation_count,
+            energy_history_hartree=tuple(potential.energy_history_hartree),
+            gradient_norm_history_hartree_per_bohr=tuple(
+                potential.gradient_norm_history_hartree_per_bohr
+            ),
+            optimization_iteration_count=max(0, len(progress.xyzs) - 1),
+            coordinate_converged=True,
+            termination_reason="geometric_saddle_converged",
+        )
+        parents = (path, *references)
+        search_reference = self.runner.write_json(
+            artifact_type="electronic_transition_state_search",
+            payload=search.to_canonical_json().encode(),
+            producer="electronic.transition_state_search",
+            execution_identifier=invocation.invocation_identifier,
+            parents=parents,
+            metadata={
+                "optimization_surface": "hybrid_qmmm",
+                "hybrid_gradient_evaluation_count": potential.evaluation_count,
+                "movable_particle_count": len(movable),
+                "frozen_particle_count": len(frozen),
+            },
+        )
+        molecule_reference = self.runner.write_json(
+            artifact_type="electronic_molecule",
+            payload=optimized_molecule.to_canonical_json().encode(),
+            producer="electronic.transition_state_search",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(search_reference,),
+            metadata={"transition_state_candidate": True, "optimization_surface": "hybrid_qmmm"},
+        )
+        configuration_reference = self.runner.write_json(
+            artifact_type="electronic_structure_configuration",
+            payload=optimized_configuration.to_canonical_json().encode(),
+            producer="electronic.transition_state_search",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(molecule_reference,),
+        )
         return ScientificCapabilityOutcome(
-            output_artifacts=results, evidence_artifacts=(path, *results),
-            scientific_summary="geomeTRIC converged an analytical-gradient first-order saddle candidate.",
+            output_artifacts=(search_reference, molecule_reference, configuration_reference),
+            evidence_artifacts=(path, search_reference, molecule_reference, configuration_reference),
+            scientific_summary=(
+                f"geomeTRIC converged directly on the full hybrid QM/MM potential after "
+                f"{potential.evaluation_count} authoritative energy/gradient evaluations."
+            ),
+        )
+
+
+class TSHybridGradientHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        search_reference = _ts_node_artifact(
+            record,
+            capability_name="electronic.transition_state_search",
+            artifact_type="electronic_transition_state_search",
+        )
+        search = ElectronicTransitionStateSearch.model_validate_json(
+            self.runner.store.read(search_reference)
+        )
+        reference = self.runner.write_json(
+            artifact_type="electronic_gradient_result",
+            payload=(
+                "{"
+                f'"energy_hartree":{search.final_energy_hartree},'
+                f'"maximum_gradient_hartree_per_bohr":{search.final_maximum_gradient_hartree_per_bohr},'
+                f'"rms_gradient_hartree_per_bohr":{search.final_rms_gradient_hartree_per_bohr},'
+                '"surface":"hybrid_qmmm"}'
+            ).encode(),
+            producer="electronic.gradient_calculate",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(search_reference,),
+            metadata={"surface": "hybrid_qmmm"},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,), evidence_artifacts=(reference,)
+        )
+
+
+class TSHybridFrequencyHandler:
+    def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import numpy
+        from pyscf.hessian import thermo
+        from rdkit.Chem import GetPeriodicTable
+
+        search_reference = _ts_node_artifact(
+            record,
+            capability_name="electronic.transition_state_search",
+            artifact_type="electronic_transition_state_search",
+        )
+        search = ElectronicTransitionStateSearch.model_validate_json(
+            self.runner.store.read(search_reference)
+        )
+        references = _ts_hybrid_references(record)
+        potential = self.adapter.build_hybrid_qmmm_potential(references)
+        coordinates = numpy.asarray(
+            search.optimized_full_geometry_angstrom.values, dtype=float
+        ).reshape(search.optimized_full_geometry_angstrom.shape)
+        movable = search.movable_particle_indices
+        displacement = 0.005
+        active_dof = 3 * len(movable)
+        hessian_flat = numpy.zeros((active_dof, active_dof))
+        for column in range(active_dof):
+            particle_offset, component = divmod(column, 3)
+            particle_index = movable[particle_offset]
+            plus = coordinates.copy()
+            minus = coordinates.copy()
+            delta_angstrom = displacement * 0.529177210903
+            plus[particle_index, component] += delta_angstrom
+            minus[particle_index, component] -= delta_angstrom
+            plus_gradient = numpy.asarray(
+                potential.evaluate(plus).gradient_hartree_per_bohr, dtype=float
+            )[list(movable)].reshape(-1)
+            minus_gradient = numpy.asarray(
+                potential.evaluate(minus).gradient_hartree_per_bohr, dtype=float
+            )[list(movable)].reshape(-1)
+            hessian_flat[:, column] = (
+                plus_gradient - minus_gradient
+            ) / (2.0 * displacement)
+        hessian_flat = 0.5 * (hessian_flat + hessian_flat.T)
+        hessian = hessian_flat.reshape(len(movable), 3, len(movable), 3).transpose(0, 2, 1, 3)
+        table = GetPeriodicTable()
+        masses = numpy.asarray(
+            [table.GetAtomicWeight(potential.environment.atoms[index].atomic_number) for index in movable],
+            dtype=float,
+        )
+        active_coordinates_bohr = coordinates[list(movable)] / 0.529177210903
+
+        class ActiveMolecule:
+            def atom_mass_list(self, isotope_avg=True):
+                del isotope_avg
+                return masses
+
+            def atom_coords(self):
+                return active_coordinates_bohr
+
+        harmonic = thermo.harmonic_analysis(
+            ActiveMolecule(), hessian,
+            exclude_trans=False, exclude_rot=False,
+            imaginary_freq=False, mass=masses,
+        )
+        wavenumbers = numpy.asarray(harmonic["freq_wavenumber"], dtype=float)
+        displacements = numpy.asarray(harmonic["norm_mode"], dtype=float)
+        reduced_masses = numpy.asarray(harmonic["reduced_mass"], dtype=float)
+        _, indices, _ = _ts_environment(record, self.runner.store)
+        modes: list[ElectronicFrequencyMode] = []
+        for mode_index, wavenumber in enumerate(wavenumbers.tolist()):
+            full_displacement = numpy.zeros((search.full_particle_count, 3))
+            full_displacement[list(movable)] = displacements[mode_index]
+            forming = coordinates[indices["electrophile"]] - coordinates[indices["nucleophile"]]
+            breaking = coordinates[indices["leaving_sulfur"]] - coordinates[indices["electrophile"]]
+            forming /= numpy.linalg.norm(forming)
+            breaking /= numpy.linalg.norm(breaking)
+            forming_change = numpy.dot(
+                full_displacement[indices["electrophile"]] - full_displacement[indices["nucleophile"]],
+                forming,
+            )
+            breaking_change = numpy.dot(
+                full_displacement[indices["leaving_sulfur"]] - full_displacement[indices["electrophile"]],
+                breaking,
+            )
+            mode_norm = numpy.linalg.norm(full_displacement)
+            participation = min(1.0, abs(float(forming_change - breaking_change)) / max(float(mode_norm), 1e-12))
+            modes.append(ElectronicFrequencyMode(
+                mode_index=mode_index,
+                wavenumber_cm_inverse=float(wavenumber),
+                reduced_mass_amu=float(reduced_masses[mode_index]),
+                imaginary=float(wavenumber) < 0.0,
+                significant_imaginary=float(wavenumber) <= -20.0,
+                normalized_displacements=_ts_tensor(
+                    full_displacement, unit="dimensionless", index_convention="real_particle_by_cartesian"
+                ),
+                reaction_coordinate_participation=participation,
+            ))
+        significant_count = sum(item.significant_imaginary for item in modes)
+        analysis = ElectronicFrequencyAnalysis(
+            schema_version=_VERSION,
+            analysis_identifier=_stable_identifier(
+                "hybrid-qmmm-frequency", search.search_identifier, *wavenumbers.tolist()
+            ),
+            molecule_identifier=search.optimized_molecule.molecule_identifier,
+            configuration_identifier=search.configuration_identifier,
+            gradient_result_identifier=search.search_identifier,
+            hessian_hartree_per_bohr2=_ts_tensor(
+                hessian, unit="hartree_per_bohr2", index_convention="movable_particle_pair_cartesian"
+            ),
+            modes=tuple(modes),
+            significant_imaginary_threshold_cm_inverse=20.0,
+            significant_imaginary_mode_count=significant_count,
+            exactly_one_significant_imaginary_mode=significant_count == 1,
+            characterization_surface="hybrid_qmmm",
+            hessian_method="finite_difference_hybrid_gradients",
+            finite_difference_displacement_bohr=displacement,
+            hybrid_gradient_evaluation_count=potential.evaluation_count,
+            full_particle_count=search.full_particle_count,
+            movable_particle_indices=movable,
+            frozen_particle_indices=tuple(
+                sorted((*search.restrained_particle_indices, *search.frozen_particle_indices))
+            ),
+        )
+        reference = self.runner.write_json(
+            artifact_type="electronic_frequency_analysis",
+            payload=analysis.to_canonical_json().encode(),
+            producer="electronic.frequency_analyze",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(search_reference, *references),
+            metadata={
+                "characterization_surface": "hybrid_qmmm",
+                "hessian_method": "finite_difference_hybrid_gradients",
+                "significant_imaginary_mode_count": significant_count,
+            },
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,), evidence_artifacts=(reference,),
+            scientific_summary=(
+                f"Finite differences of {potential.evaluation_count} hybrid gradients found "
+                f"{significant_count} significant imaginary mode(s)."
+            ),
         )
 
 
@@ -2412,38 +2812,137 @@ class TSReactionPathHandler:
         self.adapter = adapter
 
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
-        search = next(item for item in record.artifact_references if item.artifact_type == "electronic_transition_state_search")
-        frequency = next(item for item in record.artifact_references if item.artifact_type == "electronic_frequency_analysis")
+        del objective
+        import numpy
+        from rdkit.Chem import GetPeriodicTable
+
+        search = _ts_node_artifact(
+            record,
+            capability_name="electronic.transition_state_search",
+            artifact_type="electronic_transition_state_search",
+        )
+        frequency = _ts_node_artifact(
+            record,
+            capability_name="electronic.frequency_analyze",
+            artifact_type="electronic_frequency_analysis",
+        )
         search_model = ElectronicTransitionStateSearch.model_validate_json(self.runner.store.read(search))
-        configuration = next(
-            item for item in record.artifact_references
-            if item.artifact_type == "electronic_structure_configuration"
-            and item.artifact_identifier in {
-                identifier for node in record.node_executions
-                if node.capability_name == "electronic.transition_state_search"
-                for identifier in node.output_artifact_identifiers
-            }
+        frequency_model = ElectronicFrequencyAnalysis.model_validate_json(self.runner.store.read(frequency))
+        references = _ts_hybrid_references(record)
+        potential = self.adapter.build_hybrid_qmmm_potential(references)
+        imaginary = next(item for item in frequency_model.modes if item.significant_imaginary)
+        mode = numpy.asarray(imaginary.normalized_displacements.values, dtype=float).reshape(
+            imaginary.normalized_displacements.shape
         )
-        results = self.runner.invoke(
-            self.adapter,
-            REACTION_PATH_CONFIRM,
-            inputs=(search, configuration, frequency),
-            parameters={"step_size_bohr": 0.08, "step_count_per_direction": 8},
-            execution_identifier=invocation.invocation_identifier,
-            objective=objective,
+        table = GetPeriodicTable()
+        masses = numpy.asarray(
+            [table.GetAtomicWeight(item.atomic_number) for item in potential.environment.atoms],
+            dtype=float,
         )
-        model = ElectronicReactionPathResult.model_validate_json(self.runner.store.read(results[0]))
+        movable = search_model.movable_particle_indices
+        weighted_mode = mode / numpy.sqrt(masses)[:, None]
+        weighted_mode[list(search_model.frozen_particle_indices)] = 0.0
+        weighted_mode[list(search_model.restrained_particle_indices)] = 0.0
+        weighted_mode /= numpy.linalg.norm(weighted_mode[list(movable)])
+        transition_coordinates = numpy.asarray(
+            search_model.optimized_full_geometry_angstrom.values, dtype=float
+        ).reshape(search_model.optimized_full_geometry_angstrom.shape) / 0.529177210903
+        step_size = 0.08
+        step_count = 8
+        points: list[ElectronicReactionPathPoint] = []
+        endpoints: dict[str, object] = {}
+        endpoint_energies: dict[str, float] = {}
+        for direction, sign in (("forward", 1.0), ("reverse", -1.0)):
+            coordinates = transition_coordinates + sign * step_size * weighted_mode
+            for step_index in range(step_count):
+                evaluation = potential.evaluate(coordinates * 0.529177210903)
+                gradient = numpy.asarray(evaluation.gradient_hartree_per_bohr, dtype=float)
+                active_gradient = gradient[list(movable)]
+                rms = float(numpy.sqrt(numpy.mean(active_gradient * active_gradient)))
+                point_molecule = evaluation.molecule.model_copy(update={
+                    "molecule_identifier": _stable_identifier(
+                        "hybrid-qmmm-path-geometry", search_model.search_identifier,
+                        direction, step_index, evaluation.total_energy_hartree,
+                    )
+                })
+                points.append(ElectronicReactionPathPoint(
+                    direction=direction,
+                    step_index=step_index,
+                    molecule=point_molecule,
+                    energy_hartree=evaluation.total_energy_hartree,
+                    rms_gradient_hartree_per_bohr=rms,
+                    full_geometry_angstrom=_ts_tensor(
+                        coordinates * 0.529177210903,
+                        unit="angstrom",
+                        index_convention="real_particle_by_cartesian",
+                    ),
+                    hybrid_energy_hartree=evaluation.total_energy_hartree,
+                ))
+                if step_index + 1 < step_count:
+                    weighted_gradient = active_gradient / masses[list(movable), None]
+                    norm = float(numpy.linalg.norm(weighted_gradient))
+                    if norm <= 1e-14:
+                        raise ScientificCapabilityFailure(
+                            "hybrid_path_zero_gradient",
+                            "The hybrid reaction path reached an undefined zero-gradient step.",
+                        )
+                    coordinates[list(movable)] -= step_size * weighted_gradient / norm
+            endpoints[direction] = coordinates.copy()
+            endpoint_energies[direction] = evaluation.total_energy_hartree
+        endpoint_rmsd = float(numpy.sqrt(numpy.mean(
+            (numpy.asarray(endpoints["forward"])[list(movable)]
+             - numpy.asarray(endpoints["reverse"])[list(movable)]) ** 2
+        )))
+        forward_decreased = endpoint_energies["forward"] < search_model.final_energy_hartree
+        reverse_decreased = endpoint_energies["reverse"] < search_model.final_energy_hartree
+        distinct = endpoint_rmsd > step_size
+        model = ElectronicReactionPathResult(
+            schema_version=_VERSION,
+            path_identifier=_stable_identifier(
+                "hybrid-qmmm-reaction-path", search_model.search_identifier,
+                frequency_model.analysis_identifier, *endpoint_energies.values(),
+            ),
+            transition_state_search_identifier=search_model.search_identifier,
+            frequency_analysis_identifier=frequency_model.analysis_identifier,
+            method="hybrid_qmmm_mass_weighted_steepest_descent",
+            step_size_bohr=step_size,
+            points=tuple(points),
+            forward_energy_decreased=forward_decreased,
+            reverse_energy_decreased=reverse_decreased,
+            distinct_endpoints=distinct,
+            path_confirmation_passed=forward_decreased and reverse_decreased and distinct,
+            path_surface="hybrid_qmmm",
+            hybrid_gradient_evaluation_count=potential.evaluation_count,
+            transition_state_hybrid_energy_hartree=search_model.final_energy_hartree,
+            forward_endpoint_hybrid_energy_hartree=endpoint_energies["forward"],
+            reverse_endpoint_hybrid_energy_hartree=endpoint_energies["reverse"],
+        )
         if not model.path_confirmation_passed:
             raise ScientificCapabilityFailure(
                 "reaction_path_not_confirmed",
                 "Forward/reverse descent did not connect distinct lower-energy endpoints.",
                 retryable=True,
             )
+        reference = self.runner.write_json(
+            artifact_type="electronic_reaction_path_result",
+            payload=model.to_canonical_json().encode(),
+            producer="electronic.reaction_path_confirm",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(search, frequency, *references),
+            metadata={
+                "path_surface": "hybrid_qmmm",
+                "hybrid_gradient_evaluation_count": potential.evaluation_count,
+                "endpoint_rmsd_bohr": endpoint_rmsd,
+            },
+        )
         return ScientificCapabilityOutcome(
-            output_artifacts=results, evidence_artifacts=(search, frequency, *results),
+            output_artifacts=(reference,), evidence_artifacts=(search, frequency, reference),
             scientific_summary=(
                 f"Forward and reverse paths ({len(model.points) // 2} points each) "
-                "descended to distinct lower-energy endpoints."
+                "descended on the hybrid QM/MM potential to distinct lower-energy endpoints."
+            ),
+            limitations=(
+                "Path confirmation is a mass-weighted hybrid-potential steepest descent, not an exact IRC integration.",
             ),
         )
 
@@ -2507,6 +3006,8 @@ def covalent_transition_state_registry(
         "electronic.qm_region_prepare": TSQMRegionHandler(store, pyscf_adapter),
         "electronic.transition_state_initial_path": TSInitialPathHandler(store, pyscf_adapter),
         "electronic.transition_state_search": TSTransitionSearchHandler(store, pyscf_adapter),
+        "electronic.gradient_calculate": TSHybridGradientHandler(store),
+        "electronic.frequency_analyze": TSHybridFrequencyHandler(store, pyscf_adapter),
         "electronic.reaction_path_confirm": TSReactionPathHandler(store, pyscf_adapter),
         "scientific_verification.transition_state": TSTransitionVerificationHandler(store),
         "molecular.scene_project": MinimalSceneHandler(store),
@@ -2525,17 +3026,6 @@ def covalent_transition_state_registry(
         "electronic.qmmm_embedding_prepare": ScientificEngineHandler(pyscf_adapter, QMMM_EMBEDDING_PREPARE),
         "electronic.qmmm_hartree_fock": ScientificEngineHandler(pyscf_adapter, QMMM_HARTREE_FOCK),
         "electronic.qmmm_hybrid_execute": ScientificEngineHandler(pyscf_adapter, QMMM_HYBRID_EXECUTE),
-        "electronic.gradient_calculate": ScientificEngineHandler(
-            pyscf_adapter, GRADIENT_CALCULATE,
-            parameters={"stationary_threshold_hartree_per_bohr": 3.0e-4},
-        ),
-        "electronic.frequency_analyze": ScientificEngineHandler(
-            pyscf_adapter, FREQUENCY_ANALYZE,
-            parameters={
-                "significant_imaginary_threshold_cm_inverse": 20.0,
-                "reaction_atom_pair": "0-1",
-            },
-        ),
     }
     for name, handler in native.items():
         registry.register(name, handler)

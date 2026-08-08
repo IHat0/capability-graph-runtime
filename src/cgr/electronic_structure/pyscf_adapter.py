@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from pydantic import ValidationError
@@ -517,6 +518,57 @@ def _tensor(
         unit=unit,
         index_convention=index_convention,
     )
+
+
+@dataclass(frozen=True)
+class HybridQMMMPotentialEvaluation:
+    """One native evaluation of CGR's authoritative supported hybrid potential."""
+
+    total_energy_hartree: float
+    gradient_hartree_per_bohr: object
+    embedded_qm_energy_hartree: float
+    full_mm_energy_hartree: float
+    qm_model_mm_energy_hartree: float
+    classical_cross_electrostatic_energy_hartree: float
+    molecule: ElectronicMolecule
+
+
+@dataclass
+class HybridQMMMPotential:
+    """Coordinate-variable view of the same formulation used by the public capability."""
+
+    adapter: "PySCFElectronicStructureAdapter"
+    molecule: ElectronicMolecule
+    configuration: ElectronicStructureConfiguration
+    preparation: ElectronicQMRegionPreparation
+    embedding: QMMMEmbeddingFoundation
+    qmmm_result: ElectronicQMMMHartreeFockResult
+    environment: MolecularEnvironment
+    system_manifest: MolecularSimulationSystem
+    private_xml: bytes
+    full_system: object
+    model_system: object
+    cross_system: object
+    evaluation_count: int = 0
+    energy_history_hartree: list[float] = field(default_factory=list)
+    gradient_norm_history_hartree_per_bohr: list[float] = field(default_factory=list)
+
+    formulation: str = "electrostatic_embedding_subtractive_openmm_pyscf"
+
+    def evaluate(self, coordinates_angstrom: object) -> HybridQMMMPotentialEvaluation:
+        evaluation = self.adapter._evaluate_hybrid_qmmm_potential(
+            potential=self,
+            coordinates_angstrom=coordinates_angstrom,
+        )
+        import numpy
+
+        gradient = numpy.asarray(evaluation.gradient_hartree_per_bohr, dtype=float)
+        self.evaluation_count += 1
+        self.energy_history_hartree.append(evaluation.total_energy_hartree)
+        self.gradient_norm_history_hartree_per_bohr.append(
+            float(numpy.sqrt(numpy.mean(gradient * gradient)))
+        )
+        return evaluation
 
 
 class PySCFElectronicStructureAdapter:
@@ -2878,15 +2930,15 @@ class PySCFElectronicStructureAdapter:
             },
         )
 
-    def _run_qmmm_hybrid(
+    def build_hybrid_qmmm_potential(
         self,
-        invocation: CapabilityInvocation,
-    ) -> CapabilityResult:
-        """Execute the supported subtractive electrostatic-embedding model."""
+        references: tuple[ArtifactReference, ...],
+    ) -> HybridQMMMPotential:
+        """Validate immutable topology/state and construct a reusable hybrid potential."""
 
         if self._private_state_store is None:
             raise ValueError("Hybrid QM/MM requires private OpenMM system state.")
-        inputs = self._inputs_by_type(invocation)
+        inputs = {reference.artifact_type: reference for reference in references}
         required = {
             "electronic_molecule",
             "electronic_structure_configuration",
@@ -2896,35 +2948,29 @@ class PySCFElectronicStructureAdapter:
             "molecular_environment",
             "molecular_simulation_system",
         }
-        if set(inputs) != required:
+        if set(inputs) != required or len(references) != len(required):
             raise ValueError("Hybrid QM/MM requires seven exact scientific inputs.")
-        molecule_reference = self._require_input(inputs, "electronic_molecule")
-        configuration_reference = self._require_input(
-            inputs, "electronic_structure_configuration"
-        )
-        preparation_reference = self._require_input(
-            inputs, "electronic_qm_region_preparation"
-        )
-        embedding_reference = self._require_input(inputs, "qmmm_embedding_foundation")
-        qmmm_reference = self._require_input(
-            inputs, "electronic_qmmm_hartree_fock_result"
-        )
-        environment_reference = self._require_input(inputs, "molecular_environment")
-        system_reference = self._require_input(inputs, "molecular_simulation_system")
-        molecule = self._load_model(molecule_reference, ElectronicMolecule)
+        molecule = self._load_model(inputs["electronic_molecule"], ElectronicMolecule)
         configuration = self._load_model(
-            configuration_reference, ElectronicStructureConfiguration
+            inputs["electronic_structure_configuration"],
+            ElectronicStructureConfiguration,
         )
         preparation = self._load_model(
-            preparation_reference, ElectronicQMRegionPreparation
+            inputs["electronic_qm_region_preparation"],
+            ElectronicQMRegionPreparation,
         )
-        embedding = self._load_model(embedding_reference, QMMMEmbeddingFoundation)
+        embedding = self._load_model(
+            inputs["qmmm_embedding_foundation"], QMMMEmbeddingFoundation
+        )
         qmmm_result = self._load_model(
-            qmmm_reference, ElectronicQMMMHartreeFockResult
+            inputs["electronic_qmmm_hartree_fock_result"],
+            ElectronicQMMMHartreeFockResult,
         )
-        environment = self._load_model(environment_reference, MolecularEnvironment)
+        environment = self._load_model(
+            inputs["molecular_environment"], MolecularEnvironment
+        )
         system_manifest = self._load_model(
-            system_reference, MolecularSimulationSystem
+            inputs["molecular_simulation_system"], MolecularSimulationSystem
         )
         if (
             configuration.molecule_identifier != molecule.molecule_identifier
@@ -2943,67 +2989,125 @@ class PySCFElectronicStructureAdapter:
             raise ValueError("Hybrid QM/MM v1 supports non-periodic no-cutoff systems only.")
         if system_manifest.particle_count != len(environment.atoms):
             raise ValueError("Hybrid QM/MM particle identities are inconsistent.")
-        private_xml = self._private_state_store.read(system_reference)
+        private_xml = self._private_state_store.read(
+            inputs["molecular_simulation_system"]
+        )
         if (
             not isinstance(private_xml, bytes)
             or hashlib.sha256(private_xml).hexdigest()
             != system_manifest.private_state_sha256
         ):
             raise ValueError("Private OpenMM system state failed integrity validation.")
-
-        numpy, gto, scf, _, _ = _pyscf_modules()
-        from pyscf import qmmm
-
-        native_molecule = self._build_pyscf_molecule(molecule, configuration, gto)
-        native_scf = self._build_scf(
-            molecule, configuration, native_molecule, scf
-        )
-        mm_coordinates = tuple(
-            (site.x_angstrom, site.y_angstrom, site.z_angstrom)
-            for site in embedding.embedding_sites
-        )
-        mm_charges = tuple(site.charge_e for site in embedding.embedding_sites)
-        native_scf = qmmm.mm_charge(
-            native_scf, mm_coordinates, mm_charges, unit="Angstrom"
-        )
-        embedded_energy = float(native_scf.kernel())
-        if not bool(native_scf.converged):
-            return self._failure(
-                "qmmm_scf_not_converged",
-                "The hybrid QM/MM embedded SCF calculation did not converge.",
-                retryable=True,
-            )
-        if not math.isclose(
-            embedded_energy,
-            qmmm_result.embedded_total_energy_hartree,
-            rel_tol=1e-9,
-            abs_tol=1e-8,
-        ):
-            raise ValueError("Embedded QM energy is not reproducible from its inputs.")
-
         full_system, model_system, cross_system = self._qmmm_openmm_systems(
             private_xml=private_xml,
             preparation=preparation,
             embedding=embedding,
             particle_count=system_manifest.particle_count,
         )
-        positions_nm = tuple(
-            (position.x, position.y, position.z) for position in environment.positions
+        return HybridQMMMPotential(
+            adapter=self,
+            molecule=molecule,
+            configuration=configuration,
+            preparation=preparation,
+            embedding=embedding,
+            qmmm_result=qmmm_result,
+            environment=environment,
+            system_manifest=system_manifest,
+            private_xml=private_xml,
+            full_system=full_system,
+            model_system=model_system,
+            cross_system=cross_system,
         )
+
+    def _evaluate_hybrid_qmmm_potential(
+        self,
+        *,
+        potential: HybridQMMMPotential,
+        coordinates_angstrom: object,
+    ) -> HybridQMMMPotentialEvaluation:
+        """Evaluate energy and full real-particle gradient at arbitrary coordinates."""
+
+        numpy, gto, scf, _, _ = _pyscf_modules()
+        from pyscf import qmmm
+
+        coordinates = numpy.asarray(coordinates_angstrom, dtype=float)
+        particle_count = potential.system_manifest.particle_count
+        if coordinates.shape != (particle_count, 3) or not numpy.all(
+            numpy.isfinite(coordinates)
+        ):
+            raise ValueError("Hybrid QM/MM coordinates have invalid dimensions or values.")
+        selected = potential.preparation.selected_particle_indices
+        expected_qm_atoms = len(selected) + len(potential.preparation.boundary_links)
+        if len(potential.molecule.atoms) != expected_qm_atoms:
+            raise ValueError("Hybrid QM/MM molecule no longer matches its boundary topology.")
+        dynamic_atoms: list[ElectronicAtom] = []
+        for local_index, particle_index in enumerate(selected):
+            source = potential.molecule.atoms[local_index]
+            environment_atom = potential.environment.atoms[particle_index]
+            if (
+                source.atomic_number != environment_atom.atomic_number
+                or source.source_atom_index != environment_atom.source_atom_index
+            ):
+                raise ValueError("Hybrid QM/MM atom identity changed during optimization.")
+            dynamic_atoms.append(source.model_copy(update={
+                "x_angstrom": float(coordinates[particle_index, 0]),
+                "y_angstrom": float(coordinates[particle_index, 1]),
+                "z_angstrom": float(coordinates[particle_index, 2]),
+            }))
+        for offset, link in enumerate(potential.preparation.boundary_links):
+            source = potential.molecule.atoms[len(selected) + offset]
+            qm_position = coordinates[link.qm_particle_index]
+            mm_position = coordinates[link.mm_particle_index]
+            vector = mm_position - qm_position
+            length = float(numpy.linalg.norm(vector))
+            if length <= 1.0e-10:
+                raise ValueError("A QM/MM boundary bond has zero length.")
+            link_position = qm_position + link.link_distance_angstrom * vector / length
+            dynamic_atoms.append(source.model_copy(update={
+                "x_angstrom": float(link_position[0]),
+                "y_angstrom": float(link_position[1]),
+                "z_angstrom": float(link_position[2]),
+            }))
+        dynamic_molecule = potential.molecule.model_copy(
+            update={"atoms": tuple(dynamic_atoms)}
+        )
+        dynamic_sites = tuple(
+            site.model_copy(update={
+                "x_angstrom": float(coordinates[site.source_particle_index, 0]),
+                "y_angstrom": float(coordinates[site.source_particle_index, 1]),
+                "z_angstrom": float(coordinates[site.source_particle_index, 2]),
+            })
+            for site in potential.embedding.embedding_sites
+        )
+        native_molecule = self._build_pyscf_molecule(
+            dynamic_molecule, potential.configuration, gto
+        )
+        native_scf = self._build_scf(
+            dynamic_molecule, potential.configuration, native_molecule, scf
+        )
+        native_scf = qmmm.mm_charge(
+            native_scf,
+            tuple((site.x_angstrom, site.y_angstrom, site.z_angstrom) for site in dynamic_sites),
+            tuple(site.charge_e for site in dynamic_sites),
+            unit="Angstrom",
+        )
+        embedded_energy = float(native_scf.kernel())
+        if not bool(native_scf.converged):
+            raise ValueError("The hybrid QM/MM embedded SCF calculation did not converge.")
+        positions_nm = tuple(tuple(float(value) / 10.0 for value in row) for row in coordinates)
         full_energy_kj, full_gradient = self._openmm_energy_gradient(
-            full_system, positions_nm
+            potential.full_system, positions_nm
         )
         model_energy_kj, model_gradient = self._openmm_energy_gradient(
-            model_system, positions_nm
+            potential.model_system, positions_nm
         )
         cross_energy_kj, cross_gradient = self._openmm_energy_gradient(
-            cross_system, positions_nm
+            potential.cross_system, positions_nm
         )
         hartree_kj_per_mol = 2625.4996394799
         full_energy = full_energy_kj / hartree_kj_per_mol
         model_energy = model_energy_kj / hartree_kj_per_mol
         cross_energy = cross_energy_kj / hartree_kj_per_mol
-
         gradient_method = native_scf.nuc_grad_method()
         qm_gradient = numpy.asarray(gradient_method.kernel(), dtype=float)
         density = numpy.asarray(native_scf.make_rdm1())
@@ -3014,75 +3118,96 @@ class PySCFElectronicStructureAdapter:
         ):
             raise ValueError("Installed PySCF lacks analytical MM-site gradients.")
         mm_gradient = numpy.asarray(
-            gradient_method.grad_hcore_mm(density)
-            + gradient_method.grad_nuc_mm(),
+            gradient_method.grad_hcore_mm(density) + gradient_method.grad_nuc_mm(),
             dtype=float,
         )
-        if mm_gradient.shape != (len(embedding.embedding_sites), 3):
-            raise ValueError("PySCF MM-site gradient dimensions are invalid.")
-        real_qmmm_gradient = numpy.zeros((system_manifest.particle_count, 3))
-        selected = preparation.selected_particle_indices
-        if qm_gradient.shape != (
-            len(selected) + len(preparation.boundary_links),
-            3,
+        if qm_gradient.shape != (expected_qm_atoms, 3) or mm_gradient.shape != (
+            len(dynamic_sites), 3
         ):
-            raise ValueError("PySCF QM/link gradient dimensions are invalid.")
+            raise ValueError("Hybrid QM/MM analytical gradient dimensions are invalid.")
+        real_qmmm_gradient = numpy.zeros((particle_count, 3))
         for local_index, particle_index in enumerate(selected):
             real_qmmm_gradient[particle_index] += qm_gradient[local_index]
-        for site, value in zip(embedding.embedding_sites, mm_gradient, strict=True):
+        for site, value in zip(dynamic_sites, mm_gradient, strict=True):
             real_qmmm_gradient[site.source_particle_index] += value
         identity = numpy.eye(3)
-        coordinates_angstrom = numpy.asarray(positions_nm, dtype=float) * 10.0
-        for offset, link in enumerate(preparation.boundary_links):
+        for offset, link in enumerate(potential.preparation.boundary_links):
             link_gradient = qm_gradient[len(selected) + offset]
-            vector = (
-                coordinates_angstrom[link.mm_particle_index]
-                - coordinates_angstrom[link.qm_particle_index]
-            )
+            vector = coordinates[link.mm_particle_index] - coordinates[link.qm_particle_index]
             length = float(numpy.linalg.norm(vector))
-            if length <= 1e-10:
-                raise ValueError("A QM/MM boundary bond has zero length.")
             unit_vector = vector / length
             projector = (identity - numpy.outer(unit_vector, unit_vector)) / length
             derivative_mm = link.link_distance_angstrom * projector
             derivative_qm = identity - derivative_mm
             real_qmmm_gradient[link.qm_particle_index] += derivative_qm.T @ link_gradient
             real_qmmm_gradient[link.mm_particle_index] += derivative_mm.T @ link_gradient
-        correction_gradient = full_gradient - model_gradient - cross_gradient
-        total_gradient = real_qmmm_gradient + correction_gradient
-        boundary_correction = 0.0
-        total_energy = (
-            embedded_energy + full_energy - model_energy - cross_energy
-            + boundary_correction
+        total_gradient = real_qmmm_gradient + full_gradient - model_gradient - cross_gradient
+        total_energy = embedded_energy + full_energy - model_energy - cross_energy
+        return HybridQMMMPotentialEvaluation(
+            total_energy_hartree=total_energy,
+            gradient_hartree_per_bohr=total_gradient,
+            embedded_qm_energy_hartree=embedded_energy,
+            full_mm_energy_hartree=full_energy,
+            qm_model_mm_energy_hartree=model_energy,
+            classical_cross_electrostatic_energy_hartree=cross_energy,
+            molecule=dynamic_molecule,
+        )
+
+    def _run_qmmm_hybrid(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        """Execute the supported subtractive electrostatic-embedding model."""
+        import numpy
+
+        inputs = self._inputs_by_type(invocation)
+        potential = self.build_hybrid_qmmm_potential(tuple(inputs.values()))
+        coordinates_angstrom = numpy.asarray(
+            [(10.0 * item.x, 10.0 * item.y, 10.0 * item.z) for item in potential.environment.positions],
+            dtype=float,
+        )
+        evaluation = potential.evaluate(coordinates_angstrom)
+        if not math.isclose(
+            evaluation.embedded_qm_energy_hartree,
+            potential.qmmm_result.embedded_total_energy_hartree,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        ):
+            raise ValueError("Embedded QM energy is not reproducible from its inputs.")
+        total_energy = evaluation.total_energy_hartree
+        total_gradient = numpy.asarray(
+            evaluation.gradient_hartree_per_bohr, dtype=float
         )
         result = ElectronicQMMMHybridResult(
             schema_version=_SCHEMA_VERSION,
             result_identifier=_stable_identifier(
                 "electronic-qmmm-hybrid",
-                molecule.molecule_identifier,
-                configuration.configuration_identifier,
-                embedding.embedding_identifier,
+                potential.molecule.molecule_identifier,
+                potential.configuration.configuration_identifier,
+                potential.embedding.embedding_identifier,
                 total_energy,
             ),
-            molecule_identifier=molecule.molecule_identifier,
-            configuration_identifier=configuration.configuration_identifier,
-            embedding_identifier=embedding.embedding_identifier,
-            environment_identifier=environment.environment_identifier,
-            simulation_system_identifier=system_manifest.system_identifier,
-            qmmm_hartree_fock_result_identifier=qmmm_result.result_identifier,
-            embedded_qm_energy_hartree=embedded_energy,
-            full_mm_energy_hartree=full_energy,
-            subtracted_qm_model_mm_energy_hartree=model_energy,
-            subtracted_classical_qm_mm_electrostatic_energy_hartree=cross_energy,
-            boundary_energy_correction_hartree=boundary_correction,
+            molecule_identifier=potential.molecule.molecule_identifier,
+            configuration_identifier=potential.configuration.configuration_identifier,
+            embedding_identifier=potential.embedding.embedding_identifier,
+            environment_identifier=potential.environment.environment_identifier,
+            simulation_system_identifier=potential.system_manifest.system_identifier,
+            qmmm_hartree_fock_result_identifier=potential.qmmm_result.result_identifier,
+            embedded_qm_energy_hartree=evaluation.embedded_qm_energy_hartree,
+            full_mm_energy_hartree=evaluation.full_mm_energy_hartree,
+            subtracted_qm_model_mm_energy_hartree=evaluation.qm_model_mm_energy_hartree,
+            subtracted_classical_qm_mm_electrostatic_energy_hartree=(
+                evaluation.classical_cross_electrostatic_energy_hartree
+            ),
+            boundary_energy_correction_hartree=0.0,
             total_hybrid_energy_hartree=total_energy,
             gradient_hartree_per_bohr=_tensor(
                 total_gradient,
                 unit="hartree_per_bohr",
                 index_convention="real_particle_by_cartesian",
             ),
-            particle_count=system_manifest.particle_count,
-            link_atom_gradient_projected=bool(preparation.boundary_links),
+            particle_count=potential.system_manifest.particle_count,
+            link_atom_gradient_projected=bool(potential.preparation.boundary_links),
             included_physics=(
                 "qm_internal_energy",
                 "quantum_qm_mm_electrostatics",
@@ -3096,15 +3221,7 @@ class PySCFElectronicStructureAdapter:
                 "thermal_free_energy",
             ),
         )
-        parents = (
-            molecule_reference,
-            configuration_reference,
-            preparation_reference,
-            embedding_reference,
-            qmmm_reference,
-            environment_reference,
-            system_reference,
-        )
+        parents = tuple(inputs.values())
         output = self._write_model(
             invocation,
             model=result,
@@ -3129,10 +3246,13 @@ class PySCFElectronicStructureAdapter:
             ),
             diagnostics={
                 "total_hybrid_energy_hartree": total_energy,
-                "full_mm_energy_hartree": full_energy,
-                "subtracted_qm_model_mm_energy_hartree": model_energy,
-                "subtracted_classical_qm_mm_electrostatic_energy_hartree": cross_energy,
+                "full_mm_energy_hartree": evaluation.full_mm_energy_hartree,
+                "subtracted_qm_model_mm_energy_hartree": evaluation.qm_model_mm_energy_hartree,
+                "subtracted_classical_qm_mm_electrostatic_energy_hartree": (
+                    evaluation.classical_cross_electrostatic_energy_hartree
+                ),
                 "no_double_counting_verified": True,
+                "authoritative_potential_evaluation_count": potential.evaluation_count,
             },
         )
 
