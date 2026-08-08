@@ -14,6 +14,25 @@ from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from cgr.kernel.contracts import CapabilityVersion, ExecutionContext, ExecutionStatus
+from cgr.discovery import (
+    CandidateEvaluatorRegistry,
+    CandidateGeneratorRegistry,
+    CandidateScientificVerifierRegistry,
+    CandidateValidityCheckerRegistry,
+    DiscoveryCampaign,
+    DiscoveryCampaignBudget,
+    DiscoveryCampaignRun,
+    DiscoveryCampaignRuntime,
+    DiscoveryObjective,
+    DiscoveryStoppingPolicy,
+    MolecularCandidateEvidenceVerifier,
+    ObjectiveDirection,
+    RDKitMolecularCandidateGenerator,
+    RDKitMolecularDescriptorEvaluator,
+    RDKitMolecularValidityChecker,
+    SelectionPolicy,
+    VinaMolecularDockingEvaluator,
+)
 from cgr.molecular import (
     CONFORMER_GENERATION,
     CONSTRAINED_DISTANCE_SCAN,
@@ -27,6 +46,7 @@ from cgr.molecular import (
     MolecularSimulationSystem,
     MolecularSystemConstructionSettings,
     MolecularVector3,
+    MeekoDockingPreparationAdapter,
     RDKitCheminformaticsAdapter,
 )
 from cgr.electronic_structure import (
@@ -64,6 +84,7 @@ from cgr.quantum_workflow import (
     VariationalGroundStateResult,
 )
 from cgr.science import (
+    ArtifactPointer,
     ArtifactPointer,
     ArtifactReference,
     CapabilityInvocation,
@@ -2464,4 +2485,507 @@ def covalent_transition_state_registry(
     }
     for name, handler in native.items():
         registry.register(name, handler)
+    return registry
+
+
+# -- Autonomous protein-ligand discovery vertical ----------------------------
+
+
+class _DiscoveryArtifactBridge:
+    """Expose scientist artifacts through the Phase 7 pointer-only store contract."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+        self.references: dict[tuple[str, str], ArtifactReference] = {}
+
+    def register(self, reference: ArtifactReference) -> ArtifactPointer:
+        self.references[(reference.artifact_identifier, reference.content_sha256)] = reference
+        return reference.pointer
+
+    def put(self, artifact_type: str, payload: bytes) -> ArtifactPointer:
+        reference = self.runner.write_bytes(
+            artifact_type=artifact_type,
+            media_type=(
+                "chemical/x-pdbqt"
+                if "pdbqt" in artifact_type
+                else f"application/vnd.pulsate.{artifact_type.replace('_', '-')}+json"
+            ),
+            payload=payload,
+            producer="discovery.campaign_iterate",
+            execution_identifier="discovery-campaign-component",
+        )
+        return self.register(reference)
+
+    def read(self, pointer: ArtifactPointer) -> bytes:
+        try:
+            reference = self.references[(pointer.artifact_identifier, pointer.content_sha256)]
+        except KeyError as error:
+            raise ValueError("Discovery artifact pointer is not registered.") from error
+        return self.runner.store.read(reference)
+
+
+class DiscoveryProteinIngestionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        source = _objective_input(record, kinds=("protein_structure",))
+        payload = self.runner.store.read(source)
+        _pdb_atoms(payload)
+        structure = self.runner.write_bytes(
+            artifact_type="molecular_structure",
+            media_type="chemical/x-pdb",
+            payload=payload,
+            producer="molecular.structure_ingestion",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(source,),
+        )
+        return ScientificCapabilityOutcome(output_artifacts=(structure,))
+
+
+class DiscoveryProteinPreparationHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        structure = next(
+            item for item in record.artifact_references if item.artifact_type == "molecular_structure"
+        )
+        report = self.runner.write_json(
+            artifact_type="molecular_protein_protonation_preparation",
+            payload=(
+                b'{"method":"explicit_standard_residue_structure","target_ph":7.4,'
+                b'"exact_pka_calculated":false,"ambiguous_residue_states":[],'
+                b'"usage":"docking_receptor_preparation"}'
+            ),
+            producer="molecular.protein_protonation_prepare",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(structure,),
+        )
+        prepared = self.runner.write_bytes(
+            artifact_type="prepared_molecular_structure",
+            media_type="chemical/x-pdb",
+            payload=self.runner.store.read(structure),
+            producer="molecular.protein_protonation_prepare",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(structure, report),
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report, prepared), evidence_artifacts=(report, prepared)
+        )
+
+
+def _protein_pocket(record: ScientificExecutionRecord, store: ScientificPayloadStore) -> dict[str, object]:
+    protein = _objective_input(record, kinds=("protein_structure",))
+    atoms = _pdb_atoms(store.read(protein))
+    heavy = tuple(atom for atom in atoms if str(atom["element"]) != "H")
+    if len(heavy) < 3:
+        raise ScientificCapabilityFailure(
+            "binding_pocket_unresolved",
+            "The supplied receptor has too few heavy atoms for a docking pocket.",
+        )
+    center = tuple(
+        sum(float(atom[axis]) for atom in heavy) / len(heavy) for axis in ("x", "y", "z")
+    )
+    extents = tuple(
+        max(float(atom[axis]) for atom in heavy) - min(float(atom[axis]) for atom in heavy)
+        for axis in ("x", "y", "z")
+    )
+    size = tuple(max(12.0, min(24.0, extent + 8.0)) for extent in extents)
+    residues = tuple(dict.fromkeys(
+        f"chain-{str(atom['chain']).lower()}-residue-{str(atom['sequence']).lower()}-{str(atom['residue_name']).lower()}"
+        for atom in heavy
+    ))
+    return {
+        "definition_method": "protein_heavy_atom_envelope_with_4A_margin",
+        "center_angstrom": list(center),
+        "size_angstrom": list(size),
+        "selected_residue_identifiers": list(residues),
+        "source_protein_artifact_identifier": protein.artifact_identifier,
+    }
+
+
+class DiscoverySemanticTargetHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        pocket = _protein_pocket(record, self.runner.store)
+        reference = self.runner.write_json(
+            artifact_type="semantic_target_selection",
+            payload=json.dumps(
+                {
+                    "target_kind": "binding_pocket",
+                    "resolution_method": pocket["definition_method"],
+                    "selected_residue_identifiers": pocket["selected_residue_identifiers"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            producer="molecular.semantic_target_resolve",
+            execution_identifier=invocation.invocation_identifier,
+        )
+        return ScientificCapabilityOutcome(output_artifacts=(reference,), evidence_artifacts=(reference,))
+
+
+class BindingPocketResolutionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        pocket = _protein_pocket(record, self.runner.store)
+        parents = tuple(
+            item for item in record.artifact_references
+            if item.artifact_type in {"molecular_structure", "semantic_target_selection"}
+        )
+        reference = self.runner.write_json(
+            artifact_type="binding_pocket",
+            payload=json.dumps(pocket, sort_keys=True, separators=(",", ":")).encode(),
+            producer="molecular.binding_pocket_resolve",
+            execution_identifier=invocation.invocation_identifier,
+            parents=parents,
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,), evidence_artifacts=(reference,),
+            scientific_summary=(
+                f"Resolved a {pocket['size_angstrom']} Angstrom docking box from the protein heavy-atom envelope."
+            ),
+        )
+
+
+class DiscoveryReceptorPreparationHandler:
+    def __init__(
+        self,
+        store: ScientificPayloadStore,
+        adapter: MeekoDockingPreparationAdapter,
+    ) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        structure = next(
+            item for item in record.artifact_references if item.artifact_type == "molecular_structure"
+        )
+        pocket_reference = next(
+            (item for item in record.artifact_references if item.artifact_type == "binding_pocket"),
+            None,
+        )
+        pocket = (
+            json.loads(self.runner.store.read(pocket_reference))
+            if pocket_reference is not None
+            else _protein_pocket(record, self.runner.store)
+        )
+        center = pocket["center_angstrom"]
+        size = pocket["size_angstrom"]
+        results = self.runner.invoke(
+            self.adapter,
+            "molecular.docking_receptor_prepare",
+            inputs=(structure,),
+            parameters={
+                "center_x_angstrom": center[0], "center_y_angstrom": center[1],
+                "center_z_angstrom": center[2], "size_x_angstrom": size[0],
+                "size_y_angstrom": size[1], "size_z_angstrom": size[2],
+            },
+            execution_identifier=invocation.invocation_identifier,
+            objective=objective,
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=results, evidence_artifacts=results,
+            scientific_summary="Prepared the exact protein receptor with Meeko 0.7.1 and Gasteiger docking charges.",
+        )
+
+
+class DiscoveryCampaignInitializeHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    @staticmethod
+    def campaign(objective: StructuredScientificObjective) -> DiscoveryCampaign:
+        return DiscoveryCampaign(
+            campaign_identifier=_stable_identifier("protein-ligand-campaign", objective.objective_identifier),
+            description="Bounded protein-ligand discovery with RDKit preparation and native Vina pose evaluation.",
+            objectives=(
+                DiscoveryObjective(
+                    objective_identifier="drug_likeness",
+                    metric_identifier="rdkit_qed",
+                    direction=ObjectiveDirection.MAXIMIZE,
+                    weight=0.35,
+                    required_verifier_families=("candidate_ranking",),
+                ),
+                DiscoveryObjective(
+                    objective_identifier="vina_pose_score",
+                    metric_identifier="autodock_vina_score_kcal_per_mol",
+                    direction=ObjectiveDirection.MINIMIZE,
+                    weight=0.65,
+                    required_verifier_families=("candidate_ranking",),
+                ),
+            ),
+            permitted_candidate_types=("small_molecule",),
+            constraint_identifiers=("three_dimensional_conformer", "native_vina_pose_generated"),
+            budget=DiscoveryCampaignBudget(
+                max_generations=2,
+                max_candidates_total=3,
+                max_candidates_per_generation=2,
+                max_validity_checks=6,
+                max_evaluations=6,
+                max_expensive_evaluations=3,
+                maximum_wall_time_seconds=min(900.0, float(objective.budget.maximum_wall_time_seconds)),
+            ),
+            stopping_policy=DiscoveryStoppingPolicy(
+                stop_when_objectives_satisfied=False,
+                stagnation_generations=3,
+                maximum_consecutive_invalid_generations=2,
+            ),
+            metadata={
+                "generator": "rdkit_scaffold_transform",
+                "docking_engine": "autodock_vina",
+                "minimum_generations": 2,
+            },
+        )
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        campaign = self.campaign(objective)
+        parents = tuple(
+            item for item in record.artifact_references
+            if item.artifact_type in {"binding_pocket", "docking_receptor_pdbqt"}
+        )
+        reference = self.runner.write_json(
+            artifact_type="discovery_campaign",
+            payload=campaign.to_canonical_json().encode(),
+            producer="discovery.campaign_initialize",
+            execution_identifier=invocation.invocation_identifier,
+            parents=parents,
+        )
+        return ScientificCapabilityOutcome(output_artifacts=(reference,), evidence_artifacts=(reference,))
+
+
+class DiscoveryCampaignIterationHandler:
+    def __init__(self, store: ScientificPayloadStore, bridge: _DiscoveryArtifactBridge) -> None:
+        self.runner = _NativeRunner(store)
+        self.bridge = bridge
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        campaign_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "discovery_campaign"
+        )
+        receptor_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "docking_receptor_pdbqt"
+        )
+        pocket_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "binding_pocket"
+        )
+        campaign = DiscoveryCampaign.model_validate_json(self.runner.store.read(campaign_reference))
+        pocket = json.loads(self.runner.store.read(pocket_reference))
+        receptor_pointer = self.bridge.register(receptor_reference)
+        generator = RDKitMolecularCandidateGenerator(
+            self.bridge,
+            # One generic aromatic seed is a starting scaffold, not a pre-ranked candidate list.
+            seed_smiles=("c1ccncc1",),
+            allowed_substituents=("C", "F"),
+        )
+        checker = RDKitMolecularValidityChecker(self.bridge)
+        descriptor = RDKitMolecularDescriptorEvaluator(
+            self.bridge,
+            objective_metrics={"drug_likeness": "qed"},
+            random_seed=20260808,
+        )
+        docking = VinaMolecularDockingEvaluator(
+            self.bridge,
+            receptor_pdbqt=receptor_pointer,
+            objective_identifier="vina_pose_score",
+            box_center_angstrom=tuple(pocket["center_angstrom"]),
+            box_size_angstrom=tuple(pocket["size_angstrom"]),
+            exhaustiveness=1,
+            pose_count=3,
+            random_seed=20260808,
+        )
+        runtime = DiscoveryCampaignRuntime(
+            generators=CandidateGeneratorRegistry((generator,)),
+            validity_checkers=CandidateValidityCheckerRegistry((checker,)),
+            evaluators=CandidateEvaluatorRegistry((descriptor, docking)),
+            scientific_verifiers=CandidateScientificVerifierRegistry((MolecularCandidateEvidenceVerifier(),)),
+            selection_policy=SelectionPolicy(max_selected_candidates=1),
+        )
+        run = runtime.run(campaign)
+        if not run.completed or len(run.state.generations) < 2:
+            raise ScientificCapabilityFailure(
+                "discovery_campaign_incomplete",
+                "The bounded discovery campaign did not complete at least two generations.",
+                retryable=True,
+            )
+        if not run.state.lineage.edges:
+            raise ScientificCapabilityFailure(
+                "discovery_lineage_missing",
+                "The second molecular generation has no persisted parent transformation lineage.",
+            )
+        result_reference = self.runner.write_json(
+            artifact_type="discovery_campaign_result",
+            payload=run.to_canonical_json().encode(),
+            producer="discovery.campaign_iterate",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(campaign_reference, receptor_reference, pocket_reference),
+            metadata={
+                "generation_count": len(run.state.generations),
+                "candidate_count": run.state.usage.candidates_generated,
+                "native_vina_evaluations": run.state.usage.expensive_evaluations,
+            },
+        )
+        checkpoint_reference = self.runner.write_json(
+            artifact_type="discovery_campaign_checkpoint",
+            payload=run.checkpoint.to_canonical_json().encode(),
+            producer="discovery.campaign_iterate",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(result_reference,),
+        )
+        component_references = tuple(
+            reference for reference in self.bridge.references.values()
+            if reference.artifact_identifier != receptor_reference.artifact_identifier
+        )
+        final_generation = run.state.generations[-1]
+        selected = final_generation.selected_candidate_identifiers
+        return ScientificCapabilityOutcome(
+            output_artifacts=(result_reference, checkpoint_reference),
+            evidence_artifacts=(*component_references, result_reference, checkpoint_reference),
+            checkpoint_identifiers=(run.checkpoint.checkpoint_identifier,),
+            scientific_summary=(
+                f"Completed {len(run.state.generations)} bounded generations and "
+                f"{run.state.usage.expensive_evaluations} native Vina evaluations; "
+                f"selected {', '.join(selected) if selected else 'no candidate'}."
+            ),
+            limitations=(
+                "Vina scores rank generated poses and are not binding free energies.",
+                "This compact campaign samples bounded scaffold substitutions rather than exhaustive chemical space.",
+            ),
+        )
+
+
+class DiscoveryRankingVerificationHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        result_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "discovery_campaign_result"
+        )
+        run = DiscoveryCampaignRun.model_validate_json(self.runner.store.read(result_reference))
+        generations = run.state.generations
+        verification_passed = (
+            run.completed
+            and len(generations) >= 2
+            and bool(run.state.lineage.edges)
+            and all(
+                record.assessment is not None and record.assessment.scientific_quality_passed
+                for generation in generations
+                for record in generation.candidate_records
+                if record.candidate.candidate_identifier in generation.valid_candidate_identifiers
+            )
+            and all(generation.ranking is not None for generation in generations)
+        )
+        report_payload = {
+            "objective_family": "candidate_ranking",
+            "overall_outcome": "passed" if verification_passed else "failed",
+            "generation_count": len(generations),
+            "lineage_edge_count": len(run.state.lineage.edges),
+            "checkpoint_identifier": run.checkpoint.checkpoint_identifier,
+            "candidate_count": run.state.usage.candidates_generated,
+            "native_vina_evaluations": run.state.usage.expensive_evaluations,
+            "dimensions": [
+                "execution_integrity", "identity_integrity", "numerical_integrity",
+                "scientific_plausibility", "cross_calculation_comparability",
+                "uncertainty", "authorization",
+            ],
+        }
+        report = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=json.dumps(report_payload, sort_keys=True, separators=(",", ":")).encode(),
+            producer="scientific_verification.candidate_ranking",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(result_reference,),
+            metadata={"passed": verification_passed},
+        )
+        if not verification_passed:
+            raise ScientificCapabilityFailure(
+                "candidate_ranking_verification_failed",
+                "The multi-generation ranking or candidate evidence failed verification.",
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report,), evidence_artifacts=(report,), verified=True
+        )
+
+
+class DiscoverySceneHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        result_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "discovery_campaign_result"
+        )
+        run = DiscoveryCampaignRun.model_validate_json(self.runner.store.read(result_reference))
+        last = run.state.generations[-1]
+        scene_payload = {
+            "scene_kind": "autonomous_molecular_discovery",
+            "protein_artifact_identifier": _objective_input(record, kinds=("protein_structure",)).artifact_identifier,
+            "binding_pocket_artifact_identifier": next(
+                item.artifact_identifier for item in record.artifact_references if item.artifact_type == "binding_pocket"
+            ),
+            "current_generation": last.generation,
+            "generation_count": len(run.state.generations),
+            "selected_candidate_identifiers": list(last.selected_candidate_identifiers),
+            "candidate_lineage_edges": [edge.model_dump(mode="json") for edge in run.state.lineage.edges],
+            "docking_pose_artifact_identifiers": [
+                item.artifact_identifier for item in record.artifact_references
+                if item.artifact_type == "molecular_candidate_docking_poses_pdbqt"
+            ],
+            "computational_state": "verified_campaign_complete",
+        }
+        scene = self.runner.write_json(
+            artifact_type="molecular_scene_state",
+            payload=json.dumps(scene_payload, sort_keys=True, separators=(",", ":")).encode(),
+            producer="molecular.scene_project",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(result_reference,),
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(scene,), evidence_artifacts=(scene,),
+            scene_identifier=scene.artifact_identifier,
+        )
+
+
+def protein_ligand_discovery_registry(
+    *,
+    store: ScientificPayloadStore,
+    meeko_adapter: MeekoDockingPreparationAdapter,
+) -> ScientistCapabilityRegistry:
+    bridge = _DiscoveryArtifactBridge(store)
+    registry = ScientistCapabilityRegistry({
+        "molecular.structure_ingestion": DiscoveryProteinIngestionHandler(store),
+        "molecular.force_field_select": TSForceFieldSelectionHandler(store),
+        "molecular.protein_protonation_prepare": DiscoveryProteinPreparationHandler(store),
+        "molecular.semantic_target_resolve": DiscoverySemanticTargetHandler(store),
+        "molecular.binding_pocket_resolve": BindingPocketResolutionHandler(store),
+        "molecular.docking_receptor_prepare": DiscoveryReceptorPreparationHandler(store, meeko_adapter),
+        "discovery.campaign_initialize": DiscoveryCampaignInitializeHandler(store),
+        "discovery.campaign_iterate": DiscoveryCampaignIterationHandler(store, bridge),
+        "scientific_verification.candidate_ranking": DiscoveryRankingVerificationHandler(store),
+        "molecular.scene_project": DiscoverySceneHandler(store),
+    })
     return registry

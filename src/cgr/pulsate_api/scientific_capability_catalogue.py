@@ -480,7 +480,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
         ),
         ScientificCapabilityDefinition(
             capability_name="discovery.campaign_initialize",
-            accepted_artifact_types=("binding_pocket",),
+            accepted_artifact_types=("binding_pocket", "docking_receptor_pdbqt"),
             produced_artifact_types=("discovery_campaign",),
             supported_task_types=_DISCOVERY,
             priority=40,
@@ -536,7 +536,11 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
         ),
         ScientificCapabilityDefinition(
             capability_name="discovery.campaign_iterate",
-            accepted_artifact_types=("discovery_campaign", "molecular_docking_result"),
+            accepted_artifact_types=(
+                "discovery_campaign",
+                "docking_receptor_pdbqt",
+                "binding_pocket",
+            ),
             produced_artifact_types=("discovery_campaign_result", "discovery_campaign_checkpoint"),
             supported_task_types=_DISCOVERY,
             verification_required=True,

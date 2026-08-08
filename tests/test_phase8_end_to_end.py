@@ -15,13 +15,15 @@ from cgr.electronic_structure import (
     PySCFElectronicStructureAdapter,
 )
 from cgr.kernel.contracts import CapabilityVersion
-from cgr.molecular import RDKitCheminformaticsAdapter
+from cgr.discovery import DiscoveryCampaignRun
+from cgr.molecular import MeekoDockingPreparationAdapter, RDKitCheminformaticsAdapter
 from cgr.quantum_workflow import QiskitQuantumWorkflowAdapter
 from cgr.pulsate_api.phase8_scientific_handlers import (
     aqueous_conformer_registry,
     bond_dissociation_registry,
     covalent_transition_state_registry,
     metal_active_site_registry,
+    protein_ligand_discovery_registry,
 )
 from cgr.pulsate_api.scientific_executions import (
     ScientificExecutionRepository,
@@ -525,5 +527,105 @@ def test_acceptance_2_metal_active_site_local_vqe(tmp_path) -> None:
             "hamiltonian",
             "d_orbital",
             "workflow_graph",
+        )
+    )
+
+
+def test_acceptance_5_autonomous_multi_generation_drug_discovery(tmp_path) -> None:
+    pytest.importorskip("rdkit")
+    pytest.importorskip("meeko")
+    pytest.importorskip("vina")
+
+    # A complete three-residue standard peptide keeps native Meeko/Vina runtime
+    # practical while exercising the same receptor-preparation and docking code.
+    protein = b"""ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       1.450   0.000   0.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       2.000   1.400   0.000  1.00  0.00           C
+ATOM      4  O   ALA A   1       1.400   2.400   0.000  1.00  0.00           O
+ATOM      5  CB  ALA A   1       1.900  -0.800   1.200  1.00  0.00           C
+ATOM      6  N   ALA A   2       3.250   1.450   0.000  1.00  0.00           N
+ATOM      7  CA  ALA A   2       3.900   2.700   0.000  1.00  0.00           C
+ATOM      8  C   ALA A   2       5.400   2.500   0.000  1.00  0.00           C
+ATOM      9  O   ALA A   2       6.000   3.500   0.000  1.00  0.00           O
+ATOM     10  CB  ALA A   2       3.300   3.600   1.100  1.00  0.00           C
+ATOM     11  N   ALA A   3       6.000   1.350   0.000  1.00  0.00           N
+ATOM     12  CA  ALA A   3       7.400   1.000   0.000  1.00  0.00           C
+ATOM     13  C   ALA A   3       8.100   2.300   0.000  1.00  0.00           C
+ATOM     14  O   ALA A   3       7.600   3.400   0.000  1.00  0.00           O
+ATOM     15  CB  ALA A   3       7.700  -0.100   1.000  1.00  0.00           C
+ATOM     16  OXT ALA A   3       9.300   2.200   0.000  1.00  0.00           O
+TER
+END
+"""
+    store = MemoryPayloadStore()
+    source = _input_artifact(
+        store,
+        identifier="scientist-discovery-protein",
+        artifact_type="protein_structure",
+        media_type="chemical/x-pdb",
+        payload=protein,
+    )
+    repository = ScientificExecutionRepository(tmp_path / "executions")
+    repository.start()
+    record = repository.create(
+        ScientificObjectiveCompileRequest(
+            question="Discover and optimize a drug candidate for this protein.",
+            input_references=(
+                ScientificInputReference(
+                    reference_identifier="discovery-protein",
+                    artifact_type="protein_structure",
+                    artifact_identifier=source.artifact_identifier,
+                ),
+            ),
+            artifact_references=(source,),
+        )
+    )
+    runtime = ScientificObjectiveRuntime(
+        root=tmp_path / "workflow",
+        execution_repository=repository,
+        capability_registry=protein_ligand_discovery_registry(
+            store=store,
+            meeko_adapter=MeekoDockingPreparationAdapter(store),
+        ),
+    )
+    runtime.start()
+
+    completed = runtime.execute(record.execution_identifier)
+
+    assert completed.status == "succeeded", [
+        (node.capability_name, node.status, node.error_code, node.error_message)
+        for node in completed.node_executions
+    ]
+    assert completed.verified
+    assert completed.scene_identifier is not None
+    assert completed.scientist_result is not None
+    campaign_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "discovery_campaign_result"
+    )
+    campaign = DiscoveryCampaignRun.model_validate_json(store.read(campaign_reference))
+    assert campaign.completed
+    assert len(campaign.state.generations) == 2
+    assert campaign.state.usage.candidates_generated >= 2
+    assert campaign.state.usage.expensive_evaluations >= 2
+    assert campaign.state.lineage.edges
+    assert campaign.state.generations[-1].selected_candidate_identifiers
+    assert completed.checkpoint_identifiers == (campaign.checkpoint.checkpoint_identifier,)
+    docking_evidence = [
+        json.loads(store.read(item))
+        for item in completed.artifact_references
+        if item.artifact_type == "molecular_candidate_docking_evaluation"
+    ]
+    assert len(docking_evidence) >= 2
+    assert all(item["returned_pose_count"] >= 1 for item in docking_evidence)
+    assert all(item["score_semantics"] == "autodock_vina_score_not_binding_free_energy" for item in docking_evidence)
+    assert any(
+        item.artifact_type == "molecular_candidate_docking_poses_pdbqt"
+        for item in completed.artifact_references
+    )
+    assert all(
+        forbidden not in record.objective.model_dump_json()
+        for forbidden in (
+            "candidate_smiles", "docking_pose", "candidate_ranking", "workflow_graph"
         )
     )
