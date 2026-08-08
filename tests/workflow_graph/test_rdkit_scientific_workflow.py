@@ -91,7 +91,7 @@ def test_rdkit_adapter_is_discoverable_and_executes_through_phase4() -> None:
         invocation_builder=InvocationBuilder(),
     )
 
-    assert len(bridges) == 7
+    assert len(bridges) == len(adapter.declaration.capabilities) == 11
     assert SMILES_PARSE in registry.identities()
     discovered = catalogue.find(
         objective_type="smiles_parsing",

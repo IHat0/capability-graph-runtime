@@ -187,7 +187,13 @@ class ElectronicTensor(CanonicalModel):
 
     shape: tuple[int, ...] = Field(min_length=1, max_length=4)
     values: tuple[float, ...]
-    unit: Literal["dimensionless", "hartree", "electron"]
+    unit: Literal[
+        "dimensionless",
+        "hartree",
+        "electron",
+        "hartree_per_bohr",
+        "hartree_per_bohr2",
+    ]
     index_convention: str
 
     @field_validator("shape")
@@ -463,25 +469,60 @@ class ElectronicOrbitalSelectionScore(CanonicalModel):
     orbital_index: int = Field(ge=0)
     occupation: float = Field(ge=0, le=2)
     target_projection_score: float = Field(ge=0)
+    alpha_occupation: float | None = Field(default=None, ge=0, le=1)
+    beta_occupation: float | None = Field(default=None, ge=0, le=1)
+    selection_reasons: tuple[str, ...] = Field(default=(), max_length=16)
 
     @field_validator("occupation", "target_projection_score")
     @classmethod
     def validate_values(cls, value: float) -> float:
         return _finite(value, label="Active-space selection value")
 
+    @field_validator("alpha_occupation", "beta_occupation")
+    @classmethod
+    def validate_spin_occupation(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        return _finite(value, label="Active-space spin occupation")
+
+    @field_validator("selection_reasons")
+    @classmethod
+    def validate_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(
+            validate_identifier(reason, label="active-space selection reason")
+            for reason in value
+        )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Active-space selection reasons must be unique.")
+        return normalized
+
 
 class ElectronicActiveSpaceSelection(CanonicalModel):
-    """Automatic canonical-RHF orbital selection for active-space construction."""
+    """Auditable automatic orbital selection for active-space construction."""
 
     schema_version: CapabilityVersion
     selection_identifier: str
     molecule_identifier: str
     hartree_fock_result_identifier: str
-    selection_method: Literal["frontier", "target_ao_projection"]
+    selection_method: Literal[
+        "frontier",
+        "target_ao_projection",
+        "reaction_center_projection",
+        "metal_ligand_projection",
+    ]
+    reference_method: ReferenceMethod = "rhf"
+    orbital_basis: Literal[
+        "canonical_rhf",
+        "canonical_rohf",
+        "unrestricted_natural_orbital",
+    ] = "canonical_rhf"
     active_electron_count: int = Field(gt=0, le=64)
     active_spatial_orbital_count: int = Field(gt=0, le=32)
     active_orbital_indices: tuple[int, ...] = Field(min_length=1)
     target_atom_indices: tuple[int, ...] = ()
+    target_bond_atom_pairs: tuple[tuple[int, int], ...] = ()
+    target_ao_labels: tuple[str, ...] = ()
+    projection_threshold: float = Field(default=0.0, ge=0, le=1)
     orbital_scores: tuple[ElectronicOrbitalSelectionScore, ...] = Field(
         min_length=1
     )
@@ -522,6 +563,36 @@ class ElectronicActiveSpaceSelection(CanonicalModel):
             )
         return tuple(sorted(value))
 
+    @field_validator("target_bond_atom_pairs")
+    @classmethod
+    def validate_bond_pairs(
+        cls,
+        value: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[int, int], ...]:
+        normalized: list[tuple[int, int]] = []
+        for pair in value:
+            if len(pair) != 2 or pair[0] < 0 or pair[1] < 0 or pair[0] == pair[1]:
+                raise ValueError("Reaction-centre bonds require two distinct atoms.")
+            normalized.append(tuple(sorted(pair)))
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Reaction-centre bond targets must be unique.")
+        return tuple(sorted(normalized))
+
+    @field_validator("target_ao_labels")
+    @classmethod
+    def validate_ao_labels(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(label.strip() for label in value)
+        if any(not label or len(label) > 80 for label in normalized):
+            raise ValueError("Target AO labels must be nonempty and bounded.")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Target AO labels must be unique.")
+        return normalized
+
+    @field_validator("projection_threshold")
+    @classmethod
+    def validate_projection_threshold(cls, value: float) -> float:
+        return _finite(value, label="Active-space projection threshold")
+
     @field_validator("orbital_scores")
     @classmethod
     def validate_scores(
@@ -554,21 +625,29 @@ class ElectronicActiveSpaceSelection(CanonicalModel):
                 "Selection evidence must cover exactly the selected orbitals."
             )
 
-        resolved_electrons = sum(
-            score.occupation for score in self.orbital_scores
-        )
-        if not math.isclose(
-            resolved_electrons,
-            self.active_electron_count,
-            rel_tol=0,
-            abs_tol=1e-7,
-        ):
+        resolved_electrons = sum(score.occupation for score in self.orbital_scores)
+        if self.orbital_basis != "unrestricted_natural_orbital":
+            if not math.isclose(
+                resolved_electrons,
+                self.active_electron_count,
+                rel_tol=0,
+                abs_tol=1e-7,
+            ):
+                raise ValueError(
+                    "Selected occupations do not match active-electron count."
+                )
+        elif abs(resolved_electrons - self.active_electron_count) > 0.25:
             raise ValueError(
-                "Selected occupations do not match active-electron count."
+                "UNO population is inconsistent with the assigned active electrons."
             )
 
         if (
-            self.selection_method == "target_ao_projection"
+            self.selection_method
+            in {
+                "target_ao_projection",
+                "reaction_center_projection",
+                "metal_ligand_projection",
+            }
             and not self.target_atom_indices
         ):
             raise ValueError(
@@ -577,11 +656,35 @@ class ElectronicActiveSpaceSelection(CanonicalModel):
 
         if (
             self.selection_method == "frontier"
-            and self.target_atom_indices
+            and (
+                self.target_atom_indices
+                or self.target_bond_atom_pairs
+                or self.target_ao_labels
+            )
         ):
             raise ValueError(
                 "Frontier selection cannot declare target atoms."
             )
+
+        if (
+            self.selection_method == "reaction_center_projection"
+            and not self.target_bond_atom_pairs
+        ):
+            raise ValueError("Reaction-centre selection requires target bonds.")
+
+        if (
+            self.selection_method == "metal_ligand_projection"
+            and not self.target_ao_labels
+        ):
+            raise ValueError("Metal/ligand selection requires target AO labels.")
+
+        expected_basis = {
+            "rhf": "canonical_rhf",
+            "rohf": "canonical_rohf",
+            "uhf": "unrestricted_natural_orbital",
+        }[self.reference_method]
+        if self.orbital_basis != expected_basis:
+            raise ValueError("Active-space orbital basis disagrees with the reference.")
 
         return self
 
@@ -668,7 +771,10 @@ class QMMMEmbeddingSite(CanonicalModel):
     y_angstrom: float
     z_angstrom: float
     charge_e: float
-    charge_source: Literal["openmm_nonbonded_force"] = (
+    charge_source: Literal[
+        "openmm_nonbonded_force",
+        "openmm_boundary_charge_shift",
+    ] = (
         "openmm_nonbonded_force"
     )
 
@@ -693,6 +799,112 @@ class QMMMEmbeddingSite(CanonicalModel):
         return _finite(value, label="QM/MM embedding value")
 
 
+class QMMMBoundaryChargeAdjustment(CanonicalModel):
+    """One explicit MM point-charge change made by a covalent boundary scheme."""
+
+    source_particle_index: int = Field(ge=0)
+    original_charge_e: float
+    adjusted_charge_e: float
+    charge_delta_e: float
+    boundary_mm_particle_indices: tuple[int, ...] = Field(min_length=1)
+    role: Literal["boundary_charge_removed", "neighbor_charge_recipient"]
+
+    @field_validator("original_charge_e", "adjusted_charge_e", "charge_delta_e")
+    @classmethod
+    def validate_charge(cls, value: float) -> float:
+        return _finite(value, label="QM/MM boundary charge")
+
+    @field_validator("boundary_mm_particle_indices")
+    @classmethod
+    def validate_boundary_indices(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("Boundary charge sources must be unique.")
+        return tuple(sorted(value))
+
+    @model_validator(mode="after")
+    def validate_delta(self) -> Self:
+        if not math.isclose(
+            self.original_charge_e + self.charge_delta_e,
+            self.adjusted_charge_e,
+            rel_tol=0.0,
+            abs_tol=1e-10,
+        ):
+            raise ValueError("Boundary charge adjustment delta is inconsistent.")
+        if (
+            self.role == "boundary_charge_removed"
+            and not math.isclose(self.adjusted_charge_e, 0.0, abs_tol=1e-12)
+        ):
+            raise ValueError("A removed boundary charge must be exactly zero.")
+        return self
+
+
+class ElectronicImplicitSolventResult(CanonicalModel):
+    """Self-consistent continuum-solvent electronic-energy evidence."""
+
+    schema_version: CapabilityVersion
+    result_identifier: str
+    molecule_identifier: str
+    configuration_identifier: str
+    reference_method: ReferenceMethod
+    solvent_name: str = Field(min_length=1, max_length=80)
+    solvent_model: Literal["IEF-PCM", "C-PCM", "SS(V)PE", "COSMO"]
+    dielectric_constant: float = Field(gt=1.0, le=1000.0)
+    equilibrium_solvation: bool = True
+    converged: Literal[True] = True
+    vacuum_total_energy_hartree: float
+    solvated_total_energy_hartree: float
+    electronic_solvation_contribution_hartree: float
+    energy_semantics: Literal["solvated_electronic_energy"] = (
+        "solvated_electronic_energy"
+    )
+    thermal_correction_included: Literal[False] = False
+    gibbs_free_energy: Literal[False] = False
+
+    @field_validator("schema_version")
+    @classmethod
+    def validate_schema_version(cls, value: CapabilityVersion) -> CapabilityVersion:
+        return _validate_schema_version(value)
+
+    @field_validator(
+        "result_identifier",
+        "molecule_identifier",
+        "configuration_identifier",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(value, label="implicit-solvent identifier")
+
+    @field_validator("solvent_name")
+    @classmethod
+    def validate_solvent_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Solvent name cannot be blank.")
+        return normalized
+
+    @field_validator(
+        "dielectric_constant",
+        "vacuum_total_energy_hartree",
+        "solvated_total_energy_hartree",
+        "electronic_solvation_contribution_hartree",
+    )
+    @classmethod
+    def validate_scalars(cls, value: float) -> float:
+        return _finite(value, label="implicit-solvent scalar")
+
+    @model_validator(mode="after")
+    def validate_energy_difference(self) -> Self:
+        if not math.isclose(
+            self.solvated_total_energy_hartree
+            - self.vacuum_total_energy_hartree,
+            self.electronic_solvation_contribution_hartree,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("Implicit-solvent energy difference is inconsistent.")
+        return self
+
+
 class QMMMEmbeddingFoundation(CanonicalModel):
     """Real OpenMM point-charge environment prepared for PySCF embedding."""
 
@@ -705,8 +917,10 @@ class QMMMEmbeddingFoundation(CanonicalModel):
     qm_source_particle_count: int = Field(gt=0)
     embedding_sites: tuple[QMMMEmbeddingSite, ...] = Field(min_length=1)
     embedding_total_charge_e: float
+    unmodified_embedding_total_charge_e: float | None = None
+    boundary_charge_adjustments: tuple[QMMMBoundaryChargeAdjustment, ...] = ()
     electrostatic_embedding_ready: Literal[True] = True
-    boundary_policy: Literal["no_covalent_boundary"] = (
+    boundary_policy: Literal["no_covalent_boundary", "charge_shift"] = (
         "no_covalent_boundary"
     )
     charge_model: Literal["openmm_nonbonded_force"] = (
@@ -735,9 +949,14 @@ class QMMMEmbeddingFoundation(CanonicalModel):
             label="QM/MM embedding identifier",
         )
 
-    @field_validator("embedding_total_charge_e")
+    @field_validator(
+        "embedding_total_charge_e",
+        "unmodified_embedding_total_charge_e",
+    )
     @classmethod
-    def validate_embedding_total_charge(cls, value: float) -> float:
+    def validate_embedding_total_charge(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
         return _finite(
             value,
             label="QM/MM embedding total charge",
@@ -781,7 +1000,52 @@ class QMMMEmbeddingFoundation(CanonicalModel):
                 "the site-charge sum."
             )
 
+        unmodified_total = (
+            self.embedding_total_charge_e
+            if self.unmodifiable_total_is_absent
+            else self.unmodified_embedding_total_charge_e
+        )
+        if not math.isclose(
+            self.embedding_total_charge_e,
+            unmodified_total,
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            raise ValueError("Boundary charge shifting must conserve MM charge.")
+
+        adjusted_indices = [
+            item.source_particle_index for item in self.boundary_charge_adjustments
+        ]
+        if len(adjusted_indices) != len(set(adjusted_indices)):
+            raise ValueError("Boundary charge adjustments must be particle-unique.")
+        site_by_source = {
+            site.source_particle_index: site for site in self.embedding_sites
+        }
+        for adjustment in self.boundary_charge_adjustments:
+            site = site_by_source.get(adjustment.source_particle_index)
+            if site is None or not math.isclose(
+                site.charge_e,
+                adjustment.adjusted_charge_e,
+                rel_tol=0.0,
+                abs_tol=1e-10,
+            ):
+                raise ValueError(
+                    "Boundary charge adjustments must match embedding sites."
+                )
+
+        if self.boundary_policy == "charge_shift":
+            if not self.boundary_charge_adjustments:
+                raise ValueError("Charge-shift boundaries require adjustment evidence.")
+        elif self.boundary_charge_adjustments:
+            raise ValueError("Boundary-free embedding cannot contain charge shifts.")
+
         return self
+
+    @property
+    def unmodifiable_total_is_absent(self) -> bool:
+        """Return whether a legacy boundary-free artifact omitted the raw total."""
+
+        return self.unmodified_embedding_total_charge_e is None
 
 class ElectronicQMMMHartreeFockResult(CanonicalModel):
     """Hartree-Fock evidence from PySCF static MM point-charge embedding."""

@@ -12,25 +12,35 @@ from cgr.electronic_structure import (
     ACTIVE_SPACE_CONSTRUCT,
     ACTIVE_SPACE_SELECT,
     CONFIGURATION_DEFINE,
+    FREQUENCY_ANALYZE,
+    GRADIENT_CALCULATE,
     HARTREE_FOCK,
+    IMPLICIT_SOLVENT_HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
     QM_REGION_PREPARE,
     ORBITALS_GENERATE,
     QMMM_EMBEDDING_PREPARE,
     QMMM_HARTREE_FOCK,
     REFERENCE_CALCULATE,
+    TRANSITION_STATE_SEARCH,
+    REACTION_PATH_CONFIRM,
     ElectronicActiveSpace,
     ElectronicActiveSpaceSelection,
     ElectronicAtom,
     ElectronicHartreeFockResult,
+    ElectronicFrequencyAnalysis,
+    ElectronicFrequencyMode,
+    ElectronicImplicitSolventResult,
     ElectronicMolecule,
     ElectronicQMMMHartreeFockResult,
     ElectronicQMRegionPreparation,
+    ElectronicOrbitalSelectionScore,
     ElectronicOrbitalSet,
     ElectronicReferenceCalculation,
     ElectronicStructureConfiguration,
     ElectronicTensor,
     PySCFElectronicStructureAdapter,
+    QMMMBoundaryChargeAdjustment,
     QMMMEmbeddingFoundation,
     QMMMEmbeddingSite,
     pyscf_capability_envelopes,
@@ -261,14 +271,19 @@ def test_declaration_exposes_phase4_capabilities_without_importing_pyscf() -> No
     envelopes = pyscf_capability_envelopes()
     after = set(sys.modules)
 
-    assert len(envelopes) == 10
+    assert len(envelopes) == 15
     assert {envelope.descriptor.capability_name for envelope in envelopes} == {
         QM_REGION_PREPARE,
         MOLECULE_CONSTRUCT,
         CONFIGURATION_DEFINE,
+        FREQUENCY_ANALYZE,
+        GRADIENT_CALCULATE,
         HARTREE_FOCK,
+        IMPLICIT_SOLVENT_HARTREE_FOCK,
         ORBITALS_GENERATE,
         REFERENCE_CALCULATE,
+        TRANSITION_STATE_SEARCH,
+        REACTION_PATH_CONFIRM,
         ACTIVE_SPACE_SELECT,
         ACTIVE_SPACE_CONSTRUCT,
         QMMM_EMBEDDING_PREPARE,
@@ -321,6 +336,191 @@ def test_tensor_and_active_space_contracts_reject_inconsistent_shapes() -> None:
             two_body_integrals=tensor_4,
         )
 
+
+def test_reaction_active_space_selection_preserves_semantic_evidence() -> None:
+    selection = ElectronicActiveSpaceSelection(
+        schema_version=VERSION,
+        selection_identifier="selection.reaction-centre",
+        molecule_identifier="molecule.reaction-centre",
+        hartree_fock_result_identifier="hf.reaction-centre",
+        selection_method="reaction_center_projection",
+        reference_method="rohf",
+        orbital_basis="canonical_rohf",
+        active_electron_count=3,
+        active_spatial_orbital_count=3,
+        active_orbital_indices=(2, 3, 4),
+        target_atom_indices=(0, 1),
+        target_bond_atom_pairs=((0, 1),),
+        projection_threshold=0.1,
+        orbital_scores=(
+            ElectronicOrbitalSelectionScore(
+                orbital_index=2,
+                occupation=2.0,
+                alpha_occupation=1.0,
+                beta_occupation=1.0,
+                target_projection_score=0.72,
+                selection_reasons=("occupied_pair", "target_projection"),
+            ),
+            ElectronicOrbitalSelectionScore(
+                orbital_index=3,
+                occupation=1.0,
+                alpha_occupation=1.0,
+                beta_occupation=0.0,
+                target_projection_score=0.81,
+                selection_reasons=("open_shell_mandatory", "target_projection"),
+            ),
+            ElectronicOrbitalSelectionScore(
+                orbital_index=4,
+                occupation=0.0,
+                alpha_occupation=0.0,
+                beta_occupation=0.0,
+                target_projection_score=0.64,
+                selection_reasons=("virtual_partner", "target_projection"),
+            ),
+        ),
+    )
+
+    assert selection.target_bond_atom_pairs == ((0, 1),)
+    assert selection.reference_method == "rohf"
+    assert selection.orbital_scores[-1].selection_reasons == (
+        "virtual_partner",
+        "target_projection",
+    )
+
+
+def test_implicit_solvent_contract_keeps_electronic_energy_semantics() -> None:
+    result = ElectronicImplicitSolventResult(
+        schema_version=VERSION,
+        result_identifier="implicit-solvent.water",
+        molecule_identifier="molecule.water-solute",
+        configuration_identifier="configuration.water-solute",
+        reference_method="rhf",
+        solvent_name="water",
+        solvent_model="IEF-PCM",
+        dielectric_constant=78.3553,
+        equilibrium_solvation=True,
+        converged=True,
+        vacuum_total_energy_hartree=-100.0,
+        solvated_total_energy_hartree=-100.025,
+        electronic_solvation_contribution_hartree=-0.025,
+    )
+
+    assert result.energy_semantics == "solvated_electronic_energy"
+    assert not result.thermal_correction_included
+    assert not result.gibbs_free_energy
+
+    with pytest.raises(ValidationError, match="difference"):
+        ElectronicImplicitSolventResult.model_validate(
+            {
+                **result.model_dump(),
+                "electronic_solvation_contribution_hartree": -0.5,
+            }
+        )
+
+
+def test_frequency_analysis_requires_exact_mode_evidence() -> None:
+    mode_tensor = ElectronicTensor(
+        shape=(2, 3),
+        values=(1.0, 0.0, 0.0, -1.0, 0.0, 0.0),
+        unit="dimensionless",
+        index_convention="atom_by_cartesian",
+    )
+    hessian = ElectronicTensor(
+        shape=(2, 2, 3, 3),
+        values=(0.0,) * 36,
+        unit="hartree_per_bohr2",
+        index_convention="atom_atom_cartesian_cartesian",
+    )
+    analysis = ElectronicFrequencyAnalysis(
+        schema_version=VERSION,
+        analysis_identifier="frequency.ts",
+        molecule_identifier="molecule.ts",
+        configuration_identifier="configuration.ts",
+        gradient_result_identifier="gradient.ts",
+        hessian_hartree_per_bohr2=hessian,
+        modes=(
+            ElectronicFrequencyMode(
+                mode_index=0,
+                wavenumber_cm_inverse=-412.0,
+                reduced_mass_amu=6.0,
+                imaginary=True,
+                significant_imaginary=True,
+                normalized_displacements=mode_tensor,
+                reaction_coordinate_participation=0.83,
+            ),
+        ),
+        significant_imaginary_threshold_cm_inverse=20.0,
+        significant_imaginary_mode_count=1,
+        exactly_one_significant_imaginary_mode=True,
+    )
+
+    assert analysis.exactly_one_significant_imaginary_mode
+    assert analysis.modes[0].reaction_coordinate_participation == pytest.approx(0.83)
+
+
+def test_uhf_common_spatial_basis_uses_unrestricted_natural_orbitals() -> None:
+    numpy = pytest.importorskip("numpy")
+    identity = ElectronicTensor(
+        shape=(3, 3),
+        values=tuple(float(value) for value in numpy.eye(3).reshape(-1)),
+        unit="dimensionless",
+        index_convention="ao_by_ao",
+    )
+    zero = ElectronicTensor(
+        shape=(3, 3),
+        values=(0.0,) * 9,
+        unit="hartree",
+        index_convention="ao_by_ao",
+    )
+    density_alpha = ElectronicTensor(
+        shape=(3, 3),
+        values=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        unit="electron",
+        index_convention="ao_by_ao",
+    )
+    density_beta = ElectronicTensor(
+        shape=(3, 3),
+        values=(0.8, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0),
+        unit="electron",
+        index_convention="ao_by_ao",
+    )
+    result = ElectronicHartreeFockResult(
+        schema_version=VERSION,
+        result_identifier="hf.uhf-uno",
+        molecule_identifier="molecule.uhf-uno",
+        configuration_identifier="configuration.uhf-uno",
+        reference_method="uhf",
+        converged=True,
+        iterations=4,
+        electron_count=2,
+        alpha_electron_count=1,
+        beta_electron_count=1,
+        atomic_orbital_count=3,
+        spatial_orbital_count=3,
+        electronic_energy_hartree=-1.5,
+        nuclear_repulsion_energy_hartree=0.5,
+        total_energy_hartree=-1.0,
+        orbital_energies_alpha_hartree=(-0.5, 0.1, 0.4),
+        orbital_energies_beta_hartree=(-0.4, 0.2, 0.5),
+        orbital_occupations_alpha=(1.0, 0.0, 0.0),
+        orbital_occupations_beta=(1.0, 0.0, 0.0),
+        mo_coefficients_alpha=identity,
+        mo_coefficients_beta=identity,
+        overlap_matrix_ao=identity,
+        core_hamiltonian_ao=zero,
+        density_matrix_alpha_ao=density_alpha,
+        density_matrix_beta_ao=density_beta,
+    )
+
+    coefficients, occupations, alpha, beta, basis = (
+        PySCFElectronicStructureAdapter._common_spatial_orbitals(numpy, result)
+    )
+
+    assert basis == "unrestricted_natural_orbital"
+    assert occupations == pytest.approx((1.8, 0.2, 0.0))
+    assert float(sum(alpha)) == pytest.approx(1.0)
+    assert float(sum(beta)) == pytest.approx(1.0)
+    assert coefficients.T @ coefficients == pytest.approx(numpy.eye(3))
 
 def test_molecule_and_configuration_are_generic_and_explicit() -> None:
     store = MemoryPayloadStore()
@@ -612,7 +812,7 @@ def test_qmmm_foundation_uses_real_openmm_partial_charges() -> None:
     assert foundation.embedding_total_charge_e == pytest.approx(-0.834)
 
 
-def test_qmmm_foundation_rejects_covalent_boundary_without_charge_shift() -> None:
+def test_qmmm_foundation_charge_shifts_supported_covalent_boundary() -> None:
     store = MemoryPayloadStore()
     adapter = PySCFElectronicStructureAdapter(store)
 
@@ -684,9 +884,37 @@ def test_qmmm_foundation_rejects_covalent_boundary_without_charge_shift() -> Non
         )
     )
 
-    assert result.status is ExecutionStatus.FAILED
-    assert result.failure is not None
-    assert result.failure.code == "electronic_input_invalid"
+    assert result.status is ExecutionStatus.SUCCESS
+    foundation = QMMMEmbeddingFoundation.model_validate_json(
+        store.read(result.output_artifacts[0])
+    )
+    assert foundation.boundary_policy == "charge_shift"
+    assert foundation.embedding_total_charge_e == pytest.approx(0.1)
+    assert foundation.unmodified_embedding_total_charge_e == pytest.approx(0.1)
+    assert foundation.boundary_charge_adjustments == (
+        QMMMBoundaryChargeAdjustment(
+            source_particle_index=1,
+            original_charge_e=0.1,
+            adjusted_charge_e=0.0,
+            charge_delta_e=-0.1,
+            boundary_mm_particle_indices=(1,),
+            role="boundary_charge_removed",
+        ),
+        QMMMBoundaryChargeAdjustment(
+            source_particle_index=3,
+            original_charge_e=0.0,
+            adjusted_charge_e=0.1,
+            charge_delta_e=0.1,
+            boundary_mm_particle_indices=(1,),
+            role="neighbor_charge_recipient",
+        ),
+    )
+    sites = {
+        site.source_particle_index: site for site in foundation.embedding_sites
+    }
+    assert sites[1].charge_e == pytest.approx(0.0)
+    assert sites[3].charge_e == pytest.approx(0.1)
+    assert sites[1].charge_source == "openmm_boundary_charge_shift"
 
 def test_real_pyscf_h2_pipeline_produces_generic_artifacts() -> None:
     pytest.importorskip("pyscf")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.metadata
 import importlib.resources
 import math
@@ -38,6 +39,10 @@ from cgr.science import (
 
 from .cheminformatics import MolecularConformerSet
 from .rdkit_adapter import MolecularArtifactPayloadStore
+from .preparation import (
+    MolecularProteinProtonationPreparation,
+    MolecularProteinResidueState,
+)
 from .simulation import (
     MolecularDynamicsRun,
     MolecularDynamicsSettings,
@@ -72,6 +77,7 @@ _SUPPORTED_NEGATIVE_IONS = frozenset({"Cl-", "Br-", "F-", "I-"})
 _SUPPORTED_LIPIDS = frozenset({"POPC", "POPE", "DLPC", "DLPE", "DMPC", "DOPC", "DPPC"})
 
 FORCE_FIELD_SELECT = "molecular.force_field_select"
+PROTEIN_PROTONATION_PREPARE = "molecular.protein_protonation_prepare"
 ENVIRONMENT_PREPARE = "molecular.environment_prepare"
 SYSTEM_CONSTRUCT = "molecular.system_construct"
 ENERGY_MINIMIZE = "molecular.energy_minimize"
@@ -159,6 +165,18 @@ def openmm_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
             True,
             (
                 "Version 1 accepts packaged relative OpenMM XML identifiers only; custom local force-field paths are rejected.",
+            ),
+        ),
+        (
+            PROTEIN_PROTONATION_PREPARE,
+            ("molecular_structure", "molecular_force_field_selection"),
+            ("molecular_protein_protonation_preparation", "prepared_molecular_structure"),
+            ("protein_protonation", "protein_hydrogen_preparation", "catalytic_residue_state"),
+            True,
+            (
+                "OpenMM Modeller adds hydrogens and selects standard residue variants at the requested pH.",
+                "Scientist-supplied overrides use semantic chain/residue/name keys, never atom indices.",
+                "No exact pKa or metal oxidation state is inferred.",
             ),
         ),
         (
@@ -445,6 +463,8 @@ class OpenMMClassicalSimulationAdapter:
         try:
             if capability_name == FORCE_FIELD_SELECT:
                 return self._select_force_field(invocation)
+            if capability_name == PROTEIN_PROTONATION_PREPARE:
+                return self._prepare_protein_protonation(invocation)
             if capability_name == ENVIRONMENT_PREPARE:
                 return self._prepare_environment(invocation)
             if capability_name == SYSTEM_CONSTRUCT:
@@ -1546,6 +1566,250 @@ class OpenMMClassicalSimulationAdapter:
             invocation,
             artifacts=(artifact,),
             diagnostics={"selection_identifier": selection.selection_identifier},
+        )
+
+    def _prepare_protein_protonation(
+        self, invocation: CapabilityInvocation
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        if set(inputs) != {
+            "molecular_structure",
+            "molecular_force_field_selection",
+        }:
+            raise ValueError(
+                "Protein protonation requires structure and force-field artifacts."
+            )
+        structure_reference = self._require_input(inputs, "molecular_structure")
+        selection_reference = self._require_input(
+            inputs, "molecular_force_field_selection"
+        )
+        if self._string_parameter(
+            invocation, "structure_format", required=True, maximum_length=16
+        ).lower() != "pdb":
+            raise ValueError("OpenMM protein protonation currently requires PDB input.")
+        target_ph = self._float_parameter(
+            invocation, "target_ph", minimum=0.0, maximum=14.0, required=True
+        )
+        raw_overrides = self._string_parameter(
+            invocation,
+            "residue_variant_overrides",
+            default="none",
+            maximum_length=8192,
+        )
+        override_entries = (
+            ()
+            if raw_overrides.strip().lower() == "none"
+            else tuple(
+                item.strip() for item in raw_overrides.split(";") if item.strip()
+            )
+        )
+        if len(override_entries) > 128:
+            raise ValueError("Protein residue overrides must be bounded.")
+        overrides: dict[str, str] = {}
+        for entry in override_entries:
+            if entry.count("=") != 1:
+                raise ValueError("Protein residue overrides must use key=variant syntax.")
+            raw_key, raw_variant = entry.split("=", 1)
+            key = raw_key.strip().lower()
+            variant = raw_variant.strip().upper()
+            if (
+                not re.fullmatch(
+                    r"chain-[a-z0-9._-]+-residue-[a-z0-9._-]+-[a-z0-9._-]+",
+                    key,
+                )
+                or not re.fullmatch(r"[A-Z0-9]{1,8}", variant)
+            ):
+                raise ValueError("A protein residue override is invalid.")
+            if key in overrides:
+                raise ValueError("Protein residue overrides must be unique.")
+            overrides[key] = variant
+
+        selection = MolecularForceFieldSelection.model_validate_json(
+            self._read_payload(selection_reference)
+        )
+        try:
+            source_text = self._read_payload(structure_reference).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("Protein PDB input must be UTF-8 text.") from None
+        openmm, app, unit = _openmm_modules()
+        pdb = app.PDBFile(io.StringIO(source_text))
+        source_atoms = tuple(pdb.topology.atoms())
+        source_residues = tuple(pdb.topology.residues())
+        if (
+            not source_atoms
+            or len(source_atoms) > _MAXIMUM_PARTICLES
+            or not source_residues
+        ):
+            raise ValueError("Protein PDB topology is invalid.")
+
+        semantic_keys: list[str] = []
+        requested_variants: list[str | None] = []
+        for residue in source_residues:
+            chain_label = (residue.chain.id or "blank").strip().lower() or "blank"
+            sequence = (residue.id or "unknown").strip().lower() or "unknown"
+            residue_name = residue.name.strip().lower()
+            key = f"chain-{chain_label}-residue-{sequence}-{residue_name}"
+            if key in semantic_keys:
+                raise ValueError("Protein residue semantic identities are ambiguous.")
+            semantic_keys.append(key)
+            requested_variants.append(overrides.get(key))
+        if not set(overrides).issubset(semantic_keys):
+            raise ValueError("A protein residue override does not resolve.")
+
+        modeller = app.Modeller(pdb.topology, pdb.positions)
+        force_field = self._force_field(selection)
+        selected_variants = tuple(
+            modeller.addHydrogens(
+                force_field,
+                pH=target_ph,
+                variants=requested_variants,
+            )
+        )
+        prepared_atoms = tuple(modeller.topology.atoms())
+        prepared_residues = tuple(modeller.topology.residues())
+        if (
+            len(prepared_atoms) < len(source_atoms)
+            or len(prepared_atoms) > _MAXIMUM_PARTICLES
+            or len(prepared_residues) != len(source_residues)
+            or len(selected_variants) != len(source_residues)
+        ):
+            raise ValueError("Protein protonation changed unsupported topology identity.")
+
+        system = force_field.createSystem(
+            modeller.topology,
+            nonbondedMethod=app.NoCutoff,
+            constraints=None,
+            rigidWater=False,
+            removeCMMotion=False,
+        )
+        nonbonded = tuple(
+            system.getForce(index)
+            for index in range(system.getNumForces())
+            if isinstance(system.getForce(index), openmm.NonbondedForce)
+        )
+        if len(nonbonded) != 1 or system.getNumParticles() != len(prepared_atoms):
+            raise ValueError("Prepared protein charges are not auditable.")
+        charges = tuple(
+            float(
+                nonbonded[0]
+                .getParticleParameters(index)[0]
+                .value_in_unit(unit.elementary_charge)
+            )
+            for index in range(system.getNumParticles())
+        )
+        ambiguous_names = {"ARG", "ASP", "CYS", "GLU", "HIS", "LYS", "TYR"}
+        residue_states: list[MolecularProteinResidueState] = []
+        particle_offset = 0
+        for index, residue in enumerate(prepared_residues):
+            atom_count = sum(1 for _ in residue.atoms())
+            residue_charge = _rounded(
+                sum(charges[particle_offset: particle_offset + atom_count])
+            )
+            particle_offset += atom_count
+            selected = str(selected_variants[index] or residue.name)
+            residue_states.append(MolecularProteinResidueState(
+                residue_identifier=semantic_keys[index],
+                chain_identifier=residue.chain.id or "blank",
+                source_sequence_identifier=residue.id or "unknown",
+                residue_name=residue.name,
+                selected_variant=selected,
+                selection_source=(
+                    "semantic_override"
+                    if semantic_keys[index] in overrides
+                    else "openmm_ph_model"
+                ),
+                particle_partial_charge=residue_charge,
+                chemically_ambiguous=residue.name.upper() in ambiguous_names,
+            ))
+        if particle_offset != len(charges):
+            raise ValueError("Residue charges do not cover the prepared particles.")
+        transition_metals = {
+            *range(21, 31), *range(39, 49), *range(72, 81)
+        }
+        contains_transition_metal = any(
+            atom.element is not None
+            and atom.element.atomic_number in transition_metals
+            for atom in prepared_atoms
+        )
+        warnings = [
+            "OpenMM variants use force-field templates and pH heuristics; exact pKa values were not calculated.",
+            "Chemically ambiguous catalytic residues should be evaluated as bounded alternatives when relevant.",
+        ]
+        if contains_transition_metal:
+            warnings.append("Metal oxidation and spin states were not inferred.")
+
+        prepared_stream = io.StringIO()
+        app.PDBFile.writeFile(
+            modeller.topology, modeller.positions, prepared_stream, keepIds=True
+        )
+        prepared_artifact = self._write_artifact(
+            invocation=invocation,
+            artifact_type="prepared_molecular_structure",
+            media_type="chemical/x-pdb",
+            payload=prepared_stream.getvalue().encode("utf-8"),
+            identifier_prefix="prepared-protein-structure",
+            parents=(structure_reference, selection_reference),
+            metadata={
+                "target_ph": target_ph,
+                "atom_count": len(prepared_atoms),
+                "hydrogen_atoms_added": len(prepared_atoms) - len(source_atoms),
+            },
+        )
+        preparation = MolecularProteinProtonationPreparation(
+            schema_version=_SCHEMA_VERSION,
+            preparation_identifier=_stable_identifier(
+                "molecular-protein-protonation",
+                structure_reference.content_sha256,
+                selection.selection_identifier,
+                target_ph,
+                *(f"{key}:{value}" for key, value in sorted(overrides.items())),
+            ),
+            source_structure_artifact_identifier=structure_reference.artifact_identifier,
+            force_field_selection_identifier=selection.selection_identifier,
+            target_ph=target_ph,
+            source_atom_count=len(source_atoms),
+            prepared_atom_count=len(prepared_atoms),
+            hydrogen_atoms_added=len(prepared_atoms) - len(source_atoms),
+            residue_states=tuple(residue_states),
+            total_particle_partial_charge=_rounded(sum(charges)),
+            explicit_semantic_variant_overrides=tuple(sorted(overrides)),
+            contains_transition_metal=contains_transition_metal,
+            warnings=tuple(warnings),
+        )
+        report_artifact = self._write_artifact(
+            invocation=invocation,
+            artifact_type="molecular_protein_protonation_preparation",
+            media_type="application/vnd.pulsate.molecular-protein-protonation+json",
+            payload=preparation.to_canonical_json().encode("utf-8"),
+            identifier_prefix="molecular-protein-protonation",
+            parents=(structure_reference, selection_reference, prepared_artifact),
+            metadata={
+                "target_ph": target_ph,
+                "residue_count": len(residue_states),
+                "total_particle_partial_charge": preparation.total_particle_partial_charge,
+                "exact_pka_calculated": False,
+                "metal_oxidation_states_inferred": False,
+            },
+        )
+        lineage = tuple(
+            self._lineage(invocation, parent, prepared_artifact, "protonated_from")
+            for parent in (structure_reference, selection_reference)
+        ) + (
+            self._lineage(
+                invocation, prepared_artifact, report_artifact, "documented_by"
+            ),
+        )
+        return self._success(
+            invocation,
+            artifacts=(report_artifact, prepared_artifact),
+            lineage=lineage,
+            diagnostics={
+                "target_ph": target_ph,
+                "hydrogen_atoms_added": preparation.hydrogen_atoms_added,
+                "residue_count": len(residue_states),
+                "total_particle_partial_charge": preparation.total_particle_partial_charge,
+                "contains_transition_metal": contains_transition_metal,
+            },
         )
 
     def _prepare_environment(

@@ -22,12 +22,16 @@ from cgr.molecular.cheminformatics import (
     MolecularGraph,
     MolecularScaffold,
 )
+from cgr.molecular.preparation import MolecularProtonationPreparation
+from cgr.molecular.parameterization import MolecularLigandParameterization
 from cgr.molecular.rdkit_adapter import (
     CONFORMER_GENERATION,
     CONSTRAINED_DISTANCE_SCAN,
     FRAGMENT,
     GEOMETRY_VALIDATION,
+    LIGAND_PARAMETERIZE,
     PREPARE,
+    PROTONATION_PREPARE,
     SCAFFOLD,
     SMILES_PARSE,
     STRUCTURE_INGESTION,
@@ -142,7 +146,9 @@ def test_declaration_exposes_all_phase5_2_capabilities_without_importing_rdkit(
                 CONSTRAINED_DISTANCE_SCAN,
                 FRAGMENT,
                 GEOMETRY_VALIDATION,
+                LIGAND_PARAMETERIZE,
                 PREPARE,
+                PROTONATION_PREPARE,
                 SCAFFOLD,
                 SMILES_PARSE,
                 STRUCTURE_INGESTION,
@@ -208,6 +214,91 @@ def test_preparation_adds_explicit_hydrogens_and_preserves_formal_charge() -> No
     assert prepared.atoms[0].source_atom_index == 0
     assert all(atom.source_atom_index is None for atom in prepared.atoms[1:])
     assert result.lineage[0].source == source.pointer
+
+
+def test_protonation_preparation_enumerates_auditable_ph_states() -> None:
+    pytest.importorskip("rdkit")
+    pytest.importorskip("openbabel")
+    store = MemoryPayloadStore()
+    adapter = RDKitCheminformaticsAdapter(store)
+    source = _execute_smiles(adapter, "NCC(=O)O")
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            PROTONATION_PREPARE,
+            inputs=(source,),
+            parameters={
+                "target_ph": 7.4,
+                "ph_window": 1.0,
+                "ph_sampling_interval": 0.5,
+                "maximum_states": 8,
+            },
+        )
+    )
+
+    assert result.status is ExecutionStatus.SUCCESS
+    preparation = MolecularProtonationPreparation.model_validate_json(
+        store.read(result.output_artifacts[0])
+    )
+    assert preparation.target_ph == pytest.approx(7.4)
+    assert not preparation.exact_pka_calculated
+    assert 1 <= len(preparation.states) <= 8
+    assert len(result.output_artifacts) == len(preparation.states) + 1
+    assert all(
+        state.protonation_method == "openbabel_phmodel_3.1.1.23"
+        for state in preparation.states
+    )
+
+
+def test_ligand_parameterization_assigns_complete_mapped_mmff94s_terms() -> None:
+    pytest.importorskip("rdkit")
+    store = MemoryPayloadStore()
+    adapter = RDKitCheminformaticsAdapter(store)
+    graph = _execute_smiles(adapter, "CC(=O)NC")
+    prepared_result = adapter.invoke(_invocation(adapter, PREPARE, inputs=(graph,)))
+    prepared = prepared_result.output_artifacts[0]
+
+    result = adapter.invoke(
+        _invocation(adapter, LIGAND_PARAMETERIZE, inputs=(prepared,))
+    )
+
+    assert result.status is ExecutionStatus.SUCCESS
+    parameters = MolecularLigandParameterization.model_validate_json(
+        store.read(result.output_artifacts[0])
+    )
+    assert parameters.force_field_identifier == "mmff94s"
+    assert parameters.parameter_assignment_complete
+    assert not parameters.openmm_system_constructed
+    assert [atom.atom_index for atom in parameters.atoms] == list(
+        range(len(parameters.atoms))
+    )
+    assert parameters.total_partial_charge == pytest.approx(
+        parameters.total_formal_charge, abs=1.0e-4
+    )
+    assert {
+        "bond_stretch",
+        "angle_bend",
+        "stretch_bend",
+        "proper_torsion",
+        "out_of_plane",
+    }.issubset({term.term_kind for term in parameters.terms})
+
+
+def test_ligand_parameterization_rejects_unsupported_mmff94s_chemistry() -> None:
+    pytest.importorskip("rdkit")
+    store = MemoryPayloadStore()
+    adapter = RDKitCheminformaticsAdapter(store)
+    graph = _execute_smiles(adapter, "[U]")
+    prepared = adapter.invoke(_invocation(adapter, PREPARE, inputs=(graph,))).output_artifacts[0]
+
+    result = adapter.invoke(
+        _invocation(adapter, LIGAND_PARAMETERIZE, inputs=(prepared,))
+    )
+
+    assert result.status is ExecutionStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.code == "molecular_input_invalid"
 
 
 def test_seeded_conformer_generation_is_byte_deterministic() -> None:

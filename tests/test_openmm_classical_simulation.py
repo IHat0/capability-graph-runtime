@@ -20,6 +20,7 @@ from cgr.molecular.openmm_adapter import (
     ENSEMBLE_SUMMARIZE,
     ENVIRONMENT_PREPARE,
     FORCE_FIELD_SELECT,
+    PROTEIN_PROTONATION_PREPARE,
     SNAPSHOT_EXTRACT,
     SYSTEM_CONSTRUCT,
     TRAJECTORY_GENERATE,
@@ -42,10 +43,12 @@ from cgr.molecular.simulation import (
     MolecularSystemConstructionSettings,
     MolecularTrajectory,
 )
+from cgr.molecular.preparation import MolecularProteinProtonationPreparation
 from cgr.science import (
     ArtifactPointer,
     ArtifactReference,
     CapabilityInvocation,
+    CreationProvenance,
 )
 
 VERSION = CapabilityVersion(major=1, minor=0, patch=0)
@@ -280,6 +283,7 @@ def test_declaration_exposes_all_phase5_3_capabilities_without_importing_openmm(
         ENSEMBLE_SUMMARIZE,
         ENVIRONMENT_PREPARE,
         FORCE_FIELD_SELECT,
+        PROTEIN_PROTONATION_PREPARE,
         SNAPSHOT_EXTRACT,
         SYSTEM_CONSTRUCT,
         TRAJECTORY_GENERATE,
@@ -355,6 +359,82 @@ def test_force_field_selection_is_engine_neutral_and_versioned() -> None:
     assert selection.water_model == "tip3p"
     assert selection.engine_distribution_version == "8.5.2"
     assert b"<ForceField" not in store.read(artifact)
+
+
+def test_openmm_prepares_protein_hydrogens_variants_and_residue_charges() -> None:
+    pytest.importorskip("openmm")
+    pdb = b"""ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       1.450   0.000   0.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       2.000   1.400   0.000  1.00  0.00           C
+ATOM      4  O   ALA A   1       1.400   2.400   0.000  1.00  0.00           O
+ATOM      5  CB  ALA A   1       1.900  -0.800   1.200  1.00  0.00           C
+ATOM      6  N   ALA A   2       3.250   1.450   0.000  1.00  0.00           N
+ATOM      7  CA  ALA A   2       3.900   2.700   0.000  1.00  0.00           C
+ATOM      8  C   ALA A   2       5.400   2.500   0.000  1.00  0.00           C
+ATOM      9  O   ALA A   2       6.000   3.500   0.000  1.00  0.00           O
+ATOM     10  CB  ALA A   2       3.300   3.600   1.100  1.00  0.00           C
+ATOM     11  N   ALA A   3       6.000   1.350   0.000  1.00  0.00           N
+ATOM     12  CA  ALA A   3       7.400   1.000   0.000  1.00  0.00           C
+ATOM     13  C   ALA A   3       8.100   2.300   0.000  1.00  0.00           C
+ATOM     14  O   ALA A   3       7.600   3.400   0.000  1.00  0.00           O
+ATOM     15  CB  ALA A   3       7.700  -0.100   1.000  1.00  0.00           C
+ATOM     16  OXT ALA A   3       9.300   2.200   0.000  1.00  0.00           O
+TER
+END
+"""
+    store = MemoryPayloadStore()
+    adapter = OpenMMClassicalSimulationAdapter(store, MemoryPrivateStateStore())
+    source = ArtifactReference(
+        artifact_identifier="protein-three-alanine",
+        schema_version=VERSION,
+        artifact_type="molecular_structure",
+        media_type="chemical/x-pdb",
+        content_sha256=hashlib.sha256(pdb).hexdigest(),
+        byte_size=len(pdb),
+        provenance=CreationProvenance(
+            producer="test.fixture", producer_version=VERSION
+        ),
+    )
+    store.write(source, pdb)
+    force_field_result = adapter.invoke(_invocation(
+        adapter,
+        FORCE_FIELD_SELECT,
+        parameters={
+            "force_field_files": "amber14/protein.ff14SB.xml;amber14/tip3p.xml",
+            "water_model": "tip3p",
+        },
+        execution_identifier="execution.phase8.protein-force-field",
+    ))
+    assert force_field_result.status is ExecutionStatus.SUCCESS
+    force_field = force_field_result.output_artifacts[0]
+
+    result = adapter.invoke(_invocation(
+        adapter,
+        PROTEIN_PROTONATION_PREPARE,
+        inputs=(source, force_field),
+        parameters={
+            "structure_format": "pdb",
+            "target_ph": 7.4,
+            "residue_variant_overrides": "none",
+        },
+        execution_identifier="execution.phase8.protein-protonation",
+    ))
+
+    assert result.status is ExecutionStatus.SUCCESS
+    report_reference = _artifact_by_type(
+        result, "molecular_protein_protonation_preparation"
+    )
+    report = MolecularProteinProtonationPreparation.model_validate_json(
+        store.read(report_reference)
+    )
+    prepared = _artifact_by_type(result, "prepared_molecular_structure")
+    assert report.hydrogen_atoms_added > 0
+    assert report.prepared_atom_count > report.source_atom_count
+    assert len(report.residue_states) == 3
+    assert report.total_particle_partial_charge == pytest.approx(0.0, abs=1e-5)
+    assert b" H" in store.read(prepared)
+    assert not report.exact_pka_calculated
+    assert not report.metal_oxidation_states_inferred
 
 
 def test_solvent_and_ion_environment_is_periodic_and_explicit() -> None:

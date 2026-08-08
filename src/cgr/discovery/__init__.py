@@ -31,6 +31,14 @@ from .contracts import (
     SelectionPolicy,
 )
 from .integration import diagnosis_reference, replanning_reference, verification_record
+from .molecular_components import (
+    MolecularCandidateArtifactStore,
+    MolecularCandidateEvidenceVerifier,
+    RDKitMolecularCandidateGenerator,
+    RDKitMolecularDescriptorEvaluator,
+    RDKitMolecularValidityChecker,
+    molecular_discovery_registries,
+)
 from .ranking import pareto_dominates, pareto_fronts, rank_candidates
 from .registry import (
     CandidateEvaluator,
@@ -69,6 +77,11 @@ from .runtime import (
 
 __all__ = [
     "CandidateAssessment",
+    "MolecularCandidateArtifactStore",
+    "MolecularCandidateEvidenceVerifier",
+    "RDKitMolecularCandidateGenerator",
+    "RDKitMolecularDescriptorEvaluator",
+    "RDKitMolecularValidityChecker",
     "CandidateScientificVerifier",
     "CandidateScientificVerifierRegistry",
     "ContextualCandidateEvaluator",
@@ -131,4 +144,5 @@ __all__ = [
     "rank_candidates",
     "replanning_reference",
     "verification_record",
+    "molecular_discovery_registries",
 ]

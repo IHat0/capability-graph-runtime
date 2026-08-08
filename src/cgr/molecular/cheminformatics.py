@@ -110,6 +110,7 @@ class MolecularGraph(CanonicalModel):
     representation_source: Literal[
         "smiles",
         "prepared_graph",
+        "ph_protonation_state",
         "fragment",
         "scaffold",
     ]

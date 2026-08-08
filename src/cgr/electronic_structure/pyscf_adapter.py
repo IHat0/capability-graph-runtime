@@ -41,12 +41,21 @@ from .qm_region import (
     ElectronicQMRegionPreparation,
     prepare_qm_region,
 )
+from .reaction_path import (
+    ElectronicFrequencyAnalysis,
+    ElectronicFrequencyMode,
+    ElectronicGradientResult,
+    ElectronicReactionPathPoint,
+    ElectronicReactionPathResult,
+    ElectronicTransitionStateSearch,
+)
 
 from .contracts import (
     ElectronicActiveSpace,
     ElectronicActiveSpaceSelection,
     ElectronicAtom,
     ElectronicHartreeFockResult,
+    ElectronicImplicitSolventResult,
     ElectronicMolecule,
     ElectronicQMMMHartreeFockResult,
     ElectronicOrbital,
@@ -57,6 +66,7 @@ from .contracts import (
     ElectronicTensor,
     QMMMEmbeddingFoundation,
     QMMMEmbeddingSite,
+    QMMMBoundaryChargeAdjustment,
 )
 
 _SCHEMA_VERSION = CapabilityVersion(major=1, minor=0, patch=0)
@@ -76,6 +86,11 @@ ACTIVE_SPACE_SELECT = "electronic.active_space_select"
 ACTIVE_SPACE_CONSTRUCT = "electronic.active_space_construct"
 QMMM_EMBEDDING_PREPARE = "electronic.qmmm_embedding_prepare"
 QMMM_HARTREE_FOCK = "electronic.qmmm_hartree_fock"
+IMPLICIT_SOLVENT_HARTREE_FOCK = "electronic.implicit_solvent_hartree_fock"
+GRADIENT_CALCULATE = "electronic.gradient_calculate"
+FREQUENCY_ANALYZE = "electronic.frequency_analyze"
+TRANSITION_STATE_SEARCH = "electronic.transition_state_search"
+REACTION_PATH_CONFIRM = "electronic.reaction_path_confirm"
 
 
 @runtime_checkable
@@ -253,10 +268,12 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
             ),
             True,
             (
-                "Version 1 selects canonical RHF orbitals.",
-                "Frontier selection uses occupied and virtual ordering.",
-                "Target-AO projection ranks orbitals by population on "
-                "resolved target atoms.",
+                "RHF and ROHF use their common canonical spatial orbitals; "
+                "UHF is transformed to unrestricted natural orbitals.",
+                "Reaction-centre selection retains occupied/antibonding partners "
+                "with explicit bond and target-AO projection evidence.",
+                "Metal/ligand selection resolves requested metal-shell and ligand "
+                "AO labels and fails below the explicit projection threshold.",
                 "Selections remain subject to scientific verification.",
             ),
         ),
@@ -272,9 +289,84 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
             ("active_space_construction",),
             False,
             (
-                "Version 1 constructs spin-restricted active-space integrals from converged RHF orbitals.",
+                "RHF/ROHF spatial orbitals and UHF-derived unrestricted natural "
+                "orbitals produce a common spatial active-space Hamiltonian.",
                 "Active spaces are bounded to 32 spatial orbitals.",
                 "The output uses chemist-order spatial-orbital integrals and an explicit constant energy.",
+            ),
+        ),
+        (
+            IMPLICIT_SOLVENT_HARTREE_FOCK,
+            ("electronic_molecule", "electronic_structure_configuration"),
+            ("electronic_implicit_solvent_result",),
+            (
+                "implicit_solvent_electronic_structure",
+                "aqueous_electronic_energy",
+                "continuum_solvation",
+            ),
+            False,
+            (
+                "PySCF self-consistent PCM is evaluated alongside the matching "
+                "vacuum Hartree-Fock reference.",
+                "The reported difference is an electronic solvation contribution, "
+                "not a thermal or Gibbs free energy.",
+            ),
+        ),
+        (
+            GRADIENT_CALCULATE,
+            ("electronic_molecule", "electronic_structure_configuration"),
+            ("electronic_gradient_result",),
+            ("electronic_gradient", "stationary_point_assessment"),
+            False,
+            (
+                "PySCF analytical SCF nuclear gradients are reported in "
+                "Hartree/Bohr with an explicit stationary threshold.",
+            ),
+        ),
+        (
+            FREQUENCY_ANALYZE,
+            (
+                "electronic_molecule",
+                "electronic_structure_configuration",
+                "electronic_gradient_result",
+            ),
+            ("electronic_frequency_analysis",),
+            ("hessian", "harmonic_frequencies", "transition_state_characterization"),
+            False,
+            (
+                "Analytical SCF Hessians are projected to remove translations and "
+                "rotations before harmonic analysis.",
+                "Imaginary modes are significant only beyond an explicit threshold.",
+            ),
+        ),
+        (
+            TRANSITION_STATE_SEARCH,
+            ("electronic_molecule", "electronic_structure_configuration"),
+            ("electronic_transition_state_search",),
+            ("transition_state_search", "saddle_point_optimization"),
+            False,
+            (
+                "geomeTRIC is run in transition-state mode using PySCF analytical "
+                "gradients and an initial analytical Hessian where supported.",
+                "Search convergence never constitutes transition-state verification; "
+                "frequency and reaction-path evidence remain mandatory.",
+            ),
+        ),
+        (
+            REACTION_PATH_CONFIRM,
+            (
+                "electronic_transition_state_search",
+                "electronic_structure_configuration",
+                "electronic_frequency_analysis",
+            ),
+            ("electronic_reaction_path_result",),
+            ("reaction_path", "irc_confirmation", "transition_state_verification"),
+            False,
+            (
+                "A bounded forward/reverse mass-weighted steepest-descent path "
+                "is initialized from the sole significant imaginary mode.",
+                "Path confirmation requires energy descent in both directions "
+                "and geometrically distinct endpoints; it does not identify products by name.",
             ),
         ),
         (
@@ -296,8 +388,10 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
                 "OpenMM NonbondedForce artifact.",
                 "QM particles are excluded using the explicit Phase 8 "
                 "QM-region preparation artifact.",
-                "Covalent QM/MM boundaries fail closed until an explicit "
-                "charge-shift boundary treatment is available.",
+                "Simple single-bond covalent cuts use an explicit charge-shift "
+                "scheme over bonded MM-side neighbors.",
+                "Every removed and redistributed force-field charge is retained "
+                "as auditable adjustment evidence.",
                 "This capability prepares static point charges; the actual "
                 "PySCF embedded electronic calculation is a separate capability.",
             ),
@@ -324,8 +418,8 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
                 "electrostatics and electron-density/MM electrostatics.",
                 "MM internal energy, MM-MM electrostatics, QM-MM van der "
                 "Waals and other MM bonded/nonbonded terms are not included.",
-                "Covalent QM/MM boundaries remain unavailable until an "
-                "explicit boundary-charge treatment is implemented.",
+                "Supported covalent cuts consume the explicit link-atom and "
+                "charge-shift boundary preparation artifact.",
             ),
         ),
 
@@ -482,6 +576,11 @@ class PySCFElectronicStructureAdapter:
             REFERENCE_CALCULATE,
             ACTIVE_SPACE_SELECT,
             ACTIVE_SPACE_CONSTRUCT,
+            IMPLICIT_SOLVENT_HARTREE_FOCK,
+            GRADIENT_CALCULATE,
+            FREQUENCY_ANALYZE,
+            TRANSITION_STATE_SEARCH,
+            REACTION_PATH_CONFIRM,
             QMMM_HARTREE_FOCK,
         }
         if requires_engine:
@@ -510,6 +609,16 @@ class PySCFElectronicStructureAdapter:
                 return self._select_active_space(invocation)
             if capability_name == ACTIVE_SPACE_CONSTRUCT:
                 return self._construct_active_space(invocation)
+            if capability_name == IMPLICIT_SOLVENT_HARTREE_FOCK:
+                return self._run_implicit_solvent_hartree_fock(invocation)
+            if capability_name == GRADIENT_CALCULATE:
+                return self._calculate_gradient(invocation)
+            if capability_name == FREQUENCY_ANALYZE:
+                return self._analyze_frequencies(invocation)
+            if capability_name == TRANSITION_STATE_SEARCH:
+                return self._search_transition_state(invocation)
+            if capability_name == REACTION_PATH_CONFIRM:
+                return self._confirm_reaction_path(invocation)
             if capability_name == QMMM_EMBEDDING_PREPARE:
                 return self._prepare_qmmm_embedding(invocation)
             if capability_name == QMMM_HARTREE_FOCK:
@@ -1305,6 +1414,100 @@ class PySCFElectronicStructureAdapter:
         density_beta = (coeff_beta * occupation_beta) @ coeff_beta.T
         return numpy.asarray(density_alpha), numpy.asarray(density_beta)
 
+    @staticmethod
+    def _common_spatial_orbitals(
+        numpy: object,
+        result: ElectronicHartreeFockResult,
+    ) -> tuple[object, object, object, object, str]:
+        """Return one orthonormal spatial basis and auditable spin populations.
+
+        RHF and ROHF already use a common spatial-orbital basis.  UHF does not;
+        for that case the spin-summed one-particle density is diagonalized in
+        the symmetrically orthogonalized AO basis to form unrestricted natural
+        orbitals (UNOs).  The UNO basis is the common spatial representation
+        required by the public active-space integral contract.
+        """
+
+        n_ao = result.atomic_orbital_count
+        n_mo = result.spatial_orbital_count
+        alpha_coefficients = numpy.asarray(
+            result.mo_coefficients_alpha.values,
+            dtype=float,
+        ).reshape((n_ao, n_mo))
+
+        if result.reference_method != "uhf":
+            alpha_occupations = numpy.asarray(
+                result.orbital_occupations_alpha,
+                dtype=float,
+            )
+            beta_occupations = numpy.asarray(
+                result.orbital_occupations_beta,
+                dtype=float,
+            )
+            basis = (
+                "canonical_rhf"
+                if result.reference_method == "rhf"
+                else "canonical_rohf"
+            )
+            return (
+                alpha_coefficients,
+                alpha_occupations + beta_occupations,
+                alpha_occupations,
+                beta_occupations,
+                basis,
+            )
+
+        overlap = numpy.asarray(
+            result.overlap_matrix_ao.values,
+            dtype=float,
+        ).reshape((n_ao, n_ao))
+        density_alpha = numpy.asarray(
+            result.density_matrix_alpha_ao.values,
+            dtype=float,
+        ).reshape((n_ao, n_ao))
+        density_beta = numpy.asarray(
+            result.density_matrix_beta_ao.values,
+            dtype=float,
+        ).reshape((n_ao, n_ao))
+
+        overlap_values, overlap_vectors = numpy.linalg.eigh(overlap)
+        if float(numpy.min(overlap_values)) <= 1e-10:
+            raise ValueError(
+                "UHF natural orbitals require a positive-definite AO overlap."
+            )
+        overlap_half = (
+            overlap_vectors
+            @ numpy.diag(numpy.sqrt(overlap_values))
+            @ overlap_vectors.T
+        )
+        overlap_inverse_half = (
+            overlap_vectors
+            @ numpy.diag(1.0 / numpy.sqrt(overlap_values))
+            @ overlap_vectors.T
+        )
+        orthogonal_density = (
+            overlap_half @ (density_alpha + density_beta) @ overlap_half
+        )
+        occupations, natural_vectors = numpy.linalg.eigh(orthogonal_density)
+        order = numpy.argsort(occupations)[::-1]
+        occupations = numpy.clip(occupations[order], 0.0, 2.0)
+        coefficients = overlap_inverse_half @ natural_vectors[:, order]
+        alpha_occupations = numpy.diag(
+            coefficients.T @ overlap @ density_alpha @ overlap @ coefficients
+        )
+        beta_occupations = numpy.diag(
+            coefficients.T @ overlap @ density_beta @ overlap @ coefficients
+        )
+        alpha_occupations = numpy.clip(alpha_occupations, 0.0, 1.0)
+        beta_occupations = numpy.clip(beta_occupations, 0.0, 1.0)
+        return (
+            coefficients,
+            occupations,
+            alpha_occupations,
+            beta_occupations,
+            "unrestricted_natural_orbital",
+        )
+
     def _run_native_scf(
         self,
         molecule: ElectronicMolecule,
@@ -1708,15 +1911,9 @@ class PySCFElectronicStructureAdapter:
             ElectronicHartreeFockResult,
         )
 
-        if (
-            configuration.reference_method != "rhf"
-            or result.reference_method != "rhf"
-            or molecule.spin != 0
-            or not result.converged
-        ):
+        if not result.converged:
             raise ValueError(
-                "Automatic active-space selection requires "
-                "a converged RHF singlet."
+                "Automatic active-space selection requires a converged reference."
             )
 
         if (
@@ -1754,251 +1951,218 @@ class PySCFElectronicStructureAdapter:
         if method not in {
             "frontier",
             "target_ao_projection",
+            "reaction_center_projection",
+            "metal_ligand_projection",
         }:
             raise ValueError(
                 "Unsupported automatic active-space selection method."
             )
 
-        if active_electrons % 2:
-            raise ValueError(
-                "RHF automatic selection requires an even "
-                "active-electron count."
-            )
-
-        occupied_needed = active_electrons // 2
-        virtual_needed = active_orbitals - occupied_needed
-
-        if virtual_needed < 0:
-            raise ValueError(
-                "Active-space orbital count is too small "
-                "for the requested electrons."
-            )
-
-        occupations = tuple(
-            float(alpha + beta)
-            for alpha, beta in zip(
-                result.orbital_occupations_alpha,
-                result.orbital_occupations_beta,
-                strict=True,
-            )
-        )
-
-        occupied = tuple(
-            index
-            for index, occupation in enumerate(occupations)
-            if math.isclose(
-                occupation,
-                2.0,
-                rel_tol=0,
-                abs_tol=1e-7,
-            )
-        )
-
-        virtual = tuple(
-            index
-            for index, occupation in enumerate(occupations)
-            if math.isclose(
-                occupation,
-                0.0,
-                rel_tol=0,
-                abs_tol=1e-7,
-            )
-        )
-
-        if len(occupied) + len(virtual) != len(occupations):
-            raise ValueError(
-                "Automatic selection requires integer RHF occupations."
-            )
-
         if (
-            occupied_needed > len(occupied)
-            or virtual_needed > len(virtual)
+            active_electrons < molecule.spin
+            or (active_electrons - molecule.spin) % 2
         ):
             raise ValueError(
-                "Requested active-space composition is unavailable."
+                "Active electrons are incompatible with the molecular spin."
             )
+        numpy, gto, _, _, _ = _pyscf_modules()
+        (
+            coefficients,
+            occupation_array,
+            alpha_occupation_array,
+            beta_occupation_array,
+            orbital_basis,
+        ) = self._common_spatial_orbitals(numpy, result)
+        occupations = tuple(float(value) for value in occupation_array.tolist())
 
-        target_atom_indices: tuple[int, ...] = ()
-        projection_scores = {
-            index: 0.0
-            for index in range(result.spatial_orbital_count)
-        }
+        core_like = tuple(
+            index for index, occupation in enumerate(occupations)
+            if occupation >= 1.98
+        )
+        virtual = tuple(
+            index for index, occupation in enumerate(occupations)
+            if occupation <= 0.02
+        )
+        mandatory_open_shell = tuple(
+            index for index, occupation in enumerate(occupations)
+            if 0.02 < occupation < 1.98
+        )
+        mandatory_electrons = int(round(sum(
+            occupations[index] for index in mandatory_open_shell
+        )))
+        paired_electrons = active_electrons - mandatory_electrons
+        if paired_electrons < 0 or paired_electrons % 2:
+            raise ValueError(
+                "Requested electrons cannot retain every open-shell orbital."
+            )
+        occupied_needed = paired_electrons // 2
+        virtual_needed = (
+            active_orbitals
+            - len(mandatory_open_shell)
+            - occupied_needed
+        )
+        if (
+            virtual_needed < 0
+            or occupied_needed > len(core_like)
+            or virtual_needed > len(virtual)
+        ):
+            raise ValueError("Requested active-space composition is unavailable.")
 
         raw_targets = self._parameter(
-            invocation,
-            "target_atom_indices",
-            required=False,
+            invocation, "target_atom_indices", required=False
         )
+        target_atom_indices: tuple[int, ...] = ()
+        target_bond_atom_pairs: tuple[tuple[int, int], ...] = ()
+        target_ao_labels: tuple[str, ...] = ()
+        projection_threshold = self._float_parameter(
+            invocation,
+            "projection_threshold",
+            minimum=0.0,
+            maximum=1.0,
+        ) if self._parameter(
+            invocation, "projection_threshold", required=False
+        ) is not None else 0.1
 
         if method == "frontier":
             if raw_targets is not None:
-                raise ValueError(
-                    "Frontier selection cannot receive target atoms."
-                )
-
-            chosen_occupied = (
-                occupied[-occupied_needed:]
-                if occupied_needed
-                else ()
-            )
-            chosen_virtual = (
-                virtual[:virtual_needed]
-                if virtual_needed
-                else ()
-            )
-
+                raise ValueError("Frontier selection cannot receive target atoms.")
         else:
             if not isinstance(raw_targets, str):
-                raise ValueError(
-                    "Target-AO selection requires target atom indices."
-                )
-
-            parts = tuple(
-                part.strip()
-                for part in raw_targets.split(",")
-            )
-
-            if (
-                not parts
-                or any(
-                    not part or not part.isdigit()
-                    for part in parts
-                )
-            ):
+                raise ValueError("Targeted selection requires target atom indices.")
+            parts = tuple(part.strip() for part in raw_targets.split(","))
+            if not parts or any(not part.isdigit() for part in parts):
                 raise ValueError(
                     "Target atom indices must be comma-separated integers."
                 )
+            target_atom_indices = tuple(sorted(int(part) for part in parts))
+            if (
+                len(target_atom_indices) != len(set(target_atom_indices))
+                or any(index >= len(molecule.atoms) for index in target_atom_indices)
+            ):
+                raise ValueError("Target atom indices are invalid for the molecule.")
 
-            target_atom_indices = tuple(
-                sorted(int(part) for part in parts)
+        if method == "reaction_center_projection":
+            raw_bonds = self._parameter(
+                invocation, "target_bond_atom_pairs", required=False
             )
+            if not isinstance(raw_bonds, str):
+                raise ValueError("Reaction-centre selection requires target bonds.")
+            parsed_bonds: list[tuple[int, int]] = []
+            for raw_pair in raw_bonds.split(","):
+                pair = tuple(part.strip() for part in raw_pair.split("-"))
+                if len(pair) != 2 or any(not part.isdigit() for part in pair):
+                    raise ValueError("Target bonds must use 'atom-atom' notation.")
+                normalized_pair = tuple(sorted((int(pair[0]), int(pair[1]))))
+                if (
+                    normalized_pair[0] == normalized_pair[1]
+                    or any(index not in target_atom_indices for index in normalized_pair)
+                ):
+                    raise ValueError("Target bonds must join distinct target atoms.")
+                parsed_bonds.append(normalized_pair)
+            target_bond_atom_pairs = tuple(sorted(parsed_bonds))
+            if len(target_bond_atom_pairs) != len(set(target_bond_atom_pairs)):
+                raise ValueError("Target bonds must be unique.")
 
-            if len(target_atom_indices) != len(
-                set(target_atom_indices)
+        if method == "metal_ligand_projection":
+            raw_labels = self._parameter(
+                invocation, "target_ao_labels", required=False
+            )
+            if not isinstance(raw_labels, str):
+                raise ValueError("Metal/ligand selection requires target AO labels.")
+            target_ao_labels = tuple(
+                label.strip() for label in raw_labels.split(";") if label.strip()
+            )
+            if not target_ao_labels or len(target_ao_labels) != len(
+                set(target_ao_labels)
             ):
-                raise ValueError(
-                    "Target atom indices must be unique."
-                )
+                raise ValueError("Target AO labels must be unique and nonempty.")
 
-            if any(
-                index >= len(molecule.atoms)
-                for index in target_atom_indices
-            ):
-                raise ValueError(
-                    "A target atom index is outside the molecule."
-                )
-
-            numpy, gto, _, _, _ = _pyscf_modules()
-
+        projection_scores = {
+            index: 0.0 for index in range(result.spatial_orbital_count)
+        }
+        if method != "frontier":
             native_molecule = self._build_pyscf_molecule(
-                molecule,
-                configuration,
-                gto,
+                molecule, configuration, gto
             )
-
-            ao_slices = numpy.asarray(
-                native_molecule.aoslice_by_atom()
-            )
-
-            target_ao_indices: list[int] = []
-
+            ao_slices = numpy.asarray(native_molecule.aoslice_by_atom())
+            target_ao_indices: set[int] = set()
             for atom_index in target_atom_indices:
-                start_ao = int(ao_slices[atom_index, 2])
-                stop_ao = int(ao_slices[atom_index, 3])
-                target_ao_indices.extend(
-                    range(start_ao, stop_ao)
-                )
-
-            if not target_ao_indices:
-                raise ValueError(
-                    "Target atoms contain no basis functions."
-                )
-
-            n_ao = result.atomic_orbital_count
-            n_mo = result.spatial_orbital_count
-
-            coefficients = numpy.asarray(
-                result.mo_coefficients_alpha.values,
-                dtype=float,
-            ).reshape((n_ao, n_mo))
-
-            overlap = numpy.asarray(
-                result.overlap_matrix_ao.values,
-                dtype=float,
-            ).reshape((n_ao, n_ao))
-
-            overlap_coefficients = overlap @ coefficients
-
-            for orbital_index in range(n_mo):
-                population = float(
-                    sum(
-                        coefficients[
-                            ao_index,
-                            orbital_index,
-                        ]
-                        * overlap_coefficients[
-                            ao_index,
-                            orbital_index,
-                        ]
-                        for ao_index in target_ao_indices
+                target_ao_indices.update(range(
+                    int(ao_slices[atom_index, 2]),
+                    int(ao_slices[atom_index, 3]),
+                ))
+            if target_ao_labels:
+                ao_labels = tuple(str(label) for label in native_molecule.ao_labels())
+                label_matches: set[int] = set()
+                for requested_label in target_ao_labels:
+                    tokens = requested_label.lower().split()
+                    label_matches.update(
+                        index for index, label in enumerate(ao_labels)
+                        if all(token in label.lower() for token in tokens)
                     )
+                target_ao_indices.intersection_update(label_matches)
+            if not target_ao_indices:
+                raise ValueError("Semantic targets resolve to no AO basis functions.")
+            overlap = numpy.asarray(
+                result.overlap_matrix_ao.values, dtype=float
+            ).reshape((result.atomic_orbital_count, result.atomic_orbital_count))
+            overlap_coefficients = overlap @ coefficients
+            for orbital_index in range(result.spatial_orbital_count):
+                population = sum(
+                    coefficients[ao_index, orbital_index]
+                    * overlap_coefficients[ao_index, orbital_index]
+                    for ao_index in target_ao_indices
                 )
+                projection_scores[orbital_index] = round(abs(float(population)), 12)
 
-                projection_scores[orbital_index] = round(
-                    abs(population),
-                    12,
-                )
+        if method == "frontier":
+            ranked_occupied = tuple(reversed(core_like))
+            ranked_virtual = virtual
+        else:
+            ranked_occupied = tuple(sorted(
+                core_like,
+                key=lambda index: (-projection_scores[index], -index),
+            ))
+            ranked_virtual = tuple(sorted(
+                virtual,
+                key=lambda index: (-projection_scores[index], index),
+            ))
 
-            ranked_occupied = tuple(
-                sorted(
-                    occupied,
-                    key=lambda index: (
-                        -projection_scores[index],
-                        -index,
-                    ),
-                )
-            )
-
-            ranked_virtual = tuple(
-                sorted(
-                    virtual,
-                    key=lambda index: (
-                        -projection_scores[index],
-                        index,
-                    ),
-                )
-            )
-
-            chosen_occupied = ranked_occupied[
-                :occupied_needed
-            ]
-            chosen_virtual = ranked_virtual[
-                :virtual_needed
-            ]
-
-        active_indices = tuple(
-            sorted((*chosen_occupied, *chosen_virtual))
-        )
+        chosen_occupied = ranked_occupied[:occupied_needed]
+        chosen_virtual = ranked_virtual[:virtual_needed]
+        active_indices = tuple(sorted((
+            *mandatory_open_shell,
+            *chosen_occupied,
+            *chosen_virtual,
+        )))
 
         if len(active_indices) != active_orbitals:
             raise ValueError(
                 "Automatic selection produced the wrong orbital count."
             )
 
-        resolved_electrons = sum(
-            occupations[index]
-            for index in active_indices
-        )
-
+        resolved_electrons = sum(occupations[index] for index in active_indices)
+        tolerance = 0.25 if orbital_basis == "unrestricted_natural_orbital" else 1e-7
         if not math.isclose(
-            resolved_electrons,
-            active_electrons,
-            rel_tol=0,
-            abs_tol=1e-7,
+            resolved_electrons, active_electrons, rel_tol=0, abs_tol=tolerance
         ):
             raise ValueError(
                 "Automatic selection produced the wrong electron count."
             )
+        if method in {"reaction_center_projection", "metal_ligand_projection"}:
+            targeted_occupied = (*mandatory_open_shell, *chosen_occupied)
+            if (
+                not targeted_occupied
+                or not chosen_virtual
+                or max(projection_scores[index] for index in targeted_occupied)
+                < projection_threshold
+                or max(projection_scores[index] for index in chosen_virtual)
+                < projection_threshold
+            ):
+                raise ValueError(
+                    "Target projections do not support both occupied and virtual "
+                    "active orbitals at the requested threshold."
+                )
 
         selection = ElectronicActiveSpaceSelection(
             schema_version=_SCHEMA_VERSION,
@@ -2009,7 +2173,10 @@ class PySCFElectronicStructureAdapter:
                 method,
                 active_electrons,
                 active_orbitals,
+                orbital_basis,
                 *target_atom_indices,
+                *target_bond_atom_pairs,
+                *target_ao_labels,
                 *active_indices,
             ),
             molecule_identifier=molecule.molecule_identifier,
@@ -2017,16 +2184,36 @@ class PySCFElectronicStructureAdapter:
                 result.result_identifier
             ),
             selection_method=method,
+            reference_method=result.reference_method,
+            orbital_basis=orbital_basis,
             active_electron_count=active_electrons,
             active_spatial_orbital_count=active_orbitals,
             active_orbital_indices=active_indices,
             target_atom_indices=target_atom_indices,
+            target_bond_atom_pairs=target_bond_atom_pairs,
+            target_ao_labels=target_ao_labels,
+            projection_threshold=projection_threshold,
             orbital_scores=tuple(
                 ElectronicOrbitalSelectionScore(
                     orbital_index=index,
                     occupation=occupations[index],
+                    alpha_occupation=float(alpha_occupation_array[index]),
+                    beta_occupation=float(beta_occupation_array[index]),
                     target_projection_score=(
                         projection_scores[index]
+                    ),
+                    selection_reasons=tuple(
+                        reason for reason, applies in (
+                            ("open_shell_mandatory", index in mandatory_open_shell),
+                            ("occupied_pair", index in chosen_occupied),
+                            ("virtual_partner", index in chosen_virtual),
+                            (
+                                "target_projection",
+                                method != "frontier"
+                                and projection_scores[index] >= projection_threshold,
+                            ),
+                            ("frontier_ordering", method == "frontier"),
+                        ) if applies
                     ),
                 )
                 for index in active_indices
@@ -2050,6 +2237,9 @@ class PySCFElectronicStructureAdapter:
                 "active_electron_count": active_electrons,
                 "active_spatial_orbital_count": active_orbitals,
                 "target_atom_count": len(target_atom_indices),
+                "target_bond_count": len(target_bond_atom_pairs),
+                "orbital_basis": orbital_basis,
+                "reference_method": result.reference_method,
             },
         )
 
@@ -2067,6 +2257,9 @@ class PySCFElectronicStructureAdapter:
                 "active_electron_count": active_electrons,
                 "active_spatial_orbital_count": active_orbitals,
                 "target_atom_count": len(target_atom_indices),
+                "target_bond_count": len(target_bond_atom_pairs),
+                "orbital_basis": orbital_basis,
+                "reference_method": result.reference_method,
             },
         )
 
@@ -2102,13 +2295,8 @@ class PySCFElectronicStructureAdapter:
             configuration_reference, ElectronicStructureConfiguration
         )
         result = self._load_model(result_reference, ElectronicHartreeFockResult)
-        if (
-            configuration.reference_method != "rhf"
-            or result.reference_method != "rhf"
-            or molecule.spin != 0
-            or not result.converged
-        ):
-            raise ValueError("Version 1 active spaces require a converged RHF singlet.")
+        if not result.converged:
+            raise ValueError("Active spaces require a converged reference.")
         if (
             configuration.molecule_identifier != molecule.molecule_identifier
             or result.molecule_identifier != molecule.molecule_identifier
@@ -2146,6 +2334,7 @@ class PySCFElectronicStructureAdapter:
                 != molecule.molecule_identifier
                 or selection.hartree_fock_result_identifier
                 != result.result_identifier
+                or selection.reference_method != result.reference_method
             ):
                 raise ValueError(
                     "Active-space selection does not belong to "
@@ -2173,16 +2362,28 @@ class PySCFElectronicStructureAdapter:
         ):
             raise ValueError("Active orbital indices are outside the supported range.")
 
-        occupations = tuple(
-            alpha + beta
-            for alpha, beta in zip(
-                result.orbital_occupations_alpha,
-                result.orbital_occupations_beta,
-                strict=True,
+        numpy, gto, scf, _, ao2mo = _pyscf_modules()
+        (
+            coefficients,
+            occupation_array,
+            _,
+            _,
+            orbital_basis,
+        ) = self._common_spatial_orbitals(numpy, result)
+        if selection_reference is not None and selection.orbital_basis != orbital_basis:
+            raise ValueError(
+                "Active-space selection orbital representation is not reproducible."
             )
-        )
+        occupations = tuple(float(value) for value in occupation_array.tolist())
         resolved_active = sum(occupations[index] for index in active_indices)
-        if not math.isclose(resolved_active, active_electrons, abs_tol=1e-7):
+        occupation_tolerance = (
+            0.25 if orbital_basis == "unrestricted_natural_orbital" else 1e-7
+        )
+        if not math.isclose(
+            resolved_active,
+            active_electrons,
+            abs_tol=occupation_tolerance,
+        ):
             raise ValueError(
                 "Active orbital occupations do not match active electrons."
             )
@@ -2190,7 +2391,7 @@ class PySCFElectronicStructureAdapter:
             index
             for index, occupation in enumerate(occupations)
             if index not in active_indices
-            and math.isclose(occupation, 2.0, abs_tol=1e-7)
+            and math.isclose(occupation, 2.0, abs_tol=0.02)
         )
         inactive_electrons = molecule.electron_count - active_electrons
         if inactive_electrons < 0 or inactive_electrons != 2 * len(core_indices):
@@ -2198,16 +2399,14 @@ class PySCFElectronicStructureAdapter:
                 "Inactive electrons do not resolve to closed-shell core orbitals."
             )
 
-        numpy, gto, scf, _, ao2mo = _pyscf_modules()
         native_molecule = self._build_pyscf_molecule(molecule, configuration, gto)
-        native_scf = scf.RHF(native_molecule)
+        native_scf = self._build_scf(
+            molecule,
+            configuration,
+            native_molecule,
+            scf,
+        )
         hcore_ao = numpy.asarray(native_scf.get_hcore())
-        n_ao = result.atomic_orbital_count
-        n_mo = result.spatial_orbital_count
-        coefficients = numpy.asarray(
-            result.mo_coefficients_alpha.values,
-            dtype=float,
-        ).reshape((n_ao, n_mo))
         active_coefficients = coefficients[:, active_indices]
 
         if core_indices:
@@ -2232,16 +2431,15 @@ class PySCFElectronicStructureAdapter:
             ao2mo.kernel(native_molecule, active_coefficients, compact=False)
         ).reshape((n_active, n_active, n_active, n_active))
 
-        alpha_active = int(
-            round(
-                sum(result.orbital_occupations_alpha[index] for index in active_indices)
+        alpha_active = (active_electrons + molecule.spin) // 2
+        beta_active = active_electrons - alpha_active
+        if (
+            molecule.alpha_electron_count - alpha_active != len(core_indices)
+            or molecule.beta_electron_count - beta_active != len(core_indices)
+        ):
+            raise ValueError(
+                "Inactive electrons do not form a shared closed-shell core."
             )
-        )
-        beta_active = int(
-            round(
-                sum(result.orbital_occupations_beta[index] for index in active_indices)
-            )
-        )
         active_space = ElectronicActiveSpace(
             schema_version=_SCHEMA_VERSION,
             active_space_identifier=_stable_identifier(
@@ -2292,6 +2490,8 @@ class PySCFElectronicStructureAdapter:
                 "active_spatial_orbital_count": n_active,
                 "frozen_core_orbital_count": len(core_indices),
                 "integral_convention": active_space.integral_convention,
+                "orbital_basis": orbital_basis,
+                "reference_method": result.reference_method,
             },
         )
         return self._success(
@@ -2307,6 +2507,8 @@ class PySCFElectronicStructureAdapter:
                 "active_electron_count": active_electrons,
                 "active_spatial_orbital_count": n_active,
                 "frozen_core_orbital_count": len(core_indices),
+                "orbital_basis": orbital_basis,
+                "reference_method": result.reference_method,
             },
         )
 
@@ -2409,12 +2611,6 @@ class PySCFElectronicStructureAdapter:
                 "QM/MM embedding requires OpenMM NonbondedForce charges."
             )
 
-        if preparation.boundary_links:
-            raise ValueError(
-                "Covalent QM/MM boundaries require an explicit "
-                "boundary-charge treatment before electrostatic embedding."
-            )
-
         selected = set(
             preparation.selected_particle_indices
         )
@@ -2431,11 +2627,77 @@ class PySCFElectronicStructureAdapter:
                 "the molecular environment."
             )
 
-        if len(molecule.atoms) != len(selected):
+        if len(molecule.atoms) != len(selected) + len(preparation.boundary_links):
             raise ValueError(
-                "Uncapped QM molecule atom count must match "
-                "the selected source-particle count."
+                "QM molecule atom count must match selected particles and links."
             )
+
+        original_charges = {
+            particle_index: float(system.particle_partial_charges_e[particle_index])
+            for particle_index in range(len(environment.atoms))
+            if particle_index not in selected
+        }
+        adjusted_charges = dict(original_charges)
+        adjustment_boundaries: dict[int, set[int]] = {}
+        adjustment_roles: dict[int, str] = {}
+
+        if preparation.boundary_links:
+            adjacency: dict[int, set[int]] = {
+                index: set() for index in range(len(environment.atoms))
+            }
+            for bond in environment.bonds:
+                adjacency[bond.atom_index_a].add(bond.atom_index_b)
+                adjacency[bond.atom_index_b].add(bond.atom_index_a)
+
+            boundary_mm_indices = [
+                link.mm_particle_index for link in preparation.boundary_links
+            ]
+            if len(boundary_mm_indices) != len(set(boundary_mm_indices)):
+                raise ValueError(
+                    "Charge shifting does not support multiple cuts through one "
+                    "MM boundary atom."
+                )
+
+            for link in preparation.boundary_links:
+                boundary_index = link.mm_particle_index
+                if boundary_index not in original_charges:
+                    raise ValueError("Boundary MM atom is not in the MM environment.")
+                recipients = tuple(sorted(
+                    neighbor for neighbor in adjacency[boundary_index]
+                    if neighbor not in selected and neighbor != boundary_index
+                ))
+                if not recipients:
+                    raise ValueError(
+                        "Boundary charge has no bonded MM-side redistribution sites."
+                    )
+                removed_charge = adjusted_charges[boundary_index]
+                adjusted_charges[boundary_index] = 0.0
+                adjustment_boundaries.setdefault(boundary_index, set()).add(
+                    boundary_index
+                )
+                adjustment_roles[boundary_index] = "boundary_charge_removed"
+                share = removed_charge / len(recipients)
+                for recipient in recipients:
+                    adjusted_charges[recipient] += share
+                    adjustment_boundaries.setdefault(recipient, set()).add(
+                        boundary_index
+                    )
+                    adjustment_roles[recipient] = "neighbor_charge_recipient"
+
+        adjustments = tuple(
+            QMMMBoundaryChargeAdjustment(
+                source_particle_index=particle_index,
+                original_charge_e=original_charges[particle_index],
+                adjusted_charge_e=adjusted_charges[particle_index],
+                charge_delta_e=(
+                    adjusted_charges[particle_index]
+                    - original_charges[particle_index]
+                ),
+                boundary_mm_particle_indices=tuple(sorted(boundaries)),
+                role=adjustment_roles[particle_index],
+            )
+            for particle_index, boundaries in sorted(adjustment_boundaries.items())
+        )
 
         sites: list[QMMMEmbeddingSite] = []
 
@@ -2445,9 +2707,7 @@ class PySCFElectronicStructureAdapter:
 
             atom = environment.atoms[particle_index]
             position = environment.positions[particle_index]
-            charge = system.particle_partial_charges_e[
-                particle_index
-            ]
+            charge = adjusted_charges[particle_index]
 
             sites.append(
                 QMMMEmbeddingSite(
@@ -2458,7 +2718,11 @@ class PySCFElectronicStructureAdapter:
                     y_angstrom=10.0 * position.y,
                     z_angstrom=10.0 * position.z,
                     charge_e=float(charge),
-                    charge_source="openmm_nonbonded_force",
+                    charge_source=(
+                        "openmm_boundary_charge_shift"
+                        if particle_index in adjustment_boundaries
+                        else "openmm_nonbonded_force"
+                    ),
                 )
             )
 
@@ -2472,6 +2736,7 @@ class PySCFElectronicStructureAdapter:
             site.charge_e
             for site in sites
         )
+        unmodified_embedding_total_charge = sum(original_charges.values())
 
         foundation = QMMMEmbeddingFoundation(
             schema_version=_SCHEMA_VERSION,
@@ -2495,8 +2760,16 @@ class PySCFElectronicStructureAdapter:
             qm_source_particle_count=len(selected),
             embedding_sites=tuple(sites),
             embedding_total_charge_e=embedding_total_charge,
+            unmodified_embedding_total_charge_e=(
+                unmodified_embedding_total_charge
+            ),
+            boundary_charge_adjustments=adjustments,
             electrostatic_embedding_ready=True,
-            boundary_policy="no_covalent_boundary",
+            boundary_policy=(
+                "charge_shift"
+                if preparation.boundary_links
+                else "no_covalent_boundary"
+            ),
             charge_model="openmm_nonbonded_force",
         )
 
@@ -2522,6 +2795,7 @@ class PySCFElectronicStructureAdapter:
                 "electrostatic_embedding_ready": True,
                 "charge_model": foundation.charge_model,
                 "boundary_policy": foundation.boundary_policy,
+                "boundary_charge_adjustment_count": len(adjustments),
             },
         )
 
@@ -2541,6 +2815,716 @@ class PySCFElectronicStructureAdapter:
                     foundation.embedding_total_charge_e
                 ),
                 "electrostatic_embedding_ready": True,
+                "boundary_policy": foundation.boundary_policy,
+                "boundary_charge_adjustment_count": len(adjustments),
+            },
+        )
+
+    def _run_implicit_solvent_hartree_fock(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        molecule_reference = self._require_input(inputs, "electronic_molecule")
+        configuration_reference = self._require_input(
+            inputs, "electronic_structure_configuration"
+        )
+        if len(inputs) != 2:
+            raise ValueError(
+                "Implicit-solvent Hartree-Fock requires molecule and configuration."
+            )
+        molecule = self._load_model(molecule_reference, ElectronicMolecule)
+        configuration = self._load_model(
+            configuration_reference, ElectronicStructureConfiguration
+        )
+        if configuration.molecule_identifier != molecule.molecule_identifier:
+            raise ValueError("Implicit-solvent inputs do not form one problem.")
+
+        solvent_name = self._string_parameter(
+            invocation, "solvent_name", maximum_length=80
+        )
+        solvent_model = self._string_parameter(
+            invocation, "solvent_model", maximum_length=16
+        ).upper()
+        supported_models = {
+            "IEF-PCM": "IEF-PCM",
+            "C-PCM": "C-PCM",
+            "SS(V)PE": "SS(V)PE",
+            "COSMO": "COSMO",
+        }
+        if solvent_model not in supported_models:
+            raise ValueError("Unsupported PySCF PCM solvent model.")
+        dielectric = self._float_parameter(
+            invocation,
+            "dielectric_constant",
+            minimum=1.0000001,
+            maximum=1000.0,
+        )
+
+        _, native_molecule, vacuum_scf, vacuum_energy = self._run_native_scf(
+            molecule, configuration
+        )
+        if not bool(vacuum_scf.converged):
+            return self._failure(
+                "vacuum_scf_not_converged",
+                "The matched vacuum Hartree-Fock reference did not converge.",
+                retryable=True,
+            )
+
+        _, _, scf, _, _ = _pyscf_modules()
+        solvent_scf = self._build_scf(
+            molecule, configuration, native_molecule, scf
+        ).PCM()
+        solvent_scf.with_solvent.method = supported_models[solvent_model]
+        solvent_scf.with_solvent.eps = dielectric
+        solvent_scf.with_solvent.equilibrium_solvation = True
+        solvated_energy = float(solvent_scf.kernel())
+        if not bool(solvent_scf.converged):
+            return self._failure(
+                "solvated_scf_not_converged",
+                "The self-consistent PCM Hartree-Fock calculation did not converge.",
+                retryable=True,
+            )
+
+        result = ElectronicImplicitSolventResult(
+            schema_version=_SCHEMA_VERSION,
+            result_identifier=_stable_identifier(
+                "electronic-implicit-solvent",
+                molecule.molecule_identifier,
+                configuration.configuration_identifier,
+                solvent_name,
+                solvent_model,
+                dielectric,
+                vacuum_energy,
+                solvated_energy,
+            ),
+            molecule_identifier=molecule.molecule_identifier,
+            configuration_identifier=configuration.configuration_identifier,
+            reference_method=configuration.reference_method,
+            solvent_name=solvent_name,
+            solvent_model=supported_models[solvent_model],
+            dielectric_constant=dielectric,
+            equilibrium_solvation=True,
+            converged=True,
+            vacuum_total_energy_hartree=vacuum_energy,
+            solvated_total_energy_hartree=solvated_energy,
+            electronic_solvation_contribution_hartree=(
+                solvated_energy - vacuum_energy
+            ),
+            energy_semantics="solvated_electronic_energy",
+            thermal_correction_included=False,
+            gibbs_free_energy=False,
+        )
+        parents = (molecule_reference, configuration_reference)
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type="electronic_implicit_solvent_result",
+            identifier_prefix="electronic-implicit-solvent",
+            parents=parents,
+            metadata={
+                "solvent_name": solvent_name,
+                "solvent_model": result.solvent_model,
+                "dielectric_constant": dielectric,
+                "electronic_solvation_contribution_hartree": (
+                    result.electronic_solvation_contribution_hartree
+                ),
+                "energy_semantics": result.energy_semantics,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="solvates",
+            ),
+            diagnostics={
+                "converged": True,
+                "solvent_name": solvent_name,
+                "solvent_model": result.solvent_model,
+                "dielectric_constant": dielectric,
+                "solvated_total_energy_hartree": solvated_energy,
+                "electronic_solvation_contribution_hartree": (
+                    result.electronic_solvation_contribution_hartree
+                ),
+            },
+        )
+
+    def _calculate_gradient(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        molecule_reference = self._require_input(inputs, "electronic_molecule")
+        configuration_reference = self._require_input(
+            inputs, "electronic_structure_configuration"
+        )
+        if len(inputs) != 2:
+            raise ValueError("Gradient calculation requires two exact inputs.")
+        molecule = self._load_model(molecule_reference, ElectronicMolecule)
+        configuration = self._load_model(
+            configuration_reference, ElectronicStructureConfiguration
+        )
+        if configuration.molecule_identifier != molecule.molecule_identifier:
+            raise ValueError("Gradient inputs do not form one electronic problem.")
+        threshold = self._float_parameter(
+            invocation,
+            "stationary_threshold_hartree_per_bohr",
+            minimum=1e-8,
+            maximum=1e-2,
+        )
+        numpy, _, native_scf, energy = self._run_native_scf(
+            molecule, configuration
+        )
+        if not bool(native_scf.converged):
+            return self._failure(
+                "gradient_scf_not_converged",
+                "The SCF reference for the analytical gradient did not converge.",
+                retryable=True,
+            )
+        gradient = numpy.asarray(native_scf.nuc_grad_method().kernel(), dtype=float)
+        rms = float(numpy.sqrt(numpy.mean(gradient * gradient)))
+        maximum = float(numpy.max(numpy.abs(gradient)))
+        result = ElectronicGradientResult(
+            schema_version=_SCHEMA_VERSION,
+            result_identifier=_stable_identifier(
+                "electronic-gradient",
+                molecule.molecule_identifier,
+                configuration.configuration_identifier,
+                energy,
+                *_flatten(gradient),
+            ),
+            molecule_identifier=molecule.molecule_identifier,
+            configuration_identifier=configuration.configuration_identifier,
+            energy_hartree=energy,
+            gradient_hartree_per_bohr=_tensor(
+                gradient,
+                unit="hartree_per_bohr",
+                index_convention="atom_by_cartesian",
+            ),
+            rms_gradient_hartree_per_bohr=rms,
+            maximum_gradient_hartree_per_bohr=maximum,
+            stationary_threshold_hartree_per_bohr=threshold,
+            stationary=maximum <= threshold,
+        )
+        parents = (molecule_reference, configuration_reference)
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type="electronic_gradient_result",
+            identifier_prefix="electronic-gradient",
+            parents=parents,
+            metadata={
+                "energy_hartree": energy,
+                "rms_gradient_hartree_per_bohr": rms,
+                "maximum_gradient_hartree_per_bohr": maximum,
+                "stationary": result.stationary,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation, parents=parents, child=output, relationship_type="derives"
+            ),
+            diagnostics={
+                "energy_hartree": energy,
+                "rms_gradient_hartree_per_bohr": rms,
+                "maximum_gradient_hartree_per_bohr": maximum,
+                "stationary": result.stationary,
+            },
+        )
+
+    def _analyze_frequencies(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        molecule_reference = self._require_input(inputs, "electronic_molecule")
+        configuration_reference = self._require_input(
+            inputs, "electronic_structure_configuration"
+        )
+        gradient_reference = self._require_input(
+            inputs, "electronic_gradient_result"
+        )
+        if len(inputs) != 3:
+            raise ValueError("Frequency analysis requires three exact inputs.")
+        molecule = self._load_model(molecule_reference, ElectronicMolecule)
+        configuration = self._load_model(
+            configuration_reference, ElectronicStructureConfiguration
+        )
+        gradient = self._load_model(gradient_reference, ElectronicGradientResult)
+        if (
+            configuration.molecule_identifier != molecule.molecule_identifier
+            or gradient.molecule_identifier != molecule.molecule_identifier
+            or gradient.configuration_identifier
+            != configuration.configuration_identifier
+        ):
+            raise ValueError("Frequency inputs do not form one electronic problem.")
+        threshold = self._float_parameter(
+            invocation,
+            "significant_imaginary_threshold_cm_inverse",
+            minimum=1.0,
+            maximum=1000.0,
+        )
+        raw_pair = self._parameter(
+            invocation, "reaction_atom_pair", required=False
+        )
+        reaction_pair: tuple[int, int] | None = None
+        if raw_pair is not None:
+            if not isinstance(raw_pair, str):
+                raise ValueError("Reaction atom pair must use 'atom-atom' notation.")
+            parts = tuple(part.strip() for part in raw_pair.split("-"))
+            if len(parts) != 2 or any(not part.isdigit() for part in parts):
+                raise ValueError("Reaction atom pair must use 'atom-atom' notation.")
+            reaction_pair = tuple(sorted((int(parts[0]), int(parts[1]))))
+            if (
+                reaction_pair[0] == reaction_pair[1]
+                or reaction_pair[1] >= len(molecule.atoms)
+            ):
+                raise ValueError("Reaction atom pair is invalid for the molecule.")
+
+        numpy, native_molecule, native_scf, _ = self._run_native_scf(
+            molecule, configuration
+        )
+        if not bool(native_scf.converged):
+            return self._failure(
+                "hessian_scf_not_converged",
+                "The SCF reference for the Hessian did not converge.",
+                retryable=True,
+            )
+        hessian = numpy.asarray(native_scf.Hessian().kernel(), dtype=float)
+        from pyscf.hessian import thermo
+
+        harmonic = thermo.harmonic_analysis(
+            native_molecule,
+            hessian,
+            exclude_trans=True,
+            exclude_rot=True,
+            imaginary_freq=False,
+        )
+        wavenumbers = numpy.asarray(harmonic["freq_wavenumber"], dtype=float)
+        displacements = numpy.asarray(harmonic["norm_mode"], dtype=float)
+        reduced_masses = numpy.asarray(harmonic["reduced_mass"], dtype=float)
+        modes: list[ElectronicFrequencyMode] = []
+        for mode_index, wavenumber in enumerate(wavenumbers.tolist()):
+            mode_displacements = displacements[mode_index]
+            participation: float | None = None
+            if reaction_pair is not None:
+                atom_a, atom_b = reaction_pair
+                coords = native_molecule.atom_coords(unit="Angstrom")
+                bond = numpy.asarray(coords[atom_b] - coords[atom_a], dtype=float)
+                bond_norm = float(numpy.linalg.norm(bond))
+                mode_norm = float(numpy.linalg.norm(mode_displacements))
+                if bond_norm <= 1e-12 or mode_norm <= 1e-12:
+                    raise ValueError("Reaction-mode participation is undefined.")
+                stretch = float(numpy.dot(
+                    mode_displacements[atom_b] - mode_displacements[atom_a],
+                    bond / bond_norm,
+                ))
+                participation = min(1.0, abs(stretch) / mode_norm)
+            modes.append(ElectronicFrequencyMode(
+                mode_index=mode_index,
+                wavenumber_cm_inverse=float(wavenumber),
+                reduced_mass_amu=float(reduced_masses[mode_index]),
+                imaginary=float(wavenumber) < 0.0,
+                significant_imaginary=float(wavenumber) <= -threshold,
+                normalized_displacements=_tensor(
+                    mode_displacements,
+                    unit="dimensionless",
+                    index_convention="atom_by_cartesian",
+                ),
+                reaction_coordinate_participation=participation,
+            ))
+        significant_count = sum(mode.significant_imaginary for mode in modes)
+        analysis = ElectronicFrequencyAnalysis(
+            schema_version=_SCHEMA_VERSION,
+            analysis_identifier=_stable_identifier(
+                "electronic-frequency",
+                molecule.molecule_identifier,
+                configuration.configuration_identifier,
+                threshold,
+                *wavenumbers.tolist(),
+            ),
+            molecule_identifier=molecule.molecule_identifier,
+            configuration_identifier=configuration.configuration_identifier,
+            gradient_result_identifier=gradient.result_identifier,
+            hessian_hartree_per_bohr2=_tensor(
+                hessian,
+                unit="hartree_per_bohr2",
+                index_convention="atom_atom_cartesian_cartesian",
+            ),
+            modes=tuple(modes),
+            significant_imaginary_threshold_cm_inverse=threshold,
+            significant_imaginary_mode_count=significant_count,
+            exactly_one_significant_imaginary_mode=significant_count == 1,
+            thermal_corrections_calculated=False,
+        )
+        parents = (molecule_reference, configuration_reference, gradient_reference)
+        output = self._write_model(
+            invocation,
+            model=analysis,
+            artifact_type="electronic_frequency_analysis",
+            identifier_prefix="electronic-frequency",
+            parents=parents,
+            metadata={
+                "mode_count": len(modes),
+                "significant_imaginary_mode_count": significant_count,
+                "exactly_one_significant_imaginary_mode": significant_count == 1,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="characterizes",
+            ),
+            diagnostics={
+                "mode_count": len(modes),
+                "significant_imaginary_mode_count": significant_count,
+                "exactly_one_significant_imaginary_mode": significant_count == 1,
+            },
+        )
+
+    def _search_transition_state(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        molecule_reference = self._require_input(inputs, "electronic_molecule")
+        configuration_reference = self._require_input(
+            inputs, "electronic_structure_configuration"
+        )
+        if len(inputs) != 2:
+            raise ValueError("Transition-state search requires two exact inputs.")
+        molecule = self._load_model(molecule_reference, ElectronicMolecule)
+        configuration = self._load_model(
+            configuration_reference, ElectronicStructureConfiguration
+        )
+        if configuration.molecule_identifier != molecule.molecule_identifier:
+            raise ValueError("Transition-state inputs do not form one problem.")
+        raw_pair = self._string_parameter(
+            invocation, "reaction_atom_pair", maximum_length=64
+        )
+        parts = tuple(part.strip() for part in raw_pair.split("-"))
+        if len(parts) != 2 or any(not part.isdigit() for part in parts):
+            raise ValueError("Reaction atom pair must use 'atom-atom' notation.")
+        reaction_pair = tuple(sorted((int(parts[0]), int(parts[1]))))
+        if reaction_pair[0] == reaction_pair[1] or reaction_pair[1] >= len(
+            molecule.atoms
+        ):
+            raise ValueError("Reaction atom pair is invalid for the molecule.")
+        maximum_steps = self._integer_parameter(
+            invocation, "maximum_steps", minimum=1, maximum=1000
+        )
+        _, _, native_scf, _ = self._run_native_scf(molecule, configuration)
+        if not bool(native_scf.converged):
+            return self._failure(
+                "ts_initial_scf_not_converged",
+                "The initial transition-state SCF calculation did not converge.",
+                retryable=True,
+            )
+        try:
+            geometric_version = importlib.metadata.version("geometric")
+        except importlib.metadata.PackageNotFoundError:
+            return self._failure(
+                "dependency_missing",
+                "Transition-state search requires pinned geomeTRIC 1.1.1.",
+            )
+        if geometric_version != "1.1.1":
+            return self._failure(
+                "dependency_version_mismatch",
+                "Installed geomeTRIC does not match the repository pin 1.1.1.",
+            )
+        optimizer = native_scf.nuc_grad_method().optimizer(solver="geomeTRIC")
+        optimized_native = optimizer.kernel({
+            "transition": True,
+            "hessian": True,
+            "maxiter": maximum_steps,
+        })
+        coords = optimized_native.atom_coords(unit="Angstrom")
+        optimized_molecule = ElectronicMolecule(
+            schema_version=_SCHEMA_VERSION,
+            molecule_identifier=_stable_identifier(
+                "electronic-ts-geometry",
+                molecule.molecule_identifier,
+                *coords.reshape(-1).tolist(),
+            ),
+            source_artifact_identifier=molecule.source_artifact_identifier,
+            source_geometry_identifier=molecule.source_geometry_identifier,
+            atoms=tuple(
+                ElectronicAtom(
+                    atom_index=atom.atom_index,
+                    atomic_number=atom.atomic_number,
+                    element_symbol=atom.element_symbol,
+                    x_angstrom=float(coords[atom.atom_index, 0]),
+                    y_angstrom=float(coords[atom.atom_index, 1]),
+                    z_angstrom=float(coords[atom.atom_index, 2]),
+                    source_atom_index=atom.source_atom_index,
+                )
+                for atom in molecule.atoms
+            ),
+            molecular_charge=molecule.molecular_charge,
+            source_formal_charge=molecule.source_formal_charge,
+            spin=molecule.spin,
+            electron_count=molecule.electron_count,
+            alpha_electron_count=molecule.alpha_electron_count,
+            beta_electron_count=molecule.beta_electron_count,
+        )
+        numpy, _, final_scf, final_energy = self._run_native_scf(
+            optimized_molecule, configuration
+        )
+        if not bool(final_scf.converged):
+            return self._failure(
+                "ts_final_scf_not_converged",
+                "The optimized transition-state SCF calculation did not converge.",
+                retryable=True,
+            )
+        final_gradient = numpy.asarray(
+            final_scf.nuc_grad_method().kernel(), dtype=float
+        )
+        rms = float(numpy.sqrt(numpy.mean(final_gradient * final_gradient)))
+        maximum = float(numpy.max(numpy.abs(final_gradient)))
+        search = ElectronicTransitionStateSearch(
+            schema_version=_SCHEMA_VERSION,
+            search_identifier=_stable_identifier(
+                "electronic-ts-search",
+                molecule.molecule_identifier,
+                optimized_molecule.molecule_identifier,
+                final_energy,
+            ),
+            initial_molecule_identifier=molecule.molecule_identifier,
+            configuration_identifier=configuration.configuration_identifier,
+            optimizer="geometric",
+            optimizer_version=geometric_version,
+            converged=bool(getattr(optimizer, "converged", False)),
+            maximum_steps=maximum_steps,
+            intended_reaction_atom_pair=reaction_pair,
+            optimized_molecule=optimized_molecule,
+            final_energy_hartree=final_energy,
+            final_rms_gradient_hartree_per_bohr=rms,
+            final_maximum_gradient_hartree_per_bohr=maximum,
+            transition_state_verified=False,
+        )
+        parents = (molecule_reference, configuration_reference)
+        output = self._write_model(
+            invocation,
+            model=search,
+            artifact_type="electronic_transition_state_search",
+            identifier_prefix="electronic-ts-search",
+            parents=parents,
+            metadata={
+                "optimizer": "geometric",
+                "optimizer_version": geometric_version,
+                "converged": search.converged,
+                "transition_state_verified": False,
+                "final_energy_hartree": final_energy,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation, parents=parents, child=output, relationship_type="searches"
+            ),
+            diagnostics={
+                "optimizer": "geometric",
+                "converged": search.converged,
+                "transition_state_verified": False,
+                "final_rms_gradient_hartree_per_bohr": rms,
+                "final_maximum_gradient_hartree_per_bohr": maximum,
+            },
+        )
+
+    def _confirm_reaction_path(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        search_reference = self._require_input(
+            inputs, "electronic_transition_state_search"
+        )
+        configuration_reference = self._require_input(
+            inputs, "electronic_structure_configuration"
+        )
+        frequency_reference = self._require_input(
+            inputs, "electronic_frequency_analysis"
+        )
+        if len(inputs) != 3:
+            raise ValueError("Reaction-path confirmation requires three exact inputs.")
+        search = self._load_model(search_reference, ElectronicTransitionStateSearch)
+        configuration = self._load_model(
+            configuration_reference, ElectronicStructureConfiguration
+        )
+        frequency = self._load_model(
+            frequency_reference, ElectronicFrequencyAnalysis
+        )
+        transition_state = search.optimized_molecule
+        if (
+            not search.converged
+            or not frequency.exactly_one_significant_imaginary_mode
+            or frequency.molecule_identifier != transition_state.molecule_identifier
+            or frequency.configuration_identifier
+            != configuration.configuration_identifier
+            or configuration.molecule_identifier != transition_state.molecule_identifier
+        ):
+            raise ValueError(
+                "Reaction-path inputs do not describe one converged, characterized saddle."
+            )
+        step_size = self._float_parameter(
+            invocation, "step_size_bohr", minimum=1.0e-4, maximum=0.5
+        )
+        step_count = self._integer_parameter(
+            invocation, "step_count_per_direction", minimum=2, maximum=100
+        )
+        imaginary_mode = next(
+            mode for mode in frequency.modes if mode.significant_imaginary
+        )
+        numpy, native_molecule, _, _ = self._run_native_scf(
+            transition_state, configuration
+        )
+        masses = numpy.asarray(native_molecule.atom_mass_list(), dtype=float)
+        mode = numpy.asarray(
+            imaginary_mode.normalized_displacements.values, dtype=float
+        ).reshape(imaginary_mode.normalized_displacements.shape)
+        mass_weighted_mode = mode / numpy.sqrt(masses)[:, None]
+        mode_norm = float(numpy.linalg.norm(mass_weighted_mode))
+        if mode_norm <= 1.0e-12:
+            raise ValueError("The significant imaginary mode has zero displacement.")
+        mass_weighted_mode /= mode_norm
+        transition_coords = numpy.asarray(
+            native_molecule.atom_coords(unit="Bohr"), dtype=float
+        )
+
+        def molecule_at(coords_bohr: object, direction: str, index: int) -> ElectronicMolecule:
+            coords_angstrom = numpy.asarray(coords_bohr, dtype=float) * 0.529177210903
+            return ElectronicMolecule(
+                schema_version=_SCHEMA_VERSION,
+                molecule_identifier=_stable_identifier(
+                    "electronic-reaction-path-geometry",
+                    search.search_identifier,
+                    direction,
+                    index,
+                    *coords_angstrom.reshape(-1).tolist(),
+                ),
+                source_artifact_identifier=transition_state.source_artifact_identifier,
+                source_geometry_identifier=transition_state.source_geometry_identifier,
+                atoms=tuple(
+                    ElectronicAtom(
+                        atom_index=atom.atom_index,
+                        atomic_number=atom.atomic_number,
+                        element_symbol=atom.element_symbol,
+                        x_angstrom=float(coords_angstrom[atom.atom_index, 0]),
+                        y_angstrom=float(coords_angstrom[atom.atom_index, 1]),
+                        z_angstrom=float(coords_angstrom[atom.atom_index, 2]),
+                        source_atom_index=atom.source_atom_index,
+                    )
+                    for atom in transition_state.atoms
+                ),
+                molecular_charge=transition_state.molecular_charge,
+                source_formal_charge=transition_state.source_formal_charge,
+                spin=transition_state.spin,
+                electron_count=transition_state.electron_count,
+                alpha_electron_count=transition_state.alpha_electron_count,
+                beta_electron_count=transition_state.beta_electron_count,
+            )
+
+        points: list[ElectronicReactionPathPoint] = []
+        endpoint_coords: dict[str, object] = {}
+        endpoint_energies: dict[str, float] = {}
+        for direction, sign in (("forward", 1.0), ("reverse", -1.0)):
+            coords = transition_coords + sign * step_size * mass_weighted_mode
+            for index in range(step_count):
+                path_molecule = molecule_at(coords, direction, index)
+                _, _, native_scf, energy = self._run_native_scf(
+                    path_molecule, configuration
+                )
+                if not bool(native_scf.converged):
+                    return self._failure(
+                        "reaction_path_scf_not_converged",
+                        "An SCF point on the reaction path did not converge.",
+                        retryable=True,
+                    )
+                gradient = numpy.asarray(
+                    native_scf.nuc_grad_method().kernel(), dtype=float
+                )
+                rms = float(numpy.sqrt(numpy.mean(gradient * gradient)))
+                points.append(ElectronicReactionPathPoint(
+                    direction=direction,
+                    step_index=index,
+                    molecule=path_molecule,
+                    energy_hartree=energy,
+                    rms_gradient_hartree_per_bohr=rms,
+                ))
+                if index + 1 < step_count:
+                    mass_weighted_gradient = gradient / masses[:, None]
+                    gradient_norm = float(numpy.linalg.norm(mass_weighted_gradient))
+                    if gradient_norm <= 1.0e-14:
+                        raise ValueError("Reaction path reached an undefined zero-gradient step.")
+                    coords = coords - step_size * mass_weighted_gradient / gradient_norm
+            endpoint_coords[direction] = coords
+            endpoint_energies[direction] = energy
+
+        endpoint_rmsd = float(numpy.sqrt(numpy.mean(
+            (numpy.asarray(endpoint_coords["forward"])
+             - numpy.asarray(endpoint_coords["reverse"])) ** 2
+        )))
+        forward_decreased = endpoint_energies["forward"] < search.final_energy_hartree
+        reverse_decreased = endpoint_energies["reverse"] < search.final_energy_hartree
+        distinct_endpoints = endpoint_rmsd > max(step_size, 1.0e-3)
+        result = ElectronicReactionPathResult(
+            schema_version=_SCHEMA_VERSION,
+            path_identifier=_stable_identifier(
+                "electronic-reaction-path",
+                search.search_identifier,
+                frequency.analysis_identifier,
+                step_size,
+                step_count,
+                *endpoint_energies.values(),
+            ),
+            transition_state_search_identifier=search.search_identifier,
+            frequency_analysis_identifier=frequency.analysis_identifier,
+            method="mass_weighted_steepest_descent",
+            step_size_bohr=step_size,
+            points=tuple(points),
+            forward_energy_decreased=forward_decreased,
+            reverse_energy_decreased=reverse_decreased,
+            distinct_endpoints=distinct_endpoints,
+            path_confirmation_passed=(
+                forward_decreased and reverse_decreased and distinct_endpoints
+            ),
+        )
+        parents = (search_reference, configuration_reference, frequency_reference)
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type="electronic_reaction_path_result",
+            identifier_prefix="electronic-reaction-path",
+            parents=parents,
+            metadata={
+                "step_count_per_direction": step_count,
+                "forward_energy_decreased": forward_decreased,
+                "reverse_energy_decreased": reverse_decreased,
+                "distinct_endpoints": distinct_endpoints,
+                "path_confirmation_passed": result.path_confirmation_passed,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation, parents=parents, child=output, relationship_type="confirms"
+            ),
+            diagnostics={
+                "step_count_per_direction": step_count,
+                "endpoint_rmsd_bohr": endpoint_rmsd,
+                "path_confirmation_passed": result.path_confirmation_passed,
             },
         )
 
