@@ -3884,7 +3884,7 @@ class PySCFElectronicStructureAdapter:
             identifier_prefix="electronic-ts-configuration",
             parents=(configuration_reference, molecule_output),
             metadata={
-                "reference_type": optimized_configuration.reference_type,
+                "reference_method": optimized_configuration.reference_method,
                 "basis_set": optimized_configuration.basis_set,
             },
         )
