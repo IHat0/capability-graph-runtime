@@ -43,6 +43,7 @@ from .preparation import (
     MolecularProteinProtonationPreparation,
     MolecularProteinResidueState,
 )
+from .parameterization import MolecularLigandParameterization
 from .simulation import (
     MolecularDynamicsRun,
     MolecularDynamicsSettings,
@@ -80,6 +81,7 @@ FORCE_FIELD_SELECT = "molecular.force_field_select"
 PROTEIN_PROTONATION_PREPARE = "molecular.protein_protonation_prepare"
 ENVIRONMENT_PREPARE = "molecular.environment_prepare"
 SYSTEM_CONSTRUCT = "molecular.system_construct"
+LIGAND_OPENMM_SYSTEM_CONSTRUCT = "molecular.ligand_openmm_system_construct"
 ENERGY_MINIMIZE = "molecular.energy_minimize"
 DYNAMICS_RUN = "molecular.dynamics_run"
 TRAJECTORY_GENERATE = "molecular.trajectory_generate"
@@ -199,6 +201,17 @@ def openmm_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
             True,
             (
                 "Native OpenMM System XML is retained in a private engine-state store and never emitted as a public artifact.",
+            ),
+        ),
+        (
+            LIGAND_OPENMM_SYSTEM_CONSTRUCT,
+            ("molecular_conformer_set", "molecular_ligand_parameterization"),
+            ("molecular_environment", "molecular_simulation_system"),
+            ("ligand_system_construction", "mmff94s_openmm_conversion"),
+            True,
+            (
+                "The OpenMM System implements RDKit MMFF94s bonded, buffered-14-7 and electrostatic terms with explicit native-unit conversion.",
+                "Pair-specific MMFF94s nonbonded parameters and 1-4 electrostatic scaling are retained; unsupported or incomplete assignments fail closed.",
             ),
         ),
         (
@@ -469,6 +482,8 @@ class OpenMMClassicalSimulationAdapter:
                 return self._prepare_environment(invocation)
             if capability_name == SYSTEM_CONSTRUCT:
                 return self._construct_system(invocation)
+            if capability_name == LIGAND_OPENMM_SYSTEM_CONSTRUCT:
+                return self._construct_ligand_system(invocation)
             if capability_name == ENERGY_MINIMIZE:
                 return self._minimize(invocation)
             if capability_name == DYNAMICS_RUN:
@@ -2045,6 +2060,276 @@ class OpenMMClassicalSimulationAdapter:
             diagnostics={
                 "environment_identifier": environment.environment_identifier,
                 "particle_count": len(environment.atoms),
+            },
+        )
+
+    def _construct_ligand_system(
+        self, invocation: CapabilityInvocation
+    ) -> CapabilityResult:
+        """Translate a complete RDKit MMFF94s assignment into executable OpenMM."""
+
+        inputs = self._inputs_by_type(invocation)
+        if set(inputs) != {
+            "molecular_conformer_set",
+            "molecular_ligand_parameterization",
+        }:
+            raise ValueError(
+                "Ligand system construction requires conformers and MMFF94s parameters."
+            )
+        conformer_reference = self._require_input(inputs, "molecular_conformer_set")
+        parameter_reference = self._require_input(
+            inputs, "molecular_ligand_parameterization"
+        )
+        conformers = MolecularConformerSet.model_validate_json(
+            self._read_payload(conformer_reference)
+        )
+        parameters = MolecularLigandParameterization.model_validate_json(
+            self._read_payload(parameter_reference)
+        )
+        graph = conformers.source_graph
+        if parameters.source_graph_identifier != graph.graph_identifier:
+            raise ValueError("MMFF94s parameters and conformer graph identities disagree.")
+        if len(parameters.atoms) != len(graph.atoms) or not parameters.nonbonded_pairs:
+            raise ValueError("Executable MMFF94s conversion requires complete pair parameters.")
+        conformer_index = self._integer_parameter(
+            invocation,
+            "conformer_index",
+            default=0,
+            minimum=0,
+            maximum=len(conformers.conformers) - 1,
+        )
+        selected = conformers.conformers[conformer_index]
+        openmm, app, unit = _openmm_modules()
+        system = openmm.System()
+        for graph_atom in graph.atoms:
+            element = app.Element.getByAtomicNumber(graph_atom.atomic_number)
+            system.addParticle(element.mass)
+
+        # RDKit MMFF expressions are in kcal/mol, Angstrom and degrees.  Every
+        # expression below converts the OpenMM nm/radian coordinates explicitly.
+        bond_force = openmm.CustomBondForce(
+            "4.184*0.5*143.9325*kb*dr*dr*(1-2*dr+(7/3)*dr*dr); dr=10*r-r0"
+        )
+        bond_force.addPerBondParameter("kb")
+        bond_force.addPerBondParameter("r0")
+        angle_force = openmm.CustomAngleForce(
+            "4.184*(linear*143.9325*ka*(1+cos(theta))"
+            "+(1-linear)*0.5*143.9325*0.0003046174197867086*ka*d*d*(1-0.006981317*d));"
+            "d=theta*57.29577951308232-theta0"
+        )
+        for name in ("ka", "theta0", "linear"):
+            angle_force.addPerAngleParameter(name)
+        stretch_force = openmm.CustomCompoundBondForce(
+            3,
+            "4.184*143.9325*0.017453292519943295*dtheta*(k1*dr1+k2*dr2);"
+            "dr1=10*pointdistance(x1,y1,z1,x2,y2,z2)-r01;"
+            "dr2=10*pointdistance(x2,y2,z2,x3,y3,z3)-r02;"
+            "dtheta=pointangle(x1,y1,z1,x2,y2,z2,x3,y3,z3)*57.29577951308232-theta0",
+        )
+        for name in ("k1", "k2", "r01", "r02", "theta0"):
+            stretch_force.addPerBondParameter(name)
+        torsion_force = openmm.CustomTorsionForce(
+            "4.184*0.5*(v1*(1+cos(theta))+v2*(1-cos(2*theta))+v3*(1+cos(3*theta)))"
+        )
+        for name in ("v1", "v2", "v3"):
+            torsion_force.addPerTorsionParameter(name)
+        oop_force = openmm.CustomCompoundBondForce(
+            4,
+            "4.184*0.5*143.9325*0.0003046174197867086*koop*chi*chi;"
+            "chi=asin(sin(pointangle(x3,y3,z3,x2,y2,z2,x4,y4,z4))"
+            "*sin(pointdihedral(x1,y1,z1,x2,y2,z2,x3,y3,z3,x4,y4,z4)))*57.29577951308232",
+        )
+        oop_force.addPerBondParameter("koop")
+        nonbonded_force = openmm.CustomBondForce(
+            "4.184*(eps*(1.07*rs/(ra+0.07*rs))^7"
+            "*(1.12*rs^7/(ra^7+0.12*rs^7)-2)"
+            "+332.0716*qprod*escale/(ra+0.05));ra=10*r"
+        )
+        for name in ("rs", "eps", "qprod", "escale"):
+            nonbonded_force.addPerBondParameter(name)
+
+        bond_values: dict[tuple[int, int], tuple[float, float]] = {}
+        angle_values: dict[tuple[int, int, int], tuple[float, float]] = {}
+        stretch_terms: list[object] = []
+        for term in parameters.terms:
+            values = term.parameter_values
+            if term.term_kind == "bond_stretch":
+                _, kb, r0 = values
+                i, j = term.atom_indices
+                bond_force.addBond(i, j, [kb, r0])
+                bond_values[tuple(sorted((i, j)))] = (kb, r0)
+            elif term.term_kind == "angle_bend":
+                _, ka, theta0 = values
+                i, j, k = term.atom_indices
+                linear = 1.0 if abs(theta0 - 180.0) <= 1.0e-8 else 0.0
+                angle_force.addAngle(i, j, k, [ka, theta0, linear])
+                angle_values[(i, j, k)] = (ka, theta0)
+            elif term.term_kind == "stretch_bend":
+                stretch_terms.append(term)
+            elif term.term_kind == "proper_torsion":
+                _, v1, v2, v3 = values
+                torsion_force.addTorsion(*term.atom_indices, [v1, v2, v3])
+            elif term.term_kind == "out_of_plane":
+                oop_force.addBond(list(term.atom_indices), [values[0]])
+            else:
+                raise ValueError("Unsupported MMFF94s force term.")
+        for term in stretch_terms:
+            _, k1, k2 = term.parameter_values
+            i, j, k = term.atom_indices
+            _, r01 = bond_values[tuple(sorted((i, j)))]
+            _, r02 = bond_values[tuple(sorted((j, k)))]
+            _, theta0 = angle_values[(i, j, k)]
+            stretch_force.addBond([i, j, k], [k1, k2, r01, r02, theta0])
+        for pair in parameters.nonbonded_pairs:
+            nonbonded_force.addBond(
+                pair.atom_index_a,
+                pair.atom_index_b,
+                [
+                    pair.vdw_r_star,
+                    pair.vdw_epsilon,
+                    pair.charge_product,
+                    pair.electrostatic_scale,
+                ],
+            )
+        for force in (
+            bond_force,
+            angle_force,
+            stretch_force,
+            torsion_force,
+            oop_force,
+            nonbonded_force,
+        ):
+            system.addForce(force)
+
+        ff_identifier = parameters.parameterization_identifier
+        environment_identifier = _stable_identifier(
+            "molecular-ligand-vacuum-environment",
+            conformers.conformer_set_identifier,
+            conformer_index,
+            ff_identifier,
+        )
+        environment = MolecularEnvironment(
+            schema_version=_SCHEMA_VERSION,
+            environment_identifier=environment_identifier,
+            environment_type="vacuum",
+            source_conformer_set_identifier=conformers.conformer_set_identifier,
+            source_conformer_index=conformer_index,
+            force_field_selection_identifier=ff_identifier,
+            atoms=tuple(
+                MolecularSimulationAtom(
+                    particle_index=atom.atom_index,
+                    particle_kind="atom",
+                    atomic_number=atom.atomic_number,
+                    element_symbol=atom.element_symbol,
+                    atom_name=f"{atom.element_symbol}{atom.atom_index + 1}",
+                    residue_index=0,
+                    residue_name="LIG",
+                    residue_identifier="ligand-1",
+                    chain_index=0,
+                    chain_identifier="ligand-chain",
+                    source_atom_index=atom.atom_index,
+                    formal_charge=atom.formal_charge,
+                )
+                for atom in graph.atoms
+            ),
+            bonds=tuple(
+                MolecularSimulationBond(
+                    atom_index_a=bond.atom_index_a,
+                    atom_index_b=bond.atom_index_b,
+                    order=(
+                        int(round(bond.bond_order))
+                        if abs(bond.bond_order - round(bond.bond_order)) < 1.0e-8
+                        else None
+                    ),
+                )
+                for bond in graph.bonds
+            ),
+            positions=tuple(
+                MolecularVector3(x=item.x / 10, y=item.y / 10, z=item.z / 10)
+                for item in selected.coordinates
+            ),
+            source_solute_atom_count=len(graph.atoms),
+        )
+        settings = MolecularSystemConstructionSettings(
+            nonbonded_method="no_cutoff",
+            constraints="none",
+            rigid_water=False,
+            remove_center_of_mass_motion=False,
+        )
+        xml = openmm.XmlSerializer.serialize(system).encode("utf-8")
+        identity = _openmm_identity()
+        if identity is None:
+            raise ImportError("OpenMM is unavailable.")
+        masses = tuple(
+            float(system.getParticleMass(i).value_in_unit(unit.dalton))
+            for i in range(system.getNumParticles())
+        )
+        private_sha = hashlib.sha256(xml).hexdigest()
+        manifest = MolecularSimulationSystem(
+            schema_version=_SCHEMA_VERSION,
+            system_identifier=_stable_identifier(
+                "molecular-mmff94s-openmm-system", environment_identifier, private_sha
+            ),
+            environment_identifier=environment_identifier,
+            force_field_selection_identifier=ff_identifier,
+            particle_count=system.getNumParticles(),
+            massive_particle_count=sum(value > 0 for value in masses),
+            constraint_count=system.getNumConstraints(),
+            degrees_of_freedom=3 * sum(value > 0 for value in masses),
+            force_kinds=tuple(
+                _force_kind(system.getForce(i)) for i in range(system.getNumForces())
+            ),
+            total_mass_amu=_rounded(sum(masses)),
+            periodic=False,
+            settings=settings,
+            engine_identifier="engine.openmm",
+            engine_distribution_version=identity[0],
+            engine_build_version=identity[1],
+            private_state_sha256=private_sha,
+            partial_charge_source="rdkit_mmff94s_parameter_assignment",
+            particle_partial_charges_e=tuple(atom.partial_charge for atom in parameters.atoms),
+            total_partial_charge_e=parameters.total_partial_charge,
+        )
+        environment_payload = environment.to_canonical_json().encode("utf-8")
+        environment_artifact = self._write_artifact(
+            invocation=invocation,
+            artifact_type="molecular_environment",
+            media_type="application/vnd.pulsate.molecular-environment+json",
+            payload=environment_payload,
+            identifier_prefix="molecular-ligand-vacuum-environment",
+            parents=(conformer_reference, parameter_reference),
+            metadata={"environment_type": "vacuum", "force_field": "mmff94s"},
+        )
+        manifest_payload = manifest.to_canonical_json().encode("utf-8")
+        system_artifact = self._artifact_reference(
+            invocation=invocation,
+            artifact_type="molecular_simulation_system",
+            media_type="application/vnd.pulsate.molecular-simulation-system+json",
+            payload=manifest_payload,
+            identifier_prefix="molecular-mmff94s-openmm-system",
+            parents=(environment_artifact, parameter_reference),
+            metadata={
+                "particle_count": manifest.particle_count,
+                "force_field": "mmff94s",
+                "native_state_public": False,
+            },
+        )
+        self._private_state_store.write(system_artifact, xml)
+        self._payload_store.write(system_artifact, manifest_payload)
+        lineage = (
+            self._lineage(invocation, conformer_reference, environment_artifact, "coordinates_projected_into"),
+            self._lineage(invocation, parameter_reference, environment_artifact, "parameterized_into"),
+            self._lineage(invocation, environment_artifact, system_artifact, "executed_as"),
+            self._lineage(invocation, parameter_reference, system_artifact, "converted_into"),
+        )
+        return self._success(
+            invocation,
+            artifacts=(environment_artifact, system_artifact),
+            lineage=lineage,
+            diagnostics={
+                "force_field": "mmff94s",
+                "openmm_system_constructed": True,
+                "private_state_sha256": private_sha,
             },
         )
 

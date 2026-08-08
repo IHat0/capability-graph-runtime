@@ -540,7 +540,9 @@ class MolecularSimulationSystem(CanonicalModel):
     engine_build_version: str = Field(min_length=1, max_length=128)
     private_state_sha256: str
     private_state_format: Literal["openmm_system_xml"] = "openmm_system_xml"
-    partial_charge_source: Literal["openmm_nonbonded_force"]
+    partial_charge_source: Literal[
+        "openmm_nonbonded_force", "rdkit_mmff94s_parameter_assignment"
+    ]
     particle_partial_charges_e: tuple[float, ...] = Field(min_length=1)
     total_partial_charge_e: float
 

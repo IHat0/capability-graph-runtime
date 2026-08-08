@@ -50,6 +50,7 @@ from .preparation import (
 )
 from .parameterization import (
     MolecularForceFieldAtom,
+    MolecularForceFieldPair,
     MolecularForceFieldTerm,
     MolecularLigandParameterization,
 )
@@ -1339,6 +1340,27 @@ class RDKitCheminformaticsAdapter:
                     ))
 
         total_partial_charge = _rounded(sum(atom.partial_charge for atom in atoms))
+        distance_matrix = Chem.GetDistanceMatrix(molecule)
+        nonbonded_pairs: list[MolecularForceFieldPair] = []
+        for i in range(molecule.GetNumAtoms()):
+            for j in range(i + 1, molecule.GetNumAtoms()):
+                graph_distance = int(round(float(distance_matrix[i, j])))
+                if graph_distance < 3:
+                    continue
+                pair_parameters = properties.GetMMFFVdWParams(i, j)
+                if pair_parameters is None:
+                    raise ValueError("An MMFF94s nonbonded pair parameter is missing.")
+                nonbonded_pairs.append(MolecularForceFieldPair(
+                    atom_index_a=i,
+                    atom_index_b=j,
+                    graph_distance=graph_distance,
+                    vdw_r_star=_rounded(pair_parameters[2]),
+                    vdw_epsilon=_rounded(pair_parameters[3]),
+                    charge_product=_rounded(
+                        atoms[i].partial_charge * atoms[j].partial_charge
+                    ),
+                    electrostatic_scale=0.75 if graph_distance == 3 else 1.0,
+                ))
         parameterization = MolecularLigandParameterization(
             schema_version=_SCHEMA_VERSION,
             parameterization_identifier=_graph_identifier(
@@ -1349,12 +1371,14 @@ class RDKitCheminformaticsAdapter:
             force_field_engine_version=self._rdkit_version or "unknown",
             atoms=tuple(atoms),
             terms=tuple(terms),
+            nonbonded_pairs=tuple(nonbonded_pairs),
             total_formal_charge=graph.formal_charge,
             total_partial_charge=total_partial_charge,
             parameter_assignment_complete=True,
             assumptions=(
                 "RDKit MMFF94s native parameter semantics are retained without unit conversion.",
                 "Every hydrogen is an explicit mapped atom.",
+                "All graph-distance three and greater nonbonded pairs retain pair-specific MMFF94s buffered-14-7 parameters.",
             ),
             warnings=(
                 "This artifact is not an OpenMM System and must not be executed as one.",

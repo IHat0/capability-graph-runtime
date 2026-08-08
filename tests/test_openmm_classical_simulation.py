@@ -20,6 +20,7 @@ from cgr.molecular.openmm_adapter import (
     ENSEMBLE_SUMMARIZE,
     ENVIRONMENT_PREPARE,
     FORCE_FIELD_SELECT,
+    LIGAND_OPENMM_SYSTEM_CONSTRUCT,
     PROTEIN_PROTONATION_PREPARE,
     SNAPSHOT_EXTRACT,
     SYSTEM_CONSTRUCT,
@@ -28,9 +29,11 @@ from cgr.molecular.openmm_adapter import (
 )
 from cgr.molecular.rdkit_adapter import (
     CONFORMER_GENERATION,
+    LIGAND_PARAMETERIZE,
     PREPARE,
     SMILES_PARSE,
     RDKitCheminformaticsAdapter,
+    _molecule_from_graph,
 )
 from cgr.molecular.simulation import (
     MolecularDynamicsRun,
@@ -43,6 +46,7 @@ from cgr.molecular.simulation import (
     MolecularSystemConstructionSettings,
     MolecularTrajectory,
 )
+from cgr.molecular.cheminformatics import MolecularConformerSet
 from cgr.molecular.preparation import MolecularProteinProtonationPreparation
 from cgr.science import (
     ArtifactPointer,
@@ -160,6 +164,87 @@ def _water_conformer(store: MemoryPayloadStore) -> ArtifactReference:
     )
     assert conformer_result.status is ExecutionStatus.SUCCESS
     return conformer_result.output_artifacts[0]
+
+
+def test_mmff94s_parameterization_constructs_energy_equivalent_openmm_system() -> None:
+    pytest.importorskip("rdkit")
+    openmm = pytest.importorskip("openmm")
+    from openmm import unit
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    store = MemoryPayloadStore()
+    private = MemoryPrivateStateStore()
+    rdkit = RDKitCheminformaticsAdapter(store)
+    openmm_adapter = OpenMMClassicalSimulationAdapter(store, private)
+    graph = rdkit.invoke(_invocation(
+        rdkit,
+        SMILES_PARSE,
+        parameters={"smiles": "CC=O"},
+        execution_identifier="execution.mmff.graph",
+    )).output_artifacts[0]
+    prepared = rdkit.invoke(_invocation(
+        rdkit,
+        PREPARE,
+        inputs=(graph,),
+        execution_identifier="execution.mmff.prepare",
+    )).output_artifacts[0]
+    conformer_result = rdkit.invoke(_invocation(
+        rdkit,
+        CONFORMER_GENERATION,
+        inputs=(prepared,),
+        parameters={"conformer_count": 1, "random_seed": 11, "maximum_iterations": 200},
+        execution_identifier="execution.mmff.conformer",
+    ))
+    parameter_result = rdkit.invoke(_invocation(
+        rdkit,
+        LIGAND_PARAMETERIZE,
+        inputs=(prepared,),
+        execution_identifier="execution.mmff.parameters",
+    ))
+    assert conformer_result.status is ExecutionStatus.SUCCESS
+    assert parameter_result.status is ExecutionStatus.SUCCESS
+    result = openmm_adapter.invoke(_invocation(
+        openmm_adapter,
+        LIGAND_OPENMM_SYSTEM_CONSTRUCT,
+        inputs=(conformer_result.output_artifacts[0], parameter_result.output_artifacts[0]),
+        parameters={"conformer_index": 0},
+        execution_identifier="execution.mmff.openmm",
+    ))
+    assert result.status is ExecutionStatus.SUCCESS, result.failure
+    environment_reference = _artifact_by_type(result, "molecular_environment")
+    system_reference = _artifact_by_type(result, "molecular_simulation_system")
+    environment = MolecularEnvironment.model_validate_json(store.read(environment_reference))
+    manifest = MolecularSimulationSystem.model_validate_json(store.read(system_reference))
+    assert manifest.partial_charge_source == "rdkit_mmff94s_parameter_assignment"
+    assert manifest.force_field_selection_identifier.startswith("molecular-ligand-parameterization")
+
+    native = openmm.XmlSerializer.deserialize(private.read(system_reference).decode("utf-8"))
+    integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+    context = openmm.Context(native, integrator, openmm.Platform.getPlatformByName("Reference"))
+    context.setPositions([
+        openmm.Vec3(position.x, position.y, position.z) for position in environment.positions
+    ] * unit.nanometer)
+    openmm_energy = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilocalorie_per_mole
+    )
+    del context, integrator
+
+    conformer_set = MolecularConformerSet.model_validate_json(
+        store.read(conformer_result.output_artifacts[0])
+    )
+    molecule = _molecule_from_graph(conformer_set.source_graph)
+    native_conformer = Chem.Conformer(molecule.GetNumAtoms())
+    for coordinate in conformer_set.conformers[0].coordinates:
+        native_conformer.SetAtomPosition(
+            coordinate.atom_index, (coordinate.x, coordinate.y, coordinate.z)
+        )
+    molecule.RemoveAllConformers()
+    molecule.AddConformer(native_conformer)
+    properties = AllChem.MMFFGetMoleculeProperties(molecule, mmffVariant="MMFF94s")
+    field = AllChem.MMFFGetMoleculeForceField(molecule, properties, confId=0)
+    rdkit_energy = float(field.CalcEnergy())
+    assert openmm_energy == pytest.approx(rdkit_energy, abs=2.0e-5)
 
 
 def _force_field(
@@ -283,6 +368,7 @@ def test_declaration_exposes_all_phase5_3_capabilities_without_importing_openmm(
         ENSEMBLE_SUMMARIZE,
         ENVIRONMENT_PREPARE,
         FORCE_FIELD_SELECT,
+        LIGAND_OPENMM_SYSTEM_CONSTRUCT,
         PROTEIN_PROTONATION_PREPARE,
         SNAPSHOT_EXTRACT,
         SYSTEM_CONSTRUCT,

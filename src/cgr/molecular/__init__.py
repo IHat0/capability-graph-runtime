@@ -57,6 +57,7 @@ from .openmm_adapter import (
     PROTEIN_PROTONATION_PREPARE,
     SNAPSHOT_EXTRACT,
     SYSTEM_CONSTRUCT,
+    LIGAND_OPENMM_SYSTEM_CONSTRUCT,
     TRAJECTORY_GENERATE,
     OpenMMAdapterConfigurationError,
     OpenMMClassicalSimulationAdapter,
@@ -75,6 +76,7 @@ from .preparation import (
 )
 from .parameterization import (
     MolecularForceFieldAtom,
+    MolecularForceFieldPair,
     MolecularForceFieldTerm,
     MolecularLigandParameterization,
 )
@@ -87,6 +89,12 @@ from .vina_adapter import (
     DOCKING_POSE_GENERATE,
     VinaDockingAdapter,
     vina_capability_envelopes,
+)
+from .meeko_adapter import (
+    DOCKING_LIGAND_PREPARE,
+    DOCKING_RECEPTOR_PREPARE,
+    MeekoDockingPreparationAdapter,
+    meeko_capability_envelopes,
 )
 from .rdkit_adapter import (
     CONFORMER_GENERATION,
@@ -155,6 +163,8 @@ from .topology import (
 __all__ = [
     "DYNAMICS_RUN",
     "DOCKING_POSE_GENERATE",
+    "DOCKING_LIGAND_PREPARE",
+    "DOCKING_RECEPTOR_PREPARE",
     "ENERGY_MINIMIZE",
     "ENSEMBLE_SUMMARIZE",
     "ENVIRONMENT_PREPARE",
@@ -162,6 +172,7 @@ __all__ = [
     "PROTEIN_PROTONATION_PREPARE",
     "SNAPSHOT_EXTRACT",
     "SYSTEM_CONSTRUCT",
+    "LIGAND_OPENMM_SYSTEM_CONSTRUCT",
     "TRAJECTORY_GENERATE",
     "CONFORMER_GENERATION",
     "CONSTRAINED_DISTANCE_SCAN",
@@ -186,6 +197,7 @@ __all__ = [
     "MolecularDockingPose",
     "MolecularDockingResult",
     "MolecularForceFieldAtom",
+    "MolecularForceFieldPair",
     "MolecularForceFieldTerm",
     "MolecularLigandParameterization",
     "MolecularGraph",
@@ -215,8 +227,10 @@ __all__ = [
     "RDKitAdapterConfigurationError",
     "RDKitCheminformaticsAdapter",
     "VinaDockingAdapter",
+    "MeekoDockingPreparationAdapter",
     "rdkit_capability_envelopes",
     "vina_capability_envelopes",
+    "meeko_capability_envelopes",
     "MolecularDistanceScan",
     "MolecularDistanceScanPoint",
     "MolecularSubstructureMatch",

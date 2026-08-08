@@ -92,6 +92,32 @@ class MolecularForceFieldTerm(CanonicalModel):
         return self
 
 
+class MolecularForceFieldPair(CanonicalModel):
+    """One explicitly parameterized MMFF94s nonbonded atom pair."""
+
+    atom_index_a: int = Field(ge=0)
+    atom_index_b: int = Field(ge=0)
+    graph_distance: int = Field(ge=3)
+    vdw_r_star: float = Field(gt=0)
+    vdw_epsilon: float = Field(gt=0)
+    charge_product: float
+    electrostatic_scale: Literal[0.75, 1.0]
+
+    @field_validator("vdw_r_star", "vdw_epsilon", "charge_product")
+    @classmethod
+    def finite_values(cls, value: float) -> float:
+        return _finite(value, label="MMFF94s nonbonded pair parameter")
+
+    @model_validator(mode="after")
+    def validate_pair(self) -> Self:
+        if self.atom_index_a >= self.atom_index_b:
+            raise ValueError("MMFF94s pair endpoints must be canonically ordered.")
+        expected_scale = 0.75 if self.graph_distance == 3 else 1.0
+        if self.electrostatic_scale != expected_scale:
+            raise ValueError("MMFF94s 1-4 electrostatic scaling is inconsistent.")
+        return self
+
+
 class MolecularLigandParameterization(CanonicalModel):
     """Complete native MMFF parameter assignment for one small molecule.
 
@@ -108,6 +134,7 @@ class MolecularLigandParameterization(CanonicalModel):
     force_field_engine_version: str
     atoms: tuple[MolecularForceFieldAtom, ...] = Field(min_length=1)
     terms: tuple[MolecularForceFieldTerm, ...]
+    nonbonded_pairs: tuple[MolecularForceFieldPair, ...] = ()
     total_formal_charge: int
     total_partial_charge: float
     parameter_assignment_complete: bool
@@ -143,6 +170,17 @@ class MolecularLigandParameterization(CanonicalModel):
             raise ValueError("Parameter atom mappings must be unique.")
         if any(index >= len(self.atoms) for term in self.terms for index in term.atom_indices):
             raise ValueError("Every force-field term atom must resolve.")
+        pair_indices = tuple(
+            (pair.atom_index_a, pair.atom_index_b) for pair in self.nonbonded_pairs
+        )
+        if len(pair_indices) != len(set(pair_indices)):
+            raise ValueError("MMFF94s nonbonded pairs must be unique.")
+        if any(
+            index >= len(self.atoms)
+            for pair in self.nonbonded_pairs
+            for index in (pair.atom_index_a, pair.atom_index_b)
+        ):
+            raise ValueError("Every MMFF94s nonbonded pair atom must resolve.")
         if not self.parameter_assignment_complete:
             raise ValueError("Incomplete ligand parameter assignments cannot be canonical.")
         if abs(self.total_partial_charge - self.total_formal_charge) > 1.0e-4:
