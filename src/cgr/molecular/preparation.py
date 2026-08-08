@@ -139,6 +139,7 @@ class MolecularProteinResidueState(CanonicalModel):
     selection_source: Literal["openmm_ph_model", "semantic_override"]
     particle_partial_charge: float
     chemically_ambiguous: bool
+    alternative_variants: tuple[str, ...] = ()
 
     @field_validator(
         "residue_identifier", "chain_identifier", "source_sequence_identifier",
@@ -158,6 +159,42 @@ class MolecularProteinResidueState(CanonicalModel):
             raise ValueError("Protein residue partial charge must be finite.")
         return float(value)
 
+    @model_validator(mode="after")
+    def validate_alternatives(self) -> Self:
+        if len(self.alternative_variants) != len(set(self.alternative_variants)):
+            raise ValueError("Protein residue alternatives must be unique.")
+        if self.selected_variant in self.alternative_variants:
+            raise ValueError("Selected residue variant cannot also be an alternative.")
+        if self.chemically_ambiguous != bool(self.alternative_variants):
+            raise ValueError("Residue ambiguity must match explicit alternatives.")
+        return self
+
+
+class MolecularMetalElectronicState(CanonicalModel):
+    """One curated oxidation/d-electron/spin hypothesis for a metal site."""
+
+    state_identifier: str
+    metal_atom_identifier: str
+    element_symbol: str
+    oxidation_state: int = Field(ge=-2, le=8)
+    d_electron_count: int = Field(ge=0, le=10)
+    spin_multiplicity: int = Field(gt=0, le=12)
+    rationale: str = Field(min_length=1, max_length=500)
+    selected: bool = False
+
+    @field_validator("state_identifier", "metal_atom_identifier")
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(value)
+
+    @field_validator("element_symbol")
+    @classmethod
+    def validate_element(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or len(normalized) > 3 or not normalized.isalpha():
+            raise ValueError("Metal element symbol is invalid.")
+        return normalized[0].upper() + normalized[1:].lower()
+
 
 class MolecularProteinProtonationPreparation(CanonicalModel):
     """Auditable OpenMM pH-aware hydrogen and residue-variant preparation."""
@@ -175,6 +212,8 @@ class MolecularProteinProtonationPreparation(CanonicalModel):
     total_particle_partial_charge: float
     explicit_semantic_variant_overrides: tuple[str, ...] = ()
     contains_transition_metal: bool
+    metal_electronic_state_alternatives: tuple[MolecularMetalElectronicState, ...] = ()
+    requires_metal_state_selection: bool = False
     metal_oxidation_states_inferred: Literal[False] = False
     exact_pka_calculated: Literal[False] = False
     warnings: tuple[str, ...] = ()
@@ -208,4 +247,12 @@ class MolecularProteinProtonationPreparation(CanonicalModel):
         residue_ids = [state.residue_identifier for state in self.residue_states]
         if len(residue_ids) != len(set(residue_ids)):
             raise ValueError("Prepared protein residue identities must be unique.")
+        metal_ids = [state.state_identifier for state in self.metal_electronic_state_alternatives]
+        if len(metal_ids) != len(set(metal_ids)):
+            raise ValueError("Metal electronic-state alternatives must be unique.")
+        if self.contains_transition_metal != bool(self.metal_electronic_state_alternatives):
+            raise ValueError("Transition-metal identity requires explicit state alternatives.")
+        selected = [state for state in self.metal_electronic_state_alternatives if state.selected]
+        if self.requires_metal_state_selection != (self.contains_transition_metal and not selected):
+            raise ValueError("Metal state-selection ambiguity is inconsistent.")
         return self

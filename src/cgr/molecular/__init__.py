@@ -70,6 +70,7 @@ from .planning import (
 )
 from .preparation import (
     MolecularChemicalState,
+    MolecularMetalElectronicState,
     MolecularProteinProtonationPreparation,
     MolecularProteinResidueState,
     MolecularProtonationPreparation,
@@ -133,6 +134,13 @@ from .scene_projection import (
     ProjectedMolecularStructure,
     project_molecular_scene,
     read_projected_structure_bytes,
+)
+from .scientific_scene import (
+    MolecularScientificSceneState,
+    ScientificSceneCandidateLineage,
+    ScientificSceneInteraction,
+    ScientificScenePose,
+    ScientificSceneSelection,
 )
 from .simulation import (
     MolecularDynamicsRun,
@@ -250,6 +258,7 @@ __all__ = [
     "MolecularArtifactRepositoryError",
     "MolecularComponent",
     "MolecularChemicalState",
+    "MolecularMetalElectronicState",
     "MolecularMemberReference",
     "MolecularProject",
     "MolecularProtonationPreparation",
@@ -267,6 +276,11 @@ __all__ = [
     "MolecularSceneProjectionIntegrityError",
     "MolecularSceneManifest",
     "MolecularSceneProjectionNotFoundError",
+    "MolecularScientificSceneState",
+    "ScientificSceneCandidateLineage",
+    "ScientificSceneInteraction",
+    "ScientificScenePose",
+    "ScientificSceneSelection",
     "MolecularSelection",
     "MolecularStructure",
     "MolecularSystem",

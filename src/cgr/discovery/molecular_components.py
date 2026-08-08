@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from cgr.kernel.contracts import CapabilityVersion
@@ -39,6 +41,7 @@ _GENERATOR = "generator.rdkit_scaffold_transform"
 _CHECKER = "checker.rdkit_druglike_validity"
 _EVALUATOR = "evaluator.rdkit_3d_descriptors"
 _VERIFIER = "verifier.molecular_candidate_evidence"
+_DOCKING_EVALUATOR = "evaluator.autodock_vina_pose"
 
 
 def _identifier(prefix: str, *values: object) -> str:
@@ -427,6 +430,179 @@ class RDKitMolecularDescriptorEvaluator:
             objective_scores=tuple(scores),
             constraint_results=(conformer_constraint,),
             expensive=False,
+        )
+
+
+class VinaMolecularDockingEvaluator:
+    """Native Meeko/Vina pose evaluation for a prepared receptor and pocket."""
+
+    def __init__(
+        self,
+        store: MolecularCandidateArtifactStore,
+        *,
+        receptor_pdbqt: ArtifactPointer,
+        objective_identifier: str,
+        box_center_angstrom: tuple[float, float, float],
+        box_size_angstrom: tuple[float, float, float],
+        exhaustiveness: int = 8,
+        pose_count: int = 9,
+        random_seed: int = 20260808,
+    ) -> None:
+        if any(not math.isfinite(value) for value in (*box_center_angstrom, *box_size_angstrom)):
+            raise ValueError("Docking box coordinates must be finite.")
+        if any(value <= 0 or value > 126 for value in box_size_angstrom):
+            raise ValueError("Docking box dimensions are outside Vina bounds.")
+        if not 1 <= exhaustiveness <= 128 or not 1 <= pose_count <= 20:
+            raise ValueError("Docking search controls are outside their bounds.")
+        self._store = store
+        self._receptor = receptor_pdbqt
+        self._objective = objective_identifier
+        self._center = box_center_angstrom
+        self._size = box_size_angstrom
+        self._exhaustiveness = exhaustiveness
+        self._pose_count = pose_count
+        self._seed = random_seed
+
+    @property
+    def evaluator_identifier(self) -> str:
+        return _DOCKING_EVALUATOR
+
+    @property
+    def supported_candidate_types(self) -> tuple[str, ...]:
+        return (_CANDIDATE_TYPE,)
+
+    @property
+    def supported_objective_identifiers(self) -> tuple[str, ...]:
+        return (self._objective,)
+
+    @property
+    def stage_identifier(self) -> str:
+        return "autodock_vina_pose_generation"
+
+    @property
+    def stage_order(self) -> int:
+        return 20
+
+    def evaluate(self, candidate: DiscoveryCandidate) -> CandidateEvaluationResult:
+        from meeko import MoleculePreparation, PDBQTWriterLegacy
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from vina import Vina
+
+        receptor_bytes = self._store.read(self._receptor)
+        if hashlib.sha256(receptor_bytes).hexdigest() != self._receptor.content_sha256:
+            raise ValueError("Docking receptor bytes fail content addressing.")
+        if b"ATOM" not in receptor_bytes and b"HETATM" not in receptor_bytes:
+            raise ValueError("Docking receptor PDBQT contains no atoms.")
+        molecule = Chem.AddHs(Chem.MolFromSmiles(_read_smiles(self._store, candidate)))
+        embedding = AllChem.ETKDGv3()
+        embedding.randomSeed = self._seed
+        embedding.numThreads = 1
+        if int(AllChem.EmbedMolecule(molecule, embedding)) != 0:
+            raise ValueError("Candidate 3D conformer generation failed.")
+        if not AllChem.MMFFHasAllMoleculeParams(molecule):
+            raise ValueError("Candidate lacks complete MMFF94s preparation parameters.")
+        properties = AllChem.MMFFGetMoleculeProperties(molecule, mmffVariant="MMFF94s")
+        field = AllChem.MMFFGetMoleculeForceField(molecule, properties)
+        if field is None:
+            raise ValueError("Candidate MMFF94s force-field construction failed.")
+        field.Minimize(maxIts=500)
+        preparation = MoleculePreparation(charge_model="gasteiger", add_index_map=True)
+        setups = preparation.prepare(molecule, conformer_id=0)
+        if len(setups) != 1:
+            raise ValueError("Candidate Meeko preparation did not yield one ligand.")
+        ligand_pdbqt, success, error = PDBQTWriterLegacy.write_string(
+            setups[0], add_index_map=True, remove_smiles=False
+        )
+        if not success or error or "ROOT" not in ligand_pdbqt:
+            raise ValueError("Candidate Meeko ligand PDBQT is incomplete.")
+        with tempfile.TemporaryDirectory(prefix="cgr-discovery-vina-") as directory:
+            root = Path(directory)
+            receptor_path = root / "receptor.pdbqt"
+            ligand_path = root / "ligand.pdbqt"
+            receptor_path.write_bytes(receptor_bytes)
+            ligand_path.write_text(ligand_pdbqt, encoding="utf-8")
+            engine = Vina(sf_name="vina", cpu=1, seed=self._seed, no_refine=False, verbosity=0)
+            engine.set_receptor(str(receptor_path))
+            engine.set_ligand_from_file(str(ligand_path))
+            engine.compute_vina_maps(center=list(self._center), box_size=list(self._size))
+            engine.dock(exhaustiveness=self._exhaustiveness, n_poses=self._pose_count)
+            energies = engine.energies(n_poses=self._pose_count)
+            poses_pdbqt = engine.poses(n_poses=self._pose_count, energy_range=5.0)
+        if len(energies) < 1 or not poses_pdbqt.strip():
+            raise ValueError("Vina produced no candidate docking pose evidence.")
+        best_score = float(energies[0][0])
+        if not math.isfinite(best_score):
+            raise ValueError("Vina produced a non-finite docking score.")
+        pose_pointer = self._store.put(
+            "molecular_candidate_docking_poses_pdbqt", poses_pdbqt.encode("utf-8")
+        )
+        evidence_payload = json.dumps({
+            "candidate_identifier": candidate.candidate_identifier,
+            "receptor_sha256": self._receptor.content_sha256,
+            "box_center_angstrom": self._center,
+            "box_size_angstrom": self._size,
+            "exhaustiveness": self._exhaustiveness,
+            "requested_pose_count": self._pose_count,
+            "returned_pose_count": len(energies),
+            "vina_scores_kcal_per_mol": [float(row[0]) for row in energies],
+            "score_semantics": "autodock_vina_score_not_binding_free_energy",
+            "atom_mapping": "meeko_index_map_embedded_in_pdbqt",
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        evidence_pointer = self._store.put("molecular_candidate_docking_evaluation", evidence_payload)
+        evidence_identifier = _identifier(
+            "candidate-docking-evidence", candidate.candidate_identifier, evidence_pointer.content_sha256
+        )
+        evidence = CandidateEvidenceRecord(
+            evidence_identifier=evidence_identifier,
+            candidate_identifier=candidate.candidate_identifier,
+            candidate_sha256=candidate.fingerprint,
+            stage_identifier=self.stage_identifier,
+            stage_order=self.stage_order,
+            evaluator_identifier=self.evaluator_identifier,
+            artifacts=(evidence_pointer, pose_pointer),
+            metadata={
+                "vina_score_kcal_per_mol": best_score,
+                "binding_free_energy_calculated": False,
+                "pose_count": len(energies),
+            },
+        )
+        normalized = 1.0 / (1.0 + math.exp(max(-50.0, min(50.0, best_score + 7.0))))
+        score = CandidateObjectiveScore(
+            score_identifier=_identifier(
+                "objective-docking-score", candidate.candidate_identifier, self._objective
+            ),
+            candidate_identifier=candidate.candidate_identifier,
+            candidate_sha256=candidate.fingerprint,
+            objective_identifier=self._objective,
+            value=best_score,
+            normalized_value=normalized,
+            satisfies_objective=True,
+            evidence_identifiers=(evidence_identifier,),
+        )
+        constraint = CandidateConstraintResult(
+            result_identifier=_identifier("docking-pose-constraint", candidate.candidate_identifier),
+            candidate_identifier=candidate.candidate_identifier,
+            candidate_sha256=candidate.fingerprint,
+            constraint_identifier="native_vina_pose_generated",
+            passed=True,
+            hard=True,
+            rationale="A native Vina pose and finite score were persisted.",
+            evidence_identifiers=(evidence_identifier,),
+        )
+        return CandidateEvaluationResult(
+            result_identifier=_identifier(
+                "docking-evaluation-result", candidate.candidate_identifier, evidence_pointer.content_sha256
+            ),
+            evaluator_identifier=self.evaluator_identifier,
+            candidate_identifier=candidate.candidate_identifier,
+            candidate_sha256=candidate.fingerprint,
+            stage_identifier=self.stage_identifier,
+            stage_order=self.stage_order,
+            evidence_records=(evidence,),
+            objective_scores=(score,),
+            constraint_results=(constraint,),
+            expensive=True,
         )
 
 

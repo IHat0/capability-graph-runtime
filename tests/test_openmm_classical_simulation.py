@@ -47,7 +47,11 @@ from cgr.molecular.simulation import (
     MolecularTrajectory,
 )
 from cgr.molecular.cheminformatics import MolecularConformerSet
-from cgr.molecular.preparation import MolecularProteinProtonationPreparation
+from cgr.molecular.preparation import (
+    MolecularMetalElectronicState,
+    MolecularProteinProtonationPreparation,
+    MolecularProteinResidueState,
+)
 from cgr.science import (
     ArtifactPointer,
     ArtifactReference,
@@ -376,6 +380,48 @@ def test_declaration_exposes_all_phase5_3_capabilities_without_importing_openmm(
     )
     assert adapter.declaration.engine.engine_identifier == "engine.openmm"
     assert adapter.health().status is HealthStatus.UNAVAILABLE
+
+
+def test_protein_state_contract_retains_residue_and_metal_alternatives() -> None:
+    preparation = MolecularProteinProtonationPreparation(
+        schema_version=VERSION,
+        preparation_identifier="protein-state-metal",
+        source_structure_artifact_identifier="protein-artifact",
+        force_field_selection_identifier="force-field-protein",
+        target_ph=7.4,
+        source_atom_count=2,
+        prepared_atom_count=3,
+        hydrogen_atoms_added=1,
+        residue_states=(MolecularProteinResidueState(
+            residue_identifier="chain-a-residue-10-his",
+            chain_identifier="A",
+            source_sequence_identifier="10",
+            residue_name="HIS",
+            selected_variant="HIE",
+            selection_source="openmm_ph_model",
+            particle_partial_charge=0.0,
+            chemically_ambiguous=True,
+            alternative_variants=("HID", "HIP"),
+        ),),
+        total_particle_partial_charge=2.0,
+        contains_transition_metal=True,
+        metal_electronic_state_alternatives=(MolecularMetalElectronicState(
+            state_identifier="metal-fe-oxidation-2-multiplicity-5",
+            metal_atom_identifier="metal-fe",
+            element_symbol="Fe",
+            oxidation_state=2,
+            d_electron_count=6,
+            spin_multiplicity=5,
+            rationale="Curated high-spin Fe(II) hypothesis pending ligand-field comparison.",
+        ),),
+        requires_metal_state_selection=True,
+    )
+
+    assert preparation.residue_states[0].alternative_variants == ("HID", "HIP")
+    assert preparation.metal_electronic_state_alternatives[0].d_electron_count == 6
+    assert preparation.requires_metal_state_selection
+    assert not preparation.exact_pka_calculated
+    assert not preparation.metal_oxidation_states_inferred
 
 
 def test_system_settings_reject_hidden_or_inconsistent_nonbonded_controls() -> None:

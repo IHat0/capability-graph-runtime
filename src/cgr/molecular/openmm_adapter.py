@@ -40,6 +40,7 @@ from cgr.science import (
 from .cheminformatics import MolecularConformerSet
 from .rdkit_adapter import MolecularArtifactPayloadStore
 from .preparation import (
+    MolecularMetalElectronicState,
     MolecularProteinProtonationPreparation,
     MolecularProteinResidueState,
 )
@@ -1712,7 +1713,15 @@ class OpenMMClassicalSimulationAdapter:
             )
             for index in range(system.getNumParticles())
         )
-        ambiguous_names = {"ARG", "ASP", "CYS", "GLU", "HIS", "LYS", "TYR"}
+        residue_variant_hypotheses = {
+            "ARG": ("ARG", "ARN"),
+            "ASP": ("ASP", "ASH"),
+            "CYS": ("CYS", "CYX"),
+            "GLU": ("GLU", "GLH"),
+            "HIS": ("HID", "HIE", "HIP"),
+            "LYS": ("LYS", "LYN"),
+            "TYR": ("TYR", "TYM"),
+        }
         residue_states: list[MolecularProteinResidueState] = []
         particle_offset = 0
         for index, residue in enumerate(prepared_residues):
@@ -1722,6 +1731,13 @@ class OpenMMClassicalSimulationAdapter:
             )
             particle_offset += atom_count
             selected = str(selected_variants[index] or residue.name)
+            alternatives = tuple(
+                variant
+                for variant in residue_variant_hypotheses.get(
+                    residue.name.upper(), ()
+                )
+                if variant != selected
+            )
             residue_states.append(MolecularProteinResidueState(
                 residue_identifier=semantic_keys[index],
                 chain_identifier=residue.chain.id or "blank",
@@ -1734,7 +1750,8 @@ class OpenMMClassicalSimulationAdapter:
                     else "openmm_ph_model"
                 ),
                 particle_partial_charge=residue_charge,
-                chemically_ambiguous=residue.name.upper() in ambiguous_names,
+                chemically_ambiguous=bool(alternatives),
+                alternative_variants=alternatives,
             ))
         if particle_offset != len(charges):
             raise ValueError("Residue charges do not cover the prepared particles.")
@@ -1746,6 +1763,52 @@ class OpenMMClassicalSimulationAdapter:
             and atom.element.atomic_number in transition_metals
             for atom in prepared_atoms
         )
+        curated_metal_states = {
+            "Fe": (
+                (2, 6, 1), (2, 6, 3), (2, 6, 5),
+                (3, 5, 2), (3, 5, 4), (3, 5, 6),
+            ),
+            "Co": ((2, 7, 2), (2, 7, 4), (3, 6, 1), (3, 6, 3), (3, 6, 5)),
+            "Ni": ((2, 8, 1), (2, 8, 3)),
+            "Cu": ((1, 10, 1), (2, 9, 2)),
+            "Zn": ((2, 10, 1),),
+            "Mn": ((2, 5, 2), (2, 5, 4), (2, 5, 6), (3, 4, 3), (3, 4, 5)),
+            "Cr": ((2, 4, 3), (2, 4, 5), (3, 3, 4)),
+            "V": ((2, 3, 2), (2, 3, 4), (3, 2, 3), (4, 1, 2)),
+            "Mo": ((4, 2, 1), (4, 2, 3), (6, 0, 1)),
+        }
+        metal_states: list[MolecularMetalElectronicState] = []
+        for atom in prepared_atoms:
+            if atom.element is None or atom.element.atomic_number not in transition_metals:
+                continue
+            element_symbol = str(atom.element.symbol)
+            hypotheses = curated_metal_states.get(element_symbol)
+            if not hypotheses:
+                raise ValueError(
+                    "Transition-metal oxidation/spin alternatives are unavailable for this element."
+                )
+            chain = (atom.residue.chain.id or "blank").strip().lower() or "blank"
+            sequence = (atom.residue.id or "unknown").strip().lower() or "unknown"
+            atom_identity = (
+                f"metal-chain-{chain}-residue-{sequence}-"
+                f"{element_symbol.lower()}-atom-{int(atom.index) + 1}"
+            )
+            for oxidation, d_count, multiplicity in hypotheses:
+                metal_states.append(MolecularMetalElectronicState(
+                    state_identifier=(
+                        f"{atom_identity}-oxidation-{oxidation}-multiplicity-{multiplicity}"
+                    ),
+                    metal_atom_identifier=atom_identity,
+                    element_symbol=element_symbol,
+                    oxidation_state=oxidation,
+                    d_electron_count=d_count,
+                    spin_multiplicity=multiplicity,
+                    rationale=(
+                        "Curated first-row/enzymatic metal hypothesis; coordination geometry, "
+                        "ligand-field evidence, and comparative electronic energies are required "
+                        "before selecting a state."
+                    ),
+                ))
         warnings = [
             "OpenMM variants use force-field templates and pH heuristics; exact pKa values were not calculated.",
             "Chemically ambiguous catalytic residues should be evaluated as bounded alternatives when relevant.",
@@ -1789,6 +1852,8 @@ class OpenMMClassicalSimulationAdapter:
             total_particle_partial_charge=_rounded(sum(charges)),
             explicit_semantic_variant_overrides=tuple(sorted(overrides)),
             contains_transition_metal=contains_transition_metal,
+            metal_electronic_state_alternatives=tuple(metal_states),
+            requires_metal_state_selection=contains_transition_metal,
             warnings=tuple(warnings),
         )
         report_artifact = self._write_artifact(

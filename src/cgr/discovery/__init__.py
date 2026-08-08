@@ -37,6 +37,7 @@ from .molecular_components import (
     RDKitMolecularCandidateGenerator,
     RDKitMolecularDescriptorEvaluator,
     RDKitMolecularValidityChecker,
+    VinaMolecularDockingEvaluator,
     molecular_discovery_registries,
 )
 from .ranking import pareto_dominates, pareto_fronts, rank_candidates
@@ -82,6 +83,7 @@ __all__ = [
     "RDKitMolecularCandidateGenerator",
     "RDKitMolecularDescriptorEvaluator",
     "RDKitMolecularValidityChecker",
+    "VinaMolecularDockingEvaluator",
     "CandidateScientificVerifier",
     "CandidateScientificVerifierRegistry",
     "ContextualCandidateEvaluator",
