@@ -7,13 +7,20 @@ import json
 
 import pytest
 
-from cgr.electronic_structure import PySCFElectronicStructureAdapter
+from cgr.electronic_structure import (
+    ElectronicFrequencyAnalysis,
+    ElectronicQMMMHybridResult,
+    ElectronicQMRegionPreparation,
+    ElectronicReactionPathResult,
+    PySCFElectronicStructureAdapter,
+)
 from cgr.kernel.contracts import CapabilityVersion
 from cgr.molecular import RDKitCheminformaticsAdapter
 from cgr.quantum_workflow import QiskitQuantumWorkflowAdapter
 from cgr.pulsate_api.phase8_scientific_handlers import (
     aqueous_conformer_registry,
     bond_dissociation_registry,
+    covalent_transition_state_registry,
     metal_active_site_registry,
 )
 from cgr.pulsate_api.scientific_executions import (
@@ -39,6 +46,21 @@ class MemoryPayloadStore:
         existing = self.payloads.get(reference.artifact_identifier)
         if existing is not None and existing != value:
             raise ValueError("Artifact identifier is already bound to other bytes.")
+        self.payloads[reference.artifact_identifier] = value
+
+
+class MemoryPrivateStateStore:
+    def __init__(self) -> None:
+        self.payloads: dict[str, bytes] = {}
+
+    def read(self, reference: ArtifactReference) -> bytes:
+        return self.payloads[reference.artifact_identifier]
+
+    def write(self, reference: ArtifactReference, payload: bytes) -> None:
+        value = bytes(payload)
+        existing = self.payloads.get(reference.artifact_identifier)
+        if existing is not None and existing != value:
+            raise ValueError("Private state identifier is already bound to other bytes.")
         self.payloads[reference.artifact_identifier] = value
 
 
@@ -248,6 +270,161 @@ def _pdb_atom(
         f"HETATM{serial:5d} {name:<4s} {residue:>3s} A{sequence:4d}    "
         f"{x:8.3f}{y:8.3f}{z:8.3f}{1.0:6.2f}{0.0:6.2f}          "
         f"{element:>2s}{charge:>2s}\n"
+    )
+
+
+def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
+    pytest.importorskip("rdkit")
+    pytest.importorskip("openmm")
+    pytest.importorskip("pyscf")
+    pytest.importorskip("geometric")
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    # The active-site structure contains one chemically resolvable Cys SG.  The
+    # separate ligand is an ethyl methyl thioether: connectivity, rather than a
+    # fixture atom index, uniquely identifies the methyl electrophile and S
+    # leaving group used by the semantic resolver.
+    protein = "".join((
+        _pdb_atom(1, "O", "CYS", 1, 0.0, 0.0, -7.9, "O"),
+        _pdb_atom(2, "C", "CYS", 1, 0.0, 0.0, -6.7, "C"),
+        _pdb_atom(3, "CA", "CYS", 1, 0.0, 0.0, -5.3, "C"),
+        _pdb_atom(4, "CB", "CYS", 1, 0.0, 0.0, -3.8, "C"),
+        _pdb_atom(5, "SG", "CYS", 1, 0.0, 0.0, -2.1, "S"),
+        "TER\nEND\n",
+    )).encode()
+    ligand = Chem.AddHs(Chem.MolFromSmiles("CCSC"))
+    assert AllChem.EmbedMolecule(ligand, randomSeed=17) == 0
+    sulfur = next(atom for atom in ligand.GetAtoms() if atom.GetAtomicNum() == 16)
+    target = next(
+        atom for atom in sulfur.GetNeighbors()
+        if atom.GetAtomicNum() == 6
+        and sum(neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors()) == 3
+    )
+    scaffold = next(atom for atom in sulfur.GetNeighbors() if atom.GetIdx() != target.GetIdx())
+    distal = next(
+        atom for atom in scaffold.GetNeighbors()
+        if atom.GetAtomicNum() == 6 and atom.GetIdx() != sulfur.GetIdx()
+    )
+    conformer = ligand.GetConformer()
+    heavy_positions = {
+        target.GetIdx(): (0.0, 0.0, 0.0),
+        sulfur.GetIdx(): (0.0, 0.0, 2.1),
+        scaffold.GetIdx(): (0.0, 0.0, 3.8),
+        distal.GetIdx(): (0.0, 0.0, 5.3),
+    }
+    for index, position in heavy_positions.items():
+        conformer.SetAtomPosition(index, position)
+    offsets = ((0.95, 0.0, 0.2), (-0.48, 0.83, 0.2), (-0.48, -0.83, 0.2))
+    for atom in ligand.GetAtoms():
+        if atom.GetAtomicNum() != 1:
+            continue
+        parent = atom.GetNeighbors()[0].GetIdx()
+        parent_position = conformer.GetAtomPosition(parent)
+        sibling_index = tuple(
+            neighbor.GetIdx() for neighbor in ligand.GetAtomWithIdx(parent).GetNeighbors()
+            if neighbor.GetAtomicNum() == 1
+        ).index(atom.GetIdx())
+        dx, dy, dz = offsets[sibling_index]
+        conformer.SetAtomPosition(
+            atom.GetIdx(),
+            (parent_position.x + dx, parent_position.y + dy, parent_position.z + dz),
+        )
+    ligand_payload = Chem.MolToMolBlock(ligand).encode()
+
+    store = MemoryPayloadStore()
+    private = MemoryPrivateStateStore()
+    protein_reference = _input_artifact(
+        store,
+        identifier="scientist-cysteine-active-site",
+        artifact_type="protein_structure",
+        media_type="chemical/x-pdb",
+        payload=protein,
+    )
+    ligand_reference = _input_artifact(
+        store,
+        identifier="scientist-methyl-thioether-ligand",
+        artifact_type="ligand_structure",
+        media_type="chemical/x-mdl-molfile",
+        payload=ligand_payload,
+    )
+    repository = ScientificExecutionRepository(tmp_path / "executions")
+    repository.start()
+    record = repository.create(
+        ScientificObjectiveCompileRequest(
+            question=(
+                "Determine the transition state for covalent bond formation between "
+                "this ligand and the catalytic nucleophile in this protease and verify "
+                "that it connects reactant and product."
+            ),
+            input_references=(
+                ScientificInputReference(
+                    reference_identifier="protease",
+                    artifact_type="protein_structure",
+                    artifact_identifier=protein_reference.artifact_identifier,
+                ),
+                ScientificInputReference(
+                    reference_identifier="ligand",
+                    artifact_type="ligand_structure",
+                    artifact_identifier=ligand_reference.artifact_identifier,
+                ),
+            ),
+            artifact_references=(protein_reference, ligand_reference),
+        )
+    )
+    adapter = PySCFElectronicStructureAdapter(store, private_state_store=private)
+    runtime = ScientificObjectiveRuntime(
+        root=tmp_path / "workflow",
+        execution_repository=repository,
+        capability_registry=covalent_transition_state_registry(
+            store=store,
+            private_store=private,
+            pyscf_adapter=adapter,
+        ),
+    )
+    runtime.start()
+
+    completed = runtime.execute(record.execution_identifier)
+
+    assert completed.status == "succeeded", [
+        (node.capability_name, node.status, node.error_code, node.error_message)
+        for node in completed.node_executions
+    ]
+    assert completed.verified
+    assert completed.scene_identifier is not None
+    assert completed.scientist_result is not None
+    preparation_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "electronic_qm_region_preparation"
+    )
+    preparation = ElectronicQMRegionPreparation.model_validate_json(
+        store.read(preparation_reference)
+    )
+    assert len(preparation.boundary_links) >= 2
+    hybrid_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "electronic_qmmm_hybrid_result"
+    )
+    hybrid = ElectronicQMMMHybridResult.model_validate_json(store.read(hybrid_reference))
+    assert hybrid.no_double_counting_verified
+    assert hybrid.link_atom_gradient_projected
+    frequency_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "electronic_frequency_analysis"
+    )
+    frequency = ElectronicFrequencyAnalysis.model_validate_json(store.read(frequency_reference))
+    assert frequency.exactly_one_significant_imaginary_mode
+    path_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "electronic_reaction_path_result"
+    )
+    path = ElectronicReactionPathResult.model_validate_json(store.read(path_reference))
+    assert path.path_confirmation_passed
+    assert all(
+        forbidden not in record.objective.model_dump_json()
+        for forbidden in (
+            "atom_index", "qm_particle", "link_atom", "ts_geometry", "workflow_graph"
+        )
     )
 
 

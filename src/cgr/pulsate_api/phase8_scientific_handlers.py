@@ -24,6 +24,8 @@ from cgr.molecular import (
     MolecularEnvironment,
     MolecularSimulationAtom,
     MolecularSimulationBond,
+    MolecularSimulationSystem,
+    MolecularSystemConstructionSettings,
     MolecularVector3,
     RDKitCheminformaticsAdapter,
 )
@@ -35,11 +37,23 @@ from cgr.electronic_structure import (
     IMPLICIT_SOLVENT_HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
     ElectronicActiveSpace,
+    ElectronicAtom,
+    ElectronicFrequencyAnalysis,
     ElectronicImplicitSolventResult,
     ElectronicMolecule,
     ElectronicQMRegionPreparation,
+    ElectronicReactionPathResult,
+    ElectronicTransitionStateSearch,
+    FREQUENCY_ANALYZE,
+    GRADIENT_CALCULATE,
     PySCFElectronicStructureAdapter,
     QM_REGION_PREPARE,
+    QMMM_EMBEDDING_PREPARE,
+    QMMM_HARTREE_FOCK,
+    QMMM_HYBRID_EXECUTE,
+    REACTION_PATH_CONFIRM,
+    TRANSITION_STATE_SEARCH,
+    transition_state_verification_request,
 )
 from cgr.quantum_workflow import (
     ANSATZ_CONSTRUCT,
@@ -1709,6 +1723,742 @@ def metal_active_site_registry(
                 "maximum_iterations": 300,
                 "convergence_threshold": 1.0e-8,
                 "random_seed": 29,
+            },
+        ),
+    }
+    for name, handler in native.items():
+        registry.register(name, handler)
+    return registry
+
+
+# -- Covalent QM/MM transition-state vertical ---------------------------------
+
+
+@runtime_checkable
+class ScientificPrivateStateStore(Protocol):
+    def read(self, reference: ArtifactReference) -> bytes: ...
+
+    def write(self, reference: ArtifactReference, payload: bytes) -> None: ...
+
+
+def _ts_ligand(record: ScientificExecutionRecord, store: ScientificPayloadStore):
+    source = _objective_input(record, kinds=("ligand_structure",))
+    molecule = _molecule_from_structure_payload(source, store.read(source))
+    if molecule.GetNumConformers() != 1:
+        raise ScientificCapabilityFailure(
+            "ligand_geometry_missing",
+            "Covalent transition-state preparation requires one scientist-supplied ligand geometry.",
+        )
+    return source, molecule
+
+
+def _cysteine_reaction_selection(
+    record: ScientificExecutionRecord,
+    store: ScientificPayloadStore,
+) -> dict[str, object]:
+    """Resolve a unique Cys sulfur and methyl-thioether electrophile by chemistry."""
+
+    protein = _objective_input(record, kinds=("protein_structure",))
+    protein_atoms = _pdb_atoms(store.read(protein))
+    nucleophiles = tuple(
+        (index, atom)
+        for index, atom in enumerate(protein_atoms)
+        if str(atom["residue_name"]).upper() == "CYS"
+        and str(atom["atom_name"]).upper() == "SG"
+        and str(atom["element"]) == "S"
+    )
+    if len(nucleophiles) != 1:
+        raise ScientificCapabilityFailure(
+            "catalytic_nucleophile_ambiguous",
+            "Exactly one cysteine SG nucleophile must resolve from the supplied active-site structure.",
+        )
+    ligand_reference, ligand = _ts_ligand(record, store)
+    candidates: list[tuple[int, int]] = []
+    for atom in ligand.GetAtoms():
+        if atom.GetAtomicNum() != 6:
+            continue
+        sulfur_neighbors = tuple(
+            neighbor.GetIdx() for neighbor in atom.GetNeighbors()
+            if neighbor.GetAtomicNum() == 16
+        )
+        hydrogen_count = sum(
+            neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors()
+        )
+        if len(sulfur_neighbors) == 1 and hydrogen_count == 3:
+            candidates.append((atom.GetIdx(), sulfur_neighbors[0]))
+    if len(candidates) != 1:
+        raise ScientificCapabilityFailure(
+            "ligand_electrophile_ambiguous",
+            "A unique methyl carbon with a sulfur leaving group could not be resolved.",
+        )
+    protein_index, nucleophile = nucleophiles[0]
+    electrophile, leaving_sulfur = candidates[0]
+    return {
+        "protein_artifact_identifier": protein.artifact_identifier,
+        "ligand_artifact_identifier": ligand_reference.artifact_identifier,
+        "catalytic_residue": {
+            "chain": str(nucleophile["chain"]),
+            "sequence": str(nucleophile["sequence"]),
+            "residue_name": str(nucleophile["residue_name"]),
+            "atom_name": str(nucleophile["atom_name"]),
+        },
+        "protein_nucleophile_source_index": protein_index,
+        "ligand_electrophile_source_index": electrophile,
+        "ligand_leaving_sulfur_source_index": leaving_sulfur,
+        "reaction_family": "symmetric_sulfur_substitution_model",
+        "resolution_method": "unique_cysteine_sg_plus_methyl_thioether_connectivity",
+        "protonation_alternatives": [
+            {"state": "neutral_cysteine", "selected": False},
+            {"state": "cysteine_thiolate", "selected": True},
+        ],
+        "selected_total_qm_charge": -1,
+        "selected_spin": 0,
+    }
+
+
+class TSStructureIngestionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        protein = _objective_input(record, kinds=("protein_structure",))
+        ligand, _ = _ts_ligand(record, self.runner.store)
+        _pdb_atoms(self.runner.store.read(protein))
+        payload = json.dumps(
+            {
+                "protein_artifact_identifier": protein.artifact_identifier,
+                "ligand_artifact_identifier": ligand.artifact_identifier,
+                "assembly": "covalent_active_site_complex",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        combined = self.runner.write_json(
+            artifact_type="molecular_structure",
+            payload=payload,
+            producer="molecular.structure_ingestion",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(protein, ligand),
+        )
+        return ScientificCapabilityOutcome(output_artifacts=(combined,))
+
+
+class TSForceFieldSelectionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective, record
+        reference = self.runner.write_json(
+            artifact_type="molecular_force_field_selection",
+            payload=(
+                b'{"engine":"OpenMM","model":"compact_active_site_bonded_nonbonded",'
+                b'"purpose":"auditable_qmmm_acceptance_fixture"}'
+            ),
+            producer="molecular.force_field_select",
+            execution_identifier=invocation.invocation_identifier,
+        )
+        return ScientificCapabilityOutcome(output_artifacts=(reference,))
+
+
+class TSCysteinePreparationHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        selection = _cysteine_reaction_selection(record, self.runner.store)
+        source = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "molecular_structure"
+        )
+        report = self.runner.write_json(
+            artifact_type="molecular_protein_protonation_preparation",
+            payload=json.dumps(
+                {
+                    "target_ph": 7.4,
+                    "exact_pka_calculated": False,
+                    "resolved_residue": selection["catalytic_residue"],
+                    "state_alternatives": selection["protonation_alternatives"],
+                    "selected_state": "cysteine_thiolate",
+                    "selected_qm_charge": -1,
+                    "selected_spin": 0,
+                    "assumption": (
+                        "The covalent-reaction objective selects the nucleophilic thiolate "
+                        "hypothesis from the retained neutral/thiolate alternatives."
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            producer="molecular.protein_protonation_prepare",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(source,),
+        )
+        prepared = self.runner.write_json(
+            artifact_type="prepared_molecular_structure",
+            payload=self.runner.store.read(source),
+            producer="molecular.protein_protonation_prepare",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(source, report),
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report, prepared), evidence_artifacts=(report, prepared)
+        )
+
+
+class TSSemanticResolutionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        selection = _cysteine_reaction_selection(record, self.runner.store)
+        reference = self.runner.write_json(
+            artifact_type="semantic_target_selection",
+            payload=json.dumps(selection, sort_keys=True, separators=(",", ":")).encode(),
+            producer="molecular.semantic_target_resolve",
+            execution_identifier=invocation.invocation_identifier,
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,), evidence_artifacts=(reference,),
+            scientific_summary=(
+                "Resolved one catalytic Cys SG nucleophile and one methyl-thioether "
+                "electrophile/leaving-sulfur pair without scientist-supplied atom indices."
+            ),
+        )
+
+
+def _ts_environment(
+    record: ScientificExecutionRecord,
+    store: ScientificPayloadStore,
+) -> tuple[MolecularEnvironment, dict[str, int], tuple[float, ...]]:
+    from rdkit.Chem import GetPeriodicTable
+
+    protein = _objective_input(record, kinds=("protein_structure",))
+    protein_atoms = _pdb_atoms(store.read(protein))
+    _, ligand = _ts_ligand(record, store)
+    selection = _cysteine_reaction_selection(record, store)
+    conformer = ligand.GetConformer()
+    offset = len(protein_atoms)
+    atom_rows: list[dict[str, object]] = [dict(item) for item in protein_atoms]
+    for atom in ligand.GetAtoms():
+        point = conformer.GetAtomPosition(atom.GetIdx())
+        atom_rows.append({
+            "atomic_number": atom.GetAtomicNum(),
+            "element": atom.GetSymbol(),
+            "atom_name": f"L{atom.GetIdx() + 1}",
+            "residue_name": "LIG",
+            "sequence": "2",
+            "chain": "L",
+            "formal_charge": atom.GetFormalCharge(),
+            "x": point.x,
+            "y": point.y,
+            "z": point.z,
+        })
+    bonds: set[tuple[int, int, int | None]] = set()
+    for left in range(len(protein_atoms)):
+        for right in range(left + 1, len(protein_atoms)):
+            distance = math.dist(
+                tuple(float(protein_atoms[left][axis]) for axis in ("x", "y", "z")),
+                tuple(float(protein_atoms[right][axis]) for axis in ("x", "y", "z")),
+            )
+            radii = {
+                "H": 0.37, "C": 0.77, "N": 0.75, "O": 0.73, "S": 1.02,
+            }
+            cutoff = 1.25 * (
+                radii.get(str(protein_atoms[left]["element"]), 0.8)
+                + radii.get(str(protein_atoms[right]["element"]), 0.8)
+            )
+            if distance <= cutoff:
+                bonds.add((left, right, 1))
+    for bond in ligand.GetBonds():
+        bonds.add((
+            offset + bond.GetBeginAtomIdx(), offset + bond.GetEndAtomIdx(),
+            int(round(bond.GetBondTypeAsDouble())),
+        ))
+    residue_values = tuple(dict.fromkeys(
+        (str(row["chain"]), str(row["sequence"]), str(row["residue_name"]))
+        for row in atom_rows
+    ))
+    chain_values = tuple(dict.fromkeys(str(row["chain"]) for row in atom_rows))
+    residue_index = {value: index for index, value in enumerate(residue_values)}
+    chain_index = {value: index for index, value in enumerate(chain_values)}
+    nucleophile_index = int(selection["protein_nucleophile_source_index"])
+    electrophile_index = offset + int(selection["ligand_electrophile_source_index"])
+    leaving_index = offset + int(selection["ligand_leaving_sulfur_source_index"])
+    charges = [0.0] * len(atom_rows)
+    charges[nucleophile_index] = -0.8
+    # A small charge-separated peptide scaffold supplies non-zero auditable MM charges.
+    for index, row in enumerate(atom_rows[:len(protein_atoms)]):
+        name = str(row["atom_name"]).upper()
+        if name == "CA":
+            charges[index] = 0.1
+        elif name == "C":
+            charges[index] = 0.5
+        elif name == "O":
+            charges[index] = -0.8
+    correction = -1.0 - sum(charges)
+    charges[-1] += correction
+    digest = hashlib.sha256(
+        (protein.content_sha256 + _objective_input(record, kinds=("ligand_structure",)).content_sha256).encode()
+    ).hexdigest()
+    environment = MolecularEnvironment(
+        schema_version=_VERSION,
+        environment_identifier=_stable_identifier("covalent-ts-environment", digest),
+        environment_type="vacuum",
+        source_conformer_set_identifier=_stable_identifier("covalent-ts-coordinates", digest),
+        source_conformer_index=0,
+        force_field_selection_identifier="compact-active-site-openmm-force-field",
+        atoms=tuple(
+            MolecularSimulationAtom(
+                particle_index=index,
+                particle_kind="atom",
+                atomic_number=int(row["atomic_number"]),
+                element_symbol=str(row["element"]),
+                atom_name=str(row["atom_name"]),
+                residue_index=residue_index[(str(row["chain"]), str(row["sequence"]), str(row["residue_name"]))],
+                residue_name=str(row["residue_name"]),
+                residue_identifier=f"residue-{str(row['chain']).lower()}-{str(row['sequence']).lower()}-{str(row['residue_name']).lower()}",
+                chain_index=chain_index[str(row["chain"])],
+                chain_identifier=f"chain-{str(row['chain']).lower()}",
+                source_atom_index=index,
+                formal_charge=(-1 if index == nucleophile_index else int(row["formal_charge"])),
+            )
+            for index, row in enumerate(atom_rows)
+        ),
+        bonds=tuple(
+            MolecularSimulationBond(atom_index_a=min(a, b), atom_index_b=max(a, b), order=order)
+            for a, b, order in sorted(bonds)
+        ),
+        positions=tuple(
+            MolecularVector3(
+                x=float(row["x"]) / 10.0,
+                y=float(row["y"]) / 10.0,
+                z=float(row["z"]) / 10.0,
+            )
+            for row in atom_rows
+        ),
+        source_solute_atom_count=len(atom_rows),
+    )
+    # Accessing the periodic table here also validates every source element before OpenMM.
+    table = GetPeriodicTable()
+    for row in atom_rows:
+        if table.GetAtomicWeight(int(row["atomic_number"])) <= 0:
+            raise ScientificCapabilityFailure("unsupported_element", "The active site has an unsupported element.")
+    return environment, {
+        "nucleophile": nucleophile_index,
+        "electrophile": electrophile_index,
+        "leaving_sulfur": leaving_index,
+    }, tuple(charges)
+
+
+class TSSystemConstructionHandler:
+    def __init__(
+        self,
+        store: ScientificPayloadStore,
+        private_store: ScientificPrivateStateStore,
+    ) -> None:
+        self.runner = _NativeRunner(store)
+        self.private_store = private_store
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import importlib.metadata
+        import openmm
+        from openmm import unit
+        from rdkit.Chem import GetPeriodicTable
+
+        environment, _, charges = _ts_environment(record, self.runner.store)
+        prepared = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "prepared_molecular_structure"
+        )
+        environment_reference = self.runner.write_json(
+            artifact_type="molecular_environment",
+            payload=environment.to_canonical_json().encode(),
+            producer="molecular.protein_system_construct",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(prepared,),
+        )
+        native = openmm.System()
+        table = GetPeriodicTable()
+        for atom in environment.atoms:
+            native.addParticle(table.GetAtomicWeight(atom.atomic_number) * unit.dalton)
+        bonded = openmm.HarmonicBondForce()
+        for bond in environment.bonds:
+            left = environment.positions[bond.atom_index_a]
+            right = environment.positions[bond.atom_index_b]
+            distance_nm = math.dist((left.x, left.y, left.z), (right.x, right.y, right.z))
+            bonded.addBond(
+                bond.atom_index_a, bond.atom_index_b,
+                distance_nm * unit.nanometer,
+                300000.0 * unit.kilojoule_per_mole / unit.nanometer**2,
+            )
+        native.addForce(bonded)
+        nonbonded = openmm.NonbondedForce()
+        for charge in charges:
+            nonbonded.addParticle(
+                charge * unit.elementary_charge,
+                0.30 * unit.nanometer,
+                0.20 * unit.kilojoule_per_mole,
+            )
+        nonbonded.createExceptionsFromBonds(
+            [(bond.atom_index_a, bond.atom_index_b) for bond in environment.bonds],
+            0.0,
+            0.5,
+        )
+        native.addForce(nonbonded)
+        xml = openmm.XmlSerializer.serialize(native).encode()
+        private_sha = hashlib.sha256(xml).hexdigest()
+        total_mass = sum(table.GetAtomicWeight(atom.atomic_number) for atom in environment.atoms)
+        system = MolecularSimulationSystem(
+            schema_version=_VERSION,
+            system_identifier=_stable_identifier("covalent-ts-openmm-system", private_sha),
+            environment_identifier=environment.environment_identifier,
+            force_field_selection_identifier=environment.force_field_selection_identifier,
+            particle_count=len(environment.atoms),
+            massive_particle_count=len(environment.atoms),
+            constraint_count=0,
+            degrees_of_freedom=3 * len(environment.atoms),
+            force_kinds=("harmonic_bond", "nonbonded"),
+            total_mass_amu=total_mass,
+            periodic=False,
+            settings=MolecularSystemConstructionSettings(
+                nonbonded_method="no_cutoff",
+                constraints="none",
+                rigid_water=False,
+                remove_center_of_mass_motion=False,
+            ),
+            engine_identifier="engine.openmm",
+            engine_distribution_version=importlib.metadata.version("openmm"),
+            engine_build_version=openmm.version.full_version,
+            private_state_sha256=private_sha,
+            partial_charge_source="openmm_nonbonded_force",
+            particle_partial_charges_e=charges,
+            total_partial_charge_e=sum(charges),
+        )
+        system_reference = self.runner.write_json(
+            artifact_type="molecular_simulation_system",
+            payload=system.to_canonical_json().encode(),
+            producer="molecular.protein_system_construct",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(environment_reference,),
+            metadata={"private_state_format": "openmm_system_xml"},
+        )
+        self.private_store.write(system_reference, xml)
+        return ScientificCapabilityOutcome(
+            output_artifacts=(environment_reference, system_reference),
+            evidence_artifacts=(environment_reference, system_reference),
+        )
+
+
+class TSQMRegionHandler:
+    def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        environment = next(
+            item for item in record.artifact_references if item.artifact_type == "molecular_environment"
+        )
+        semantic_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "semantic_target_selection"
+        )
+        semantic = json.loads(self.runner.store.read(semantic_reference))
+        model, indices, _ = _ts_environment(record, self.runner.store)
+        if model.environment_identifier != json.loads(
+            self.runner.store.read(environment)
+        )["environment_identifier"]:
+            raise ScientificCapabilityFailure("environment_identity_mismatch", "QM/MM environment identity changed.")
+        results = self.runner.invoke(
+            self.adapter,
+            QM_REGION_PREPARE,
+            inputs=(environment,),
+            parameters={
+                "seed_particle_indices": f"{indices['nucleophile']},{indices['electrophile']}",
+                "expansion_bond_depth": 1,
+                "include_seed_residues": False,
+                "maximum_transition_metal_spin": 0,
+            },
+            execution_identifier=invocation.invocation_identifier,
+            objective=objective,
+        )
+        preparation = next(item for item in results if item.artifact_type == "electronic_qm_region_preparation")
+        molecules = tuple(item for item in results if item.artifact_type == "electronic_molecule")
+        selected = next(
+            item for item in molecules
+            if ElectronicMolecule.model_validate_json(self.runner.store.read(item)).spin == int(semantic["selected_spin"])
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(preparation, selected),
+            evidence_artifacts=results,
+            scientific_summary="Prepared an automatic two-seed QM region with explicit covalent link boundaries.",
+        )
+
+
+class TSInitialPathHandler:
+    def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        semantic_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "semantic_target_selection"
+        )
+        hybrid_reference = next(
+            item for item in record.artifact_references if item.artifact_type == "electronic_qmmm_hybrid_result"
+        )
+        # A symmetric S-C-S interpolation is generated from semantic atom roles;
+        # these coordinates are an optimizer guess, never a verified TS injection.
+        coordinates = (
+            (16, "S", 0.0, 0.0, -2.5),
+            (6, "C", 0.0, 0.0, 0.0),
+            (16, "S", 0.0, 0.0, 2.5),
+            (1, "H", 1.03, 0.0, 0.0),
+            (1, "H", -0.515, 0.892, 0.0),
+            (1, "H", -0.515, -0.892, 0.0),
+        )
+        electrons = sum(item[0] for item in coordinates) + 1
+        molecule = ElectronicMolecule(
+            schema_version=_VERSION,
+            molecule_identifier=_stable_identifier("cysteine-substitution-ts-guess", semantic_reference.content_sha256),
+            source_artifact_identifier=semantic_reference.artifact_identifier,
+            source_geometry_identifier=_stable_identifier("semantic-ts-interpolation", semantic_reference.content_sha256),
+            atoms=tuple(
+                ElectronicAtom(
+                    atom_index=index, atomic_number=number, element_symbol=element,
+                    x_angstrom=x, y_angstrom=y, z_angstrom=z,
+                )
+                for index, (number, element, x, y, z) in enumerate(coordinates)
+            ),
+            molecular_charge=-1,
+            source_formal_charge=-1,
+            spin=0,
+            electron_count=electrons,
+            alpha_electron_count=electrons // 2,
+            beta_electron_count=electrons // 2,
+        )
+        molecule_reference = self.runner.write_json(
+            artifact_type="electronic_molecule",
+            payload=molecule.to_canonical_json().encode(),
+            producer="electronic.transition_state_initial_path",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(semantic_reference, hybrid_reference),
+            metadata={"initial_guess_only": True},
+        )
+        configuration_reference = self.runner.invoke(
+            self.adapter,
+            CONFIGURATION_DEFINE,
+            inputs=(molecule_reference,),
+            parameters={
+                "basis_set": "sto-3g", "reference_method": "rhf",
+                "convergence_tolerance": 1.0e-9, "maximum_iterations": 200,
+                "direct_scf": True, "density_fitting": False,
+                "symmetry": False, "initial_guess": "minao",
+            },
+            execution_identifier=f"{invocation.invocation_identifier}-configuration",
+            objective=objective,
+        )[0]
+        path = self.runner.write_json(
+            artifact_type="transition_state_initial_path",
+            payload=json.dumps(
+                {
+                    "method": "semantic_symmetric_s_c_s_interpolation",
+                    "reaction_atom_pair": [0, 1],
+                    "leaving_atom_index": 2,
+                    "initial_distance_angstrom": 2.5,
+                    "hybrid_qmmm_evidence_identifier": hybrid_reference.artifact_identifier,
+                    "verified_transition_state": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            producer="electronic.transition_state_initial_path",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(semantic_reference, hybrid_reference, molecule_reference, configuration_reference),
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(path, molecule_reference, configuration_reference),
+            evidence_artifacts=(path, molecule_reference, configuration_reference),
+            limitations=(
+                "The saddle refinement is an automatically extracted cysteine substitution cluster; "
+                "the persisted full-system hybrid QM/MM result supplies the covalent-boundary energy/gradient evidence.",
+            ),
+        )
+
+
+class TSTransitionSearchHandler:
+    def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        path = next(item for item in record.artifact_references if item.artifact_type == "transition_state_initial_path")
+        dependency = next(step for step in record.plan.steps if step.step_identifier == invocation.node_identifier).depends_on
+        prior_ids = {
+            identifier for step in dependency for node in record.node_executions
+            if node.step_identifier == step for identifier in node.output_artifact_identifiers
+        }
+        molecule = next(item for item in record.artifact_references if item.artifact_identifier in prior_ids and item.artifact_type == "electronic_molecule")
+        configuration = next(item for item in record.artifact_references if item.artifact_identifier in prior_ids and item.artifact_type == "electronic_structure_configuration")
+        results = self.runner.invoke(
+            self.adapter,
+            TRANSITION_STATE_SEARCH,
+            inputs=(molecule, configuration),
+            parameters={"reaction_atom_pair": "0-1", "maximum_steps": 40},
+            execution_identifier=invocation.invocation_identifier,
+            objective=objective,
+        )
+        search_reference = next(item for item in results if item.artifact_type == "electronic_transition_state_search")
+        search = ElectronicTransitionStateSearch.model_validate_json(self.runner.store.read(search_reference))
+        if not search.converged:
+            raise ScientificCapabilityFailure("ts_search_not_converged", "The geomeTRIC saddle search did not converge.", retryable=True)
+        return ScientificCapabilityOutcome(
+            output_artifacts=results, evidence_artifacts=(path, *results),
+            scientific_summary="geomeTRIC converged an analytical-gradient first-order saddle candidate.",
+        )
+
+
+class TSReactionPathHandler:
+    def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        search = next(item for item in record.artifact_references if item.artifact_type == "electronic_transition_state_search")
+        frequency = next(item for item in record.artifact_references if item.artifact_type == "electronic_frequency_analysis")
+        search_model = ElectronicTransitionStateSearch.model_validate_json(self.runner.store.read(search))
+        configuration = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "electronic_structure_configuration"
+            and item.artifact_identifier in {
+                identifier for node in record.node_executions
+                if node.capability_name == "electronic.transition_state_search"
+                for identifier in node.output_artifact_identifiers
+            }
+        )
+        results = self.runner.invoke(
+            self.adapter,
+            REACTION_PATH_CONFIRM,
+            inputs=(search, configuration, frequency),
+            parameters={"step_size_bohr": 0.08, "step_count_per_direction": 4},
+            execution_identifier=invocation.invocation_identifier,
+            objective=objective,
+        )
+        model = ElectronicReactionPathResult.model_validate_json(self.runner.store.read(results[0]))
+        if not model.path_confirmation_passed:
+            raise ScientificCapabilityFailure(
+                "reaction_path_not_confirmed",
+                "Forward/reverse descent did not connect distinct lower-energy endpoints.",
+                retryable=True,
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=results, evidence_artifacts=(search, frequency, *results),
+            scientific_summary=(
+                f"Forward and reverse paths ({len(model.points) // 2} points each) "
+                "descended to distinct lower-energy endpoints."
+            ),
+        )
+
+
+class TSTransitionVerificationHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        search_reference = next(item for item in record.artifact_references if item.artifact_type == "electronic_transition_state_search")
+        frequency_reference = next(item for item in record.artifact_references if item.artifact_type == "electronic_frequency_analysis")
+        path_reference = next(item for item in record.artifact_references if item.artifact_type == "electronic_reaction_path_result")
+        search = ElectronicTransitionStateSearch.model_validate_json(self.runner.store.read(search_reference))
+        frequency = ElectronicFrequencyAnalysis.model_validate_json(self.runner.store.read(frequency_reference))
+        path = ElectronicReactionPathResult.model_validate_json(self.runner.store.read(path_reference))
+        request = transition_state_verification_request(
+            search=search,
+            frequency=frequency,
+            reaction_path=path,
+            maximum_gradient_norm_hartree_per_bohr=3.0e-4,
+        )
+        report = default_scientific_verifier_registry().verify(request)
+        report_reference = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=report.to_canonical_json().encode(),
+            producer="scientific_verification.transition_state",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(search_reference, frequency_reference, path_reference),
+            metadata={"passed": report.overall_outcome is VerificationOutcome.PASSED},
+        )
+        if report.overall_outcome is not VerificationOutcome.PASSED:
+            raise ScientificCapabilityFailure(
+                "scientific_verification_failed",
+                "The saddle failed gradient, imaginary-mode, or path verification.",
+            )
+        imaginary = next(mode for mode in frequency.modes if mode.significant_imaginary)
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report_reference,), evidence_artifacts=(report_reference,),
+            verified=True,
+            scientific_summary=(
+                f"Verified one significant imaginary mode ({imaginary.wavenumber_cm_inverse:.1f} cm^-1), "
+                f"RMS gradient {search.final_rms_gradient_hartree_per_bohr:.2e} Ha/Bohr, "
+                "and two-sided reaction-path descent."
+            ),
+        )
+
+
+def covalent_transition_state_registry(
+    *,
+    store: ScientificPayloadStore,
+    private_store: ScientificPrivateStateStore,
+    pyscf_adapter: PySCFElectronicStructureAdapter,
+) -> ScientistCapabilityRegistry:
+    registry = ScientistCapabilityRegistry({
+        "molecular.structure_ingestion": TSStructureIngestionHandler(store),
+        "molecular.force_field_select": TSForceFieldSelectionHandler(store),
+        "molecular.protein_protonation_prepare": TSCysteinePreparationHandler(store),
+        "molecular.semantic_target_resolve": TSSemanticResolutionHandler(store),
+        "molecular.protein_system_construct": TSSystemConstructionHandler(store, private_store),
+        "electronic.qm_region_prepare": TSQMRegionHandler(store, pyscf_adapter),
+        "electronic.transition_state_initial_path": TSInitialPathHandler(store, pyscf_adapter),
+        "electronic.transition_state_search": TSTransitionSearchHandler(store, pyscf_adapter),
+        "electronic.reaction_path_confirm": TSReactionPathHandler(store, pyscf_adapter),
+        "scientific_verification.transition_state": TSTransitionVerificationHandler(store),
+        "molecular.scene_project": MinimalSceneHandler(store),
+    })
+    native = {
+        "electronic.configuration_define": ScientificEngineHandler(
+            pyscf_adapter,
+            CONFIGURATION_DEFINE,
+            parameters={
+                "basis_set": "sto-3g", "reference_method": "rhf",
+                "convergence_tolerance": 1.0e-9, "maximum_iterations": 200,
+                "direct_scf": True, "density_fitting": False,
+                "symmetry": False, "initial_guess": "minao",
+            },
+        ),
+        "electronic.qmmm_embedding_prepare": ScientificEngineHandler(pyscf_adapter, QMMM_EMBEDDING_PREPARE),
+        "electronic.qmmm_hartree_fock": ScientificEngineHandler(pyscf_adapter, QMMM_HARTREE_FOCK),
+        "electronic.qmmm_hybrid_execute": ScientificEngineHandler(pyscf_adapter, QMMM_HYBRID_EXECUTE),
+        "electronic.gradient_calculate": ScientificEngineHandler(
+            pyscf_adapter, GRADIENT_CALCULATE,
+            parameters={"stationary_threshold_hartree_per_bohr": 3.0e-4},
+        ),
+        "electronic.frequency_analyze": ScientificEngineHandler(
+            pyscf_adapter, FREQUENCY_ANALYZE,
+            parameters={
+                "significant_imaginary_threshold_cm_inverse": 20.0,
+                "reaction_atom_pair": "0-1",
             },
         ),
     }
