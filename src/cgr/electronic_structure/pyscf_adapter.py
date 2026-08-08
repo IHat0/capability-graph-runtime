@@ -687,10 +687,14 @@ class PySCFElectronicStructureAdapter:
                 "dependency_missing",
                 "The optional PySCF dependency is unavailable.",
             )
-        except Exception:
+        except Exception as error:
+            detail = " ".join(str(error).split())[:512]
             return self._failure(
                 "electronic_execution_failed",
-                "The electronic-structure capability failed without valid evidence.",
+                (
+                    "The electronic-structure capability failed unexpectedly "
+                    f"({type(error).__name__}: {detail or 'no diagnostic supplied'})."
+                ),
             )
         return self._failure(
             "capability_not_implemented",
