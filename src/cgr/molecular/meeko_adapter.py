@@ -239,7 +239,10 @@ class MeekoDockingPreparationAdapter:
             raise ValueError("Receptor PDB bytes are invalid or too large.")
         executable = shutil.which("mk_prepare_receptor.py") or shutil.which("mk_prepare_receptor")
         if executable is None:
-            adjacent = Path(sys.executable).resolve().parent / "mk_prepare_receptor.py"
+            # Preserve the virtual-environment executable path. Resolving its
+            # Python symlink would incorrectly search the system interpreter's
+            # directory instead of the environment that installed Meeko.
+            adjacent = Path(sys.executable).parent / "mk_prepare_receptor.py"
             if adjacent.is_file():
                 executable = str(adjacent)
         if executable is None:
