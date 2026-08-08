@@ -782,3 +782,212 @@ class QMMMEmbeddingFoundation(CanonicalModel):
             )
 
         return self
+
+class ElectronicQMMMHartreeFockResult(CanonicalModel):
+    """Hartree-Fock evidence from PySCF static MM point-charge embedding."""
+
+    schema_version: CapabilityVersion
+    result_identifier: str
+    molecule_identifier: str
+    configuration_identifier: str
+    embedding_identifier: str
+    reference_method: ReferenceMethod
+
+    converged: Literal[True] = True
+    iterations: int = Field(ge=0)
+
+    electron_count: int = Field(gt=0)
+    alpha_electron_count: int = Field(ge=0)
+    beta_electron_count: int = Field(ge=0)
+
+    atomic_orbital_count: int = Field(gt=0)
+    spatial_orbital_count: int = Field(gt=0)
+
+    embedding_site_count: int = Field(gt=0)
+    embedding_total_charge_e: float
+
+    qm_nuclear_repulsion_energy_hartree: float
+    qm_mm_nuclear_interaction_energy_hartree: float
+    embedded_electronic_energy_hartree: float
+    embedded_total_energy_hartree: float
+
+    orbital_energies_alpha_hartree: tuple[float, ...] = Field(
+        min_length=1
+    )
+    orbital_energies_beta_hartree: tuple[float, ...] = Field(
+        min_length=1
+    )
+    orbital_occupations_alpha: tuple[float, ...] = Field(
+        min_length=1
+    )
+    orbital_occupations_beta: tuple[float, ...] = Field(
+        min_length=1
+    )
+
+    mo_coefficients_alpha: ElectronicTensor
+    mo_coefficients_beta: ElectronicTensor
+    overlap_matrix_ao: ElectronicTensor
+    embedded_core_hamiltonian_ao: ElectronicTensor
+    density_matrix_alpha_ao: ElectronicTensor
+    density_matrix_beta_ao: ElectronicTensor
+
+    energy_model: Literal[
+        "pyscf_point_charge_electrostatic_embedding"
+    ] = "pyscf_point_charge_electrostatic_embedding"
+
+    mm_internal_energy_included: Literal[False] = False
+    mm_mm_electrostatics_included: Literal[False] = False
+    qm_mm_vdw_included: Literal[False] = False
+
+    @field_validator("schema_version")
+    @classmethod
+    def validate_schema_version(
+        cls,
+        value: CapabilityVersion,
+    ) -> CapabilityVersion:
+        return _validate_schema_version(value)
+
+    @field_validator(
+        "result_identifier",
+        "molecule_identifier",
+        "configuration_identifier",
+        "embedding_identifier",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(
+            value,
+            label="QM/MM Hartree-Fock identifier",
+        )
+
+    @field_validator(
+        "embedding_total_charge_e",
+        "qm_nuclear_repulsion_energy_hartree",
+        "qm_mm_nuclear_interaction_energy_hartree",
+        "embedded_electronic_energy_hartree",
+        "embedded_total_energy_hartree",
+    )
+    @classmethod
+    def validate_energy_scalars(cls, value: float) -> float:
+        return _finite(
+            value,
+            label="QM/MM Hartree-Fock scalar",
+        )
+
+    @field_validator(
+        "orbital_energies_alpha_hartree",
+        "orbital_energies_beta_hartree",
+        "orbital_occupations_alpha",
+        "orbital_occupations_beta",
+    )
+    @classmethod
+    def validate_orbital_values(
+        cls,
+        value: tuple[float, ...],
+    ) -> tuple[float, ...]:
+        return tuple(
+            _finite(
+                item,
+                label="QM/MM Hartree-Fock orbital value",
+            )
+            for item in value
+        )
+
+    @model_validator(mode="after")
+    def validate_result(self) -> Self:
+        if (
+            self.alpha_electron_count
+            + self.beta_electron_count
+            != self.electron_count
+        ):
+            raise ValueError(
+                "QM/MM Hartree-Fock spin populations must sum "
+                "to the electron count."
+            )
+
+        count = self.spatial_orbital_count
+
+        if any(
+            len(values) != count
+            for values in (
+                self.orbital_energies_alpha_hartree,
+                self.orbital_energies_beta_hartree,
+                self.orbital_occupations_alpha,
+                self.orbital_occupations_beta,
+            )
+        ):
+            raise ValueError(
+                "QM/MM Hartree-Fock orbital vectors must match "
+                "the spatial-orbital count."
+            )
+
+        coefficient_shape = (
+            self.atomic_orbital_count,
+            self.spatial_orbital_count,
+        )
+
+        if (
+            self.mo_coefficients_alpha.shape
+            != coefficient_shape
+            or self.mo_coefficients_beta.shape
+            != coefficient_shape
+        ):
+            raise ValueError(
+                "QM/MM Hartree-Fock coefficient matrices "
+                "have invalid shapes."
+            )
+
+        ao_shape = (
+            self.atomic_orbital_count,
+            self.atomic_orbital_count,
+        )
+
+        for tensor in (
+            self.overlap_matrix_ao,
+            self.embedded_core_hamiltonian_ao,
+            self.density_matrix_alpha_ao,
+            self.density_matrix_beta_ao,
+        ):
+            if tensor.shape != ao_shape:
+                raise ValueError(
+                    "QM/MM Hartree-Fock AO matrices have invalid shapes."
+                )
+
+        reconstructed_total = (
+            self.embedded_electronic_energy_hartree
+            + self.qm_nuclear_repulsion_energy_hartree
+            + self.qm_mm_nuclear_interaction_energy_hartree
+        )
+
+        if not math.isclose(
+            reconstructed_total,
+            self.embedded_total_energy_hartree,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "QM/MM Hartree-Fock energy components do not "
+                "sum to the embedded total energy."
+            )
+
+        if not math.isclose(
+            sum(self.orbital_occupations_alpha),
+            self.alpha_electron_count,
+            abs_tol=1e-7,
+        ):
+            raise ValueError(
+                "QM/MM alpha occupations do not match "
+                "the alpha-electron count."
+            )
+
+        if not math.isclose(
+            sum(self.orbital_occupations_beta),
+            self.beta_electron_count,
+            abs_tol=1e-7,
+        ):
+            raise ValueError(
+                "QM/MM beta occupations do not match "
+                "the beta-electron count."
+            )
+
+        return self

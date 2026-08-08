@@ -17,11 +17,13 @@ from cgr.electronic_structure import (
     QM_REGION_PREPARE,
     ORBITALS_GENERATE,
     QMMM_EMBEDDING_PREPARE,
+    QMMM_HARTREE_FOCK,
     REFERENCE_CALCULATE,
     ElectronicActiveSpace,
     ElectronicActiveSpaceSelection,
     ElectronicHartreeFockResult,
     ElectronicMolecule,
+    ElectronicQMMMHartreeFockResult,
     ElectronicQMRegionPreparation,
     ElectronicOrbitalSet,
     ElectronicReferenceCalculation,
@@ -29,6 +31,7 @@ from cgr.electronic_structure import (
     ElectronicTensor,
     PySCFElectronicStructureAdapter,
     QMMMEmbeddingFoundation,
+    QMMMEmbeddingSite,
     pyscf_capability_envelopes,
 )
 from cgr.kernel.contracts import (
@@ -257,7 +260,7 @@ def test_declaration_exposes_phase4_capabilities_without_importing_pyscf() -> No
     envelopes = pyscf_capability_envelopes()
     after = set(sys.modules)
 
-    assert len(envelopes) == 9
+    assert len(envelopes) == 10
     assert {envelope.descriptor.capability_name for envelope in envelopes} == {
         QM_REGION_PREPARE,
         MOLECULE_CONSTRUCT,
@@ -268,6 +271,7 @@ def test_declaration_exposes_phase4_capabilities_without_importing_pyscf() -> No
         ACTIVE_SPACE_SELECT,
         ACTIVE_SPACE_CONSTRUCT,
         QMMM_EMBEDDING_PREPARE,
+        QMMM_HARTREE_FOCK,
     }
     assert not any(
         name == "pyscf" or name.startswith("pyscf.") for name in after - before
@@ -1134,4 +1138,285 @@ def test_qm_region_prepare_fails_without_charge_evidence() -> None:
     assert result.status is ExecutionStatus.FAILED
     assert result.failure is not None
     assert result.failure.code == "electronic_input_invalid"
+
+def _qmmm_embedding_for_molecule(
+    molecule_identifier: str,
+    *,
+    charge_e: float = -0.834,
+) -> QMMMEmbeddingFoundation:
+    return QMMMEmbeddingFoundation(
+        schema_version=VERSION,
+        embedding_identifier=(
+            "embedding.native-qmmm-hf"
+        ),
+        molecule_identifier=molecule_identifier,
+        qm_region_preparation_identifier=(
+            "qm-region.native-qmmm-hf"
+        ),
+        environment_identifier=(
+            "environment.native-qmmm-hf"
+        ),
+        simulation_system_identifier=(
+            "system.native-qmmm-hf"
+        ),
+        qm_source_particle_count=1,
+        embedding_sites=(
+            QMMMEmbeddingSite(
+                site_index=0,
+                source_particle_index=100,
+                element_symbol="O",
+                x_angstrom=5.0,
+                y_angstrom=0.0,
+                z_angstrom=0.0,
+                charge_e=charge_e,
+                charge_source="openmm_nonbonded_force",
+            ),
+        ),
+        embedding_total_charge_e=charge_e,
+        electrostatic_embedding_ready=True,
+        boundary_policy="no_covalent_boundary",
+        charge_model="openmm_nonbonded_force",
+    )
+
+
+def test_real_pyscf_qmmm_hartree_fock_changes_hamiltonian_and_energy() -> None:
+    pytest.importorskip("pyscf")
+
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    molecule_reference = _construct_h2(
+        adapter,
+        store,
+    )
+    configuration_reference = _configure_h2(
+        adapter,
+        molecule_reference,
+    )
+
+    molecule = ElectronicMolecule.model_validate_json(
+        store.read(molecule_reference)
+    )
+
+    embedding = _qmmm_embedding_for_molecule(
+        molecule.molecule_identifier
+    )
+    embedding_reference = _store_model(
+        store,
+        "fixture.native-qmmm-hf-embedding",
+        "qmmm_embedding_foundation",
+        embedding,
+    )
+
+    bare_invocation = adapter.invoke(
+        _invocation(
+            adapter,
+            HARTREE_FOCK,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+            ),
+            execution_identifier=(
+                "execution.native-qmmm-hf-bare"
+            ),
+        )
+    )
+
+    assert bare_invocation.status is ExecutionStatus.SUCCESS
+
+    bare = ElectronicHartreeFockResult.model_validate_json(
+        store.read(
+            bare_invocation.output_artifacts[0]
+        )
+    )
+
+    embedded_invocation = adapter.invoke(
+        _invocation(
+            adapter,
+            QMMM_HARTREE_FOCK,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+                embedding_reference,
+            ),
+            execution_identifier=(
+                "execution.native-qmmm-hf-embedded"
+            ),
+        )
+    )
+
+    assert (
+        embedded_invocation.status
+        is ExecutionStatus.SUCCESS
+    )
+
+    embedded = ElectronicQMMMHartreeFockResult.model_validate_json(
+        store.read(
+            embedded_invocation.output_artifacts[0]
+        )
+    )
+
+    assert embedded.converged
+    assert embedded.reference_method == "rhf"
+    assert embedded.embedding_identifier == (
+        embedding.embedding_identifier
+    )
+    assert embedded.embedding_site_count == 1
+    assert embedded.embedding_total_charge_e == pytest.approx(
+        -0.834
+    )
+    assert embedded.energy_model == (
+        "pyscf_point_charge_electrostatic_embedding"
+    )
+
+    assert (
+        abs(
+            embedded.embedded_total_energy_hartree
+            - bare.total_energy_hartree
+        )
+        > 1e-6
+    )
+
+    hcore_delta = max(
+        abs(embedded_value - bare_value)
+        for embedded_value, bare_value in zip(
+            embedded.embedded_core_hamiltonian_ao.values,
+            bare.core_hamiltonian_ao.values,
+            strict=True,
+        )
+    )
+
+    assert hcore_delta > 1e-8
+
+    assert (
+        embedded.embedded_total_energy_hartree
+        == pytest.approx(
+            embedded.embedded_electronic_energy_hartree
+            + embedded.qm_nuclear_repulsion_energy_hartree
+            + embedded.qm_mm_nuclear_interaction_energy_hartree,
+            abs=1e-9,
+        )
+    )
+
+    assert not embedded.mm_internal_energy_included
+    assert not embedded.mm_mm_electrostatics_included
+    assert not embedded.qm_mm_vdw_included
+
+
+@pytest.mark.parametrize(
+    "reference_method",
+    ("uhf", "rohf"),
+)
+def test_real_pyscf_qmmm_hartree_fock_supports_open_shell(
+    reference_method: str,
+) -> None:
+    pytest.importorskip("pyscf")
+
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    molecule = ElectronicMolecule(
+        schema_version=VERSION,
+        molecule_identifier=(
+            f"molecule.native-qmmm-{reference_method}"
+        ),
+        source_artifact_identifier=(
+            f"source.native-qmmm-{reference_method}"
+        ),
+        source_geometry_identifier=(
+            f"geometry.native-qmmm-{reference_method}"
+        ),
+        atoms=(
+            ElectronicAtom(
+                atom_index=0,
+                atomic_number=1,
+                element_symbol="H",
+                x_angstrom=0.0,
+                y_angstrom=0.0,
+                z_angstrom=0.0,
+                source_atom_index=0,
+            ),
+        ),
+        molecular_charge=0,
+        source_formal_charge=0,
+        spin=1,
+        electron_count=1,
+        alpha_electron_count=1,
+        beta_electron_count=0,
+    )
+
+    molecule_reference = _store_model(
+        store,
+        f"fixture.native-qmmm-{reference_method}-molecule",
+        "electronic_molecule",
+        molecule,
+    )
+
+    configuration = ElectronicStructureConfiguration(
+        schema_version=VERSION,
+        configuration_identifier=(
+            f"configuration.native-qmmm-{reference_method}"
+        ),
+        molecule_identifier=molecule.molecule_identifier,
+        basis_set="sto-3g",
+        reference_method=reference_method,
+        convergence_tolerance=1e-10,
+        maximum_iterations=100,
+        direct_scf=True,
+        density_fitting=False,
+        symmetry=False,
+        initial_guess="minao",
+    )
+
+    configuration_reference = _store_model(
+        store,
+        f"fixture.native-qmmm-{reference_method}-configuration",
+        "electronic_structure_configuration",
+        configuration,
+    )
+
+    embedding = _qmmm_embedding_for_molecule(
+        molecule.molecule_identifier
+    )
+
+    embedding_reference = _store_model(
+        store,
+        f"fixture.native-qmmm-{reference_method}-embedding",
+        "qmmm_embedding_foundation",
+        embedding,
+    )
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            QMMM_HARTREE_FOCK,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+                embedding_reference,
+            ),
+            execution_identifier=(
+                f"execution.native-qmmm-{reference_method}"
+            ),
+        )
+    )
+
+    assert result.status is ExecutionStatus.SUCCESS
+
+    evidence = ElectronicQMMMHartreeFockResult.model_validate_json(
+        store.read(result.output_artifacts[0])
+    )
+
+    assert evidence.converged
+    assert evidence.reference_method == reference_method
+    assert evidence.electron_count == 1
+    assert evidence.alpha_electron_count == 1
+    assert evidence.beta_electron_count == 0
+    assert evidence.embedded_total_energy_hartree < 0.0
+    assert (
+        abs(
+            evidence.qm_mm_nuclear_interaction_energy_hartree
+        )
+        > 1e-8
+    )
 

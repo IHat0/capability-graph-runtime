@@ -48,6 +48,7 @@ from .contracts import (
     ElectronicAtom,
     ElectronicHartreeFockResult,
     ElectronicMolecule,
+    ElectronicQMMMHartreeFockResult,
     ElectronicOrbital,
     ElectronicOrbitalSelectionScore,
     ElectronicOrbitalSet,
@@ -74,6 +75,7 @@ REFERENCE_CALCULATE = "electronic.reference_calculate"
 ACTIVE_SPACE_SELECT = "electronic.active_space_select"
 ACTIVE_SPACE_CONSTRUCT = "electronic.active_space_construct"
 QMMM_EMBEDDING_PREPARE = "electronic.qmmm_embedding_prepare"
+QMMM_HARTREE_FOCK = "electronic.qmmm_hartree_fock"
 
 
 @runtime_checkable
@@ -300,6 +302,33 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
                 "PySCF embedded electronic calculation is a separate capability.",
             ),
         ),
+        (
+            QMMM_HARTREE_FOCK,
+            (
+                "electronic_molecule",
+                "electronic_structure_configuration",
+                "qmmm_embedding_foundation",
+            ),
+            ("electronic_qmmm_hartree_fock_result",),
+            (
+                "qmmm_hartree_fock",
+                "electrostatic_embedding_execution",
+                "coupled_qm_mm_electronic_calculation",
+            ),
+            False,
+            (
+                "PySCF point-charge electrostatic embedding is used.",
+                "RHF, UHF and ROHF references are supported through "
+                "the existing explicit electronic configuration.",
+                "The embedded energy includes QM energy, QM-nuclei/MM "
+                "electrostatics and electron-density/MM electrostatics.",
+                "MM internal energy, MM-MM electrostatics, QM-MM van der "
+                "Waals and other MM bonded/nonbonded terms are not included.",
+                "Covalent QM/MM boundaries remain unavailable until an "
+                "explicit boundary-charge treatment is implemented.",
+            ),
+        ),
+
     )
 
     return tuple(
@@ -453,6 +482,7 @@ class PySCFElectronicStructureAdapter:
             REFERENCE_CALCULATE,
             ACTIVE_SPACE_SELECT,
             ACTIVE_SPACE_CONSTRUCT,
+            QMMM_HARTREE_FOCK,
         }
         if requires_engine:
             health = self.health()
@@ -482,6 +512,8 @@ class PySCFElectronicStructureAdapter:
                 return self._construct_active_space(invocation)
             if capability_name == QMMM_EMBEDDING_PREPARE:
                 return self._prepare_qmmm_embedding(invocation)
+            if capability_name == QMMM_HARTREE_FOCK:
+                return self._run_qmmm_hartree_fock(invocation)
         except (ValidationError, ValueError, KeyError, IndexError):
             return self._failure(
                 "electronic_input_invalid",
@@ -2509,5 +2541,309 @@ class PySCFElectronicStructureAdapter:
                     foundation.embedding_total_charge_e
                 ),
                 "electrostatic_embedding_ready": True,
+            },
+        )
+
+    def _run_qmmm_hartree_fock(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+
+        molecule_reference = self._require_input(
+            inputs,
+            "electronic_molecule",
+        )
+        configuration_reference = self._require_input(
+            inputs,
+            "electronic_structure_configuration",
+        )
+        embedding_reference = self._require_input(
+            inputs,
+            "qmmm_embedding_foundation",
+        )
+
+        if len(inputs) != 3:
+            raise ValueError(
+                "QM/MM Hartree-Fock requires exactly molecule, "
+                "configuration and embedding artifacts."
+            )
+
+        molecule = self._load_model(
+            molecule_reference,
+            ElectronicMolecule,
+        )
+        configuration = self._load_model(
+            configuration_reference,
+            ElectronicStructureConfiguration,
+        )
+        embedding = self._load_model(
+            embedding_reference,
+            QMMMEmbeddingFoundation,
+        )
+
+        if (
+            configuration.molecule_identifier
+            != molecule.molecule_identifier
+        ):
+            raise ValueError(
+                "Electronic configuration does not match "
+                "the QM/MM molecule."
+            )
+
+        if (
+            embedding.molecule_identifier
+            != molecule.molecule_identifier
+        ):
+            raise ValueError(
+                "QM/MM embedding does not match "
+                "the electronic molecule."
+            )
+
+        if not embedding.electrostatic_embedding_ready:
+            raise ValueError(
+                "QM/MM embedding is not ready for "
+                "electrostatic execution."
+            )
+
+        if embedding.boundary_policy != "no_covalent_boundary":
+            raise ValueError(
+                "Unsupported QM/MM boundary policy."
+            )
+
+        numpy, gto, scf, _, _ = _pyscf_modules()
+        from pyscf import qmmm
+
+        native_molecule = self._build_pyscf_molecule(
+            molecule,
+            configuration,
+            gto,
+        )
+        native_scf = self._build_scf(
+            molecule,
+            configuration,
+            native_molecule,
+            scf,
+        )
+
+        mm_coordinates = tuple(
+            (
+                site.x_angstrom,
+                site.y_angstrom,
+                site.z_angstrom,
+            )
+            for site in embedding.embedding_sites
+        )
+        mm_charges = tuple(
+            site.charge_e
+            for site in embedding.embedding_sites
+        )
+
+        native_scf = qmmm.mm_charge(
+            native_scf,
+            mm_coordinates,
+            mm_charges,
+            unit="Angstrom",
+        )
+
+        total_energy = float(native_scf.kernel())
+
+        if not bool(native_scf.converged):
+            return self._failure(
+                "qmmm_scf_not_converged",
+                "The electrostatically embedded Hartree-Fock "
+                "calculation did not converge.",
+                retryable=True,
+            )
+
+        (
+            coeff_alpha,
+            coeff_beta,
+            energy_alpha,
+            energy_beta,
+            occupation_alpha,
+            occupation_beta,
+        ) = self._spin_data(
+            numpy,
+            method=configuration.reference_method,
+            mo_coeff=native_scf.mo_coeff,
+            mo_energy=native_scf.mo_energy,
+            mo_occ=native_scf.mo_occ,
+        )
+
+        density_alpha, density_beta = self._density_matrices(
+            numpy,
+            coeff_alpha=coeff_alpha,
+            coeff_beta=coeff_beta,
+            occupation_alpha=occupation_alpha,
+            occupation_beta=occupation_beta,
+        )
+
+        overlap = numpy.asarray(native_scf.get_ovlp())
+        embedded_hcore = numpy.asarray(native_scf.get_hcore())
+
+        qm_nuclear = float(
+            native_molecule.energy_nuc()
+        )
+        embedded_nuclear = float(
+            native_scf.energy_nuc()
+        )
+        qm_mm_nuclear = (
+            embedded_nuclear
+            - qm_nuclear
+        )
+        embedded_electronic = (
+            total_energy
+            - embedded_nuclear
+        )
+
+        result = ElectronicQMMMHartreeFockResult(
+            schema_version=_SCHEMA_VERSION,
+            result_identifier=_stable_identifier(
+                "qmmm-hartree-fock",
+                molecule.molecule_identifier,
+                configuration.configuration_identifier,
+                embedding.embedding_identifier,
+                total_energy,
+                bool(native_scf.converged),
+            ),
+            molecule_identifier=molecule.molecule_identifier,
+            configuration_identifier=(
+                configuration.configuration_identifier
+            ),
+            embedding_identifier=embedding.embedding_identifier,
+            reference_method=configuration.reference_method,
+            converged=True,
+            iterations=int(
+                getattr(native_scf, "cycles", 0)
+                or 0
+            ),
+            electron_count=molecule.electron_count,
+            alpha_electron_count=molecule.alpha_electron_count,
+            beta_electron_count=molecule.beta_electron_count,
+            atomic_orbital_count=int(
+                coeff_alpha.shape[0]
+            ),
+            spatial_orbital_count=int(
+                coeff_alpha.shape[1]
+            ),
+            embedding_site_count=len(
+                embedding.embedding_sites
+            ),
+            embedding_total_charge_e=(
+                embedding.embedding_total_charge_e
+            ),
+            qm_nuclear_repulsion_energy_hartree=(
+                qm_nuclear
+            ),
+            qm_mm_nuclear_interaction_energy_hartree=(
+                qm_mm_nuclear
+            ),
+            embedded_electronic_energy_hartree=(
+                embedded_electronic
+            ),
+            embedded_total_energy_hartree=(
+                total_energy
+            ),
+            orbital_energies_alpha_hartree=tuple(
+                float(value)
+                for value in energy_alpha.tolist()
+            ),
+            orbital_energies_beta_hartree=tuple(
+                float(value)
+                for value in energy_beta.tolist()
+            ),
+            orbital_occupations_alpha=tuple(
+                float(value)
+                for value in occupation_alpha.tolist()
+            ),
+            orbital_occupations_beta=tuple(
+                float(value)
+                for value in occupation_beta.tolist()
+            ),
+            mo_coefficients_alpha=_tensor(
+                coeff_alpha,
+                unit="dimensionless",
+                index_convention="ao_by_spatial_orbital",
+            ),
+            mo_coefficients_beta=_tensor(
+                coeff_beta,
+                unit="dimensionless",
+                index_convention="ao_by_spatial_orbital",
+            ),
+            overlap_matrix_ao=_tensor(
+                overlap,
+                unit="dimensionless",
+                index_convention="ao_by_ao",
+            ),
+            embedded_core_hamiltonian_ao=_tensor(
+                embedded_hcore,
+                unit="hartree",
+                index_convention="ao_by_ao",
+            ),
+            density_matrix_alpha_ao=_tensor(
+                density_alpha,
+                unit="electron",
+                index_convention="ao_by_ao",
+            ),
+            density_matrix_beta_ao=_tensor(
+                density_beta,
+                unit="electron",
+                index_convention="ao_by_ao",
+            ),
+        )
+
+        parents = (
+            molecule_reference,
+            configuration_reference,
+            embedding_reference,
+        )
+
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type=(
+                "electronic_qmmm_hartree_fock_result"
+            ),
+            identifier_prefix="qmmm-hartree-fock",
+            parents=parents,
+            metadata={
+                "reference_method": (
+                    result.reference_method
+                ),
+                "embedding_site_count": (
+                    result.embedding_site_count
+                ),
+                "embedding_total_charge_e": (
+                    result.embedding_total_charge_e
+                ),
+                "embedded_total_energy_hartree": (
+                    result.embedded_total_energy_hartree
+                ),
+                "energy_model": result.energy_model,
+            },
+        )
+
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="calculates",
+            ),
+            diagnostics={
+                "converged": True,
+                "iterations": result.iterations,
+                "reference_method": (
+                    result.reference_method
+                ),
+                "embedding_site_count": (
+                    result.embedding_site_count
+                ),
+                "embedded_total_energy_hartree": (
+                    result.embedded_total_energy_hartree
+                ),
             },
         )
