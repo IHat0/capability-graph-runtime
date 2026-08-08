@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from cgr.kernel.contracts import CapabilityVersion, ExecutionStatus, HealthStatus
@@ -33,6 +34,12 @@ _VERSION = CapabilityVersion(major=1, minor=0, patch=0)
 _MEEKO_VERSION = "0.7.1"
 DOCKING_RECEPTOR_PREPARE = "molecular.docking_receptor_prepare"
 DOCKING_LIGAND_PREPARE = "molecular.docking_ligand_prepare"
+
+
+class _MeekoPreparationFailure(ValueError):
+    def __init__(self, message: str, *, diagnostics: Mapping[str, object]) -> None:
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics)
 
 
 def meeko_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
@@ -131,10 +138,19 @@ class MeekoDockingPreparationAdapter:
         )
 
     @staticmethod
-    def _failure(code: str, message: str) -> CapabilityResult:
+    def _failure(
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> CapabilityResult:
         return CapabilityResult(
             status=ExecutionStatus.FAILED,
-            failure=FailureInformation(code=code, message=message),
+            failure=FailureInformation(
+                code=code,
+                message=message,
+                details=dict(details or {}),
+            ),
         )
 
     def invoke(self, invocation: CapabilityInvocation) -> CapabilityResult:
@@ -155,6 +171,12 @@ class MeekoDockingPreparationAdapter:
             if invocation.capability.capability_name == DOCKING_RECEPTOR_PREPARE:
                 return self._prepare_receptor(invocation)
             return self._prepare_ligand(invocation)
+        except _MeekoPreparationFailure as error:
+            return self._failure(
+                "docking_preparation_invalid",
+                "Docking preparation failed controlled chemical validation.",
+                details=error.diagnostics,
+            )
         except (ValueError, KeyError, UnicodeDecodeError, subprocess.SubprocessError):
             return self._failure(
                 "docking_preparation_invalid",
@@ -249,7 +271,20 @@ class MeekoDockingPreparationAdapter:
                 timeout=120,
             )
             if completed.returncode != 0 or not output_path.is_file():
-                raise ValueError("Meeko receptor preparation did not produce PDBQT.")
+                stderr = " ".join(
+                    completed.stderr.decode("utf-8", errors="replace").split()
+                )[-2048:]
+                stdout = " ".join(
+                    completed.stdout.decode("utf-8", errors="replace").split()
+                )[-2048:]
+                raise _MeekoPreparationFailure(
+                    "Meeko receptor preparation did not produce PDBQT.",
+                    diagnostics={
+                        "return_code": completed.returncode,
+                        "stderr_tail": stderr or "none",
+                        "stdout_tail": stdout or "none",
+                    },
+                )
             payload = output_path.read_bytes()
         if b"ATOM" not in payload and b"HETATM" not in payload:
             raise ValueError("Prepared receptor PDBQT contains no atoms.")
