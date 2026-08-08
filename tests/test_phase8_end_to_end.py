@@ -10,7 +10,10 @@ import pytest
 from cgr.electronic_structure import PySCFElectronicStructureAdapter
 from cgr.kernel.contracts import CapabilityVersion
 from cgr.molecular import RDKitCheminformaticsAdapter
-from cgr.pulsate_api.phase8_scientific_handlers import aqueous_conformer_registry
+from cgr.pulsate_api.phase8_scientific_handlers import (
+    aqueous_conformer_registry,
+    bond_dissociation_registry,
+)
 from cgr.pulsate_api.scientific_executions import (
     ScientificExecutionRepository,
     ScientificObjectiveCompileRequest,
@@ -138,6 +141,91 @@ def test_acceptance_4_aqueous_axial_equatorial_conformer_comparison(tmp_path) ->
             "atom_index",
             "orbital_index",
             "conformer_index",
+            "workflow_graph",
+        )
+    )
+
+
+def test_acceptance_3_fifteen_point_bond_dissociation_pes(tmp_path) -> None:
+    pytest.importorskip("rdkit")
+    pytest.importorskip("pyscf")
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    molecule = Chem.AddHs(Chem.MolFromSmiles("CC"))
+    AllChem.Compute2DCoords(molecule)
+    payload = Chem.MolToMolBlock(molecule).encode("utf-8")
+    store = MemoryPayloadStore()
+    source = _input_artifact(
+        store,
+        identifier="scientist-ethane-structure",
+        artifact_type="molecular_structure",
+        media_type="chemical/x-mdl-molfile",
+        payload=payload,
+    )
+    repository = ScientificExecutionRepository(tmp_path / "executions")
+    repository.start()
+    record = repository.create(
+        ScientificObjectiveCompileRequest(
+            question=(
+                "Calculate a 15-point potential-energy scan for this bond from "
+                "1.2 Angstrom to 2.8 Angstrom and use an active space appropriate "
+                "for bond breaking."
+            ),
+            input_references=(
+                ScientificInputReference(
+                    reference_identifier="ethane",
+                    artifact_type="molecular_structure",
+                    artifact_identifier=source.artifact_identifier,
+                ),
+            ),
+            artifact_references=(source,),
+        )
+    )
+    runtime = ScientificObjectiveRuntime(
+        root=tmp_path / "workflow",
+        execution_repository=repository,
+        capability_registry=bond_dissociation_registry(
+            store=store,
+            rdkit_adapter=RDKitCheminformaticsAdapter(store),
+            pyscf_adapter=PySCFElectronicStructureAdapter(store),
+        ),
+    )
+    runtime.start()
+
+    completed = runtime.execute(record.execution_identifier)
+
+    assert completed.status == "succeeded", [
+        (node.capability_name, node.status, node.error_code)
+        for node in completed.node_executions
+    ]
+    assert completed.verified
+    assert completed.scene_identifier is not None
+    assert completed.scientist_result is not None
+    curve_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "potential_energy_curve"
+    )
+    curve = json.loads(store.read(curve_reference))
+    assert curve["point_count"] == 15
+    assert len(curve["points"]) == 15
+    assert curve["points"][0]["requested_distance_angstrom"] == 1.2
+    assert curve["points"][-1]["requested_distance_angstrom"] == 2.8
+    assert curve["automatic_active_space"] is True
+    assert all(
+        point["distance_residual_angstrom"] <= 0.05 for point in curve["points"]
+    )
+    assert len(
+        {
+            point["active_space_selection_identifier"] for point in curve["points"]
+        }
+    ) == 15
+    assert all(
+        forbidden not in record.objective.model_dump_json()
+        for forbidden in (
+            "atom_index",
+            "orbital_index",
+            "active_orbital",
             "workflow_graph",
         )
     )

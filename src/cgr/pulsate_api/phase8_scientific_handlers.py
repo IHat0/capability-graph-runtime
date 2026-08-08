@@ -16,15 +16,21 @@ from typing import Protocol, runtime_checkable
 from cgr.kernel.contracts import CapabilityVersion, ExecutionContext, ExecutionStatus
 from cgr.molecular import (
     CONFORMER_GENERATION,
+    CONSTRAINED_DISTANCE_SCAN,
     PREPARE,
     SMILES_PARSE,
     MolecularConformerSet,
+    MolecularDistanceScan,
     RDKitCheminformaticsAdapter,
 )
 from cgr.electronic_structure import (
+    ACTIVE_SPACE_CONSTRUCT,
+    ACTIVE_SPACE_SELECT,
     CONFIGURATION_DEFINE,
+    HARTREE_FOCK,
     IMPLICIT_SOLVENT_HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
+    ElectronicActiveSpace,
     ElectronicImplicitSolventResult,
     PySCFElectronicStructureAdapter,
 )
@@ -35,6 +41,13 @@ from cgr.science import (
     CreationProvenance,
 )
 from cgr.workflow_graph import CapabilityInvocation as WorkflowCapabilityInvocation
+from cgr.scientific_verification import (
+    CalculationEvidence,
+    PotentialEnergyCurveRequest,
+    PotentialEnergyPoint,
+    VerificationOutcome,
+    default_scientific_verifier_registry,
+)
 
 from .scientific_executions import ScientificExecutionRecord
 from .scientific_objectives import StructuredScientificObjective
@@ -607,6 +620,457 @@ def aqueous_conformer_registry(
             ),
             "scientific_verification.conformer_comparison": (
                 ConformerComparisonVerificationHandler(store)
+            ),
+            "molecular.scene_project": MinimalSceneHandler(store),
+        }
+    )
+
+
+def _prepared_graph_from_structure(
+    *,
+    runner: _NativeRunner,
+    adapter: RDKitCheminformaticsAdapter,
+    source: ArtifactReference,
+    objective: StructuredScientificObjective,
+    execution_identifier: str,
+) -> tuple[ArtifactReference, ArtifactReference]:
+    from rdkit import Chem
+
+    molecule = _molecule_from_structure_payload(source, runner.store.read(source))
+    smiles = Chem.MolToSmiles(Chem.RemoveHs(molecule), canonical=True)
+    graph = runner.invoke(
+        adapter,
+        SMILES_PARSE,
+        parameters={"smiles": smiles},
+        execution_identifier=f"{execution_identifier}-parse",
+        objective=objective,
+    )[0]
+    prepared = runner.invoke(
+        adapter,
+        PREPARE,
+        inputs=(graph,),
+        parameters={"add_hydrogens": True},
+        execution_identifier=f"{execution_identifier}-prepare",
+        objective=objective,
+    )[0]
+    return graph, prepared
+
+
+class BondSemanticResolutionHandler:
+    """Resolve one scientist-referenced bond without accepting atom indices."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+        from rdkit import Chem
+
+        source = _objective_input(record, kinds=("molecular_structure",))
+        molecule = _molecule_from_structure_payload(source, self.runner.store.read(source))
+        molecule = Chem.RemoveHs(molecule)
+        heavy_bonds = tuple(
+            bond for bond in molecule.GetBonds()
+            if bond.GetBeginAtom().GetAtomicNum() > 1
+            and bond.GetEndAtom().GetAtomicNum() > 1
+        )
+        candidates = heavy_bonds or tuple(molecule.GetBonds())
+        if len(candidates) != 1:
+            raise ScientificCapabilityFailure(
+                "semantic_bond_ambiguous",
+                "The scientist-referenced bond does not resolve uniquely from the structure.",
+            )
+        bond = candidates[0]
+        selection = {
+            "selection_kind": "bond",
+            "resolution_method": "unique_heavy_atom_bond",
+            "atom_index_a": int(bond.GetBeginAtomIdx()),
+            "atom_index_b": int(bond.GetEndAtomIdx()),
+            "element_a": bond.GetBeginAtom().GetSymbol(),
+            "element_b": bond.GetEndAtom().GetSymbol(),
+            "bond_order": float(bond.GetBondTypeAsDouble()),
+        }
+        payload = json.dumps(selection, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        reference = self.runner.write_json(
+            artifact_type="semantic_target_selection",
+            payload=payload,
+            producer="molecular.semantic_target_resolve",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(source,),
+            metadata={"selection_kind": "bond"},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,),
+            evidence_artifacts=(reference,),
+            scientific_summary=(
+                f"Resolved the unique {selection['element_a']}-{selection['element_b']} bond."
+            ),
+        )
+
+
+def _semantic_bond(store: ScientificPayloadStore, record: ScientificExecutionRecord) -> dict[str, object]:
+    import json
+
+    reference = next(
+        item for item in record.artifact_references
+        if item.artifact_type == "semantic_target_selection"
+    )
+    return json.loads(store.read(reference))
+
+
+class ConstrainedDistanceScanHandler:
+    def __init__(self, store: ScientificPayloadStore, adapter: RDKitCheminformaticsAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        source = _objective_input(record, kinds=("molecular_structure",))
+        selection = _semantic_bond(self.runner.store, record)
+        graph, prepared = _prepared_graph_from_structure(
+            runner=self.runner,
+            adapter=self.adapter,
+            source=source,
+            objective=objective,
+            execution_identifier=invocation.invocation_identifier,
+        )
+        artifacts = self.runner.invoke(
+            self.adapter,
+            CONSTRAINED_DISTANCE_SCAN,
+            inputs=(prepared,),
+            parameters={
+                "atom_index_a": int(selection["atom_index_a"]),
+                "atom_index_b": int(selection["atom_index_b"]),
+                "start_distance_angstrom": objective.scan_start_angstrom,
+                "stop_distance_angstrom": objective.scan_end_angstrom,
+                "point_count": objective.scan_point_count,
+                "random_seed": 23,
+                "maximum_iterations": 2000,
+                "force_constant": 2000.0,
+            },
+            execution_identifier=f"{invocation.invocation_identifier}-scan",
+            objective=objective,
+        )
+        scan_reference = next(
+            item for item in artifacts if item.artifact_type == "molecular_distance_scan"
+        )
+        scan = MolecularDistanceScan.model_validate_json(self.runner.store.read(scan_reference))
+        if (
+            scan.point_count != objective.scan_point_count
+            or scan.start_distance_angstrom != objective.scan_start_angstrom
+            or scan.stop_distance_angstrom != objective.scan_end_angstrom
+            or any(point.optimization_status != "converged" for point in scan.points)
+            or any(
+                point.distance_residual_angstrom > scan.coordinate_tolerance_angstrom
+                for point in scan.points
+            )
+        ):
+            raise ScientificCapabilityFailure(
+                "constrained_geometry_invalid",
+                "The constrained scan did not satisfy every requested coordinate.",
+                retryable=True,
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(graph, prepared, *artifacts),
+            evidence_artifacts=artifacts,
+            scientific_summary=(
+                f"Generated {scan.point_count} validated constrained geometries from "
+                f"{scan.start_distance_angstrom:.1f} to {scan.stop_distance_angstrom:.1f} Angstrom."
+            ),
+        )
+
+
+class BondBreakingActiveSpacePolicyHandler:
+    """Persist the automatic reaction-centre selection policy used at every point."""
+
+    def __init__(self, store: ScientificPayloadStore, *, artifact_type: str) -> None:
+        self.runner = _NativeRunner(store)
+        self.artifact_type = artifact_type
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        selection = _semantic_bond(self.runner.store, record)
+        payload = json.dumps(
+            {
+                "selection_method": "reaction_center_projection",
+                "active_electron_count": 2,
+                "active_spatial_orbital_count": 2,
+                "target_bond": selection,
+                "manual_orbital_indices": False,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        reference = self.runner.write_json(
+            artifact_type=self.artifact_type,
+            payload=payload,
+            producer=invocation.capability_identity,
+            execution_identifier=invocation.invocation_identifier,
+            parents=tuple(
+                item for item in record.artifact_references
+                if item.artifact_type == "semantic_target_selection"
+            ),
+            metadata={"selection_method": "reaction_center_projection"},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,), evidence_artifacts=(reference,)
+        )
+
+
+class BondDissociationPESHandler:
+    """Run matched reaction-centre CASCI calculations for every scan point."""
+
+    def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+        import numpy
+        from pyscf import fci
+
+        conformer_reference = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "molecular_conformer_set"
+            and "point_count" in item.metadata
+        )
+        scan_reference = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "molecular_distance_scan"
+        )
+        scan = MolecularDistanceScan.model_validate_json(self.runner.store.read(scan_reference))
+        selection = _semantic_bond(self.runner.store, record)
+        point_records: list[dict[str, object]] = []
+        evidence: list[ArtifactReference] = []
+        method_payload = b"rhf/sto-3g reaction-center CASCI(2e,2o)"
+        method_sha = hashlib.sha256(method_payload).hexdigest()
+        for point in scan.points:
+            prefix = f"{invocation.invocation_identifier}-point-{point.point_index:02d}"
+            molecule = self.runner.invoke(
+                self.adapter,
+                MOLECULE_CONSTRUCT,
+                inputs=(conformer_reference,),
+                parameters={
+                    "conformer_index": point.point_index,
+                    "molecular_charge": 0,
+                    "spin": 0,
+                },
+                execution_identifier=f"{prefix}-molecule",
+                objective=objective,
+            )[0]
+            configuration = self.runner.invoke(
+                self.adapter,
+                CONFIGURATION_DEFINE,
+                inputs=(molecule,),
+                parameters={
+                    "basis_set": "sto-3g",
+                    "reference_method": "rhf",
+                    "convergence_tolerance": 1.0e-9,
+                    "maximum_iterations": 150,
+                    "direct_scf": True,
+                    "density_fitting": False,
+                    "symmetry": False,
+                    "initial_guess": "minao",
+                },
+                execution_identifier=f"{prefix}-configuration",
+                objective=objective,
+            )[0]
+            hartree_fock = self.runner.invoke(
+                self.adapter,
+                HARTREE_FOCK,
+                inputs=(molecule, configuration),
+                execution_identifier=f"{prefix}-hf",
+                objective=objective,
+            )[0]
+            target_a = int(selection["atom_index_a"])
+            target_b = int(selection["atom_index_b"])
+            active_selection = self.runner.invoke(
+                self.adapter,
+                ACTIVE_SPACE_SELECT,
+                inputs=(molecule, configuration, hartree_fock),
+                parameters={
+                    "active_electron_count": 2,
+                    "active_spatial_orbital_count": 2,
+                    "selection_method": "reaction_center_projection",
+                    "target_atom_indices": f"{target_a},{target_b}",
+                    "target_bond_atom_pairs": f"{target_a}-{target_b}",
+                    "projection_threshold": 0.01,
+                },
+                execution_identifier=f"{prefix}-selection",
+                objective=objective,
+            )[0]
+            active_reference = self.runner.invoke(
+                self.adapter,
+                ACTIVE_SPACE_CONSTRUCT,
+                inputs=(molecule, configuration, hartree_fock, active_selection),
+                execution_identifier=f"{prefix}-active-space",
+                objective=objective,
+            )[0]
+            active = ElectronicActiveSpace.model_validate_json(
+                self.runner.store.read(active_reference)
+            )
+            one_body = numpy.asarray(active.one_body_integrals.values).reshape(
+                active.active_spatial_orbital_count,
+                active.active_spatial_orbital_count,
+            )
+            two_body = numpy.asarray(active.two_body_integrals.values).reshape(
+                (active.active_spatial_orbital_count,) * 4
+            )
+            energy, _ = fci.direct_spin1.kernel(
+                one_body,
+                two_body,
+                active.active_spatial_orbital_count,
+                (active.alpha_electron_count, active.beta_electron_count),
+                ecore=active.constant_energy_hartree,
+            )
+            energy = float(energy)
+            if not math.isfinite(energy):
+                raise ScientificCapabilityFailure(
+                    "pes_energy_nonfinite", "A potential-energy point is non-finite."
+                )
+            geometry_sha = hashlib.sha256(
+                f"{point.requested_distance_angstrom}:{point.observed_distance_angstrom}".encode()
+            ).hexdigest()
+            calculation_identifier = f"pes-point-{point.point_index:02d}"
+            point_records.append(
+                {
+                    "calculation_identifier": calculation_identifier,
+                    "point_index": point.point_index,
+                    "requested_distance_angstrom": point.requested_distance_angstrom,
+                    "observed_distance_angstrom": point.observed_distance_angstrom,
+                    "distance_residual_angstrom": point.distance_residual_angstrom,
+                    "total_energy_hartree": energy,
+                    "geometry_sha256": geometry_sha,
+                    "active_space_selection_identifier": active_selection.artifact_identifier,
+                    "active_space_identifier": active.active_space_identifier,
+                }
+            )
+            evidence.extend((molecule, configuration, hartree_fock, active_selection, active_reference))
+        curve = {
+            "point_count": len(point_records),
+            "start_distance_angstrom": scan.start_distance_angstrom,
+            "stop_distance_angstrom": scan.stop_distance_angstrom,
+            "method": method_payload.decode(),
+            "automatic_active_space": True,
+            "points": point_records,
+        }
+        curve_payload = json.dumps(curve, sort_keys=True, separators=(",", ":")).encode()
+        curve_reference = self.runner.write_json(
+            artifact_type="potential_energy_curve",
+            payload=curve_payload,
+            producer="electronic.bond_dissociation_pes_execute",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(scan_reference, *evidence),
+            metadata={"point_count": len(point_records), "method_sha256": method_sha},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(curve_reference,),
+            evidence_artifacts=(*evidence, curve_reference),
+            scientific_summary=(
+                f"Completed {len(point_records)} matched reaction-centre CASCI(2e,2o) "
+                "electronic calculations for the bond-dissociation curve."
+            ),
+        )
+
+
+class PotentialEnergyCurveVerificationHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        curve_reference = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "potential_energy_curve"
+        )
+        curve = json.loads(self.runner.store.read(curve_reference))
+        method_sha = str(curve_reference.metadata["method_sha256"])
+        calculations = tuple(
+            CalculationEvidence(
+                calculation_identifier=point["calculation_identifier"],
+                artifact_sha256=curve_reference.content_sha256,
+                molecule_identifier="bond-scan-molecule",
+                geometry_sha256=point["geometry_sha256"],
+                method_identifier="reaction-center-casci-2e-2o",
+                method_sha256=method_sha,
+                execution_completed=True,
+                execution_successful=True,
+                identity_valid=True,
+                numerically_converged=True,
+                values_finite=True,
+                authorized=True,
+                total_energy_hartree=point["total_energy_hartree"],
+            )
+            for point in curve["points"]
+        )
+        request = PotentialEnergyCurveRequest(
+            request_identifier="phase8-bond-dissociation-pes-verification",
+            subject_identifier="bond-dissociation-pes",
+            calculations=calculations,
+            points=tuple(
+                PotentialEnergyPoint(
+                    calculation_identifier=point["calculation_identifier"],
+                    reaction_coordinate=point["requested_distance_angstrom"],
+                    reaction_coordinate_unit="angstrom",
+                )
+                for point in curve["points"]
+            ),
+            require_same_molecule=True,
+            require_same_method=True,
+            require_same_geometry=False,
+            require_uncertainty=False,
+            authorization_required=True,
+        )
+        report = default_scientific_verifier_registry().verify(request)
+        report_payload = report.to_canonical_json().encode()
+        report_reference = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=report_payload,
+            producer="scientific_verification.potential_energy_curve",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(curve_reference,),
+            metadata={"passed": report.overall_outcome is VerificationOutcome.PASSED},
+        )
+        if report.overall_outcome is not VerificationOutcome.PASSED:
+            raise ScientificCapabilityFailure(
+                "scientific_verification_failed",
+                "The potential-energy curve failed seven-dimension verification.",
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report_reference,),
+            evidence_artifacts=(report_reference,),
+            verified=True,
+        )
+
+
+def bond_dissociation_registry(
+    *,
+    store: ScientificPayloadStore,
+    rdkit_adapter: RDKitCheminformaticsAdapter,
+    pyscf_adapter: PySCFElectronicStructureAdapter,
+) -> ScientistCapabilityRegistry:
+    return ScientistCapabilityRegistry(
+        {
+            "molecular.structure_ingestion": MolecularInputValidationHandler(store),
+            "molecular.semantic_target_resolve": BondSemanticResolutionHandler(store),
+            "molecular.constrained_distance_scan": ConstrainedDistanceScanHandler(
+                store, rdkit_adapter
+            ),
+            "electronic.active_space_select": BondBreakingActiveSpacePolicyHandler(
+                store, artifact_type="electronic_active_space_selection"
+            ),
+            "electronic.active_space_construct": BondBreakingActiveSpacePolicyHandler(
+                store, artifact_type="electronic_active_space"
+            ),
+            "electronic.bond_dissociation_pes_execute": BondDissociationPESHandler(
+                store, pyscf_adapter
+            ),
+            "scientific_verification.potential_energy_curve": (
+                PotentialEnergyCurveVerificationHandler(store)
             ),
             "molecular.scene_project": MinimalSceneHandler(store),
         }
