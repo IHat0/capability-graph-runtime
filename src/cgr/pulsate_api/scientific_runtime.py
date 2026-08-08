@@ -545,6 +545,29 @@ class ScientificObjectiveRuntime:
                     error_code=error.code,
                     error_message=error.public_message,
                 )
+            except Exception as error:
+                detail = " ".join(str(error).split())[:1024]
+                message = (
+                    "Scientist capability handler failed unexpectedly "
+                    f"({type(error).__name__}: {detail or 'no diagnostic supplied'})."
+                )
+                current = self.execution_repository.get(record.execution_identifier)
+                self._update_node(
+                    current,
+                    node.model_copy(update={
+                        "status": "failed",
+                        "attempt_count": invocation.attempt_number,
+                        "error_code": "scientific_handler_unexpected",
+                        "error_message": message,
+                    }),
+                )
+                return CapabilityInvocationResult(
+                    invocation_identifier=invocation.invocation_identifier,
+                    status=CapabilityInvocationStatus.FAILED,
+                    retryable=False,
+                    error_code="scientific_handler_unexpected",
+                    error_message=message,
+                )
             current = self.execution_repository.get(record.execution_identifier)
             merged = {
                 artifact.artifact_identifier: artifact
