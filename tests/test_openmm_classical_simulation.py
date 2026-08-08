@@ -22,6 +22,7 @@ from cgr.molecular.openmm_adapter import (
     FORCE_FIELD_SELECT,
     LIGAND_OPENMM_SYSTEM_CONSTRUCT,
     PROTEIN_PROTONATION_PREPARE,
+    PROTEIN_SYSTEM_CONSTRUCT,
     SNAPSHOT_EXTRACT,
     SYSTEM_CONSTRUCT,
     TRAJECTORY_GENERATE,
@@ -374,6 +375,7 @@ def test_declaration_exposes_all_phase5_3_capabilities_without_importing_openmm(
         FORCE_FIELD_SELECT,
         LIGAND_OPENMM_SYSTEM_CONSTRUCT,
         PROTEIN_PROTONATION_PREPARE,
+        PROTEIN_SYSTEM_CONSTRUCT,
         SNAPSHOT_EXTRACT,
         SYSTEM_CONSTRUCT,
         TRAJECTORY_GENERATE,
@@ -515,7 +517,8 @@ TER
 END
 """
     store = MemoryPayloadStore()
-    adapter = OpenMMClassicalSimulationAdapter(store, MemoryPrivateStateStore())
+    private = MemoryPrivateStateStore()
+    adapter = OpenMMClassicalSimulationAdapter(store, private)
     source = ArtifactReference(
         artifact_identifier="protein-three-alanine",
         schema_version=VERSION,
@@ -567,6 +570,24 @@ END
     assert b" H" in store.read(prepared)
     assert not report.exact_pka_calculated
     assert not report.metal_oxidation_states_inferred
+
+    system_result = adapter.invoke(_invocation(
+        adapter,
+        PROTEIN_SYSTEM_CONSTRUCT,
+        inputs=(prepared, force_field),
+        execution_identifier="execution.phase8.protein-system",
+    ))
+    assert system_result.status is ExecutionStatus.SUCCESS, system_result.failure
+    environment_reference = _artifact_by_type(system_result, "molecular_environment")
+    system_reference = _artifact_by_type(system_result, "molecular_simulation_system")
+    environment = MolecularEnvironment.model_validate_json(store.read(environment_reference))
+    system = MolecularSimulationSystem.model_validate_json(store.read(system_reference))
+    assert environment.environment_type == "vacuum"
+    assert environment.source_solute_atom_count == report.prepared_atom_count
+    assert sum(atom.formal_charge or 0 for atom in environment.atoms) == 0
+    assert system.particle_count == report.prepared_atom_count
+    assert system.partial_charge_source == "openmm_nonbonded_force"
+    assert hashlib.sha256(private.read(system_reference)).hexdigest() == system.private_state_sha256
 
 
 def test_solvent_and_ion_environment_is_periodic_and_explicit() -> None:

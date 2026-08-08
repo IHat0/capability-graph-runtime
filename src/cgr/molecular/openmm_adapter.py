@@ -80,6 +80,7 @@ _SUPPORTED_LIPIDS = frozenset({"POPC", "POPE", "DLPC", "DLPE", "DMPC", "DOPC", "
 
 FORCE_FIELD_SELECT = "molecular.force_field_select"
 PROTEIN_PROTONATION_PREPARE = "molecular.protein_protonation_prepare"
+PROTEIN_SYSTEM_CONSTRUCT = "molecular.protein_system_construct"
 ENVIRONMENT_PREPARE = "molecular.environment_prepare"
 SYSTEM_CONSTRUCT = "molecular.system_construct"
 LIGAND_OPENMM_SYSTEM_CONSTRUCT = "molecular.ligand_openmm_system_construct"
@@ -180,6 +181,17 @@ def openmm_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
                 "OpenMM Modeller adds hydrogens and selects standard residue variants at the requested pH.",
                 "Scientist-supplied overrides use semantic chain/residue/name keys, never atom indices.",
                 "No exact pKa or metal oxidation state is inferred.",
+            ),
+        ),
+        (
+            PROTEIN_SYSTEM_CONSTRUCT,
+            ("prepared_molecular_structure", "molecular_force_field_selection"),
+            ("molecular_environment", "molecular_simulation_system"),
+            ("protein_system_construction", "qmmm_environment_preparation"),
+            True,
+            (
+                "Prepared PDB topology and coordinates are retained in a vacuum OpenMM environment.",
+                "Residue-integral formal-charge bookkeeping supports complete-residue QM regions; partial-residue charge selection requires explicit review.",
             ),
         ),
         (
@@ -479,6 +491,8 @@ class OpenMMClassicalSimulationAdapter:
                 return self._select_force_field(invocation)
             if capability_name == PROTEIN_PROTONATION_PREPARE:
                 return self._prepare_protein_protonation(invocation)
+            if capability_name == PROTEIN_SYSTEM_CONSTRUCT:
+                return self._construct_protein_system(invocation)
             if capability_name == ENVIRONMENT_PREPARE:
                 return self._prepare_environment(invocation)
             if capability_name == SYSTEM_CONSTRUCT:
@@ -1889,6 +1903,185 @@ class OpenMMClassicalSimulationAdapter:
                 "residue_count": len(residue_states),
                 "total_particle_partial_charge": preparation.total_particle_partial_charge,
                 "contains_transition_metal": contains_transition_metal,
+            },
+        )
+
+    def _construct_protein_system(
+        self, invocation: CapabilityInvocation
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+        if set(inputs) != {
+            "prepared_molecular_structure",
+            "molecular_force_field_selection",
+        }:
+            raise ValueError(
+                "Protein system construction requires prepared PDB and force field."
+            )
+        structure_reference = self._require_input(
+            inputs, "prepared_molecular_structure"
+        )
+        selection_reference = self._require_input(
+            inputs, "molecular_force_field_selection"
+        )
+        selection = MolecularForceFieldSelection.model_validate_json(
+            self._read_payload(selection_reference)
+        )
+        try:
+            source_text = self._read_payload(structure_reference).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("Prepared protein PDB must be UTF-8 text.") from None
+        openmm, app, unit = _openmm_modules()
+        pdb = app.PDBFile(io.StringIO(source_text))
+        topology = pdb.topology
+        atoms = tuple(topology.atoms())
+        residues = tuple(topology.residues())
+        if not atoms or len(atoms) > _MAXIMUM_PARTICLES or not residues:
+            raise ValueError("Prepared protein PDB topology is invalid.")
+        force_field = self._force_field(selection)
+        preliminary = force_field.createSystem(
+            topology,
+            nonbondedMethod=app.NoCutoff,
+            constraints=None,
+            rigidWater=False,
+            removeCMMotion=False,
+        )
+        nonbonded = tuple(
+            preliminary.getForce(index)
+            for index in range(preliminary.getNumForces())
+            if isinstance(preliminary.getForce(index), openmm.NonbondedForce)
+        )
+        if len(nonbonded) != 1 or preliminary.getNumParticles() != len(atoms):
+            raise ValueError("Prepared protein charges are not auditable.")
+        charges = tuple(
+            float(
+                nonbonded[0].getParticleParameters(index)[0].value_in_unit(
+                    unit.elementary_charge
+                )
+            )
+            for index in range(len(atoms))
+        )
+        residue_formal_charge_by_atom: dict[int, int] = {}
+        for residue in residues:
+            members = tuple(residue.atoms())
+            if not members:
+                raise ValueError("Prepared protein contains an empty residue.")
+            total = sum(charges[int(atom.index)] for atom in members)
+            integral = int(round(total))
+            if abs(total - integral) > 1.0e-4:
+                raise ValueError("Prepared residue charge is not integral.")
+            charge_carrier = next(
+                (atom for atom in members if atom.element is not None and atom.element.atomic_number > 1),
+                members[0],
+            )
+            for atom in members:
+                residue_formal_charge_by_atom[int(atom.index)] = (
+                    integral if atom is charge_carrier else 0
+                )
+        environment_identifier = _stable_identifier(
+            "molecular-protein-vacuum-environment",
+            structure_reference.content_sha256,
+            selection.selection_identifier,
+        )
+        chain_indices = {chain: index for index, chain in enumerate(topology.chains())}
+        residue_indices = {residue: index for index, residue in enumerate(residues)}
+        environment = MolecularEnvironment(
+            schema_version=_SCHEMA_VERSION,
+            environment_identifier=environment_identifier,
+            environment_type="vacuum",
+            source_conformer_set_identifier=_stable_identifier(
+                "prepared-protein-coordinate-set", structure_reference.content_sha256
+            ),
+            source_conformer_index=0,
+            force_field_selection_identifier=selection.selection_identifier,
+            atoms=tuple(
+                MolecularSimulationAtom(
+                    particle_index=int(atom.index),
+                    particle_kind="atom",
+                    atomic_number=int(atom.element.atomic_number),
+                    element_symbol=str(atom.element.symbol),
+                    atom_name=str(atom.name),
+                    residue_index=residue_indices[atom.residue],
+                    residue_name=str(atom.residue.name),
+                    residue_identifier=(
+                        f"chain-{(atom.residue.chain.id or 'blank').lower()}-"
+                        f"residue-{(atom.residue.id or str(residue_indices[atom.residue] + 1)).lower()}-"
+                        f"{atom.residue.name.lower()}"
+                    ),
+                    chain_index=chain_indices[atom.residue.chain],
+                    chain_identifier=(
+                        f"chain-{(atom.residue.chain.id or 'blank').lower()}"
+                    ),
+                    source_atom_index=int(atom.index),
+                    formal_charge=residue_formal_charge_by_atom[int(atom.index)],
+                )
+                for atom in atoms
+                if atom.element is not None
+            ),
+            bonds=tuple(
+                MolecularSimulationBond(
+                    atom_index_a=int(atom_a.index),
+                    atom_index_b=int(atom_b.index),
+                    order=None,
+                )
+                for atom_a, atom_b in topology.bonds()
+            ),
+            positions=tuple(
+                MolecularVector3(
+                    x=float(position.x),
+                    y=float(position.y),
+                    z=float(position.z),
+                )
+                for position in pdb.positions.value_in_unit(unit.nanometer)
+            ),
+            source_solute_atom_count=len(atoms),
+        )
+        if len(environment.atoms) != len(atoms):
+            raise ValueError("Prepared protein contains unsupported extra particles.")
+        environment_artifact = self._write_artifact(
+            invocation=invocation,
+            artifact_type="molecular_environment",
+            media_type="application/vnd.pulsate.molecular-environment+json",
+            payload=environment.to_canonical_json().encode("utf-8"),
+            identifier_prefix="molecular-protein-vacuum-environment",
+            parents=(structure_reference, selection_reference),
+            metadata={
+                "environment_type": "vacuum",
+                "particle_count": len(atoms),
+                "formal_charge_bookkeeping": "residue_integral",
+            },
+        )
+        system_invocation = invocation.model_copy(update={
+            "capability": self._envelopes[SYSTEM_CONSTRUCT].descriptor,
+            "input_artifacts": (environment_artifact, selection_reference),
+            "parameters": {
+                "nonbonded_method": "no_cutoff",
+                "constraints": "none",
+                "rigid_water": False,
+                "remove_center_of_mass_motion": False,
+            },
+        })
+        system_result = self._construct_system(system_invocation)
+        if system_result.status is not ExecutionStatus.SUCCESS:
+            return system_result
+        return self._success(
+            invocation,
+            artifacts=(environment_artifact, *system_result.output_artifacts),
+            lineage=(
+                self._lineage(
+                    invocation, structure_reference, environment_artifact,
+                    "projects_coordinates_into",
+                ),
+                self._lineage(
+                    invocation, selection_reference, environment_artifact,
+                    "parameterizes",
+                ),
+                *system_result.lineage,
+            ),
+            diagnostics={
+                "particle_count": len(atoms),
+                "residue_count": len(residues),
+                "formal_charge_bookkeeping": "residue_integral",
+                "openmm_system_constructed": True,
             },
         )
 
