@@ -21,6 +21,7 @@ from cgr.electronic_structure import (
     REFERENCE_CALCULATE,
     ElectronicActiveSpace,
     ElectronicActiveSpaceSelection,
+    ElectronicAtom,
     ElectronicHartreeFockResult,
     ElectronicMolecule,
     ElectronicQMMMHartreeFockResult,
