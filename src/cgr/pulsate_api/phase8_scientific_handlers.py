@@ -474,12 +474,16 @@ class ImplicitSolventConformerComparisonHandler:
                 "energy_semantics": "solvated_electronic_energy",
             },
         )
+        implicit_references = tuple(
+            item for item in artifacts
+            if item.artifact_type == "electronic_implicit_solvent_result"
+        )
         return ScientificCapabilityOutcome(
-            output_artifacts=(*artifacts, comparison_reference),
-            evidence_artifacts=tuple(
-                item for item in artifacts
-                if item.artifact_type == "electronic_implicit_solvent_result"
-            ) + (comparison_reference,),
+            # Workflow nodes require unique output artifact types.  The second
+            # matched calculation and all intermediate molecule/configuration
+            # artifacts remain persisted as evidence rather than being hidden.
+            output_artifacts=(implicit_references[0], comparison_reference),
+            evidence_artifacts=(*artifacts, comparison_reference),
             scientific_summary=(
                 f"The {preferred} conformer has the lower matched IEF-PCM/RHF "
                 f"solvated electronic energy by {difference:.8f} Hartree. "
