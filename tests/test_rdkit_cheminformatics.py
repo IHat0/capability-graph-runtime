@@ -24,12 +24,14 @@ from cgr.molecular.cheminformatics import (
 )
 from cgr.molecular.rdkit_adapter import (
     CONFORMER_GENERATION,
+    CONSTRAINED_DISTANCE_SCAN,
     FRAGMENT,
     GEOMETRY_VALIDATION,
     PREPARE,
     SCAFFOLD,
     SMILES_PARSE,
     STRUCTURE_INGESTION,
+    SUBSTRUCTURE_RESOLUTION,
     RDKitCheminformaticsAdapter,
 )
 from cgr.science import (
@@ -133,14 +135,20 @@ def test_declaration_exposes_all_phase5_2_capabilities_without_importing_rdkit(
     assert tuple(
         envelope.descriptor.capability_name
         for envelope in adapter.declaration.capabilities
-    ) == (
-        CONFORMER_GENERATION,
-        FRAGMENT,
-        GEOMETRY_VALIDATION,
-        PREPARE,
-        SCAFFOLD,
-        SMILES_PARSE,
-        STRUCTURE_INGESTION,
+    ) == tuple(
+        sorted(
+            (
+                CONFORMER_GENERATION,
+                CONSTRAINED_DISTANCE_SCAN,
+                FRAGMENT,
+                GEOMETRY_VALIDATION,
+                PREPARE,
+                SCAFFOLD,
+                SMILES_PARSE,
+                STRUCTURE_INGESTION,
+                SUBSTRUCTURE_RESOLUTION,
+            )
+        )
     )
     assert adapter.declaration.engine.engine_identifier == "engine.rdkit"
     assert adapter.health().status is HealthStatus.UNAVAILABLE

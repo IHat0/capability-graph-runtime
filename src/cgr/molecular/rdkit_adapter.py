@@ -44,6 +44,10 @@ from .cheminformatics import (
     MolecularScaffold,
 )
 from .ingestion import StructureIngestionError, ingest_structure_bytes
+from .rdkit_advanced_geometry import (
+    constrained_bond_distance_scan,
+    resolve_smarts_substructure,
+)
 
 _SCHEMA_VERSION = CapabilityVersion(major=1, minor=0, patch=0)
 _ADAPTER_VERSION = CapabilityVersion(major=1, minor=0, patch=0)
@@ -58,6 +62,8 @@ SMILES_PARSE = "molecular.smiles_parse"
 PREPARE = "molecular.rdkit_prepare"
 CONFORMER_GENERATION = "molecular.conformer_generate"
 GEOMETRY_VALIDATION = "molecular.geometry_validate"
+CONSTRAINED_DISTANCE_SCAN = "molecular.constrained_distance_scan"
+SUBSTRUCTURE_RESOLUTION = "molecular.substructure_resolve"
 FRAGMENT = "molecular.fragment"
 SCAFFOLD = "molecular.scaffold"
 
@@ -122,6 +128,19 @@ def rdkit_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
             ("The SMILES value must be supplied explicitly as a parameter.",),
         ),
         (
+            SUBSTRUCTURE_RESOLUTION,
+            ("molecular_graph", "prepared_molecular_graph"),
+            ("molecular_substructure_resolution",),
+            (
+                "substructure_resolution",
+                "functional_group_resolution",
+            ),
+            (
+                "SMARTS resolution returns structural evidence only; "
+                "scientific interpretation remains outside RDKit.",
+            ),
+        ),
+        (
             PREPARE,
             ("molecular_graph",),
             ("prepared_molecular_graph",),
@@ -135,6 +154,25 @@ def rdkit_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
             ("conformer_generation",),
             (
                 "Conformer generation is deterministic only for the pinned RDKit version and fixed seed.",
+            ),
+        ),
+        (
+            CONSTRAINED_DISTANCE_SCAN,
+            ("prepared_molecular_graph",),
+            (
+                "molecular_conformer_set",
+                "molecular_distance_scan",
+            ),
+            (
+                "constrained_geometry_optimization",
+                "reaction_coordinate_scan",
+                "bond_distance_scan",
+            ),
+            (
+                "Version 1 constrains one explicit graph bond while optimizing "
+                "the remaining coordinates with MMFF94s or UFF.",
+                "The resulting classical scan geometries are preparation evidence, "
+                "not electronic energies.",
             ),
         ),
         (
@@ -458,10 +496,14 @@ class RDKitCheminformaticsAdapter:
                 return self._ingest_structure(invocation)
             if capability_name == SMILES_PARSE:
                 return self._parse_smiles(invocation)
+            if capability_name == SUBSTRUCTURE_RESOLUTION:
+                return self._resolve_substructure(invocation)
             if capability_name == PREPARE:
                 return self._prepare(invocation)
             if capability_name == CONFORMER_GENERATION:
                 return self._generate_conformers(invocation)
+            if capability_name == CONSTRAINED_DISTANCE_SCAN:
+                return self._constrained_distance_scan(invocation)
             if capability_name == GEOMETRY_VALIDATION:
                 return self._validate_geometry(invocation)
             if capability_name == FRAGMENT:
@@ -819,6 +861,65 @@ class RDKitCheminformaticsAdapter:
             },
         )
 
+    def _resolve_substructure(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        source = self._one_input(
+            invocation,
+            ("molecular_graph", "prepared_molecular_graph"),
+        )
+        graph = self._load_graph(source)
+        query_smarts = self._string_parameter(
+            invocation,
+            "query_smarts",
+            required=True,
+            maximum_length=_MAXIMUM_SMILES_LENGTH,
+        )
+        require_unique = self._boolean_parameter(
+            invocation,
+            "require_unique",
+            default=False,
+        )
+
+        resolution = resolve_smarts_substructure(
+            graph,
+            query_smarts=query_smarts,
+            require_unique=require_unique,
+        )
+        payload = resolution.to_canonical_json().encode("utf-8")
+        artifact = self._write_artifact(
+            invocation=invocation,
+            artifact_type="molecular_substructure_resolution",
+            media_type=(
+                "application/vnd.pulsate."
+                "molecular-substructure-resolution+json"
+            ),
+            payload=payload,
+            identifier_prefix="molecular-substructure-resolution",
+            parents=(source,),
+            metadata={
+                "match_count": len(resolution.matches),
+                "require_unique": require_unique,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(artifact,),
+            lineage=(
+                self._lineage(
+                    invocation,
+                    source,
+                    artifact,
+                    "resolved_from",
+                ),
+            ),
+            diagnostics={
+                "match_count": len(resolution.matches),
+                "query_smarts": resolution.query_smarts,
+            },
+        )
+
     def _prepare(self, invocation: CapabilityInvocation) -> CapabilityResult:
         source = self._one_input(invocation, ("molecular_graph",))
         graph = self._load_graph(source)
@@ -1050,6 +1151,175 @@ class RDKitCheminformaticsAdapter:
                 "generated_conformer_count": len(conformer_set.conformers),
                 "force_field": force_field,
                 "random_seed": random_seed,
+            },
+        )
+
+    def _constrained_distance_scan(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        source = self._one_input(
+            invocation,
+            ("prepared_molecular_graph",),
+        )
+        graph = self._load_graph(source)
+
+        atom_index_a = self._integer_parameter(
+            invocation,
+            "atom_index_a",
+            default=-1,
+            minimum=0,
+            maximum=len(graph.atoms) - 1,
+        )
+        atom_index_b = self._integer_parameter(
+            invocation,
+            "atom_index_b",
+            default=-1,
+            minimum=0,
+            maximum=len(graph.atoms) - 1,
+        )
+
+        start_value = self._parameter(
+            invocation,
+            "start_distance_angstrom",
+            required=True,
+        )
+        stop_value = self._parameter(
+            invocation,
+            "stop_distance_angstrom",
+            required=True,
+        )
+        if (
+            isinstance(start_value, bool)
+            or not isinstance(start_value, (int, float))
+            or isinstance(stop_value, bool)
+            or not isinstance(stop_value, (int, float))
+        ):
+            raise ValueError(
+                "Distance-scan endpoints must be numeric."
+            )
+
+        start_distance = float(start_value)
+        stop_distance = float(stop_value)
+        if (
+            not math.isfinite(start_distance)
+            or not math.isfinite(stop_distance)
+            or start_distance <= 0
+            or stop_distance <= 0
+        ):
+            raise ValueError(
+                "Distance-scan endpoints must be finite and positive."
+            )
+
+        point_count = self._integer_parameter(
+            invocation,
+            "point_count",
+            default=15,
+            minimum=2,
+            maximum=100,
+        )
+        random_seed = self._integer_parameter(
+            invocation,
+            "random_seed",
+            default=7,
+            minimum=0,
+            maximum=2_147_483_647,
+        )
+        maximum_iterations = self._integer_parameter(
+            invocation,
+            "maximum_iterations",
+            default=500,
+            minimum=1,
+            maximum=100_000,
+        )
+        force_constant = self._float_parameter(
+            invocation,
+            "force_constant",
+            default=1000.0,
+            minimum=1e-9,
+            maximum=1_000_000.0,
+        )
+
+        conformer_set, scan = constrained_bond_distance_scan(
+            graph,
+            atom_index_a=atom_index_a,
+            atom_index_b=atom_index_b,
+            start_distance_angstrom=start_distance,
+            stop_distance_angstrom=stop_distance,
+            point_count=point_count,
+            random_seed=random_seed,
+            maximum_iterations=maximum_iterations,
+            force_constant=force_constant,
+        )
+
+        conformer_payload = conformer_set.to_canonical_json().encode(
+            "utf-8"
+        )
+        conformer_artifact = self._write_artifact(
+            invocation=invocation,
+            artifact_type="molecular_conformer_set",
+            media_type=(
+                "application/vnd.pulsate."
+                "molecular-conformer-set+json"
+            ),
+            payload=conformer_payload,
+            identifier_prefix="molecular-conformer-set-distance-scan",
+            parents=(source,),
+            metadata={
+                "point_count": scan.point_count,
+                "bond_index": scan.bond_index,
+                "force_field": scan.force_field,
+            },
+        )
+
+        scan_payload = scan.to_canonical_json().encode("utf-8")
+        scan_artifact = self._write_artifact(
+            invocation=invocation,
+            artifact_type="molecular_distance_scan",
+            media_type=(
+                "application/vnd.pulsate."
+                "molecular-distance-scan+json"
+            ),
+            payload=scan_payload,
+            identifier_prefix="molecular-distance-scan",
+            parents=(source, conformer_artifact),
+            metadata={
+                "point_count": scan.point_count,
+                "bond_index": scan.bond_index,
+                "force_field": scan.force_field,
+                "start_distance_angstrom": (
+                    scan.start_distance_angstrom
+                ),
+                "stop_distance_angstrom": (
+                    scan.stop_distance_angstrom
+                ),
+            },
+        )
+
+        return self._success(
+            invocation,
+            artifacts=(
+                conformer_artifact,
+                scan_artifact,
+            ),
+            lineage=(
+                self._lineage(
+                    invocation,
+                    source,
+                    conformer_artifact,
+                    "constrained_from",
+                ),
+                self._lineage(
+                    invocation,
+                    conformer_artifact,
+                    scan_artifact,
+                    "described_by",
+                ),
+            ),
+            diagnostics={
+                "point_count": scan.point_count,
+                "bond_index": scan.bond_index,
+                "force_field": scan.force_field,
             },
         )
 

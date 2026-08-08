@@ -1,5 +1,11 @@
 """Artifact-backed molecular project and scene contracts."""
 
+from .advanced_geometry import (
+    MolecularDistanceScan,
+    MolecularDistanceScanPoint,
+    MolecularSubstructureMatch,
+    MolecularSubstructureResolution,
+)
 from .artifact_repository import (
     MolecularArtifactConflictError,
     MolecularArtifactIntegrityError,
@@ -62,16 +68,30 @@ from .planning import (
 )
 from .rdkit_adapter import (
     CONFORMER_GENERATION,
+    CONSTRAINED_DISTANCE_SCAN,
     FRAGMENT,
     GEOMETRY_VALIDATION,
     PREPARE,
     SCAFFOLD,
     SMILES_PARSE,
     STRUCTURE_INGESTION,
+    SUBSTRUCTURE_RESOLUTION,
     MolecularArtifactPayloadStore,
     RDKitAdapterConfigurationError,
     RDKitCheminformaticsAdapter,
     rdkit_capability_envelopes,
+)
+from .rdkit_advanced_geometry import (
+    RDKitAdvancedGeometryError,
+    constrained_bond_distance_scan,
+    resolve_smarts_substructure,
+)
+from .scientific_selection import (
+    MolecularScientificSelectionError,
+    ScientificSelectionResolution,
+    resolve_atom_selection,
+    resolve_bond_selection,
+    resolve_residue_selection,
 )
 from .scene_projection import (
     MolecularSceneProjection,
@@ -118,12 +138,14 @@ __all__ = [
     "SYSTEM_CONSTRUCT",
     "TRAJECTORY_GENERATE",
     "CONFORMER_GENERATION",
+    "CONSTRAINED_DISTANCE_SCAN",
     "FRAGMENT",
     "GEOMETRY_VALIDATION",
     "PREPARE",
     "SCAFFOLD",
     "SMILES_PARSE",
     "STRUCTURE_INGESTION",
+    "SUBSTRUCTURE_RESOLUTION",
     "MolecularArtifactPayloadStore",
     "MolecularConformer",
     "MolecularConformerSet",
@@ -159,6 +181,18 @@ __all__ = [
     "RDKitAdapterConfigurationError",
     "RDKitCheminformaticsAdapter",
     "rdkit_capability_envelopes",
+    "MolecularDistanceScan",
+    "MolecularDistanceScanPoint",
+    "MolecularSubstructureMatch",
+    "MolecularSubstructureResolution",
+    "MolecularScientificSelectionError",
+    "ScientificSelectionResolution",
+    "RDKitAdvancedGeometryError",
+    "constrained_bond_distance_scan",
+    "resolve_smarts_substructure",
+    "resolve_atom_selection",
+    "resolve_bond_selection",
+    "resolve_residue_selection",
     "MolecularArtifactConflictError",
     "MolecularArtifactIntegrityError",
     "MolecularArtifactNotFoundError",
