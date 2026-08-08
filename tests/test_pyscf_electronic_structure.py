@@ -1701,6 +1701,8 @@ def test_real_pyscf_qmmm_hartree_fock_supports_open_shell(
 
 
 def test_native_hybrid_qmmm_energy_gradient_has_no_electrostatic_double_counting() -> None:
+    import numpy
+
     pytest.importorskip("pyscf")
     openmm = pytest.importorskip("openmm")
     from openmm import unit
@@ -1733,6 +1735,9 @@ def test_native_hybrid_qmmm_energy_gradient_has_no_electrostatic_double_counting
     region_by_type = {item.artifact_type: item for item in region_result.output_artifacts}
     preparation_reference = region_by_type["electronic_qm_region_preparation"]
     molecule_reference = region_by_type["electronic_molecule"]
+    preparation = ElectronicQMRegionPreparation.model_validate_json(
+        store.read(preparation_reference)
+    )
     molecule = ElectronicMolecule.model_validate_json(store.read(molecule_reference))
     configuration_result = adapter.invoke(_invocation(
         adapter,
@@ -1863,5 +1868,34 @@ def test_native_hybrid_qmmm_energy_gradient_has_no_electrostatic_double_counting
         - hybrid.subtracted_classical_qm_mm_electrostatic_energy_hartree
         + hybrid.boundary_energy_correction_hartree,
         abs=1e-10,
+    )
+    potential = adapter.build_hybrid_qmmm_potential((
+        molecule_reference,
+        configuration_reference,
+        preparation_reference,
+        embedding_reference,
+        qmmm_result.output_artifacts[0],
+        environment_reference,
+        system_reference,
+    ))
+    coordinates = numpy.asarray([
+        (10.0 * position.x, 10.0 * position.y, 10.0 * position.z)
+        for position in environment.positions
+    ])
+    reproduced = potential.evaluate(coordinates)
+    displaced_coordinates = coordinates.copy()
+    displaced_coordinates[preparation.selected_particle_indices[0], 0] += 0.001
+    displaced = potential.evaluate(displaced_coordinates)
+
+    assert reproduced.total_energy_hartree == pytest.approx(
+        hybrid.total_hybrid_energy_hartree, abs=1e-8
+    )
+    assert potential.evaluation_count == 2
+    assert len(potential.energy_history_hartree) == 2
+    assert len(potential.gradient_norm_history_hartree_per_bohr) == 2
+    assert numpy.asarray(displaced.gradient_hartree_per_bohr).shape == (4, 3)
+    assert displaced.molecule.atoms[0].x_angstrom == pytest.approx(
+        coordinates[preparation.selected_particle_indices[0], 0]
+        + 0.001
     )
 
