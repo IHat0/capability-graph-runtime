@@ -1296,6 +1296,14 @@ class MetalSemanticResolutionHandler:
                 "metal_element": selection["metal_element"],
             },
         )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,),
+            evidence_artifacts=(reference,),
+            scientific_summary=(
+                f"Resolved {selection['metal_element']} with coordination number "
+                f"{selection['coordination_number']} and bounded oxidation/spin alternatives."
+            ),
+        )
 
 
 class ProteinInputValidationHandler:
@@ -1309,14 +1317,6 @@ class ProteinInputValidationHandler:
         return ScientificCapabilityOutcome(
             output_artifacts=(source,),
             scientific_summary="Validated the exact scientist-supplied protein/active-site PDB.",
-        )
-        return ScientificCapabilityOutcome(
-            output_artifacts=(reference,),
-            evidence_artifacts=(reference,),
-            scientific_summary=(
-                f"Resolved {selection['metal_element']} with coordination number "
-                f"{selection['coordination_number']} and bounded oxidation/spin alternatives."
-            ),
         )
 
 
