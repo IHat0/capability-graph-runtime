@@ -362,6 +362,20 @@ PUBLIC_ROUTES = frozenset({
 })
 
 ROUTE_PROTECTIONS: dict[tuple[str, str], RouteProtection] = {
+    ("POST", "/api/v1/scientific/objectives/compile"): RouteProtection(
+        (ProtectedAction.PLANNING_EVALUATE,),
+        "scientific-execution",
+        "static:collection",
+        True,
+    ),
+    (
+        "GET",
+        "/api/v1/scientific/executions/{execution_identifier}",
+    ): RouteProtection(
+        (ProtectedAction.RUN_READ,),
+        "scientific-execution",
+        "path:execution_identifier",
+    ),
     ("GET", "/api/v1/molecular/scenes/projected"): RouteProtection(
         (ProtectedAction.PROJECT_READ, ProtectedAction.SCENE_READ),
         "project",

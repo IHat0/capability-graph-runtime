@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from cgr.molecular import (
     MolecularArtifactRepository,
@@ -72,6 +72,10 @@ from .molecular_planning import (
     MOLECULAR_PLANNING_REQUEST_MAXIMUM_BYTES,
 )
 from .production_catalogue import ProductionCapabilityCatalogue
+from .scientific_executions import (
+    ScientificExecutionRepository,
+    ScientificObjectiveCompileRequest,
+)
 from .runs import (
     ArtifactUnavailableError,
     ExistingQuantumPreflightExecutor,
@@ -374,6 +378,7 @@ def create_app(
     scientific_capability_catalogue: ScientificCapabilityCatalog | None = None,
     security_services: SecurityServices | None = None,
     workflow_service: WorkflowService | None = None,
+    scientific_execution_repository: ScientificExecutionRepository | None = None,
 ) -> FastAPI:
     security_services = security_services or SecurityServices.from_environment()
     runtime_configuration = getattr(security_services, "configuration", None)
@@ -517,6 +522,21 @@ def create_app(
             observer=workflow_observer,
         )
 
+    if scientific_execution_repository is None:
+        scientific_execution_root = (
+            application_data_root / "scientific-executions"
+            if application_data_root is not None
+            else Path(
+                os.environ.get(
+                    "PULSATE_SCIENTIFIC_EXECUTION_ROOT",
+                    str(REPO_ROOT / ".pulsate-scientific-executions"),
+                )
+            )
+        )
+        scientific_execution_repository = ScientificExecutionRepository(
+            scientific_execution_root
+        )
+
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         _application.state.lifecycle_ready = False
@@ -541,6 +561,7 @@ def create_app(
                 natural_language_store.start()
                 run_coordinator.start()
                 workflow_service.start()
+                scientific_execution_repository.start()
                 if molecular_project_repository is not None:
                     molecular_project_repository.start()
                 if molecular_scene_service is not None:
@@ -574,22 +595,25 @@ def create_app(
                             molecular_project_repository.close()
                     finally:
                         try:
-                            workflow_service.close()
+                            scientific_execution_repository.close()
                         finally:
                             try:
-                                run_coordinator.close()
+                                workflow_service.close()
                             finally:
                                 try:
-                                    natural_language_store.close()
+                                    run_coordinator.close()
                                 finally:
                                     try:
-                                        experiment_store.close()
+                                        natural_language_store.close()
                                     finally:
                                         try:
-                                            if production_capability_catalogue is not None:
-                                                production_capability_catalogue.close()
+                                            experiment_store.close()
                                         finally:
-                                            security_services.close()
+                                            try:
+                                                if production_capability_catalogue is not None:
+                                                    production_capability_catalogue.close()
+                                            finally:
+                                                security_services.close()
 
     async def enforce_security(request: Request) -> None:
         route = request.scope.get("route")
@@ -663,6 +687,9 @@ def create_app(
         production_capability_catalogue
     )
     application.state.security_services = security_services
+    application.state.scientific_execution_repository = (
+        scientific_execution_repository
+    )
     application.state.lifecycle_ready = False
 
     @application.exception_handler(SecurityBoundaryError)
@@ -902,6 +929,55 @@ def create_app(
             "service": "pulsate-api", "status": "healthy", "version": "0.2.0",
         }
 
+    @application.post("/api/v1/scientific/objectives/compile", status_code=201)
+    async def compile_scientific_request(request: Request):
+        payload = await _read_bounded_json_object(
+            request,
+            maximum_bytes=2 * 1024 * 1024,
+            error_code="scientific_objective_invalid",
+            error_message="Scientific objective request is invalid.",
+            too_large_code="scientific_objective_too_large",
+            too_large_message="Scientific objective request exceeds its size limit.",
+        )
+        try:
+            compile_request = ScientificObjectiveCompileRequest.model_validate(payload)
+            return scientific_execution_repository.create(compile_request)
+        except ValidationError:
+            raise _typed_error(
+                422,
+                "scientific_objective_invalid",
+                "Scientific objective request is invalid.",
+            ) from None
+        except ValueError:
+            raise _typed_error(
+                422,
+                "scientific_objective_unsupported",
+                "Scientific objective is unsupported or ambiguous.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "scientific_execution_unavailable",
+                "Scientific execution persistence is unavailable.",
+            ) from None
+
+    @application.get("/api/v1/scientific/executions/{execution_identifier}")
+    def get_scientific_execution(execution_identifier: str):
+        try:
+            return scientific_execution_repository.get(execution_identifier)
+        except KeyError:
+            raise _typed_error(
+                404,
+                "scientific_execution_not_found",
+                "Scientific execution was not found.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "scientific_execution_unavailable",
+                "Scientific execution persistence is unavailable.",
+            ) from None
+
     @application.get("/live")
     def liveness() -> dict[str, str]:
         return {"status": "alive"}
@@ -917,6 +993,7 @@ def create_app(
             molecular_scene_service,
             molecular_planning_service,
             workflow_service,
+            scientific_execution_repository,
         )
         repositories_ready = all(
             service is None or bool(getattr(service, "_started", True))
