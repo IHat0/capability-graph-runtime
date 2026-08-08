@@ -2353,7 +2353,7 @@ class TSReactionPathHandler:
             self.adapter,
             REACTION_PATH_CONFIRM,
             inputs=(search, configuration, frequency),
-            parameters={"step_size_bohr": 0.08, "step_count_per_direction": 4},
+            parameters={"step_size_bohr": 0.08, "step_count_per_direction": 8},
             execution_identifier=invocation.invocation_identifier,
             objective=objective,
         )
