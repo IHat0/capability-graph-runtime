@@ -7,7 +7,9 @@ import hashlib
 import pytest
 
 from cgr.electronic_structure import (
+    ACTIVE_SPACE_SELECT,
     MOLECULE_CONSTRUCT,
+    QM_REGION_PREPARE,
     ElectronicArtifactPayloadStore,
     PySCFElectronicStructureAdapter,
 )
@@ -179,8 +181,13 @@ def test_pyscf_adapter_is_discoverable_and_executes_through_workflow() -> None:
         invocation_builder=InvocationBuilder(),
     )
 
-    assert len(bridges) == 7
-    assert MOLECULE_CONSTRUCT in registry.identities()
+    assert len(bridges) == len(adapter.declaration.capabilities)
+
+    registered = set(registry.identities())
+
+    assert MOLECULE_CONSTRUCT in registered
+    assert ACTIVE_SPACE_SELECT in registered
+    assert QM_REGION_PREPARE in registered
     discovered = catalogue.find(
         objective_type="electronic_molecule_construction",
         execution_target="local_cpu",
