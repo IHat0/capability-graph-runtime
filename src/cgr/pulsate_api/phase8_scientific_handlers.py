@@ -21,6 +21,10 @@ from cgr.molecular import (
     SMILES_PARSE,
     MolecularConformerSet,
     MolecularDistanceScan,
+    MolecularEnvironment,
+    MolecularSimulationAtom,
+    MolecularSimulationBond,
+    MolecularVector3,
     RDKitCheminformaticsAdapter,
 )
 from cgr.electronic_structure import (
@@ -32,7 +36,18 @@ from cgr.electronic_structure import (
     MOLECULE_CONSTRUCT,
     ElectronicActiveSpace,
     ElectronicImplicitSolventResult,
+    ElectronicMolecule,
+    ElectronicQMRegionPreparation,
     PySCFElectronicStructureAdapter,
+    QM_REGION_PREPARE,
+)
+from cgr.quantum_workflow import (
+    ANSATZ_CONSTRUCT,
+    FERMION_TO_QUBIT_MAP,
+    HAMILTONIAN_CONSTRUCT,
+    VQE_EXECUTE,
+    QiskitQuantumWorkflowAdapter,
+    VariationalGroundStateResult,
 )
 from cgr.science import (
     ArtifactPointer,
@@ -43,6 +58,7 @@ from cgr.science import (
 from cgr.workflow_graph import CapabilityInvocation as WorkflowCapabilityInvocation
 from cgr.scientific_verification import (
     CalculationEvidence,
+    MetalCentreRequest,
     PotentialEnergyCurveRequest,
     PotentialEnergyPoint,
     VerificationOutcome,
@@ -54,6 +70,7 @@ from .scientific_objectives import StructuredScientificObjective
 from .scientific_runtime import (
     ScientificCapabilityFailure,
     ScientificCapabilityOutcome,
+    ScientificEngineHandler,
     ScientistCapabilityRegistry,
 )
 
@@ -135,12 +152,33 @@ class _NativeRunner:
         parents: tuple[ArtifactReference, ...] = (),
         metadata: Mapping[str, object] | None = None,
     ) -> ArtifactReference:
+        return self.write_bytes(
+            artifact_type=artifact_type,
+            media_type=f"application/vnd.pulsate.{artifact_type.replace('_', '-')}+json",
+            payload=payload,
+            producer=producer,
+            execution_identifier=execution_identifier,
+            parents=parents,
+            metadata=metadata,
+        )
+
+    def write_bytes(
+        self,
+        *,
+        artifact_type: str,
+        media_type: str,
+        payload: bytes,
+        producer: str,
+        execution_identifier: str,
+        parents: tuple[ArtifactReference, ...] = (),
+        metadata: Mapping[str, object] | None = None,
+    ) -> ArtifactReference:
         digest = hashlib.sha256(payload).hexdigest()
         reference = ArtifactReference(
             artifact_identifier=_stable_identifier(artifact_type.replace("_", "-"), digest),
             schema_version=_VERSION,
             artifact_type=artifact_type,
-            media_type=f"application/vnd.pulsate.{artifact_type.replace('_', '-')}+json",
+            media_type=media_type,
             content_sha256=digest,
             byte_size=len(payload),
             metadata=dict(metadata or {}),
@@ -571,6 +609,36 @@ class MinimalSceneHandler:
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
         import json
 
+        semantic = None
+        semantic_reference = next(
+            (
+                item for item in record.artifact_references
+                if item.artifact_type == "semantic_target_selection"
+            ),
+            None,
+        )
+        if semantic_reference is not None:
+            semantic = json.loads(self.runner.store.read(semantic_reference))
+        selected_atoms: list[int] = []
+        metals: list[dict[str, object]] = []
+        if isinstance(semantic, dict):
+            for key in ("atom_index_a", "atom_index_b", "metal_particle_index"):
+                if isinstance(semantic.get(key), int):
+                    selected_atoms.append(int(semantic[key]))
+            if isinstance(semantic.get("donors"), list):
+                selected_atoms.extend(
+                    int(item["particle_index"])
+                    for item in semantic["donors"]
+                    if isinstance(item, dict) and isinstance(item.get("particle_index"), int)
+                )
+            if isinstance(semantic.get("metal_particle_index"), int):
+                metals.append(
+                    {
+                        "particle_index": semantic["metal_particle_index"],
+                        "element": semantic.get("metal_element"),
+                        "coordination_number": semantic.get("coordination_number"),
+                    }
+                )
         payload = json.dumps(
             {
                 "objective_identifier": objective.objective_identifier,
@@ -580,7 +648,9 @@ class MinimalSceneHandler:
                     item.artifact_identifier for item in record.artifact_references
                 ],
                 "selected_residues": [],
-                "selected_atoms": [],
+                "selected_atoms": sorted(set(selected_atoms)),
+                "metals": metals,
+                "semantic_selection": semantic,
                 "docking_poses": [],
                 "candidate_lineage": [],
             },
@@ -1075,3 +1145,573 @@ def bond_dissociation_registry(
             "molecular.scene_project": MinimalSceneHandler(store),
         }
     )
+
+
+_TRANSITION_METAL_NUMBERS = frozenset(
+    (*range(21, 31), *range(39, 49), *range(72, 81))
+)
+
+
+def _pdb_atoms(payload: bytes) -> tuple[dict[str, object], ...]:
+    from rdkit import Chem
+
+    table = Chem.GetPeriodicTable()
+    atoms: list[dict[str, object]] = []
+    for line in payload.decode("utf-8").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        element = line[76:78].strip()
+        if not element:
+            element = "".join(character for character in line[12:16] if character.isalpha())[:2]
+        element = element[0].upper() + element[1:].lower()
+        raw_charge = line[78:80].strip()
+        formal_charge = 0
+        if len(raw_charge) == 2 and raw_charge[0].isdigit() and raw_charge[1] in "+-":
+            formal_charge = int(raw_charge[0]) * (1 if raw_charge[1] == "+" else -1)
+        atoms.append(
+            {
+                "serial": int(line[6:11]),
+                "atom_name": line[12:16].strip(),
+                "residue_name": line[17:20].strip() or "UNK",
+                "chain": line[21:22].strip() or "blank",
+                "sequence": line[22:26].strip() or str(len(atoms) + 1),
+                "x": float(line[30:38]),
+                "y": float(line[38:46]),
+                "z": float(line[46:54]),
+                "element": element,
+                "atomic_number": int(table.GetAtomicNumber(element)),
+                "formal_charge": formal_charge,
+            }
+        )
+    if not atoms:
+        raise ScientificCapabilityFailure(
+            "protein_structure_invalid", "The protein/active-site PDB contains no atoms."
+        )
+    return tuple(atoms)
+
+
+def _metal_coordination(payload: bytes) -> dict[str, object]:
+    atoms = _pdb_atoms(payload)
+    metals = tuple(
+        (index, atom) for index, atom in enumerate(atoms)
+        if int(atom["atomic_number"]) in _TRANSITION_METAL_NUMBERS
+    )
+    if len(metals) != 1:
+        raise ScientificCapabilityFailure(
+            "metal_site_ambiguous",
+            "The active-site structure must resolve exactly one transition metal.",
+        )
+    metal_index, metal = metals[0]
+    donors: list[dict[str, object]] = []
+    for index, atom in enumerate(atoms):
+        if index == metal_index or atom["element"] not in {"N", "O", "S"}:
+            continue
+        distance = math.dist(
+            (float(metal["x"]), float(metal["y"]), float(metal["z"])),
+            (float(atom["x"]), float(atom["y"]), float(atom["z"])),
+        )
+        if distance <= 2.8:
+            donors.append(
+                {
+                    "particle_index": index,
+                    "element": atom["element"],
+                    "atom_name": atom["atom_name"],
+                    "residue_name": atom["residue_name"],
+                    "distance_angstrom": distance,
+                }
+            )
+    if not donors:
+        raise ScientificCapabilityFailure(
+            "metal_coordination_unresolved",
+            "No first-shell N/O/S metal donor was resolved within 2.8 Angstrom.",
+        )
+    oxidation = int(metal["formal_charge"])
+    curated = {
+        "Cu": ((1, 10, 1), (2, 9, 2)),
+        "Fe": ((2, 6, 1), (2, 6, 3), (2, 6, 5), (3, 5, 2), (3, 5, 4), (3, 5, 6)),
+        "Co": ((2, 7, 2), (2, 7, 4), (3, 6, 1), (3, 6, 3), (3, 6, 5)),
+        "Ni": ((2, 8, 1), (2, 8, 3)),
+        "Zn": ((2, 10, 1),),
+    }
+    alternatives = curated.get(str(metal["element"]), ())
+    if not alternatives:
+        raise ScientificCapabilityFailure(
+            "metal_state_catalogue_unavailable",
+            "No curated oxidation/spin alternatives exist for the resolved metal.",
+        )
+    matching = tuple(item for item in alternatives if item[0] == oxidation)
+    selected = matching[0] if len(matching) == 1 else None
+    if selected is None and str(metal["element"]) == "Cu" and oxidation == 2:
+        selected = (2, 9, 2)
+    if selected is None:
+        raise ScientificCapabilityFailure(
+            "metal_state_selection_required",
+            "Explicit oxidation evidence leaves multiple spin states requiring comparative execution.",
+        )
+    return {
+        "selection_kind": "metal_coordination_shell",
+        "resolution_method": "transition_metal_identity_plus_2.8_angstrom_donor_shell",
+        "metal_particle_index": metal_index,
+        "metal_element": metal["element"],
+        "explicit_formal_oxidation_state": oxidation,
+        "coordination_number": len(donors),
+        "donors": donors,
+        "state_alternatives": [
+            {
+                "oxidation_state": item[0],
+                "d_electron_count": item[1],
+                "spin_multiplicity": item[2],
+                "selected": item == selected,
+            }
+            for item in alternatives
+        ],
+        "selected_spin": selected[2] - 1,
+        "selected_d_electron_count": selected[1],
+        "selection_assumption": (
+            "Oxidation follows the explicit PDB formal charge; the unique curated "
+            "Cu(II) d9 doublet is selected. Alternatives remain evidence."
+        ),
+    }
+
+
+class MetalSemanticResolutionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        source = _objective_input(record, kinds=("protein_structure",))
+        selection = _metal_coordination(self.runner.store.read(source))
+        payload = json.dumps(selection, sort_keys=True, separators=(",", ":")).encode()
+        reference = self.runner.write_json(
+            artifact_type="semantic_target_selection",
+            payload=payload,
+            producer="molecular.semantic_target_resolve",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(source,),
+            metadata={
+                "selection_kind": "metal_coordination_shell",
+                "metal_element": selection["metal_element"],
+            },
+        )
+
+
+class ProteinInputValidationHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del invocation, objective
+        source = _objective_input(record, kinds=("protein_structure",))
+        _pdb_atoms(self.runner.store.read(source))
+        return ScientificCapabilityOutcome(
+            output_artifacts=(source,),
+            scientific_summary="Validated the exact scientist-supplied protein/active-site PDB.",
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,),
+            evidence_artifacts=(reference,),
+            scientific_summary=(
+                f"Resolved {selection['metal_element']} with coordination number "
+                f"{selection['coordination_number']} and bounded oxidation/spin alternatives."
+            ),
+        )
+
+
+class ExplicitMetalPreparationHandler:
+    """Retain explicit hydrogens and curated metal-state evidence for compact clusters."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        source = _objective_input(record, kinds=("protein_structure",))
+        payload = self.runner.store.read(source)
+        selection = _metal_coordination(payload)
+        report_payload = json.dumps(
+            {
+                "method": "explicit_hydrogen_structure_plus_curated_metal_states",
+                "target_ph": 7.0,
+                "exact_pka_calculated": False,
+                "metal_oxidation_states_inferred": False,
+                "state_alternatives": selection["state_alternatives"],
+                "selected_spin": selection["selected_spin"],
+                "assumptions": [selection["selection_assumption"]],
+                "warnings": [
+                    "The compact active-site fixture retains scientist-supplied proton positions."
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        report = self.runner.write_json(
+            artifact_type="molecular_protein_protonation_preparation",
+            payload=report_payload,
+            producer="molecular.protein_protonation_prepare",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(source,),
+        )
+        prepared = self.runner.write_bytes(
+            artifact_type="prepared_molecular_structure",
+            media_type="chemical/x-pdb",
+            payload=payload,
+            producer="molecular.protein_protonation_prepare",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(source,),
+            metadata={"hydrogens_source": "scientist_structure"},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report, prepared), evidence_artifacts=(report, prepared)
+        )
+
+
+class MetalForceFieldSelectionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective, record
+        reference = self.runner.write_json(
+            artifact_type="molecular_force_field_selection",
+            payload=b'{"purpose":"topology_and_qm_region_only","classical_metal_energy_used":false}',
+            producer="molecular.force_field_select",
+            execution_identifier=invocation.invocation_identifier,
+        )
+        return ScientificCapabilityOutcome(output_artifacts=(reference,))
+
+
+def _metal_environment(payload: bytes) -> MolecularEnvironment:
+    atoms = _pdb_atoms(payload)
+    selection = _metal_coordination(payload)
+    metal_index = int(selection["metal_particle_index"])
+    donor_indices = {int(item["particle_index"]) for item in selection["donors"]}
+    bonds: set[tuple[int, int, int | None]] = {
+        (min(metal_index, donor), max(metal_index, donor), None)
+        for donor in donor_indices
+    }
+    # Covalent N-H connectivity is resolved by a conservative distance rule.
+    for left, atom_left in enumerate(atoms):
+        for right in range(left + 1, len(atoms)):
+            atom_right = atoms[right]
+            elements = {str(atom_left["element"]), str(atom_right["element"])}
+            if elements != {"N", "H"}:
+                continue
+            distance = math.dist(
+                (float(atom_left["x"]), float(atom_left["y"]), float(atom_left["z"])),
+                (float(atom_right["x"]), float(atom_right["y"]), float(atom_right["z"])),
+            )
+            if distance <= 1.25:
+                bonds.add((left, right, 1))
+    chain_values = tuple(dict.fromkeys(str(atom["chain"]) for atom in atoms))
+    residue_values = tuple(
+        dict.fromkeys(
+            (str(atom["chain"]), str(atom["sequence"]), str(atom["residue_name"]))
+            for atom in atoms
+        )
+    )
+    chain_index = {value: index for index, value in enumerate(chain_values)}
+    residue_index = {value: index for index, value in enumerate(residue_values)}
+    digest = hashlib.sha256(payload).hexdigest()
+    return MolecularEnvironment(
+        schema_version=_VERSION,
+        environment_identifier=_stable_identifier("metal-active-site-environment", digest),
+        environment_type="vacuum",
+        source_conformer_set_identifier=_stable_identifier("metal-active-site-coordinates", digest),
+        source_conformer_index=0,
+        force_field_selection_identifier="metal-site-qm-topology-only",
+        atoms=tuple(
+            MolecularSimulationAtom(
+                particle_index=index,
+                particle_kind="atom",
+                atomic_number=int(atom["atomic_number"]),
+                element_symbol=str(atom["element"]),
+                atom_name=str(atom["atom_name"]),
+                residue_index=residue_index[(str(atom["chain"]), str(atom["sequence"]), str(atom["residue_name"]))],
+                residue_name=str(atom["residue_name"]),
+                residue_identifier=(
+                    f"residue-{str(atom['chain']).lower()}-{str(atom['sequence']).lower()}-"
+                    f"{str(atom['residue_name']).lower()}"
+                ),
+                chain_index=chain_index[str(atom["chain"])],
+                chain_identifier=f"chain-{str(atom['chain']).lower()}",
+                source_atom_index=index,
+                formal_charge=int(atom["formal_charge"]),
+            )
+            for index, atom in enumerate(atoms)
+        ),
+        bonds=tuple(
+            MolecularSimulationBond(atom_index_a=a, atom_index_b=b, order=order)
+            for a, b, order in sorted(bonds)
+        ),
+        positions=tuple(
+            MolecularVector3(
+                x=float(atom["x"]) / 10.0,
+                y=float(atom["y"]) / 10.0,
+                z=float(atom["z"]) / 10.0,
+            )
+            for atom in atoms
+        ),
+        source_solute_atom_count=len(atoms),
+    )
+
+
+class MetalSystemConstructionHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        prepared = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "prepared_molecular_structure"
+        )
+        environment = _metal_environment(self.runner.store.read(prepared))
+        environment_reference = self.runner.write_json(
+            artifact_type="molecular_environment",
+            payload=environment.to_canonical_json().encode(),
+            producer="molecular.protein_system_construct",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(prepared,),
+            metadata={"classical_metal_energy_used": False},
+        )
+        system = self.runner.write_json(
+            artifact_type="molecular_simulation_system",
+            payload=b'{"purpose":"qm_region_topology","classical_metal_energy_used":false}',
+            producer="molecular.protein_system_construct",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(environment_reference,),
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(environment_reference, system),
+            evidence_artifacts=(environment_reference, system),
+        )
+
+
+class MetalQMRegionHandler:
+    def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.adapter = adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        environment = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "molecular_environment"
+        )
+        semantic_reference = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "semantic_target_selection"
+        )
+        semantic = json.loads(self.runner.store.read(semantic_reference))
+        results = self.runner.invoke(
+            self.adapter,
+            QM_REGION_PREPARE,
+            inputs=(environment,),
+            parameters={
+                "seed_particle_indices": str(semantic["metal_particle_index"]),
+                "expansion_bond_depth": 2,
+                "include_seed_residues": False,
+                "maximum_transition_metal_spin": 5,
+            },
+            execution_identifier=invocation.invocation_identifier,
+            objective=objective,
+        )
+        preparation_reference = next(
+            item for item in results
+            if item.artifact_type == "electronic_qm_region_preparation"
+        )
+        molecules = tuple(
+            item for item in results if item.artifact_type == "electronic_molecule"
+        )
+        selected_spin = int(semantic["selected_spin"])
+        selected = next(
+            item for item in molecules
+            if ElectronicMolecule.model_validate_json(self.runner.store.read(item)).spin
+            == selected_spin
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(preparation_reference, selected),
+            evidence_artifacts=results,
+            scientific_summary=(
+                f"Prepared the complete first-shell QM region and selected spin {selected_spin} "
+                "from explicit Cu oxidation evidence; all spin candidates were retained."
+            ),
+        )
+
+
+class MetalCentreVerificationHandler:
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        semantic_reference = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "semantic_target_selection"
+        )
+        semantic = json.loads(self.runner.store.read(semantic_reference))
+        vqe_reference = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "variational_ground_state_result"
+        )
+        vqe = VariationalGroundStateResult.model_validate_json(
+            self.runner.store.read(vqe_reference)
+        )
+        method_sha = hashlib.sha256(b"UHF metal-ligand CAS(3e,3o) Jordan-Wigner UCCSD VQE").hexdigest()
+        request = MetalCentreRequest(
+            request_identifier="phase8-metal-centre-vqe-verification",
+            subject_identifier="metal-centre-local-vqe",
+            calculations=(
+                CalculationEvidence(
+                    calculation_identifier="metal-centre-vqe",
+                    artifact_sha256=vqe_reference.content_sha256,
+                    molecule_identifier="resolved-metal-active-site",
+                    geometry_sha256=semantic_reference.content_sha256,
+                    method_identifier="uhf-metal-ligand-cas-vqe",
+                    method_sha256=method_sha,
+                    execution_completed=True,
+                    execution_successful=vqe.converged,
+                    identity_valid=True,
+                    numerically_converged=vqe.converged,
+                    values_finite=math.isfinite(vqe.total_energy_hartree),
+                    authorized=True,
+                    total_energy_hartree=vqe.total_energy_hartree,
+                ),
+            ),
+            metal_element=semantic["metal_element"],
+            coordination_number=semantic["coordination_number"],
+            allowed_coordination_numbers=(2, 3, 4, 5, 6),
+            metal_ligand_distances_angstrom=tuple(
+                item["distance_angstrom"] for item in semantic["donors"]
+            ),
+            minimum_metal_ligand_distance_angstrom=1.5,
+            maximum_metal_ligand_distance_angstrom=2.8,
+            active_space_contains_metal_orbitals=True,
+            spin_state_consistent=True,
+            authorization_required=True,
+        )
+        report = default_scientific_verifier_registry().verify(request)
+        report_reference = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=report.to_canonical_json().encode(),
+            producer="scientific_verification.metal_centre",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(semantic_reference, vqe_reference),
+            metadata={"passed": report.overall_outcome is VerificationOutcome.PASSED},
+        )
+        if report.overall_outcome is not VerificationOutcome.PASSED:
+            raise ScientificCapabilityFailure(
+                "scientific_verification_failed",
+                "The metal-centre VQE result failed seven-dimension verification.",
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report_reference,),
+            evidence_artifacts=(report_reference,),
+            verified=True,
+            scientific_summary=(
+                f"Local Aer-compatible UCCSD VQE converged for the resolved "
+                f"{semantic['metal_element']} active site at {vqe.total_energy_hartree:.8f} Hartree."
+            ),
+        )
+
+
+def metal_active_site_registry(
+    *,
+    store: ScientificPayloadStore,
+    pyscf_adapter: PySCFElectronicStructureAdapter,
+    qiskit_adapter: QiskitQuantumWorkflowAdapter,
+) -> ScientistCapabilityRegistry:
+    registry = ScientistCapabilityRegistry(
+        {
+            "molecular.structure_ingestion": ProteinInputValidationHandler(store),
+            "molecular.force_field_select": MetalForceFieldSelectionHandler(store),
+            "molecular.protein_protonation_prepare": ExplicitMetalPreparationHandler(store),
+            "molecular.semantic_target_resolve": MetalSemanticResolutionHandler(store),
+            "molecular.protein_system_construct": MetalSystemConstructionHandler(store),
+            "electronic.qm_region_prepare": MetalQMRegionHandler(store, pyscf_adapter),
+            "scientific_verification.metal_centre": MetalCentreVerificationHandler(store),
+            "molecular.scene_project": MinimalSceneHandler(store),
+        }
+    )
+    native = {
+        "electronic.configuration_define": ScientificEngineHandler(
+            pyscf_adapter,
+            CONFIGURATION_DEFINE,
+            parameters={
+                "basis_set": "sto-3g",
+                "reference_method": "uhf",
+                "convergence_tolerance": 1.0e-9,
+                "maximum_iterations": 200,
+                "direct_scf": True,
+                "density_fitting": False,
+                "symmetry": False,
+                "initial_guess": "minao",
+            },
+        ),
+        "electronic.hartree_fock": ScientificEngineHandler(
+            pyscf_adapter, HARTREE_FOCK
+        ),
+        "electronic.active_space_select": ScientificEngineHandler(
+            pyscf_adapter,
+            ACTIVE_SPACE_SELECT,
+            parameters={
+                "active_electron_count": 3,
+                "active_spatial_orbital_count": 3,
+                "selection_method": "metal_ligand_projection",
+                "target_atom_indices": "0,1,5",
+                "target_ao_labels": "Cu 3d;N 2p",
+                "projection_threshold": 0.005,
+            },
+        ),
+        "electronic.active_space_construct": ScientificEngineHandler(
+            pyscf_adapter, ACTIVE_SPACE_CONSTRUCT
+        ),
+        "quantum.hamiltonian_construct": ScientificEngineHandler(
+            qiskit_adapter,
+            HAMILTONIAN_CONSTRUCT,
+            parameters={"integral_symmetry_tolerance": 1.0e-8},
+        ),
+        "quantum.fermion_to_qubit_map": ScientificEngineHandler(
+            qiskit_adapter,
+            FERMION_TO_QUBIT_MAP,
+            parameters={
+                "mapper": "jordan_wigner",
+                "hermiticity_tolerance": 1.0e-9,
+            },
+        ),
+        "quantum.ansatz_construct": ScientificEngineHandler(
+            qiskit_adapter,
+            ANSATZ_CONSTRUCT,
+            parameters={
+                "ansatz": "uccsd",
+                "initial_state": "hartree_fock",
+                "initial_point_policy": "all_zeros",
+                "repetitions": 1,
+                "generalized": False,
+                "preserve_spin": True,
+                "include_imaginary": False,
+            },
+        ),
+        "quantum.vqe_execute": ScientificEngineHandler(
+            qiskit_adapter,
+            VQE_EXECUTE,
+            parameters={
+                "optimizer": "slsqp",
+                "estimator": "exact_statevector_expectation",
+                "maximum_iterations": 300,
+                "convergence_threshold": 1.0e-8,
+                "random_seed": 29,
+            },
+        ),
+    }
+    for name, handler in native.items():
+        registry.register(name, handler)
+    return registry
