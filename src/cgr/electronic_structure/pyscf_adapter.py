@@ -18,6 +18,7 @@ from cgr.kernel.contracts import (
 from cgr.molecular import (
     MolecularConformerSet,
     MolecularEnvironment,
+    MolecularSimulationSystem,
     MolecularSnapshot,
 )
 from cgr.science import (
@@ -276,13 +277,27 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
         ),
         (
             QMMM_EMBEDDING_PREPARE,
-            ("electronic_molecule", "molecular_environment"),
+            (
+                "electronic_qm_region_preparation",
+                "electronic_molecule",
+                "molecular_environment",
+                "molecular_simulation_system",
+            ),
             ("qmmm_embedding_foundation",),
-            ("qmmm_embedding_foundation",),
+            (
+                "qmmm_embedding_foundation",
+                "electrostatic_embedding_preparation",
+            ),
             True,
             (
-                "Version 1 publishes environment sites and charge-assignment status only; it does not execute a coupled QM/MM calculation.",
-                "Formal charges are not substitutes for force-field partial charges; unassigned sites keep the foundation not ready for electrostatic embedding.",
+                "Embedding charges come only from the parameterized "
+                "OpenMM NonbondedForce artifact.",
+                "QM particles are excluded using the explicit Phase 8 "
+                "QM-region preparation artifact.",
+                "Covalent QM/MM boundaries fail closed until an explicit "
+                "charge-shift boundary treatment is available.",
+                "This capability prepares static point charges; the actual "
+                "PySCF embedded electronic calculation is a separate capability.",
             ),
         ),
     )
@@ -2268,61 +2283,198 @@ class PySCFElectronicStructureAdapter:
         invocation: CapabilityInvocation,
     ) -> CapabilityResult:
         inputs = self._inputs_by_type(invocation)
-        molecule_reference = self._require_input(inputs, "electronic_molecule")
-        environment_reference = self._require_input(inputs, "molecular_environment")
-        if len(inputs) != 2:
-            raise ValueError("QM/MM embedding preparation requires two exact inputs.")
-        molecule = self._load_model(molecule_reference, ElectronicMolecule)
-        environment = self._load_model(environment_reference, MolecularEnvironment)
-        if environment.source_solute_atom_count != len(molecule.atoms):
+
+        preparation_reference = self._require_input(
+            inputs,
+            "electronic_qm_region_preparation",
+        )
+        molecule_reference = self._require_input(
+            inputs,
+            "electronic_molecule",
+        )
+        environment_reference = self._require_input(
+            inputs,
+            "molecular_environment",
+        )
+        system_reference = self._require_input(
+            inputs,
+            "molecular_simulation_system",
+        )
+
+        if len(inputs) != 4:
             raise ValueError(
-                "QM molecule and environment solute atom counts do not match."
+                "QM/MM embedding preparation requires exactly "
+                "QM-region, molecule, environment and system artifacts."
+            )
+
+        preparation = self._load_model(
+            preparation_reference,
+            ElectronicQMRegionPreparation,
+        )
+        molecule = self._load_model(
+            molecule_reference,
+            ElectronicMolecule,
+        )
+        environment = self._load_model(
+            environment_reference,
+            MolecularEnvironment,
+        )
+        system = self._load_model(
+            system_reference,
+            MolecularSimulationSystem,
+        )
+
+        if (
+            preparation.environment_identifier
+            != environment.environment_identifier
+        ):
+            raise ValueError(
+                "QM-region preparation and molecular environment disagree."
+            )
+
+        if (
+            molecule.molecule_identifier
+            not in preparation.electronic_molecule_identifiers
+        ):
+            raise ValueError(
+                "Electronic molecule is not a candidate produced by "
+                "the supplied QM-region preparation."
+            )
+
+        if (
+            molecule.source_geometry_identifier
+            != environment.environment_identifier
+        ):
+            raise ValueError(
+                "QM molecule geometry does not match the environment."
+            )
+
+        if (
+            system.environment_identifier
+            != environment.environment_identifier
+        ):
+            raise ValueError(
+                "Simulation system and molecular environment disagree."
+            )
+
+        if (
+            system.force_field_selection_identifier
+            != environment.force_field_selection_identifier
+        ):
+            raise ValueError(
+                "Simulation system and molecular environment use "
+                "different force-field selections."
+            )
+
+        if system.particle_count != len(environment.atoms):
+            raise ValueError(
+                "Simulation-system particle count does not match "
+                "the molecular environment."
+            )
+
+        if system.partial_charge_source != "openmm_nonbonded_force":
+            raise ValueError(
+                "QM/MM embedding requires OpenMM NonbondedForce charges."
+            )
+
+        if preparation.boundary_links:
+            raise ValueError(
+                "Covalent QM/MM boundaries require an explicit "
+                "boundary-charge treatment before electrostatic embedding."
+            )
+
+        selected = set(
+            preparation.selected_particle_indices
+        )
+
+        if (
+            not selected
+            or any(
+                index >= len(environment.atoms)
+                for index in selected
+            )
+        ):
+            raise ValueError(
+                "QM-region particle membership is invalid for "
+                "the molecular environment."
+            )
+
+        if len(molecule.atoms) != len(selected):
+            raise ValueError(
+                "Uncapped QM molecule atom count must match "
+                "the selected source-particle count."
             )
 
         sites: list[QMMMEmbeddingSite] = []
-        for site_index, particle_index in enumerate(
-            range(environment.source_solute_atom_count, len(environment.atoms))
-        ):
+
+        for particle_index in range(len(environment.atoms)):
+            if particle_index in selected:
+                continue
+
             atom = environment.atoms[particle_index]
             position = environment.positions[particle_index]
-            charge = (
-                float(atom.formal_charge) if atom.formal_charge is not None else None
-            )
+            charge = system.particle_partial_charges_e[
+                particle_index
+            ]
+
             sites.append(
                 QMMMEmbeddingSite(
-                    site_index=site_index,
+                    site_index=len(sites),
                     source_particle_index=particle_index,
                     element_symbol=atom.element_symbol,
                     x_angstrom=10.0 * position.x,
                     y_angstrom=10.0 * position.y,
                     z_angstrom=10.0 * position.z,
-                    charge_e=charge,
-                    charge_source=(
-                        "formal_charge" if charge is not None else "unassigned"
-                    ),
+                    charge_e=float(charge),
+                    charge_source="openmm_nonbonded_force",
                 )
             )
 
-        assigned = sum(site.charge_e is not None for site in sites)
+        if not sites:
+            raise ValueError(
+                "QM/MM embedding requires at least one MM particle "
+                "outside the QM region."
+            )
+
+        embedding_total_charge = sum(
+            site.charge_e
+            for site in sites
+        )
+
         foundation = QMMMEmbeddingFoundation(
             schema_version=_SCHEMA_VERSION,
             embedding_identifier=_stable_identifier(
                 "qmmm-embedding",
+                preparation.preparation_identifier,
                 molecule.molecule_identifier,
                 environment.environment_identifier,
-                len(sites),
-                assigned,
+                system.system_identifier,
+                *(
+                    site.model_dump_json()
+                    for site in sites
+                ),
             ),
             molecule_identifier=molecule.molecule_identifier,
+            qm_region_preparation_identifier=(
+                preparation.preparation_identifier
+            ),
             environment_identifier=environment.environment_identifier,
-            qm_atom_count=len(molecule.atoms),
-            excluded_solute_particle_count=environment.source_solute_atom_count,
+            simulation_system_identifier=system.system_identifier,
+            qm_source_particle_count=len(selected),
             embedding_sites=tuple(sites),
-            assigned_charge_count=assigned,
-            unassigned_charge_count=len(sites) - assigned,
-            electrostatic_embedding_ready=assigned == len(sites),
+            embedding_total_charge_e=embedding_total_charge,
+            electrostatic_embedding_ready=True,
+            boundary_policy="no_covalent_boundary",
+            charge_model="openmm_nonbonded_force",
         )
-        parents = (molecule_reference, environment_reference)
+
+        parents = (
+            preparation_reference,
+            molecule_reference,
+            environment_reference,
+            system_reference,
+        )
+
         output = self._write_model(
             invocation,
             model=foundation,
@@ -2331,11 +2483,16 @@ class PySCFElectronicStructureAdapter:
             parents=parents,
             metadata={
                 "embedding_site_count": len(sites),
-                "assigned_charge_count": assigned,
-                "unassigned_charge_count": len(sites) - assigned,
-                "electrostatic_embedding_ready": foundation.electrostatic_embedding_ready,
+                "qm_source_particle_count": len(selected),
+                "embedding_total_charge_e": (
+                    foundation.embedding_total_charge_e
+                ),
+                "electrostatic_embedding_ready": True,
+                "charge_model": foundation.charge_model,
+                "boundary_policy": foundation.boundary_policy,
             },
         )
+
         return self._success(
             invocation,
             artifacts=(output,),
@@ -2347,8 +2504,10 @@ class PySCFElectronicStructureAdapter:
             ),
             diagnostics={
                 "embedding_site_count": len(sites),
-                "assigned_charge_count": assigned,
-                "unassigned_charge_count": len(sites) - assigned,
-                "electrostatic_embedding_ready": foundation.electrostatic_embedding_ready,
+                "qm_source_particle_count": len(selected),
+                "embedding_total_charge_e": (
+                    foundation.embedding_total_charge_e
+                ),
+                "electrostatic_embedding_ready": True,
             },
         )

@@ -659,7 +659,7 @@ class ElectronicActiveSpace(CanonicalModel):
 
 
 class QMMMEmbeddingSite(CanonicalModel):
-    """One environment site prepared for later QM/MM coupling."""
+    """One real force-field point charge used for QM electrostatic embedding."""
 
     site_index: int = Field(ge=0)
     source_particle_index: int = Field(ge=0)
@@ -667,8 +667,10 @@ class QMMMEmbeddingSite(CanonicalModel):
     x_angstrom: float
     y_angstrom: float
     z_angstrom: float
-    charge_e: float | None = None
-    charge_source: Literal["formal_charge", "unassigned"]
+    charge_e: float
+    charge_source: Literal["openmm_nonbonded_force"] = (
+        "openmm_nonbonded_force"
+    )
 
     @field_validator("element_symbol")
     @classmethod
@@ -680,69 +682,103 @@ class QMMMEmbeddingSite(CanonicalModel):
             raise ValueError("Embedding-site element symbol is invalid.")
         return normalized[0].upper() + normalized[1:].lower()
 
-    @field_validator("x_angstrom", "y_angstrom", "z_angstrom")
+    @field_validator(
+        "x_angstrom",
+        "y_angstrom",
+        "z_angstrom",
+        "charge_e",
+    )
     @classmethod
-    def validate_coordinate(cls, value: float) -> float:
-        return _finite(value, label="QM/MM embedding coordinate")
-
-    @field_validator("charge_e")
-    @classmethod
-    def validate_charge(cls, value: float | None) -> float | None:
-        return None if value is None else _finite(value, label="QM/MM embedding charge")
-
-    @model_validator(mode="after")
-    def validate_charge_source(self) -> Self:
-        if (self.charge_e is None) != (self.charge_source == "unassigned"):
-            raise ValueError("Embedding charge source must match charge availability.")
-        return self
+    def validate_scalar(cls, value: float) -> float:
+        return _finite(value, label="QM/MM embedding value")
 
 
 class QMMMEmbeddingFoundation(CanonicalModel):
-    """Provenance-rich MM environment sites; not yet a coupled QM/MM calculation."""
+    """Real OpenMM point-charge environment prepared for PySCF embedding."""
 
     schema_version: CapabilityVersion
     embedding_identifier: str
     molecule_identifier: str
+    qm_region_preparation_identifier: str
     environment_identifier: str
-    qm_atom_count: int = Field(gt=0)
-    excluded_solute_particle_count: int = Field(gt=0)
-    embedding_sites: tuple[QMMMEmbeddingSite, ...]
-    assigned_charge_count: int = Field(ge=0)
-    unassigned_charge_count: int = Field(ge=0)
-    electrostatic_embedding_ready: bool
-    boundary_policy: Literal["none"] = "none"
-    charge_model: Literal["environment_formal_charge_foundation"] = (
-        "environment_formal_charge_foundation"
+    simulation_system_identifier: str
+    qm_source_particle_count: int = Field(gt=0)
+    embedding_sites: tuple[QMMMEmbeddingSite, ...] = Field(min_length=1)
+    embedding_total_charge_e: float
+    electrostatic_embedding_ready: Literal[True] = True
+    boundary_policy: Literal["no_covalent_boundary"] = (
+        "no_covalent_boundary"
+    )
+    charge_model: Literal["openmm_nonbonded_force"] = (
+        "openmm_nonbonded_force"
     )
 
     @field_validator("schema_version")
     @classmethod
-    def validate_schema_version(cls, value: CapabilityVersion) -> CapabilityVersion:
+    def validate_schema_version(
+        cls,
+        value: CapabilityVersion,
+    ) -> CapabilityVersion:
         return _validate_schema_version(value)
 
     @field_validator(
         "embedding_identifier",
         "molecule_identifier",
+        "qm_region_preparation_identifier",
         "environment_identifier",
+        "simulation_system_identifier",
     )
     @classmethod
     def validate_identifiers(cls, value: str) -> str:
-        return validate_identifier(value, label="QM/MM embedding identifier")
+        return validate_identifier(
+            value,
+            label="QM/MM embedding identifier",
+        )
+
+    @field_validator("embedding_total_charge_e")
+    @classmethod
+    def validate_embedding_total_charge(cls, value: float) -> float:
+        return _finite(
+            value,
+            label="QM/MM embedding total charge",
+        )
 
     @model_validator(mode="after")
     def validate_embedding(self) -> Self:
-        indices = [site.site_index for site in self.embedding_sites]
+        indices = [
+            site.site_index
+            for site in self.embedding_sites
+        ]
+
         if indices != list(range(len(self.embedding_sites))):
-            raise ValueError("QM/MM embedding site indices must be contiguous.")
-        assigned = sum(site.charge_e is not None for site in self.embedding_sites)
-        unassigned = len(self.embedding_sites) - assigned
-        if (
-            assigned != self.assigned_charge_count
-            or unassigned != self.unassigned_charge_count
-        ):
-            raise ValueError("QM/MM embedding charge counts are inconsistent.")
-        if self.electrostatic_embedding_ready != (unassigned == 0):
             raise ValueError(
-                "QM/MM embedding readiness must reflect charge assignment."
+                "QM/MM embedding site indices must be contiguous."
             )
+
+        source_indices = [
+            site.source_particle_index
+            for site in self.embedding_sites
+        ]
+
+        if len(source_indices) != len(set(source_indices)):
+            raise ValueError(
+                "QM/MM embedding source-particle indices must be unique."
+            )
+
+        charge_sum = sum(
+            site.charge_e
+            for site in self.embedding_sites
+        )
+
+        if not math.isclose(
+            charge_sum,
+            self.embedding_total_charge_e,
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            raise ValueError(
+                "QM/MM embedding total charge must equal "
+                "the site-charge sum."
+            )
+
         return self

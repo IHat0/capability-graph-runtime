@@ -47,6 +47,8 @@ from cgr.molecular import (
     MolecularPeriodicBox,
     MolecularSimulationAtom,
     MolecularSimulationBond,
+    MolecularSimulationSystem,
+    MolecularSystemConstructionSettings,
     MolecularVector3,
 )
 from cgr.science import (
@@ -402,14 +404,56 @@ def test_configuration_rejects_rhf_for_open_shell_molecule() -> None:
     assert configuration_result.failure.code == "electronic_input_invalid"
 
 
-def test_qmmm_foundation_records_unassigned_environment_charges() -> None:
+def _qmmm_system_fixture(
+    environment: MolecularEnvironment,
+    charges: tuple[float, ...],
+) -> MolecularSimulationSystem:
+    assert len(charges) == len(environment.atoms)
+
+    settings = MolecularSystemConstructionSettings(
+        nonbonded_method="no_cutoff",
+        nonbonded_cutoff_nm=None,
+        switch_distance_nm=None,
+        constraints="none",
+        rigid_water=False,
+        remove_center_of_mass_motion=False,
+        hydrogen_mass_amu=None,
+        ewald_error_tolerance=None,
+    )
+
+    return MolecularSimulationSystem(
+        schema_version=VERSION,
+        system_identifier="system.qmmm-fixture",
+        environment_identifier=environment.environment_identifier,
+        force_field_selection_identifier=(
+            environment.force_field_selection_identifier
+        ),
+        particle_count=len(environment.atoms),
+        massive_particle_count=len(environment.atoms),
+        constraint_count=0,
+        degrees_of_freedom=3 * len(environment.atoms),
+        force_kinds=("nonbonded_force",),
+        total_mass_amu=float(len(environment.atoms)),
+        periodic=False,
+        settings=settings,
+        engine_identifier="engine.openmm",
+        engine_distribution_version="8.5.2",
+        engine_build_version="8.5.2",
+        private_state_sha256="a" * 64,
+        partial_charge_source="openmm_nonbonded_force",
+        particle_partial_charges_e=charges,
+        total_partial_charge_e=sum(charges),
+    )
+
+
+def test_qmmm_foundation_uses_real_openmm_partial_charges() -> None:
     store = MemoryPayloadStore()
     adapter = PySCFElectronicStructureAdapter(store)
-    molecule_reference = _construct_h2(adapter, store)
+
     environment = MolecularEnvironment(
         schema_version=VERSION,
-        environment_identifier="environment.h2-solvent",
-        environment_type="solvent",
+        environment_identifier="environment.h2-mm-charge",
+        environment_type="vacuum",
         source_conformer_set_identifier="conformers.h2",
         source_conformer_index=0,
         force_field_selection_identifier="force-field.test",
@@ -447,58 +491,197 @@ def test_qmmm_foundation_records_unassigned_environment_charges() -> None:
                 particle_kind="atom",
                 atomic_number=8,
                 element_symbol="O",
-                atom_name="O",
+                atom_name="OMM",
                 residue_index=1,
-                residue_name="HOH",
-                residue_identifier="residue.water",
+                residue_name="MM",
+                residue_identifier="residue.mm",
                 chain_index=1,
-                chain_identifier="chain.w",
+                chain_identifier="chain.m",
+                source_atom_index=None,
                 formal_charge=None,
             ),
         ),
-        bonds=(MolecularSimulationBond(atom_index_a=0, atom_index_b=1, order=1),),
+        bonds=(
+            MolecularSimulationBond(
+                atom_index_a=0,
+                atom_index_b=1,
+                order=1,
+            ),
+        ),
         positions=(
             MolecularVector3(x=0.0, y=0.0, z=-0.037),
             MolecularVector3(x=0.0, y=0.0, z=0.037),
-            MolecularVector3(x=0.5, y=0.5, z=0.5),
+            MolecularVector3(x=0.5, y=0.0, z=0.0),
         ),
         source_solute_atom_count=2,
-        periodic_box=MolecularPeriodicBox(
-            vector_a=MolecularVector3(x=2.0, y=0.0, z=0.0),
-            vector_b=MolecularVector3(x=0.0, y=2.0, z=0.0),
-            vector_c=MolecularVector3(x=0.0, y=0.0, z=2.0),
-        ),
-        water_model="tip3p",
-        ionic_strength_molar=0.0,
-        positive_ion="Na+",
-        negative_ion="Cl-",
-        neutralized=True,
-        solvent_padding_nm=1.0,
-        solvent_box_shape="cube",
     )
+
     environment_reference = _store_model(
         store,
-        "fixture.h2-environment",
+        "fixture.qmmm-real-charge-environment",
         "molecular_environment",
         environment,
     )
+
+    qm_result = adapter.invoke(
+        _invocation(
+            adapter,
+            QM_REGION_PREPARE,
+            inputs=(environment_reference,),
+            parameters={
+                "seed_particle_indices": "0,1",
+                "expansion_bond_depth": 0,
+                "include_seed_residues": False,
+                "maximum_transition_metal_spin": 6,
+            },
+            execution_identifier="execution.qmmm-real-qm-region",
+        )
+    )
+
+    assert qm_result.status is ExecutionStatus.SUCCESS
+
+    qm_artifacts = {
+        artifact.artifact_type: artifact
+        for artifact in qm_result.output_artifacts
+    }
+
+    preparation_reference = qm_artifacts[
+        "electronic_qm_region_preparation"
+    ]
+    molecule_reference = qm_artifacts["electronic_molecule"]
+
+    preparation = ElectronicQMRegionPreparation.model_validate_json(
+        store.read(preparation_reference)
+    )
+
+    assert preparation.boundary_links == ()
+
+    system = _qmmm_system_fixture(
+        environment,
+        (0.1, -0.1, -0.834),
+    )
+
+    system_reference = _store_model(
+        store,
+        "fixture.qmmm-real-charge-system",
+        "molecular_simulation_system",
+        system,
+    )
+
     result = adapter.invoke(
         _invocation(
             adapter,
             QMMM_EMBEDDING_PREPARE,
-            inputs=(molecule_reference, environment_reference),
-            execution_identifier="execution.phase4-qmmm",
+            inputs=(
+                preparation_reference,
+                molecule_reference,
+                environment_reference,
+                system_reference,
+            ),
+            execution_identifier="execution.qmmm-real-foundation",
         )
     )
+
     assert result.status is ExecutionStatus.SUCCESS
+
     foundation = QMMMEmbeddingFoundation.model_validate_json(
         store.read(result.output_artifacts[0])
     )
-    assert len(foundation.embedding_sites) == 1
-    assert foundation.assigned_charge_count == 0
-    assert foundation.unassigned_charge_count == 1
-    assert not foundation.electrostatic_embedding_ready
 
+    assert foundation.qm_region_preparation_identifier == (
+        preparation.preparation_identifier
+    )
+    assert foundation.simulation_system_identifier == system.system_identifier
+    assert foundation.qm_source_particle_count == 2
+    assert foundation.charge_model == "openmm_nonbonded_force"
+    assert foundation.boundary_policy == "no_covalent_boundary"
+    assert foundation.electrostatic_embedding_ready
+    assert len(foundation.embedding_sites) == 1
+
+    site = foundation.embedding_sites[0]
+
+    assert site.source_particle_index == 2
+    assert site.charge_source == "openmm_nonbonded_force"
+    assert site.charge_e == pytest.approx(-0.834)
+    assert site.x_angstrom == pytest.approx(5.0)
+    assert foundation.embedding_total_charge_e == pytest.approx(-0.834)
+
+
+def test_qmmm_foundation_rejects_covalent_boundary_without_charge_shift() -> None:
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    environment = _qm_region_environment()
+
+    environment_reference = _store_model(
+        store,
+        "fixture.qmmm-boundary-environment",
+        "molecular_environment",
+        environment,
+    )
+
+    qm_result = adapter.invoke(
+        _invocation(
+            adapter,
+            QM_REGION_PREPARE,
+            inputs=(environment_reference,),
+            parameters={
+                "seed_particle_indices": "0",
+                "expansion_bond_depth": 0,
+                "include_seed_residues": True,
+                "maximum_transition_metal_spin": 6,
+            },
+            execution_identifier="execution.qmmm-boundary-qm-region",
+        )
+    )
+
+    assert qm_result.status is ExecutionStatus.SUCCESS
+
+    qm_artifacts = {
+        artifact.artifact_type: artifact
+        for artifact in qm_result.output_artifacts
+    }
+
+    preparation_reference = qm_artifacts[
+        "electronic_qm_region_preparation"
+    ]
+    molecule_reference = qm_artifacts["electronic_molecule"]
+
+    preparation = ElectronicQMRegionPreparation.model_validate_json(
+        store.read(preparation_reference)
+    )
+
+    assert preparation.boundary_links
+
+    system = _qmmm_system_fixture(
+        environment,
+        (-0.1, 0.1, 0.0, 0.0),
+    )
+
+    system_reference = _store_model(
+        store,
+        "fixture.qmmm-boundary-system",
+        "molecular_simulation_system",
+        system,
+    )
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            QMMM_EMBEDDING_PREPARE,
+            inputs=(
+                preparation_reference,
+                molecule_reference,
+                environment_reference,
+                system_reference,
+            ),
+            execution_identifier="execution.qmmm-boundary-foundation",
+        )
+    )
+
+    assert result.status is ExecutionStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.code == "electronic_input_invalid"
 
 def test_real_pyscf_h2_pipeline_produces_generic_artifacts() -> None:
     pytest.importorskip("pyscf")
