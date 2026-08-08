@@ -338,6 +338,10 @@ class RDKitMolecularDescriptorEvaluator:
     def stage_order(self) -> int:
         return 10
 
+    @property
+    def expensive(self) -> bool:
+        return False
+
     def evaluate(self, candidate: DiscoveryCandidate) -> CandidateEvaluationResult:
         Chem, AllChem, Crippen, Descriptors, extra = _modules()
         Lipinski, QED = extra
@@ -482,6 +486,10 @@ class VinaMolecularDockingEvaluator:
     @property
     def stage_order(self) -> int:
         return 20
+
+    @property
+    def expensive(self) -> bool:
+        return True
 
     def evaluate(self, candidate: DiscoveryCandidate) -> CandidateEvaluationResult:
         from meeko import MoleculePreparation, PDBQTWriterLegacy
