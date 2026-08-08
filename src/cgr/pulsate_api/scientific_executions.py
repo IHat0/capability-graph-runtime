@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cgr.quantum_preflight.artifacts import write_json_atomic
 from cgr.science.canonical import validate_identifier
+from cgr.science import ArtifactReference
 
 from .scientific_objectives import (
     ScientificExecutionBudget,
@@ -26,6 +27,54 @@ from .scientific_objectives import (
 
 _MAXIMUM_RECORD_BYTES = 4 * 1024 * 1024
 _EXECUTION_ID = re.compile(r"^scientific-execution-[0-9a-f]{32}$")
+
+
+class ScientificNodeExecutionRecord(BaseModel):
+    """Persisted scientist-workflow node state and exact produced evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    step_identifier: str
+    capability_name: str
+    status: Literal["pending", "running", "succeeded", "failed", "blocked"]
+    attempt_count: int = Field(default=0, ge=0, le=10)
+    output_artifact_identifiers: tuple[str, ...] = ()
+    evidence_artifact_identifiers: tuple[str, ...] = ()
+    error_code: str | None = None
+    error_message: str | None = Field(default=None, max_length=4096)
+
+    @field_validator("step_identifier", "capability_name", "error_code")
+    @classmethod
+    def identifiers(cls, value: str | None) -> str | None:
+        return validate_identifier(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def consistent(self) -> "ScientificNodeExecutionRecord":
+        failed = self.status in {"failed", "blocked"}
+        if failed != (self.error_code is not None and self.error_message is not None):
+            raise ValueError("Failed scientific nodes require a controlled error.")
+        if self.status in {"running", "succeeded", "failed"} and self.attempt_count < 1:
+            raise ValueError("Attempted scientific nodes require an attempt count.")
+        return self
+
+
+class ScientistFacingResult(BaseModel):
+    """Stable product result, distinct from raw engine output."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    original_request: str
+    resolved_interpretation: str
+    structures_and_entities: tuple[str, ...]
+    methods: tuple[str, ...]
+    assumptions: tuple[str, ...]
+    scientific_result: str
+    verification_status: Literal["passed", "failed", "inconclusive"]
+    uncertainty: tuple[str, ...]
+    replanning_history: tuple[str, ...]
+    important_limitations: tuple[str, ...]
+    evidence_artifact_identifiers: tuple[str, ...]
+    scene_identifiers: tuple[str, ...]
 
 
 class ScientificExecutionRecord(BaseModel):
@@ -44,8 +93,14 @@ class ScientificExecutionRecord(BaseModel):
     evidence_artifact_identifiers: tuple[str, ...] = ()
     checkpoint_identifiers: tuple[str, ...] = ()
     replanning_event_identifiers: tuple[str, ...] = ()
+    artifact_references: tuple[ArtifactReference, ...] = ()
+    node_executions: tuple[ScientificNodeExecutionRecord, ...] = ()
+    workflow_graph_identifier: str | None = None
+    workflow_run_identifier: str | None = None
+    workflow_snapshot_fingerprint: str | None = None
     scene_identifier: str | None = None
     scientist_summary: str
+    scientist_result: ScientistFacingResult | None = None
     limitations: tuple[str, ...] = ()
     verified: bool = False
 
@@ -62,8 +117,18 @@ class ScientificExecutionRecord(BaseModel):
             raise ValueError("Scientific execution timestamps are inconsistent.")
         if self.status == "succeeded" and not self.result_artifact_identifiers:
             raise ValueError("Successful science requires result artifacts.")
-        if self.verified and self.status != "succeeded":
-            raise ValueError("Only a successful execution can be verified.")
+        if self.verified and self.status not in {"running", "succeeded"}:
+            raise ValueError("Only a running or successful execution can be verified.")
+        if self.status == "succeeded" and self.scientist_result is None:
+            raise ValueError("Successful science requires a scientist-facing result.")
+        if self.scientist_result is not None and self.status not in {"running", "succeeded"}:
+            raise ValueError("Only an assembling or successful execution may carry a scientist result.")
+        artifact_ids = [item.artifact_identifier for item in self.artifact_references]
+        if len(artifact_ids) != len(set(artifact_ids)):
+            raise ValueError("Scientific artifact references must have unique identities.")
+        step_ids = [item.step_identifier for item in self.node_executions]
+        if len(step_ids) != len(set(step_ids)):
+            raise ValueError("Scientific node execution identities must be unique.")
         return self
 
 
@@ -118,6 +183,14 @@ class ScientificExecutionRepository:
             status=status, objective=objective, plan=plan,
             scientist_summary=summary,
             limitations=("This record contains a plan, not fabricated calculation results.",),
+            node_executions=tuple(
+                ScientificNodeExecutionRecord(
+                    step_identifier=step.step_identifier,
+                    capability_name=step.capability_name,
+                    status="pending",
+                )
+                for step in plan.steps
+            ),
             verified=False,
         )
         with self._lock:
@@ -154,6 +227,27 @@ class ScientificExecutionRepository:
                 raise KeyError("Scientific execution not found.") from None
             if record.execution_identifier != execution_identifier:
                 raise KeyError("Scientific execution not found.")
+            return record
+
+    def replace(
+        self,
+        record: ScientificExecutionRecord,
+        *,
+        expected_updated_at: datetime,
+    ) -> ScientificExecutionRecord:
+        """Atomically replace one execution record with optimistic concurrency."""
+
+        with self._lock:
+            self._require_started()
+            current = self.get(record.execution_identifier)
+            if current.updated_at != expected_updated_at:
+                raise RuntimeError("Scientific execution record changed concurrently.")
+            if record.created_at != current.created_at or record.updated_at <= current.updated_at:
+                raise RuntimeError("Scientific execution timestamps cannot be rewritten.")
+            if record.objective != current.objective or record.plan != current.plan:
+                raise RuntimeError("Scientific objective and plan are immutable.")
+            path = self.root / record.execution_identifier / "record.json"
+            write_json_atomic(path, record, maximum_bytes=_MAXIMUM_RECORD_BYTES)
             return record
 
     def _require_started(self) -> None:

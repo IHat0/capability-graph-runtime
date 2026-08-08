@@ -16,6 +16,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cgr.science.canonical import validate_identifier
 
+from .scientific_capability_catalogue import (
+    ScientificCapabilityCatalogue,
+    phase8_scientific_capability_catalogue,
+    public_capability_name,
+)
+
 ScientificTask = Literal[
     "covalent_transition_state",
     "metal_active_site_quantum",
@@ -274,70 +280,63 @@ def compile_scientific_objective(
     )
 
 
-def plan_scientific_objective(objective: StructuredScientificObjective) -> ScientificWorkflowPlan:
-    """Compose declared capability names into a deterministic dependency DAG."""
+def plan_scientific_objective(
+    objective: StructuredScientificObjective,
+    *,
+    catalogue: ScientificCapabilityCatalogue | None = None,
+) -> ScientificWorkflowPlan:
+    """Compose a capability DAG by recursively satisfying artifact requirements."""
 
-    definitions: list[tuple[str, str, tuple[str, ...], bool, bool]] = []
-
-    def add(name: str, produces: tuple[str, ...], *, verify: bool = False, authorize: bool = False) -> None:
-        step_id = f"step-{len(definitions) + 1:02d}-{name.replace('.', '-')}"
-        dependencies = (definitions[-1][0],) if definitions else ()
-        definitions.append((step_id, name, produces, verify, authorize))
-        dependency_by_id[step_id] = dependencies
-
-    dependency_by_id: dict[str, tuple[str, ...]] = {}
-    add("molecular.structure_ingestion", ("molecular_topology",))
-    if objective.task_type in {"covalent_transition_state", "metal_active_site_quantum", "protein_ligand_discovery"}:
-        add(
-            "molecular.protein_protonation_prepare",
-            ("molecular_protein_protonation_preparation", "prepared_molecular_structure"),
-            verify=True,
+    catalogue = catalogue or phase8_scientific_capability_catalogue()
+    required = ["scientist_facing_result"]
+    if objective.quantum_execution_target == "ibm_quantum":
+        required.append("authorization_request")
+    definitions = catalogue.compose(
+        task_type=objective.task_type,
+        available_artifact_types=("scientist_input",),
+        required_artifact_types=tuple(required),
+    )
+    producer_by_artifact: dict[str, str] = {}
+    steps: list[ScientificWorkflowStep] = []
+    for position, definition in enumerate(definitions, start=1):
+        capability_name = public_capability_name(definition.capability_name)
+        step_identifier = (
+            f"step-{position:02d}-{capability_name.replace('.', '-')}"
         )
-    if objective.task_type == "covalent_transition_state":
-        add("molecular.protonation_prepare", ("molecular_protonation_preparation",))
-        add("electronic.qm_region_prepare", ("electronic_qm_region_preparation",))
-        add("electronic.qmmm_embedding_prepare", ("qmmm_embedding_foundation",))
-        add("electronic.active_space_select", ("electronic_active_space_selection",), verify=True)
-        add("electronic.transition_state_search", ("electronic_transition_state_search",))
-        add("electronic.frequency_analyze", ("electronic_frequency_analysis",), verify=True)
-        add("electronic.reaction_path_confirm", ("electronic_reaction_path_result",), verify=True)
-    elif objective.task_type == "metal_active_site_quantum":
-        add("electronic.qm_region_prepare", ("electronic_qm_region_preparation",))
-        add("electronic.active_space_select", ("electronic_active_space_selection",), verify=True)
-        add("electronic.active_space_construct", ("electronic_active_space",))
-        add("quantum_workflow.fermionic_hamiltonian_map", ("mapped_qubit_hamiltonian",))
-        add("quantum_workflow.vqe", ("variational_ground_state_result",), verify=True)
-        if objective.quantum_execution_target == "ibm_quantum":
-            add("quantum.ibm_execution_prepare", ("authorization_request",), authorize=True)
-    elif objective.task_type == "bond_dissociation_scan":
-        add("molecular.constrained_distance_scan", ("molecular_distance_scan",), verify=True)
-        add("electronic.active_space_select", ("electronic_active_space_selection",), verify=True)
-        add("electronic.active_space_construct", ("electronic_active_space",))
-        add("scientific_verification.potential_energy_curve", ("scientific_verification_report",), verify=True)
-    elif objective.task_type == "solvated_conformer_comparison":
-        add("molecular.conformer_generate", ("molecular_conformer_set",))
-        add("electronic.implicit_solvent_hartree_fock", ("electronic_implicit_solvent_result",))
-        add("scientific_verification.conformer_comparison", ("scientific_verification_report",), verify=True)
-    else:
-        add("discovery.campaign_initialize", ("discovery_campaign_checkpoint",))
-        add("molecular.conformer_generate", ("molecular_conformer_set",))
-        add("molecular.ligand_parameterize", ("molecular_ligand_parameterization",), verify=True)
-        add("molecular.docking_pose_generate", ("molecular_docking_result", "docking_pose_pdbqt"), verify=True)
-        add("discovery.campaign_iterate", ("discovery_campaign_checkpoint",), verify=True)
-        add("molecular.scene_project", ("molecular_scene",))
+        dependencies = tuple(
+            dict.fromkeys(
+                producer_by_artifact[artifact_type]
+                for artifact_type in definition.accepted_artifact_types
+                if artifact_type in producer_by_artifact
+            )
+        )
+        steps.append(ScientificWorkflowStep(
+            step_identifier=step_identifier,
+            capability_name=capability_name,
+            depends_on=dependencies,
+            produces_artifact_types=definition.produced_artifact_types,
+            verification_required=definition.verification_required,
+            authorization_required=definition.authorization_required,
+        ))
+        for artifact_type in definition.produced_artifact_types:
+            producer_by_artifact[artifact_type] = step_identifier
 
-    steps = tuple(ScientificWorkflowStep(
-        step_identifier=step_id, capability_name=name,
-        depends_on=dependency_by_id[step_id], produces_artifact_types=produces,
-        verification_required=verify, authorization_required=authorize,
-    ) for step_id, name, produces, verify, authorize in definitions)
+    # Authorization is an explicit terminal handoff.  It is never a dependency
+    # of local result assembly and never represents an IBM submission.
+    step_values = tuple(
+        (*(
+            step for step in steps if not step.authorization_required
+        ), *(
+            step for step in steps if step.authorization_required
+        ))
+    )
     blockers = list(objective.ambiguity_hypotheses)
-    if any(step.authorization_required for step in steps):
+    if any(step.authorization_required for step in step_values):
         blockers.append("IBM execution requires a separate explicit human authorization decision.")
-    digest = hashlib.sha256((objective.objective_identifier + repr(steps)).encode()).hexdigest()[:32]
+    digest = hashlib.sha256((objective.objective_identifier + repr(step_values)).encode()).hexdigest()[:32]
     return ScientificWorkflowPlan(
         plan_identifier=f"scientific-plan-{digest}",
-        objective_identifier=objective.objective_identifier, steps=steps,
+        objective_identifier=objective.objective_identifier, steps=step_values,
         executable=not blockers, blocking_reasons=tuple(blockers),
         ibm_job_submission_planned=False,
     )
