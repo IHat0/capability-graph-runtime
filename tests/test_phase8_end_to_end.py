@@ -426,14 +426,15 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
     assert search.full_particle_count == hybrid.particle_count
     assert search.optimized_full_geometry_angstrom.shape == (hybrid.particle_count, 3)
     assert search.final_full_gradient_hartree_per_bohr.shape == (hybrid.particle_count, 3)
-    assert len(search.movable_particle_indices) == 3
+    assert len(search.movable_particle_indices) == 6
     assert not search.restrained_particle_indices
     assert search.frozen_particle_indices
     assert set(search.movable_particle_indices) | set(search.frozen_particle_indices) == set(
         range(hybrid.particle_count)
     )
     assert search.region_selection_method == (
-        "semantic_reacting_triad_movable_full_environment_frozen"
+        "semantic_reacting_triad_and_electrophile_hydrogens_movable_"
+        "full_environment_frozen"
     )
     frequency_reference = next(
         item for item in completed.artifact_references

@@ -2403,7 +2403,26 @@ class TSInitialPathHandler:
         distance = float(min(2.5, max(1.8, distance)))
         coordinates[nucleophile] = coordinates[electrophile] - distance * axis
         coordinates[leaving] = coordinates[electrophile] + distance * axis
-        movable = tuple(sorted((nucleophile, electrophile, leaving)))
+        electrophile_hydrogens = {
+            (
+                bond.atom_index_b
+                if bond.atom_index_a == electrophile
+                else bond.atom_index_a
+            )
+            for bond in environment.bonds
+            if electrophile in (bond.atom_index_a, bond.atom_index_b)
+            and environment.atoms[
+                bond.atom_index_b
+                if bond.atom_index_a == electrophile
+                else bond.atom_index_a
+            ].atomic_number == 1
+        }
+        movable = tuple(sorted({
+            nucleophile,
+            electrophile,
+            leaving,
+            *electrophile_hydrogens,
+        }))
         frozen = tuple(index for index in range(len(environment.atoms)) if index not in movable)
         path = self.runner.write_json(
             artifact_type="transition_state_initial_path",
@@ -2415,10 +2434,15 @@ class TSInitialPathHandler:
                     "movable_particle_indices": list(movable),
                     "restrained_particle_indices": [],
                     "frozen_particle_indices": list(frozen),
-                    "region_selection_method": "semantic_reacting_triad_movable_full_environment_frozen",
+                    "region_selection_method": (
+                        "semantic_reacting_triad_and_electrophile_hydrogens_movable_"
+                        "full_environment_frozen"
+                    ),
                     "restraint_force_constant_hartree_per_bohr2": None,
                     "region_rationale": (
-                        "The resolved nucleophile, electrophile, and leaving group move; "
+                        "The resolved nucleophile, electrophile, leaving group, and hydrogens "
+                        "directly bonded to the electrophile move so reaction-axis and methyl "
+                        "bending modes are represented; "
                         "all other real particles remain frozen but contribute to every hybrid evaluation."
                     ),
                     "hybrid_qmmm_evidence_identifier": hybrid_reference.artifact_identifier,
@@ -2435,8 +2459,9 @@ class TSInitialPathHandler:
         return ScientificCapabilityOutcome(
             output_artifacts=(path,), evidence_artifacts=(path,),
             scientific_summary=(
-                "Built a semantic full-system hybrid QM/MM saddle guess with three movable "
-                f"reaction particles and {len(frozen)} frozen environment particles."
+                "Built a semantic full-system hybrid QM/MM saddle guess with "
+                f"{len(movable)} movable reaction particles and {len(frozen)} frozen "
+                "environment particles."
             ),
         )
 
@@ -2511,9 +2536,11 @@ class TSTransitionSearchHandler:
                     frequency=False,
                 )
         except Exception as error:
+            detail = " ".join(str(error).split())[:512]
             raise ScientificCapabilityFailure(
                 "hybrid_qmmm_ts_search_failed",
-                f"geomeTRIC hybrid QM/MM saddle search failed: {type(error).__name__}.",
+                f"geomeTRIC hybrid QM/MM saddle search failed: {type(error).__name__}"
+                f"{f': {detail}' if detail else '.'}",
                 retryable=True,
             ) from error
         final_coordinates = base_coordinates.copy()
