@@ -36,6 +36,11 @@ from cgr.science import (
     ScientificEngineIdentity,
 )
 
+from .qm_region import (
+    ElectronicQMRegionPreparation,
+    prepare_qm_region,
+)
+
 from .contracts import (
     ElectronicActiveSpace,
     ElectronicActiveSpaceSelection,
@@ -59,6 +64,7 @@ _MAXIMUM_PAYLOAD_BYTES = 256 * 1024 * 1024
 _MAXIMUM_ATOMS = 100_000
 _MAXIMUM_ACTIVE_ORBITALS = 32
 
+QM_REGION_PREPARE = "electronic.qm_region_prepare"
 MOLECULE_CONSTRUCT = "electronic.molecule_construct"
 CONFIGURATION_DEFINE = "electronic.configuration_define"
 HARTREE_FOCK = "electronic.hartree_fock"
@@ -137,6 +143,32 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
     """Return planner declarations for the Phase 4 PySCF capabilities."""
 
     definitions = (
+        (
+            QM_REGION_PREPARE,
+            ("molecular_environment",),
+            (
+                "electronic_qm_region_preparation",
+                "electronic_molecule",
+            ),
+            (
+                "qm_region_construction",
+                "qm_mm_boundary_capping",
+                "charge_spin_determination",
+            ),
+            True,
+            (
+                "QM seeds are expanded deterministically through the "
+                "prepared solute topology.",
+                "Single or unspecified-order covalent boundaries are capped "
+                "with explicit link hydrogens.",
+                "Explicit multiple-bond and transition-metal boundary cuts "
+                "fail closed.",
+                "Charge is accepted only when every selected atom carries "
+                "formal-charge evidence.",
+                "Transition-metal regions retain multiple parity-compatible "
+                "spin candidates rather than assuming one ground state.",
+            ),
+        ),
         (
             MOLECULE_CONSTRUCT,
             (
@@ -417,6 +449,8 @@ class PySCFElectronicStructureAdapter:
                 )
 
         try:
+            if capability_name == QM_REGION_PREPARE:
+                return self._prepare_qm_region(invocation)
             if capability_name == MOLECULE_CONSTRUCT:
                 return self._construct_molecule(invocation)
             if capability_name == CONFIGURATION_DEFINE:
@@ -720,6 +754,155 @@ class PySCFElectronicStructureAdapter:
             raise ValueError("Spin is incompatible with electron count.")
         alpha = (electron_count + spin) // 2
         return alpha, electron_count - alpha
+
+    def _prepare_qm_region(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+
+        environment_reference = self._require_input(
+            inputs,
+            "molecular_environment",
+        )
+
+        if len(inputs) != 1:
+            raise ValueError(
+                "QM-region preparation requires one exact environment input."
+            )
+
+        environment = self._load_model(
+            environment_reference,
+            MolecularEnvironment,
+        )
+
+        seed_indices = self._index_list_parameter(
+            invocation,
+            "seed_particle_indices",
+        )
+
+        expansion_depth = self._integer_parameter(
+            invocation,
+            "expansion_bond_depth",
+            minimum=0,
+            maximum=8,
+        )
+
+        include_seed_residues = self._boolean_parameter(
+            invocation,
+            "include_seed_residues",
+        )
+
+        maximum_spin = self._integer_parameter(
+            invocation,
+            "maximum_transition_metal_spin",
+            minimum=0,
+            maximum=12,
+        )
+
+        result = prepare_qm_region(
+            environment,
+            source_artifact_identifier=(
+                environment_reference.artifact_identifier
+            ),
+            seed_particle_indices=seed_indices,
+            expansion_bond_depth=expansion_depth,
+            include_seed_residues=include_seed_residues,
+            maximum_transition_metal_spin=maximum_spin,
+        )
+
+        molecule_references = tuple(
+            self._write_model(
+                invocation,
+                model=molecule,
+                artifact_type="electronic_molecule",
+                identifier_prefix="electronic-molecule",
+                parents=(environment_reference,),
+                metadata={
+                    "atom_count": len(molecule.atoms),
+                    "electron_count": molecule.electron_count,
+                    "molecular_charge": molecule.molecular_charge,
+                    "spin": molecule.spin,
+                    "qm_region_prepared": True,
+                },
+            )
+            for molecule in result.molecules
+        )
+
+        preparation_reference = self._write_model(
+            invocation,
+            model=result.preparation,
+            artifact_type="electronic_qm_region_preparation",
+            identifier_prefix="electronic-qm-region",
+            parents=(
+                environment_reference,
+                *molecule_references,
+            ),
+            metadata={
+                "selected_particle_count": len(
+                    result.preparation.selected_particle_indices
+                ),
+                "boundary_link_count": len(
+                    result.preparation.boundary_links
+                ),
+                "molecular_charge": (
+                    result.preparation
+                    .charge_spin_assessment
+                    .molecular_charge
+                ),
+                "spin_candidate_count": len(
+                    result.preparation
+                    .charge_spin_assessment
+                    .spin_candidates
+                ),
+            },
+        )
+
+        lineage: list[ArtifactLineageEdge] = []
+
+        for reference in molecule_references:
+            lineage.extend(
+                self._lineage(
+                    invocation,
+                    parents=(environment_reference,),
+                    child=reference,
+                    relationship_type="constructs",
+                )
+            )
+
+        lineage.extend(
+            self._lineage(
+                invocation,
+                parents=(
+                    environment_reference,
+                    *molecule_references,
+                ),
+                child=preparation_reference,
+                relationship_type="prepares",
+            )
+        )
+
+        return self._success(
+            invocation,
+            artifacts=(
+                preparation_reference,
+                *molecule_references,
+            ),
+            lineage=tuple(lineage),
+            diagnostics={
+                "selected_particle_count": len(
+                    result.preparation.selected_particle_indices
+                ),
+                "boundary_link_count": len(
+                    result.preparation.boundary_links
+                ),
+                "spin_candidate_count": len(
+                    result.preparation
+                    .charge_spin_assessment
+                    .spin_candidates
+                ),
+            },
+        )
 
     def _construct_molecule(
         self,

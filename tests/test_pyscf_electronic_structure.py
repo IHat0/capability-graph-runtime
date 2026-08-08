@@ -14,6 +14,7 @@ from cgr.electronic_structure import (
     CONFIGURATION_DEFINE,
     HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
+    QM_REGION_PREPARE,
     ORBITALS_GENERATE,
     QMMM_EMBEDDING_PREPARE,
     REFERENCE_CALCULATE,
@@ -21,6 +22,7 @@ from cgr.electronic_structure import (
     ElectronicActiveSpaceSelection,
     ElectronicHartreeFockResult,
     ElectronicMolecule,
+    ElectronicQMRegionPreparation,
     ElectronicOrbitalSet,
     ElectronicReferenceCalculation,
     ElectronicStructureConfiguration,
@@ -253,8 +255,9 @@ def test_declaration_exposes_phase4_capabilities_without_importing_pyscf() -> No
     envelopes = pyscf_capability_envelopes()
     after = set(sys.modules)
 
-    assert len(envelopes) == 8
+    assert len(envelopes) == 9
     assert {envelope.descriptor.capability_name for envelope in envelopes} == {
+        QM_REGION_PREPARE,
         MOLECULE_CONSTRUCT,
         CONFIGURATION_DEFINE,
         HARTREE_FOCK,
@@ -704,6 +707,243 @@ def test_automatic_selection_rejects_impossible_electron_count() -> None:
                 "active_electron_count": 4,
                 "active_spatial_orbital_count": 2,
                 "selection_method": "frontier",
+            },
+        )
+    )
+
+    assert result.status is ExecutionStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.code == "electronic_input_invalid"
+
+def _qm_region_environment(
+    *,
+    metal_boundary: bool = False,
+    missing_charge: bool = False,
+) -> MolecularEnvironment:
+    first_atomic_number = 30 if metal_boundary else 6
+    first_symbol = "Zn" if metal_boundary else "C"
+
+    return MolecularEnvironment(
+        schema_version=VERSION,
+        environment_identifier="environment.qm-region-test",
+        environment_type="vacuum",
+        source_conformer_set_identifier="conformers.qm-region-test",
+        source_conformer_index=0,
+        force_field_selection_identifier="force-field.test",
+        atoms=(
+            MolecularSimulationAtom(
+                particle_index=0,
+                particle_kind="atom",
+                atomic_number=first_atomic_number,
+                element_symbol=first_symbol,
+                atom_name=first_symbol,
+                residue_index=0,
+                residue_name="QMA",
+                residue_identifier="residue.qma",
+                chain_index=0,
+                chain_identifier="chain.a",
+                source_atom_index=0,
+                formal_charge=None if missing_charge else 0,
+            ),
+            MolecularSimulationAtom(
+                particle_index=1,
+                particle_kind="atom",
+                atomic_number=6 if not metal_boundary else 7,
+                element_symbol="C" if not metal_boundary else "N",
+                atom_name="C2" if not metal_boundary else "N1",
+                residue_index=1,
+                residue_name="MMB",
+                residue_identifier="residue.mmb",
+                chain_index=0,
+                chain_identifier="chain.a",
+                source_atom_index=1,
+                formal_charge=0,
+            ),
+            MolecularSimulationAtom(
+                particle_index=2,
+                particle_kind="atom",
+                atomic_number=1,
+                element_symbol="H",
+                atom_name="H1",
+                residue_index=0,
+                residue_name="QMA",
+                residue_identifier="residue.qma",
+                chain_index=0,
+                chain_identifier="chain.a",
+                source_atom_index=2,
+                formal_charge=0,
+            ),
+            MolecularSimulationAtom(
+                particle_index=3,
+                particle_kind="atom",
+                atomic_number=1,
+                element_symbol="H",
+                atom_name="H2",
+                residue_index=1,
+                residue_name="MMB",
+                residue_identifier="residue.mmb",
+                chain_index=0,
+                chain_identifier="chain.a",
+                source_atom_index=3,
+                formal_charge=0,
+            ),
+        ),
+        bonds=(
+            MolecularSimulationBond(
+                atom_index_a=0,
+                atom_index_b=1,
+                order=None if metal_boundary else 1,
+            ),
+            MolecularSimulationBond(
+                atom_index_a=0,
+                atom_index_b=2,
+                order=1,
+            ),
+            MolecularSimulationBond(
+                atom_index_a=1,
+                atom_index_b=3,
+                order=1,
+            ),
+        ),
+        positions=(
+            MolecularVector3(x=0.0, y=0.0, z=0.0),
+            MolecularVector3(x=0.154, y=0.0, z=0.0),
+            MolecularVector3(x=-0.100, y=0.0, z=0.0),
+            MolecularVector3(x=0.254, y=0.0, z=0.0),
+        ),
+        source_solute_atom_count=4,
+    )
+
+
+def test_qm_region_prepare_caps_boundary_and_determines_charge_spin() -> None:
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    environment_reference = _store_model(
+        store,
+        "fixture.qm-region-environment",
+        "molecular_environment",
+        _qm_region_environment(),
+    )
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            QM_REGION_PREPARE,
+            inputs=(environment_reference,),
+            parameters={
+                "seed_particle_indices": "0",
+                "expansion_bond_depth": 0,
+                "include_seed_residues": True,
+                "maximum_transition_metal_spin": 6,
+            },
+            execution_identifier="execution.phase8-qm-region",
+        )
+    )
+
+    assert result.status is ExecutionStatus.SUCCESS
+    assert len(result.output_artifacts) == 2
+
+    artifacts_by_type = {
+        reference.artifact_type: reference
+        for reference in result.output_artifacts
+    }
+
+    assert set(artifacts_by_type) == {
+        "electronic_qm_region_preparation",
+        "electronic_molecule",
+    }
+
+    preparation = ElectronicQMRegionPreparation.model_validate_json(
+        store.read(
+            artifacts_by_type[
+                "electronic_qm_region_preparation"
+            ]
+        )
+    )
+    molecule = ElectronicMolecule.model_validate_json(
+        store.read(
+            artifacts_by_type["electronic_molecule"]
+        )
+    )
+
+    assert preparation.selected_particle_indices == (0, 2)
+    assert preparation.selected_source_atom_indices == (0, 2)
+    assert preparation.included_residue_identifiers == ("residue.qma",)
+    assert len(preparation.boundary_links) == 1
+
+    link = preparation.boundary_links[0]
+    assert link.qm_particle_index == 0
+    assert link.mm_particle_index == 1
+    assert link.link_atom_index == 2
+    assert link.link_distance_angstrom == pytest.approx(1.09)
+    assert link.x_angstrom == pytest.approx(1.09)
+
+    assessment = preparation.charge_spin_assessment
+    assert assessment.molecular_charge == 0
+    assert assessment.electron_count == 8
+    assert assessment.spin_candidates == (0,)
+    assert not assessment.contains_transition_metal
+
+    assert molecule.molecular_charge == 0
+    assert molecule.spin == 0
+    assert molecule.electron_count == 8
+    assert len(molecule.atoms) == 3
+    assert molecule.atoms[-1].element_symbol == "H"
+    assert molecule.atoms[-1].source_atom_index is None
+
+
+def test_qm_region_prepare_rejects_transition_metal_boundary_cut() -> None:
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    environment_reference = _store_model(
+        store,
+        "fixture.qm-region-metal-boundary",
+        "molecular_environment",
+        _qm_region_environment(metal_boundary=True),
+    )
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            QM_REGION_PREPARE,
+            inputs=(environment_reference,),
+            parameters={
+                "seed_particle_indices": "0",
+                "expansion_bond_depth": 0,
+                "include_seed_residues": False,
+                "maximum_transition_metal_spin": 6,
+            },
+        )
+    )
+
+    assert result.status is ExecutionStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.code == "electronic_input_invalid"
+
+
+def test_qm_region_prepare_fails_without_charge_evidence() -> None:
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    environment_reference = _store_model(
+        store,
+        "fixture.qm-region-missing-charge",
+        "molecular_environment",
+        _qm_region_environment(missing_charge=True),
+    )
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            QM_REGION_PREPARE,
+            inputs=(environment_reference,),
+            parameters={
+                "seed_particle_indices": "0",
+                "expansion_bond_depth": 0,
+                "include_seed_residues": True,
+                "maximum_transition_metal_spin": 6,
             },
         )
     )
