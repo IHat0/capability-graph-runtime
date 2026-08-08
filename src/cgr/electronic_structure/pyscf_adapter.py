@@ -57,6 +57,7 @@ from .contracts import (
     ElectronicHartreeFockResult,
     ElectronicImplicitSolventResult,
     ElectronicMolecule,
+    ElectronicQMMMHybridResult,
     ElectronicQMMMHartreeFockResult,
     ElectronicOrbital,
     ElectronicOrbitalSelectionScore,
@@ -86,6 +87,7 @@ ACTIVE_SPACE_SELECT = "electronic.active_space_select"
 ACTIVE_SPACE_CONSTRUCT = "electronic.active_space_construct"
 QMMM_EMBEDDING_PREPARE = "electronic.qmmm_embedding_prepare"
 QMMM_HARTREE_FOCK = "electronic.qmmm_hartree_fock"
+QMMM_HYBRID_EXECUTE = "electronic.qmmm_hybrid_execute"
 IMPLICIT_SOLVENT_HARTREE_FOCK = "electronic.implicit_solvent_hartree_fock"
 GRADIENT_CALCULATE = "electronic.gradient_calculate"
 FREQUENCY_ANALYZE = "electronic.frequency_analyze"
@@ -100,6 +102,13 @@ class ElectronicArtifactPayloadStore(Protocol):
     def read(self, reference: ArtifactReference) -> bytes:
         """Return exact bytes addressed by a complete reference."""
         ...
+
+
+@runtime_checkable
+class ElectronicPrivateStateStore(Protocol):
+    """Read private native state bound to a public scientific manifest."""
+
+    def read(self, reference: ArtifactReference) -> bytes: ...
 
     def write(self, reference: ArtifactReference, payload: bytes) -> None:
         """Persist exact bytes under a content-addressed reference."""
@@ -422,6 +431,36 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
                 "charge-shift boundary preparation artifact.",
             ),
         ),
+        (
+            QMMM_HYBRID_EXECUTE,
+            (
+                "electronic_molecule",
+                "electronic_structure_configuration",
+                "electronic_qm_region_preparation",
+                "qmmm_embedding_foundation",
+                "electronic_qmmm_hartree_fock_result",
+                "molecular_environment",
+                "molecular_simulation_system",
+            ),
+            ("electronic_qmmm_hybrid_result",),
+            (
+                "qmmm_total_energy",
+                "qmmm_gradient",
+                "covalent_qmmm_boundary_execution",
+            ),
+            False,
+            (
+                "The supported subtractive expression removes both the QM-region "
+                "MM model energy and classical QM/MM electrostatics, preventing "
+                "double counting with PySCF electronic embedding.",
+                "Version 1 accepts non-periodic OpenMM systems with one conventional "
+                "NonbondedForce and standard harmonic/periodic bonded forces.",
+                "Link-atom gradients are projected onto real QM/MM boundary atoms "
+                "by the analytical link-coordinate Jacobian.",
+                "Periodic electrostatics, polarizable force fields, custom forces, "
+                "and multiple-bond or metal-crossing boundaries fail closed.",
+            ),
+        ),
 
     )
 
@@ -483,6 +522,7 @@ class PySCFElectronicStructureAdapter:
         self,
         payload_store: ElectronicArtifactPayloadStore,
         *,
+        private_state_store: ElectronicPrivateStateStore | None = None,
         maximum_payload_bytes: int = _MAXIMUM_PAYLOAD_BYTES,
     ) -> None:
         if not isinstance(payload_store, ElectronicArtifactPayloadStore):
@@ -494,6 +534,13 @@ class PySCFElectronicStructureAdapter:
                 "The PySCF payload limit must be positive."
             )
         self._payload_store = payload_store
+        if private_state_store is not None and not isinstance(
+            private_state_store, ElectronicPrivateStateStore
+        ):
+            raise PySCFAdapterConfigurationError(
+                "The PySCF private-state store does not implement exact reads."
+            )
+        self._private_state_store = private_state_store
         self._maximum_payload_bytes = maximum_payload_bytes
         distribution = _distribution_version() or "unavailable"
         self._declaration = ScientificEngineAdapterDeclaration(
@@ -582,6 +629,7 @@ class PySCFElectronicStructureAdapter:
             TRANSITION_STATE_SEARCH,
             REACTION_PATH_CONFIRM,
             QMMM_HARTREE_FOCK,
+            QMMM_HYBRID_EXECUTE,
         }
         if requires_engine:
             health = self.health()
@@ -623,6 +671,8 @@ class PySCFElectronicStructureAdapter:
                 return self._prepare_qmmm_embedding(invocation)
             if capability_name == QMMM_HARTREE_FOCK:
                 return self._run_qmmm_hartree_fock(invocation)
+            if capability_name == QMMM_HYBRID_EXECUTE:
+                return self._run_qmmm_hybrid(invocation)
         except (ValidationError, ValueError, KeyError, IndexError):
             return self._failure(
                 "electronic_input_invalid",
@@ -2820,6 +2870,479 @@ class PySCFElectronicStructureAdapter:
             },
         )
 
+    def _run_qmmm_hybrid(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        """Execute the supported subtractive electrostatic-embedding model."""
+
+        if self._private_state_store is None:
+            raise ValueError("Hybrid QM/MM requires private OpenMM system state.")
+        inputs = self._inputs_by_type(invocation)
+        required = {
+            "electronic_molecule",
+            "electronic_structure_configuration",
+            "electronic_qm_region_preparation",
+            "qmmm_embedding_foundation",
+            "electronic_qmmm_hartree_fock_result",
+            "molecular_environment",
+            "molecular_simulation_system",
+        }
+        if set(inputs) != required:
+            raise ValueError("Hybrid QM/MM requires seven exact scientific inputs.")
+        molecule_reference = self._require_input(inputs, "electronic_molecule")
+        configuration_reference = self._require_input(
+            inputs, "electronic_structure_configuration"
+        )
+        preparation_reference = self._require_input(
+            inputs, "electronic_qm_region_preparation"
+        )
+        embedding_reference = self._require_input(inputs, "qmmm_embedding_foundation")
+        qmmm_reference = self._require_input(
+            inputs, "electronic_qmmm_hartree_fock_result"
+        )
+        environment_reference = self._require_input(inputs, "molecular_environment")
+        system_reference = self._require_input(inputs, "molecular_simulation_system")
+        molecule = self._load_model(molecule_reference, ElectronicMolecule)
+        configuration = self._load_model(
+            configuration_reference, ElectronicStructureConfiguration
+        )
+        preparation = self._load_model(
+            preparation_reference, ElectronicQMRegionPreparation
+        )
+        embedding = self._load_model(embedding_reference, QMMMEmbeddingFoundation)
+        qmmm_result = self._load_model(
+            qmmm_reference, ElectronicQMMMHartreeFockResult
+        )
+        environment = self._load_model(environment_reference, MolecularEnvironment)
+        system_manifest = self._load_model(
+            system_reference, MolecularSimulationSystem
+        )
+        if (
+            configuration.molecule_identifier != molecule.molecule_identifier
+            or embedding.molecule_identifier != molecule.molecule_identifier
+            or qmmm_result.molecule_identifier != molecule.molecule_identifier
+            or qmmm_result.configuration_identifier
+            != configuration.configuration_identifier
+            or qmmm_result.embedding_identifier != embedding.embedding_identifier
+            or preparation.environment_identifier != environment.environment_identifier
+            or embedding.environment_identifier != environment.environment_identifier
+            or system_manifest.environment_identifier != environment.environment_identifier
+            or embedding.simulation_system_identifier != system_manifest.system_identifier
+        ):
+            raise ValueError("Hybrid QM/MM inputs do not describe one calculation.")
+        if system_manifest.periodic or system_manifest.settings.nonbonded_method != "no_cutoff":
+            raise ValueError("Hybrid QM/MM v1 supports non-periodic no-cutoff systems only.")
+        if system_manifest.particle_count != len(environment.atoms):
+            raise ValueError("Hybrid QM/MM particle identities are inconsistent.")
+        private_xml = self._private_state_store.read(system_reference)
+        if (
+            not isinstance(private_xml, bytes)
+            or hashlib.sha256(private_xml).hexdigest()
+            != system_manifest.private_state_sha256
+        ):
+            raise ValueError("Private OpenMM system state failed integrity validation.")
+
+        numpy, gto, scf, _, _ = _pyscf_modules()
+        from pyscf import qmmm
+
+        native_molecule = self._build_pyscf_molecule(molecule, configuration, gto)
+        native_scf = self._build_scf(
+            molecule, configuration, native_molecule, scf
+        )
+        mm_coordinates = tuple(
+            (site.x_angstrom, site.y_angstrom, site.z_angstrom)
+            for site in embedding.embedding_sites
+        )
+        mm_charges = tuple(site.charge_e for site in embedding.embedding_sites)
+        native_scf = qmmm.mm_charge(
+            native_scf, mm_coordinates, mm_charges, unit="Angstrom"
+        )
+        embedded_energy = float(native_scf.kernel())
+        if not bool(native_scf.converged):
+            return self._failure(
+                "qmmm_scf_not_converged",
+                "The hybrid QM/MM embedded SCF calculation did not converge.",
+                retryable=True,
+            )
+        if not math.isclose(
+            embedded_energy,
+            qmmm_result.embedded_total_energy_hartree,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        ):
+            raise ValueError("Embedded QM energy is not reproducible from its inputs.")
+
+        full_system, model_system, cross_system = self._qmmm_openmm_systems(
+            private_xml=private_xml,
+            preparation=preparation,
+            embedding=embedding,
+            particle_count=system_manifest.particle_count,
+        )
+        positions_nm = tuple(
+            (position.x, position.y, position.z) for position in environment.positions
+        )
+        full_energy_kj, full_gradient = self._openmm_energy_gradient(
+            full_system, positions_nm
+        )
+        model_energy_kj, model_gradient = self._openmm_energy_gradient(
+            model_system, positions_nm
+        )
+        cross_energy_kj, cross_gradient = self._openmm_energy_gradient(
+            cross_system, positions_nm
+        )
+        hartree_kj_per_mol = 2625.4996394799
+        full_energy = full_energy_kj / hartree_kj_per_mol
+        model_energy = model_energy_kj / hartree_kj_per_mol
+        cross_energy = cross_energy_kj / hartree_kj_per_mol
+
+        gradient_method = native_scf.nuc_grad_method()
+        qm_gradient = numpy.asarray(gradient_method.kernel(), dtype=float)
+        density = numpy.asarray(native_scf.make_rdm1())
+        if density.ndim == 3:
+            density = density.sum(axis=0)
+        if not hasattr(gradient_method, "grad_hcore_mm") or not hasattr(
+            gradient_method, "grad_nuc_mm"
+        ):
+            raise ValueError("Installed PySCF lacks analytical MM-site gradients.")
+        mm_gradient = numpy.asarray(
+            gradient_method.grad_hcore_mm(density)
+            + gradient_method.grad_nuc_mm(),
+            dtype=float,
+        )
+        if mm_gradient.shape != (len(embedding.embedding_sites), 3):
+            raise ValueError("PySCF MM-site gradient dimensions are invalid.")
+        real_qmmm_gradient = numpy.zeros((system_manifest.particle_count, 3))
+        selected = preparation.selected_particle_indices
+        if qm_gradient.shape != (
+            len(selected) + len(preparation.boundary_links),
+            3,
+        ):
+            raise ValueError("PySCF QM/link gradient dimensions are invalid.")
+        for local_index, particle_index in enumerate(selected):
+            real_qmmm_gradient[particle_index] += qm_gradient[local_index]
+        for site, value in zip(embedding.embedding_sites, mm_gradient, strict=True):
+            real_qmmm_gradient[site.source_particle_index] += value
+        identity = numpy.eye(3)
+        coordinates_angstrom = numpy.asarray(positions_nm, dtype=float) * 10.0
+        for offset, link in enumerate(preparation.boundary_links):
+            link_gradient = qm_gradient[len(selected) + offset]
+            vector = (
+                coordinates_angstrom[link.mm_particle_index]
+                - coordinates_angstrom[link.qm_particle_index]
+            )
+            length = float(numpy.linalg.norm(vector))
+            if length <= 1e-10:
+                raise ValueError("A QM/MM boundary bond has zero length.")
+            unit_vector = vector / length
+            projector = (identity - numpy.outer(unit_vector, unit_vector)) / length
+            derivative_mm = link.link_distance_angstrom * projector
+            derivative_qm = identity - derivative_mm
+            real_qmmm_gradient[link.qm_particle_index] += derivative_qm.T @ link_gradient
+            real_qmmm_gradient[link.mm_particle_index] += derivative_mm.T @ link_gradient
+        correction_gradient = full_gradient - model_gradient - cross_gradient
+        total_gradient = real_qmmm_gradient + correction_gradient
+        boundary_correction = 0.0
+        total_energy = (
+            embedded_energy + full_energy - model_energy - cross_energy
+            + boundary_correction
+        )
+        result = ElectronicQMMMHybridResult(
+            schema_version=_SCHEMA_VERSION,
+            result_identifier=_stable_identifier(
+                "electronic-qmmm-hybrid",
+                molecule.molecule_identifier,
+                configuration.configuration_identifier,
+                embedding.embedding_identifier,
+                total_energy,
+            ),
+            molecule_identifier=molecule.molecule_identifier,
+            configuration_identifier=configuration.configuration_identifier,
+            embedding_identifier=embedding.embedding_identifier,
+            environment_identifier=environment.environment_identifier,
+            simulation_system_identifier=system_manifest.system_identifier,
+            qmmm_hartree_fock_result_identifier=qmmm_result.result_identifier,
+            embedded_qm_energy_hartree=embedded_energy,
+            full_mm_energy_hartree=full_energy,
+            subtracted_qm_model_mm_energy_hartree=model_energy,
+            subtracted_classical_qm_mm_electrostatic_energy_hartree=cross_energy,
+            boundary_energy_correction_hartree=boundary_correction,
+            total_hybrid_energy_hartree=total_energy,
+            gradient_hartree_per_bohr=_tensor(
+                total_gradient,
+                unit="hartree_per_bohr",
+                index_convention="real_particle_by_cartesian",
+            ),
+            particle_count=system_manifest.particle_count,
+            link_atom_gradient_projected=bool(preparation.boundary_links),
+            included_physics=(
+                "qm_internal_energy",
+                "quantum_qm_mm_electrostatics",
+                "mm_internal_energy",
+                "mm_mm_nonbonded_energy",
+                "qm_mm_vdw_and_bonded_energy",
+            ),
+            excluded_physics=(
+                "polarizable_embedding",
+                "periodic_long_range_electrostatics",
+                "thermal_free_energy",
+            ),
+        )
+        parents = (
+            molecule_reference,
+            configuration_reference,
+            preparation_reference,
+            embedding_reference,
+            qmmm_reference,
+            environment_reference,
+            system_reference,
+        )
+        output = self._write_model(
+            invocation,
+            model=result,
+            artifact_type="electronic_qmmm_hybrid_result",
+            identifier_prefix="electronic-qmmm-hybrid",
+            parents=parents,
+            metadata={
+                "formulation": result.formulation,
+                "total_hybrid_energy_hartree": total_energy,
+                "no_double_counting_verified": True,
+                "link_atom_gradient_projected": result.link_atom_gradient_projected,
+            },
+        )
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="combines_without_double_counting",
+            ),
+            diagnostics={
+                "total_hybrid_energy_hartree": total_energy,
+                "full_mm_energy_hartree": full_energy,
+                "subtracted_qm_model_mm_energy_hartree": model_energy,
+                "subtracted_classical_qm_mm_electrostatic_energy_hartree": cross_energy,
+                "no_double_counting_verified": True,
+            },
+        )
+
+    @staticmethod
+    def _openmm_energy_gradient(
+        system: object,
+        positions_nm: tuple[tuple[float, float, float], ...],
+    ) -> tuple[float, object]:
+        import numpy
+        import openmm
+        from openmm import unit
+
+        integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+        platform = openmm.Platform.getPlatformByName("Reference")
+        context = openmm.Context(system, integrator, platform)
+        try:
+            context.setPositions(
+                unit.Quantity(
+                    [openmm.Vec3(*position) for position in positions_nm],
+                    unit.nanometer,
+                )
+            )
+            state = context.getState(getEnergy=True, getForces=True)
+            energy = float(
+                state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+            )
+            forces = numpy.asarray(
+                state.getForces(asNumpy=True).value_in_unit(
+                    unit.kilojoule_per_mole / unit.nanometer
+                ),
+                dtype=float,
+            )
+        finally:
+            del context, integrator
+        bohr_nm = 0.0529177210903
+        hartree_kj_per_mol = 2625.4996394799
+        gradient = -forces * bohr_nm / hartree_kj_per_mol
+        return energy, gradient
+
+    @staticmethod
+    def _qmmm_openmm_systems(
+        *,
+        private_xml: bytes,
+        preparation: ElectronicQMRegionPreparation,
+        embedding: QMMMEmbeddingFoundation,
+        particle_count: int,
+    ) -> tuple[object, object, object]:
+        """Build full, QM-model and isolated cross-Coulomb OpenMM systems."""
+
+        import openmm
+        from openmm import unit
+
+        full = openmm.XmlSerializer.deserialize(private_xml.decode("utf-8"))
+        if full.getNumParticles() != particle_count:
+            raise ValueError("Private OpenMM system particle count is inconsistent.")
+        qm_indices = set(preparation.selected_particle_indices)
+        mm_indices = set(range(particle_count)) - qm_indices
+        if {site.source_particle_index for site in embedding.embedding_sites} != mm_indices:
+            raise ValueError("Embedding sites must cover every and only MM particle.")
+        nonbonded = tuple(
+            full.getForce(index)
+            for index in range(full.getNumForces())
+            if isinstance(full.getForce(index), openmm.NonbondedForce)
+        )
+        if len(nonbonded) != 1:
+            raise ValueError("Hybrid QM/MM requires exactly one NonbondedForce.")
+        force = nonbonded[0]
+        if (
+            force.getNonbondedMethod() != openmm.NonbondedForce.NoCutoff
+            or force.getNumParticleParameterOffsets()
+            or force.getNumExceptionParameterOffsets()
+        ):
+            raise ValueError("Unsupported OpenMM nonbonded method or parameter offsets.")
+        original_charge: list[float] = []
+        sigma_values: list[object] = []
+        epsilon_values: list[object] = []
+        for index in range(particle_count):
+            charge, sigma, epsilon = force.getParticleParameters(index)
+            original_charge.append(float(charge.value_in_unit(unit.elementary_charge)))
+            sigma_values.append(sigma)
+            epsilon_values.append(epsilon)
+        adjusted_charge = list(original_charge)
+        for site in embedding.embedding_sites:
+            adjusted_charge[site.source_particle_index] = site.charge_e
+        for index in range(particle_count):
+            force.setParticleParameters(
+                index,
+                adjusted_charge[index] * unit.elementary_charge,
+                sigma_values[index],
+                epsilon_values[index],
+            )
+        adjusted_exceptions: dict[tuple[int, int], float] = {}
+        for exception_index in range(force.getNumExceptions()):
+            i, j, charge_product, sigma, epsilon = force.getExceptionParameters(
+                exception_index
+            )
+            i, j = int(i), int(j)
+            product = float(
+                charge_product.value_in_unit(unit.elementary_charge ** 2)
+            )
+            if (i in qm_indices) != (j in qm_indices):
+                denominator = original_charge[i] * original_charge[j]
+                if abs(denominator) <= 1e-14:
+                    if abs(product) > 1e-14:
+                        raise ValueError("A cross-boundary exception cannot be rescaled.")
+                    adjusted_product = 0.0
+                else:
+                    adjusted_product = (
+                        product / denominator * adjusted_charge[i] * adjusted_charge[j]
+                    )
+                force.setExceptionParameters(
+                    exception_index,
+                    i,
+                    j,
+                    adjusted_product * unit.elementary_charge ** 2,
+                    sigma,
+                    epsilon,
+                )
+                adjusted_exceptions[tuple(sorted((i, j)))] = adjusted_product
+
+        serialized_full = openmm.XmlSerializer.serialize(full)
+        model = openmm.XmlSerializer.deserialize(serialized_full)
+        supported = (
+            openmm.NonbondedForce,
+            openmm.HarmonicBondForce,
+            openmm.HarmonicAngleForce,
+            openmm.PeriodicTorsionForce,
+            openmm.RBTorsionForce,
+            openmm.CMMotionRemover,
+        )
+        for force_index in range(model.getNumForces()):
+            model_force = model.getForce(force_index)
+            if not isinstance(model_force, supported):
+                raise ValueError(
+                    f"Unsupported OpenMM force at QM/MM boundary: {type(model_force).__name__}."
+                )
+            if isinstance(model_force, openmm.NonbondedForce):
+                for index in mm_indices:
+                    _, sigma, _ = model_force.getParticleParameters(index)
+                    model_force.setParticleParameters(
+                        index,
+                        0.0 * unit.elementary_charge,
+                        sigma,
+                        0.0 * unit.kilojoule_per_mole,
+                    )
+                for exception_index in range(model_force.getNumExceptions()):
+                    i, j, charge_product, sigma, epsilon = model_force.getExceptionParameters(
+                        exception_index
+                    )
+                    if int(i) not in qm_indices or int(j) not in qm_indices:
+                        model_force.setExceptionParameters(
+                            exception_index,
+                            i,
+                            j,
+                            0.0 * unit.elementary_charge ** 2,
+                            sigma,
+                            0.0 * unit.kilojoule_per_mole,
+                        )
+            elif isinstance(model_force, openmm.HarmonicBondForce):
+                for index in range(model_force.getNumBonds()):
+                    i, j, length, k = model_force.getBondParameters(index)
+                    if int(i) not in qm_indices or int(j) not in qm_indices:
+                        model_force.setBondParameters(
+                            index, i, j, length, 0.0 * k
+                        )
+            elif isinstance(model_force, openmm.HarmonicAngleForce):
+                for index in range(model_force.getNumAngles()):
+                    i, j, k_atom, angle, k_force = model_force.getAngleParameters(index)
+                    if not {int(i), int(j), int(k_atom)}.issubset(qm_indices):
+                        model_force.setAngleParameters(
+                            index, i, j, k_atom, angle, 0.0 * k_force
+                        )
+            elif isinstance(model_force, openmm.PeriodicTorsionForce):
+                for index in range(model_force.getNumTorsions()):
+                    i, j, k_atom, l, periodicity, phase, k_force = (
+                        model_force.getTorsionParameters(index)
+                    )
+                    if not {int(i), int(j), int(k_atom), int(l)}.issubset(qm_indices):
+                        model_force.setTorsionParameters(
+                            index, i, j, k_atom, l, periodicity, phase, 0.0 * k_force
+                        )
+            elif isinstance(model_force, openmm.RBTorsionForce):
+                for index in range(model_force.getNumTorsions()):
+                    values = model_force.getTorsionParameters(index)
+                    atoms = tuple(int(value) for value in values[:4])
+                    if not set(atoms).issubset(qm_indices):
+                        model_force.setTorsionParameters(
+                            index, *values[:4], *(0.0 * value for value in values[4:])
+                        )
+
+        cross = openmm.System()
+        for _ in range(particle_count):
+            cross.addParticle(0.0)
+        cross_nonbonded = openmm.CustomNonbondedForce(
+            "138.935456*q1*q2/r"
+        )
+        cross_nonbonded.addPerParticleParameter("q")
+        cross_nonbonded.setNonbondedMethod(openmm.CustomNonbondedForce.NoCutoff)
+        for charge in adjusted_charge:
+            cross_nonbonded.addParticle((charge,))
+        cross_nonbonded.addInteractionGroup(qm_indices, mm_indices)
+        cross_exceptions = openmm.CustomBondForce("138.935456*charge_product/r")
+        cross_exceptions.addPerBondParameter("charge_product")
+        for exception_index in range(force.getNumExceptions()):
+            i, j, charge_product, _, _ = force.getExceptionParameters(exception_index)
+            i, j = int(i), int(j)
+            cross_nonbonded.addExclusion(i, j)
+            if (i in qm_indices) != (j in qm_indices):
+                product = adjusted_exceptions.get(
+                    tuple(sorted((i, j))),
+                    float(charge_product.value_in_unit(unit.elementary_charge ** 2)),
+                )
+                if abs(product) > 0.0:
+                    cross_exceptions.addBond(i, j, (product,))
+        cross.addForce(cross_nonbonded)
+        cross.addForce(cross_exceptions)
+        return full, model, cross
+
     def _run_implicit_solvent_hartree_fock(
         self,
         invocation: CapabilityInvocation,
@@ -3590,7 +4113,10 @@ class PySCFElectronicStructureAdapter:
                 "electrostatic execution."
             )
 
-        if embedding.boundary_policy != "no_covalent_boundary":
+        if embedding.boundary_policy not in {
+            "no_covalent_boundary",
+            "charge_shift",
+        }:
             raise ValueError(
                 "Unsupported QM/MM boundary policy."
             )

@@ -1255,3 +1255,92 @@ class ElectronicQMMMHartreeFockResult(CanonicalModel):
             )
 
         return self
+
+
+class ElectronicQMMMHybridResult(CanonicalModel):
+    """Auditable electrostatic-embedding subtractive QM/MM energy and gradient.
+
+    The implemented expression is
+
+    E = E_QM^emb(QM; q_MM) + E_MM(full) - E_MM(QM)
+        - E_MM,coul(QM,MM).
+
+    The last term removes the classical QM/MM electrostatics already replaced
+    by the PySCF electronic embedding.  Cross-boundary bonded and van der Waals
+    terms remain in ``E_MM(full)``.  V1 supports non-periodic OpenMM systems
+    with one conventional NonbondedForce and standard bonded forces only.
+    """
+
+    schema_version: CapabilityVersion
+    result_identifier: str
+    molecule_identifier: str
+    configuration_identifier: str
+    embedding_identifier: str
+    environment_identifier: str
+    simulation_system_identifier: str
+    qmmm_hartree_fock_result_identifier: str
+    formulation: Literal[
+        "electrostatic_embedding_subtractive_openmm_pyscf"
+    ] = "electrostatic_embedding_subtractive_openmm_pyscf"
+    embedded_qm_energy_hartree: float
+    full_mm_energy_hartree: float
+    subtracted_qm_model_mm_energy_hartree: float
+    subtracted_classical_qm_mm_electrostatic_energy_hartree: float
+    boundary_energy_correction_hartree: float
+    total_hybrid_energy_hartree: float
+    gradient_hartree_per_bohr: ElectronicTensor
+    particle_count: int = Field(gt=0)
+    link_atom_gradient_projected: bool
+    no_double_counting_verified: Literal[True] = True
+    included_physics: tuple[str, ...] = Field(min_length=1)
+    excluded_physics: tuple[str, ...] = ()
+
+    @field_validator("schema_version")
+    @classmethod
+    def validate_schema_version(cls, value: CapabilityVersion) -> CapabilityVersion:
+        return _validate_schema_version(value)
+
+    @field_validator(
+        "result_identifier",
+        "molecule_identifier",
+        "configuration_identifier",
+        "embedding_identifier",
+        "environment_identifier",
+        "simulation_system_identifier",
+        "qmmm_hartree_fock_result_identifier",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(value, label="hybrid QM/MM identifier")
+
+    @field_validator(
+        "embedded_qm_energy_hartree",
+        "full_mm_energy_hartree",
+        "subtracted_qm_model_mm_energy_hartree",
+        "subtracted_classical_qm_mm_electrostatic_energy_hartree",
+        "boundary_energy_correction_hartree",
+        "total_hybrid_energy_hartree",
+    )
+    @classmethod
+    def validate_energies(cls, value: float) -> float:
+        return _finite(value, label="hybrid QM/MM energy")
+
+    @model_validator(mode="after")
+    def validate_hybrid_result(self) -> Self:
+        reconstructed = (
+            self.embedded_qm_energy_hartree
+            + self.full_mm_energy_hartree
+            - self.subtracted_qm_model_mm_energy_hartree
+            - self.subtracted_classical_qm_mm_electrostatic_energy_hartree
+            + self.boundary_energy_correction_hartree
+        )
+        if not math.isclose(
+            reconstructed,
+            self.total_hybrid_energy_hartree,
+            rel_tol=1e-10,
+            abs_tol=1e-10,
+        ):
+            raise ValueError("Hybrid QM/MM energy components do not sum to the total.")
+        if self.gradient_hartree_per_bohr.shape != (self.particle_count, 3):
+            raise ValueError("Hybrid QM/MM gradient must cover every real particle.")
+        return self

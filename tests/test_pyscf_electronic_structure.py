@@ -21,6 +21,7 @@ from cgr.electronic_structure import (
     ORBITALS_GENERATE,
     QMMM_EMBEDDING_PREPARE,
     QMMM_HARTREE_FOCK,
+    QMMM_HYBRID_EXECUTE,
     REFERENCE_CALCULATE,
     TRANSITION_STATE_SEARCH,
     REACTION_PATH_CONFIRM,
@@ -33,6 +34,7 @@ from cgr.electronic_structure import (
     ElectronicImplicitSolventResult,
     ElectronicMolecule,
     ElectronicQMMMHartreeFockResult,
+    ElectronicQMMMHybridResult,
     ElectronicQMRegionPreparation,
     ElectronicOrbitalSelectionScore,
     ElectronicOrbitalSet,
@@ -95,6 +97,17 @@ class MemoryPayloadStore:
         existing = self.payloads.get(key)
         assert existing is None or existing == payload
         self.payloads[key] = payload
+
+
+class MemoryElectronicPrivateStateStore:
+    def __init__(self) -> None:
+        self.payloads: dict[tuple[str, str], bytes] = {}
+
+    def read(self, reference: ArtifactReference) -> bytes:
+        return self.payloads[(reference.artifact_identifier, reference.content_sha256)]
+
+    def write(self, reference: ArtifactReference, payload: bytes) -> None:
+        self.payloads[(reference.artifact_identifier, reference.content_sha256)] = payload
 
 
 def _source_reference(
@@ -271,7 +284,7 @@ def test_declaration_exposes_phase4_capabilities_without_importing_pyscf() -> No
     envelopes = pyscf_capability_envelopes()
     after = set(sys.modules)
 
-    assert len(envelopes) == 15
+    assert len(envelopes) == 16
     assert {envelope.descriptor.capability_name for envelope in envelopes} == {
         QM_REGION_PREPARE,
         MOLECULE_CONSTRUCT,
@@ -288,6 +301,7 @@ def test_declaration_exposes_phase4_capabilities_without_importing_pyscf() -> No
         ACTIVE_SPACE_CONSTRUCT,
         QMMM_EMBEDDING_PREPARE,
         QMMM_HARTREE_FOCK,
+        QMMM_HYBRID_EXECUTE,
     }
     assert not any(
         name == "pyscf" or name.startswith("pyscf.") for name in after - before
@@ -1647,5 +1661,171 @@ def test_real_pyscf_qmmm_hartree_fock_supports_open_shell(
             evidence.qm_mm_nuclear_interaction_energy_hartree
         )
         > 1e-8
+    )
+
+
+def test_native_hybrid_qmmm_energy_gradient_has_no_electrostatic_double_counting() -> None:
+    pytest.importorskip("pyscf")
+    openmm = pytest.importorskip("openmm")
+    from openmm import unit
+
+    store = MemoryPayloadStore()
+    private = MemoryElectronicPrivateStateStore()
+    adapter = PySCFElectronicStructureAdapter(
+        store, private_state_store=private
+    )
+    environment = _qm_region_environment()
+    environment_reference = _store_model(
+        store,
+        "fixture.hybrid-qmmm-environment",
+        "molecular_environment",
+        environment,
+    )
+    region_result = adapter.invoke(_invocation(
+        adapter,
+        QM_REGION_PREPARE,
+        inputs=(environment_reference,),
+        parameters={
+            "seed_particle_indices": "0",
+            "expansion_bond_depth": 0,
+            "include_seed_residues": True,
+            "maximum_transition_metal_spin": 6,
+        },
+        execution_identifier="execution.hybrid-qmmm-region",
+    ))
+    assert region_result.status is ExecutionStatus.SUCCESS
+    region_by_type = {item.artifact_type: item for item in region_result.output_artifacts}
+    preparation_reference = region_by_type["electronic_qm_region_preparation"]
+    molecule_reference = region_by_type["electronic_molecule"]
+    molecule = ElectronicMolecule.model_validate_json(store.read(molecule_reference))
+    configuration_result = adapter.invoke(_invocation(
+        adapter,
+        CONFIGURATION_DEFINE,
+        inputs=(molecule_reference,),
+        parameters={
+            "basis_set": "sto-3g",
+            "reference_method": "rhf",
+            "convergence_tolerance": 1e-10,
+            "maximum_iterations": 100,
+            "direct_scf": True,
+            "density_fitting": False,
+            "symmetry": False,
+            "initial_guess": "minao",
+        },
+        execution_identifier="execution.hybrid-qmmm-config",
+    ))
+    configuration_reference = configuration_result.output_artifacts[0]
+
+    native_system = openmm.System()
+    for mass in (12.011, 12.011, 1.008, 1.008):
+        native_system.addParticle(mass * unit.dalton)
+    bonds = openmm.HarmonicBondForce()
+    for i, j, length in ((0, 1, 0.154), (0, 2, 0.100), (1, 3, 0.100)):
+        bonds.addBond(
+            i, j, length * unit.nanometer,
+            250000.0 * unit.kilojoule_per_mole / unit.nanometer**2,
+        )
+    native_system.addForce(bonds)
+    nonbonded = openmm.NonbondedForce()
+    charges = (-0.20, 0.10, 0.05, 0.05)
+    for charge in charges:
+        nonbonded.addParticle(
+            charge * unit.elementary_charge,
+            0.30 * unit.nanometer,
+            0.20 * unit.kilojoule_per_mole,
+        )
+    for i, j in ((0, 1), (0, 2), (1, 3)):
+        nonbonded.addException(
+            i, j, 0.0 * unit.elementary_charge**2,
+            0.30 * unit.nanometer,
+            0.0 * unit.kilojoule_per_mole,
+        )
+    native_system.addForce(nonbonded)
+    xml = openmm.XmlSerializer.serialize(native_system).encode("utf-8")
+    private_sha = hashlib.sha256(xml).hexdigest()
+    manifest = MolecularSimulationSystem(
+        schema_version=VERSION,
+        system_identifier="system.hybrid-qmmm",
+        environment_identifier=environment.environment_identifier,
+        force_field_selection_identifier=environment.force_field_selection_identifier,
+        particle_count=4,
+        massive_particle_count=4,
+        constraint_count=0,
+        degrees_of_freedom=12,
+        force_kinds=("harmonic_bond", "nonbonded"),
+        total_mass_amu=26.038,
+        periodic=False,
+        settings=MolecularSystemConstructionSettings(
+            nonbonded_method="no_cutoff",
+            constraints="none",
+            rigid_water=False,
+            remove_center_of_mass_motion=False,
+        ),
+        engine_identifier="engine.openmm",
+        engine_distribution_version="8.5.2",
+        engine_build_version="8.5.0.dev-13cbe23",
+        private_state_sha256=private_sha,
+        partial_charge_source="openmm_nonbonded_force",
+        particle_partial_charges_e=charges,
+        total_partial_charge_e=sum(charges),
+    )
+    system_reference = _store_model(
+        store,
+        "fixture.hybrid-qmmm-system",
+        "molecular_simulation_system",
+        manifest,
+    )
+    private.write(system_reference, xml)
+    embedding_result = adapter.invoke(_invocation(
+        adapter,
+        QMMM_EMBEDDING_PREPARE,
+        inputs=(
+            preparation_reference,
+            molecule_reference,
+            environment_reference,
+            system_reference,
+        ),
+        execution_identifier="execution.hybrid-qmmm-embedding",
+    ))
+    assert embedding_result.status is ExecutionStatus.SUCCESS
+    embedding_reference = embedding_result.output_artifacts[0]
+    embedding = QMMMEmbeddingFoundation.model_validate_json(store.read(embedding_reference))
+    assert embedding.boundary_policy == "charge_shift"
+    qmmm_result = adapter.invoke(_invocation(
+        adapter,
+        QMMM_HARTREE_FOCK,
+        inputs=(molecule_reference, configuration_reference, embedding_reference),
+        execution_identifier="execution.hybrid-qmmm-scf",
+    ))
+    assert qmmm_result.status is ExecutionStatus.SUCCESS
+    hybrid_result = adapter.invoke(_invocation(
+        adapter,
+        QMMM_HYBRID_EXECUTE,
+        inputs=(
+            molecule_reference,
+            configuration_reference,
+            preparation_reference,
+            embedding_reference,
+            qmmm_result.output_artifacts[0],
+            environment_reference,
+            system_reference,
+        ),
+        execution_identifier="execution.hybrid-qmmm-total",
+    ))
+
+    assert hybrid_result.status is ExecutionStatus.SUCCESS
+    hybrid = ElectronicQMMMHybridResult.model_validate_json(
+        store.read(hybrid_result.output_artifacts[0])
+    )
+    assert hybrid.no_double_counting_verified
+    assert hybrid.link_atom_gradient_projected
+    assert hybrid.gradient_hartree_per_bohr.shape == (4, 3)
+    assert hybrid.total_hybrid_energy_hartree == pytest.approx(
+        hybrid.embedded_qm_energy_hartree
+        + hybrid.full_mm_energy_hartree
+        - hybrid.subtracted_qm_model_mm_energy_hartree
+        - hybrid.subtracted_classical_qm_mm_electrostatic_energy_hartree
+        + hybrid.boundary_energy_correction_hartree,
+        abs=1e-10,
     )
 
