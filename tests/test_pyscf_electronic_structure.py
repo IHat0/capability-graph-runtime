@@ -1039,6 +1039,42 @@ def test_real_pyscf_h2_pipeline_produces_generic_artifacts() -> None:
     assert active.two_body_integrals.shape == (2, 2, 2, 2)
     assert "pyscf" not in active.to_canonical_json().lower()
 
+
+def test_native_pyscf_pcm_reports_solvated_electronic_not_gibbs_energy() -> None:
+    pytest.importorskip("pyscf")
+
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+    molecule_reference = _construct_h2(adapter, store)
+    configuration_reference = _configure_h2(adapter, molecule_reference)
+    result = adapter.invoke(_invocation(
+        adapter,
+        IMPLICIT_SOLVENT_HARTREE_FOCK,
+        inputs=(molecule_reference, configuration_reference),
+        parameters={
+            "solvent_name": "water",
+            "solvent_model": "IEF-PCM",
+            "dielectric_constant": 78.3553,
+        },
+        execution_identifier="execution.phase8-native-water-pcm",
+    ))
+
+    assert result.status is ExecutionStatus.SUCCESS, result.failure
+    solvent = ElectronicImplicitSolventResult.model_validate_json(
+        store.read(result.output_artifacts[0])
+    )
+    assert solvent.converged
+    assert solvent.solvent_name == "water"
+    assert solvent.solvent_model == "IEF-PCM"
+    assert solvent.dielectric_constant == pytest.approx(78.3553)
+    assert solvent.electronic_solvation_contribution_hartree == pytest.approx(
+        solvent.solvated_total_energy_hartree - solvent.vacuum_total_energy_hartree,
+        abs=1e-10,
+    )
+    assert solvent.energy_semantics == "solvated_electronic_energy"
+    assert not solvent.thermal_correction_included
+    assert not solvent.gibbs_free_energy
+
 def test_target_ao_projection_selects_without_manual_orbital_indices() -> None:
     pytest.importorskip("pyscf")
 

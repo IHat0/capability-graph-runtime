@@ -351,7 +351,11 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
         (
             TRANSITION_STATE_SEARCH,
             ("electronic_molecule", "electronic_structure_configuration"),
-            ("electronic_transition_state_search",),
+            (
+                "electronic_transition_state_search",
+                "electronic_molecule",
+                "electronic_structure_configuration",
+            ),
             ("transition_state_search", "saddle_point_optimization"),
             False,
             (
@@ -3835,6 +3839,14 @@ class PySCFElectronicStructureAdapter:
             final_maximum_gradient_hartree_per_bohr=maximum,
             transition_state_verified=False,
         )
+        optimized_configuration = configuration.model_copy(update={
+            "configuration_identifier": _stable_identifier(
+                "electronic-ts-configuration",
+                configuration.configuration_identifier,
+                optimized_molecule.molecule_identifier,
+            ),
+            "molecule_identifier": optimized_molecule.molecule_identifier,
+        })
         parents = (molecule_reference, configuration_reference)
         output = self._write_model(
             invocation,
@@ -3850,11 +3862,45 @@ class PySCFElectronicStructureAdapter:
                 "final_energy_hartree": final_energy,
             },
         )
+        molecule_output = self._write_model(
+            invocation,
+            model=optimized_molecule,
+            artifact_type="electronic_molecule",
+            identifier_prefix="electronic-ts-molecule",
+            parents=(output,),
+            metadata={
+                "transition_state_candidate": True,
+                "transition_state_verified": False,
+            },
+        )
+        configuration_output = self._write_model(
+            invocation,
+            model=optimized_configuration,
+            artifact_type="electronic_structure_configuration",
+            identifier_prefix="electronic-ts-configuration",
+            parents=(configuration_reference, molecule_output),
+            metadata={
+                "reference_type": optimized_configuration.reference_type,
+                "basis_set": optimized_configuration.basis_set,
+            },
+        )
         return self._success(
             invocation,
-            artifacts=(output,),
-            lineage=self._lineage(
-                invocation, parents=parents, child=output, relationship_type="searches"
+            artifacts=(output, molecule_output, configuration_output),
+            lineage=(
+                *self._lineage(
+                    invocation, parents=parents, child=output, relationship_type="searches"
+                ),
+                *self._lineage(
+                    invocation, parents=(output,), child=molecule_output,
+                    relationship_type="optimizes_into",
+                ),
+                *self._lineage(
+                    invocation,
+                    parents=(configuration_reference, molecule_output),
+                    child=configuration_output,
+                    relationship_type="rebinds_to",
+                ),
             ),
             diagnostics={
                 "optimizer": "geometric",

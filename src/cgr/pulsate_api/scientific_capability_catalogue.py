@@ -213,20 +213,48 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
         ScientificCapabilityDefinition(
             capability_name="electronic.transition_state_initial_path",
             accepted_artifact_types=("qmmm_hybrid_energy_gradient", "semantic_target_selection"),
-            produced_artifact_types=("transition_state_initial_path",),
+            produced_artifact_types=(
+                "transition_state_initial_path",
+                "electronic_molecule",
+                "electronic_structure_configuration",
+            ),
             supported_task_types=_TS,
             priority=60,
         ),
         ScientificCapabilityDefinition(
             capability_name="electronic.transition_state_search",
-            accepted_artifact_types=("transition_state_initial_path",),
-            produced_artifact_types=("electronic_transition_state_search",),
+            accepted_artifact_types=(
+                "transition_state_initial_path",
+                "electronic_molecule",
+                "electronic_structure_configuration",
+            ),
+            produced_artifact_types=(
+                "electronic_transition_state_search",
+                "electronic_molecule",
+                "electronic_structure_configuration",
+            ),
             supported_task_types=_TS,
             priority=65,
         ),
         ScientificCapabilityDefinition(
+            capability_name="electronic.gradient_calculate",
+            accepted_artifact_types=(
+                "electronic_transition_state_search",
+                "electronic_molecule",
+                "electronic_structure_configuration",
+            ),
+            produced_artifact_types=("electronic_gradient_result",),
+            supported_task_types=_TS,
+            priority=68,
+        ),
+        ScientificCapabilityDefinition(
             capability_name="electronic.frequency_analyze",
-            accepted_artifact_types=("electronic_transition_state_search",),
+            accepted_artifact_types=(
+                "electronic_transition_state_search",
+                "electronic_molecule",
+                "electronic_structure_configuration",
+                "electronic_gradient_result",
+            ),
             produced_artifact_types=("electronic_frequency_analysis",),
             supported_task_types=_TS,
             verification_required=True,
