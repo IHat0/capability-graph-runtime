@@ -177,10 +177,14 @@ class MeekoDockingPreparationAdapter:
                 "Docking preparation failed controlled chemical validation.",
                 details=error.diagnostics,
             )
-        except (ValueError, KeyError, UnicodeDecodeError, subprocess.SubprocessError):
+        except (ValueError, KeyError, UnicodeDecodeError, subprocess.SubprocessError) as error:
             return self._failure(
                 "docking_preparation_invalid",
                 "Docking preparation failed controlled chemical validation.",
+                details={
+                    "exception_class": type(error).__name__,
+                    "diagnostic": " ".join(str(error).split())[:2048] or "none",
+                },
             )
         except Exception:
             return self._failure(
