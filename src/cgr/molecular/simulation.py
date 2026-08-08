@@ -540,6 +540,9 @@ class MolecularSimulationSystem(CanonicalModel):
     engine_build_version: str = Field(min_length=1, max_length=128)
     private_state_sha256: str
     private_state_format: Literal["openmm_system_xml"] = "openmm_system_xml"
+    partial_charge_source: Literal["openmm_nonbonded_force"]
+    particle_partial_charges_e: tuple[float, ...] = Field(min_length=1)
+    total_partial_charge_e: float
 
     @field_validator("schema_version")
     @classmethod
@@ -577,6 +580,28 @@ class MolecularSimulationSystem(CanonicalModel):
     def validate_private_state_sha256(cls, value: str) -> str:
         return validate_sha256(value)
 
+    @field_validator("particle_partial_charges_e")
+    @classmethod
+    def validate_particle_partial_charges(
+        cls,
+        value: tuple[float, ...],
+    ) -> tuple[float, ...]:
+        return tuple(
+            _finite(
+                item,
+                label="Simulation particle partial charge",
+            )
+            for item in value
+        )
+
+    @field_validator("total_partial_charge_e")
+    @classmethod
+    def validate_total_partial_charge(cls, value: float) -> float:
+        return _finite(
+            value,
+            label="Simulation total partial charge",
+        )
+
     @model_validator(mode="after")
     def validate_periodicity(self) -> Self:
         periodic_methods = {"cutoff_periodic", "ewald", "pme", "ljpme"}
@@ -589,6 +614,25 @@ class MolecularSimulationSystem(CanonicalModel):
             raise ValueError(
                 "Massive simulation particle count cannot exceed total particles."
             )
+
+        if len(self.particle_partial_charges_e) != self.particle_count:
+            raise ValueError(
+                "Simulation partial charges must contain one value per particle."
+            )
+
+        charge_sum = sum(self.particle_partial_charges_e)
+
+        if not math.isclose(
+            charge_sum,
+            self.total_partial_charge_e,
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            raise ValueError(
+                "Simulation total partial charge must equal "
+                "the particle-charge sum."
+            )
+
         expected_degrees = 3 * self.massive_particle_count - self.constraint_count
         if self.settings.remove_center_of_mass_motion:
             expected_degrees -= 3

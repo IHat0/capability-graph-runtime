@@ -1898,6 +1898,55 @@ class OpenMMClassicalSimulationAdapter:
             kwargs["hydrogenMass"] = hydrogen_mass * unit.dalton
         system = force_field.createSystem(topology, **kwargs)
         openmm, _, _ = _openmm_modules()
+
+        nonbonded_forces = tuple(
+            system.getForce(index)
+            for index in range(system.getNumForces())
+            if isinstance(
+                system.getForce(index),
+                openmm.NonbondedForce,
+            )
+        )
+
+        if len(nonbonded_forces) != 1:
+            raise ValueError(
+                "Constructed OpenMM system must contain exactly one "
+                "NonbondedForce for auditable partial-charge extraction."
+            )
+
+        nonbonded_force = nonbonded_forces[0]
+
+        if (
+            nonbonded_force.getNumParticleParameterOffsets()
+            != 0
+        ):
+            raise ValueError(
+                "OpenMM particle parameter offsets are not supported "
+                "by the current partial-charge extraction contract."
+            )
+
+        if (
+            nonbonded_force.getNumParticles()
+            != system.getNumParticles()
+        ):
+            raise ValueError(
+                "OpenMM NonbondedForce particle count does not "
+                "match the system."
+            )
+
+        particle_partial_charges = tuple(
+            _rounded(
+                nonbonded_force
+                .getParticleParameters(index)[0]
+                .value_in_unit(unit.elementary_charge)
+            )
+            for index in range(system.getNumParticles())
+        )
+
+        total_partial_charge = _rounded(
+            sum(particle_partial_charges)
+        )
+
         xml = openmm.XmlSerializer.serialize(system).encode("utf-8")
         if not xml or len(xml) > self._maximum_private_state_bytes:
             raise ValueError("Generated private OpenMM system state is invalid.")
@@ -1946,6 +1995,9 @@ class OpenMMClassicalSimulationAdapter:
             engine_distribution_version=identity[0],
             engine_build_version=identity[1],
             private_state_sha256=private_sha256,
+            partial_charge_source="openmm_nonbonded_force",
+            particle_partial_charges_e=particle_partial_charges,
+            total_partial_charge_e=total_partial_charge,
         )
         payload = manifest.to_canonical_json().encode("utf-8")
         artifact = self._artifact_reference(
@@ -1961,6 +2013,8 @@ class OpenMMClassicalSimulationAdapter:
                 "constraint_count": manifest.constraint_count,
                 "degrees_of_freedom": manifest.degrees_of_freedom,
                 "periodic": manifest.periodic,
+                "partial_charge_source": manifest.partial_charge_source,
+                "total_partial_charge_e": manifest.total_partial_charge_e,
                 "native_state_public": False,
             },
         )
@@ -1977,6 +2031,8 @@ class OpenMMClassicalSimulationAdapter:
             diagnostics={
                 "system_identifier": manifest.system_identifier,
                 "particle_count": manifest.particle_count,
+                "partial_charge_source": manifest.partial_charge_source,
+                "total_partial_charge_e": manifest.total_partial_charge_e,
                 "private_state_sha256": private_sha256,
             },
         )

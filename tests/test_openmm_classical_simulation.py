@@ -427,6 +427,29 @@ def test_environment_and_system_keep_native_openmm_state_private() -> None:
     assert system.massive_particle_count == 3
     assert system.degrees_of_freedom == 3
     assert system.periodic is False
+
+    assert system.partial_charge_source == "openmm_nonbonded_force"
+    assert len(system.particle_partial_charges_e) == system.particle_count
+    assert system.total_partial_charge_e == pytest.approx(
+        0.0,
+        abs=1e-8,
+    )
+
+    oxygen_charge, hydrogen_charge_1, hydrogen_charge_2 = (
+        system.particle_partial_charges_e
+    )
+
+    assert oxygen_charge < 0.0
+    assert hydrogen_charge_1 > 0.0
+    assert hydrogen_charge_2 > 0.0
+    assert hydrogen_charge_1 == pytest.approx(
+        hydrogen_charge_2
+    )
+    assert sum(system.particle_partial_charges_e) == pytest.approx(
+        system.total_partial_charge_e,
+        abs=1e-8,
+    )
+
     assert hashlib.sha256(private_payload).hexdigest() == system.private_state_sha256
     assert b"<System" in private_payload
     assert b"<System" not in store.read(system_reference)
