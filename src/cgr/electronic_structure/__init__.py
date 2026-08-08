@@ -2,10 +2,12 @@
 
 from .contracts import (
     ElectronicActiveSpace,
+    ElectronicActiveSpaceSelection,
     ElectronicAtom,
     ElectronicHartreeFockResult,
     ElectronicMolecule,
     ElectronicOrbital,
+    ElectronicOrbitalSelectionScore,
     ElectronicOrbitalSet,
     ElectronicReferenceCalculation,
     ElectronicStructureConfiguration,
@@ -15,6 +17,7 @@ from .contracts import (
 )
 from .pyscf_adapter import (
     ACTIVE_SPACE_CONSTRUCT,
+    ACTIVE_SPACE_SELECT,
     CONFIGURATION_DEFINE,
     HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
@@ -29,6 +32,7 @@ from .pyscf_adapter import (
 
 __all__ = [
     "ACTIVE_SPACE_CONSTRUCT",
+    "ACTIVE_SPACE_SELECT",
     "CONFIGURATION_DEFINE",
     "HARTREE_FOCK",
     "MOLECULE_CONSTRUCT",
@@ -36,11 +40,13 @@ __all__ = [
     "QMMM_EMBEDDING_PREPARE",
     "REFERENCE_CALCULATE",
     "ElectronicActiveSpace",
+    "ElectronicActiveSpaceSelection",
     "ElectronicArtifactPayloadStore",
     "ElectronicAtom",
     "ElectronicHartreeFockResult",
     "ElectronicMolecule",
     "ElectronicOrbital",
+    "ElectronicOrbitalSelectionScore",
     "ElectronicOrbitalSet",
     "ElectronicReferenceCalculation",
     "ElectronicStructureConfiguration",

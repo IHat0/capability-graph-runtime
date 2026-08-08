@@ -38,10 +38,12 @@ from cgr.science import (
 
 from .contracts import (
     ElectronicActiveSpace,
+    ElectronicActiveSpaceSelection,
     ElectronicAtom,
     ElectronicHartreeFockResult,
     ElectronicMolecule,
     ElectronicOrbital,
+    ElectronicOrbitalSelectionScore,
     ElectronicOrbitalSet,
     ElectronicReferenceCalculation,
     ElectronicStructureConfiguration,
@@ -62,6 +64,7 @@ CONFIGURATION_DEFINE = "electronic.configuration_define"
 HARTREE_FOCK = "electronic.hartree_fock"
 ORBITALS_GENERATE = "electronic.orbitals_generate"
 REFERENCE_CALCULATE = "electronic.reference_calculate"
+ACTIVE_SPACE_SELECT = "electronic.active_space_select"
 ACTIVE_SPACE_CONSTRUCT = "electronic.active_space_construct"
 QMMM_EMBEDDING_PREPARE = "electronic.qmmm_embedding_prepare"
 
@@ -200,11 +203,35 @@ def pyscf_capability_envelopes() -> tuple[CapabilityExecutionEnvelope, ...]:
             ),
         ),
         (
+            ACTIVE_SPACE_SELECT,
+            (
+                "electronic_molecule",
+                "electronic_structure_configuration",
+                "electronic_hartree_fock_result",
+            ),
+            ("electronic_active_space_selection",),
+            (
+                "active_space_selection",
+                "automatic_active_space_selection",
+                "metal_center_active_space_selection",
+                "reaction_center_active_space_selection",
+            ),
+            True,
+            (
+                "Version 1 selects canonical RHF orbitals.",
+                "Frontier selection uses occupied and virtual ordering.",
+                "Target-AO projection ranks orbitals by population on "
+                "resolved target atoms.",
+                "Selections remain subject to scientific verification.",
+            ),
+        ),
+        (
             ACTIVE_SPACE_CONSTRUCT,
             (
                 "electronic_molecule",
                 "electronic_structure_configuration",
                 "electronic_hartree_fock_result",
+                "electronic_active_space_selection",
             ),
             ("electronic_active_space",),
             ("active_space_construction",),
@@ -377,6 +404,7 @@ class PySCFElectronicStructureAdapter:
         requires_engine = capability_name in {
             HARTREE_FOCK,
             REFERENCE_CALCULATE,
+            ACTIVE_SPACE_SELECT,
             ACTIVE_SPACE_CONSTRUCT,
         }
         if requires_engine:
@@ -399,6 +427,8 @@ class PySCFElectronicStructureAdapter:
                 return self._generate_orbitals(invocation)
             if capability_name == REFERENCE_CALCULATE:
                 return self._calculate_reference(invocation)
+            if capability_name == ACTIVE_SPACE_SELECT:
+                return self._select_active_space(invocation)
             if capability_name == ACTIVE_SPACE_CONSTRUCT:
                 return self._construct_active_space(invocation)
             if capability_name == QMMM_EMBEDDING_PREPARE:
@@ -1411,6 +1441,405 @@ class PySCFElectronicStructureAdapter:
             },
         )
 
+    def _select_active_space(
+        self,
+        invocation: CapabilityInvocation,
+    ) -> CapabilityResult:
+        inputs = self._inputs_by_type(invocation)
+
+        molecule_reference = self._require_input(
+            inputs,
+            "electronic_molecule",
+        )
+        configuration_reference = self._require_input(
+            inputs,
+            "electronic_structure_configuration",
+        )
+        result_reference = self._require_input(
+            inputs,
+            "electronic_hartree_fock_result",
+        )
+
+        if len(inputs) != 3:
+            raise ValueError(
+                "Active-space selection requires three exact inputs."
+            )
+
+        molecule = self._load_model(
+            molecule_reference,
+            ElectronicMolecule,
+        )
+        configuration = self._load_model(
+            configuration_reference,
+            ElectronicStructureConfiguration,
+        )
+        result = self._load_model(
+            result_reference,
+            ElectronicHartreeFockResult,
+        )
+
+        if (
+            configuration.reference_method != "rhf"
+            or result.reference_method != "rhf"
+            or molecule.spin != 0
+            or not result.converged
+        ):
+            raise ValueError(
+                "Automatic active-space selection requires "
+                "a converged RHF singlet."
+            )
+
+        if (
+            configuration.molecule_identifier
+            != molecule.molecule_identifier
+            or result.molecule_identifier
+            != molecule.molecule_identifier
+            or result.configuration_identifier
+            != configuration.configuration_identifier
+        ):
+            raise ValueError(
+                "Active-space selection inputs do not form "
+                "one electronic problem."
+            )
+
+        active_electrons = self._integer_parameter(
+            invocation,
+            "active_electron_count",
+            minimum=1,
+            maximum=2 * _MAXIMUM_ACTIVE_ORBITALS,
+        )
+        active_orbitals = self._integer_parameter(
+            invocation,
+            "active_spatial_orbital_count",
+            minimum=1,
+            maximum=_MAXIMUM_ACTIVE_ORBITALS,
+        )
+
+        method = self._string_parameter(
+            invocation,
+            "selection_method",
+            maximum_length=64,
+        ).lower()
+
+        if method not in {
+            "frontier",
+            "target_ao_projection",
+        }:
+            raise ValueError(
+                "Unsupported automatic active-space selection method."
+            )
+
+        if active_electrons % 2:
+            raise ValueError(
+                "RHF automatic selection requires an even "
+                "active-electron count."
+            )
+
+        occupied_needed = active_electrons // 2
+        virtual_needed = active_orbitals - occupied_needed
+
+        if virtual_needed < 0:
+            raise ValueError(
+                "Active-space orbital count is too small "
+                "for the requested electrons."
+            )
+
+        occupations = tuple(
+            float(alpha + beta)
+            for alpha, beta in zip(
+                result.orbital_occupations_alpha,
+                result.orbital_occupations_beta,
+                strict=True,
+            )
+        )
+
+        occupied = tuple(
+            index
+            for index, occupation in enumerate(occupations)
+            if math.isclose(
+                occupation,
+                2.0,
+                rel_tol=0,
+                abs_tol=1e-7,
+            )
+        )
+
+        virtual = tuple(
+            index
+            for index, occupation in enumerate(occupations)
+            if math.isclose(
+                occupation,
+                0.0,
+                rel_tol=0,
+                abs_tol=1e-7,
+            )
+        )
+
+        if len(occupied) + len(virtual) != len(occupations):
+            raise ValueError(
+                "Automatic selection requires integer RHF occupations."
+            )
+
+        if (
+            occupied_needed > len(occupied)
+            or virtual_needed > len(virtual)
+        ):
+            raise ValueError(
+                "Requested active-space composition is unavailable."
+            )
+
+        target_atom_indices: tuple[int, ...] = ()
+        projection_scores = {
+            index: 0.0
+            for index in range(result.spatial_orbital_count)
+        }
+
+        raw_targets = self._parameter(
+            invocation,
+            "target_atom_indices",
+            required=False,
+        )
+
+        if method == "frontier":
+            if raw_targets is not None:
+                raise ValueError(
+                    "Frontier selection cannot receive target atoms."
+                )
+
+            chosen_occupied = (
+                occupied[-occupied_needed:]
+                if occupied_needed
+                else ()
+            )
+            chosen_virtual = (
+                virtual[:virtual_needed]
+                if virtual_needed
+                else ()
+            )
+
+        else:
+            if not isinstance(raw_targets, str):
+                raise ValueError(
+                    "Target-AO selection requires target atom indices."
+                )
+
+            parts = tuple(
+                part.strip()
+                for part in raw_targets.split(",")
+            )
+
+            if (
+                not parts
+                or any(
+                    not part or not part.isdigit()
+                    for part in parts
+                )
+            ):
+                raise ValueError(
+                    "Target atom indices must be comma-separated integers."
+                )
+
+            target_atom_indices = tuple(
+                sorted(int(part) for part in parts)
+            )
+
+            if len(target_atom_indices) != len(
+                set(target_atom_indices)
+            ):
+                raise ValueError(
+                    "Target atom indices must be unique."
+                )
+
+            if any(
+                index >= len(molecule.atoms)
+                for index in target_atom_indices
+            ):
+                raise ValueError(
+                    "A target atom index is outside the molecule."
+                )
+
+            numpy, gto, _, _, _ = _pyscf_modules()
+
+            native_molecule = self._build_pyscf_molecule(
+                molecule,
+                configuration,
+                gto,
+            )
+
+            ao_slices = numpy.asarray(
+                native_molecule.aoslice_by_atom()
+            )
+
+            target_ao_indices: list[int] = []
+
+            for atom_index in target_atom_indices:
+                start_ao = int(ao_slices[atom_index, 2])
+                stop_ao = int(ao_slices[atom_index, 3])
+                target_ao_indices.extend(
+                    range(start_ao, stop_ao)
+                )
+
+            if not target_ao_indices:
+                raise ValueError(
+                    "Target atoms contain no basis functions."
+                )
+
+            n_ao = result.atomic_orbital_count
+            n_mo = result.spatial_orbital_count
+
+            coefficients = numpy.asarray(
+                result.mo_coefficients_alpha.values,
+                dtype=float,
+            ).reshape((n_ao, n_mo))
+
+            overlap = numpy.asarray(
+                result.overlap_matrix_ao.values,
+                dtype=float,
+            ).reshape((n_ao, n_ao))
+
+            overlap_coefficients = overlap @ coefficients
+
+            for orbital_index in range(n_mo):
+                population = float(
+                    sum(
+                        coefficients[
+                            ao_index,
+                            orbital_index,
+                        ]
+                        * overlap_coefficients[
+                            ao_index,
+                            orbital_index,
+                        ]
+                        for ao_index in target_ao_indices
+                    )
+                )
+
+                projection_scores[orbital_index] = round(
+                    abs(population),
+                    12,
+                )
+
+            ranked_occupied = tuple(
+                sorted(
+                    occupied,
+                    key=lambda index: (
+                        -projection_scores[index],
+                        -index,
+                    ),
+                )
+            )
+
+            ranked_virtual = tuple(
+                sorted(
+                    virtual,
+                    key=lambda index: (
+                        -projection_scores[index],
+                        index,
+                    ),
+                )
+            )
+
+            chosen_occupied = ranked_occupied[
+                :occupied_needed
+            ]
+            chosen_virtual = ranked_virtual[
+                :virtual_needed
+            ]
+
+        active_indices = tuple(
+            sorted((*chosen_occupied, *chosen_virtual))
+        )
+
+        if len(active_indices) != active_orbitals:
+            raise ValueError(
+                "Automatic selection produced the wrong orbital count."
+            )
+
+        resolved_electrons = sum(
+            occupations[index]
+            for index in active_indices
+        )
+
+        if not math.isclose(
+            resolved_electrons,
+            active_electrons,
+            rel_tol=0,
+            abs_tol=1e-7,
+        ):
+            raise ValueError(
+                "Automatic selection produced the wrong electron count."
+            )
+
+        selection = ElectronicActiveSpaceSelection(
+            schema_version=_SCHEMA_VERSION,
+            selection_identifier=_stable_identifier(
+                "electronic-active-selection",
+                molecule.molecule_identifier,
+                result.result_identifier,
+                method,
+                active_electrons,
+                active_orbitals,
+                *target_atom_indices,
+                *active_indices,
+            ),
+            molecule_identifier=molecule.molecule_identifier,
+            hartree_fock_result_identifier=(
+                result.result_identifier
+            ),
+            selection_method=method,
+            active_electron_count=active_electrons,
+            active_spatial_orbital_count=active_orbitals,
+            active_orbital_indices=active_indices,
+            target_atom_indices=target_atom_indices,
+            orbital_scores=tuple(
+                ElectronicOrbitalSelectionScore(
+                    orbital_index=index,
+                    occupation=occupations[index],
+                    target_projection_score=(
+                        projection_scores[index]
+                    ),
+                )
+                for index in active_indices
+            ),
+        )
+
+        parents = (
+            molecule_reference,
+            configuration_reference,
+            result_reference,
+        )
+
+        output = self._write_model(
+            invocation,
+            model=selection,
+            artifact_type="electronic_active_space_selection",
+            identifier_prefix="electronic-active-selection",
+            parents=parents,
+            metadata={
+                "selection_method": method,
+                "active_electron_count": active_electrons,
+                "active_spatial_orbital_count": active_orbitals,
+                "target_atom_count": len(target_atom_indices),
+            },
+        )
+
+        return self._success(
+            invocation,
+            artifacts=(output,),
+            lineage=self._lineage(
+                invocation,
+                parents=parents,
+                child=output,
+                relationship_type="selects",
+            ),
+            diagnostics={
+                "selection_method": method,
+                "active_electron_count": active_electrons,
+                "active_spatial_orbital_count": active_orbitals,
+                "target_atom_count": len(target_atom_indices),
+            },
+        )
+
     def _construct_active_space(
         self,
         invocation: CapabilityInvocation,
@@ -1420,10 +1849,25 @@ class PySCFElectronicStructureAdapter:
         configuration_reference = self._require_input(
             inputs, "electronic_structure_configuration"
         )
-        result_reference = self._require_input(inputs, "electronic_hartree_fock_result")
-        if len(inputs) != 3:
-            raise ValueError("Active-space construction requires three exact inputs.")
-        molecule = self._load_model(molecule_reference, ElectronicMolecule)
+        result_reference = self._require_input(
+            inputs,
+            "electronic_hartree_fock_result",
+        )
+        selection_reference = inputs.get(
+            "electronic_active_space_selection"
+        )
+        expected_input_count = (
+            4 if selection_reference is not None else 3
+        )
+        if len(inputs) != expected_input_count:
+            raise ValueError(
+                "Active-space construction received an invalid "
+                "input combination."
+            )
+        molecule = self._load_model(
+            molecule_reference,
+            ElectronicMolecule,
+        )
         configuration = self._load_model(
             configuration_reference, ElectronicStructureConfiguration
         )
@@ -1442,15 +1886,56 @@ class PySCFElectronicStructureAdapter:
         ):
             raise ValueError("Active-space inputs do not form one electronic problem.")
 
-        active_indices = self._index_list_parameter(
-            invocation, "active_orbital_indices"
-        )
-        active_electrons = self._integer_parameter(
-            invocation,
-            "active_electron_count",
-            minimum=1,
-            maximum=2 * _MAXIMUM_ACTIVE_ORBITALS,
-        )
+        if selection_reference is not None:
+            if (
+                self._parameter(
+                    invocation,
+                    "active_orbital_indices",
+                    required=False,
+                )
+                is not None
+                or self._parameter(
+                    invocation,
+                    "active_electron_count",
+                    required=False,
+                )
+                is not None
+            ):
+                raise ValueError(
+                    "Automatic selection evidence cannot be combined "
+                    "with manual active-space parameters."
+                )
+
+            selection = self._load_model(
+                selection_reference,
+                ElectronicActiveSpaceSelection,
+            )
+
+            if (
+                selection.molecule_identifier
+                != molecule.molecule_identifier
+                or selection.hartree_fock_result_identifier
+                != result.result_identifier
+            ):
+                raise ValueError(
+                    "Active-space selection does not belong to "
+                    "the supplied electronic problem."
+                )
+
+            active_indices = selection.active_orbital_indices
+            active_electrons = selection.active_electron_count
+
+        else:
+            active_indices = self._index_list_parameter(
+                invocation,
+                "active_orbital_indices",
+            )
+            active_electrons = self._integer_parameter(
+                invocation,
+                "active_electron_count",
+                minimum=1,
+                maximum=2 * _MAXIMUM_ACTIVE_ORBITALS,
+            )
         if (
             not active_indices
             or len(active_indices) > _MAXIMUM_ACTIVE_ORBITALS
@@ -1556,7 +2041,16 @@ class PySCFElectronicStructureAdapter:
                 index_convention="chemist_active_pqrs",
             ),
         )
-        parents = (molecule_reference, configuration_reference, result_reference)
+        parents = (
+            molecule_reference,
+            configuration_reference,
+            result_reference,
+            *(
+                (selection_reference,)
+                if selection_reference is not None
+                else ()
+            ),
+        )
         output = self._write_model(
             invocation,
             model=active_space,

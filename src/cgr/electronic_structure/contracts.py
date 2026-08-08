@@ -457,6 +457,135 @@ class ElectronicReferenceCalculation(CanonicalModel):
         return self
 
 
+class ElectronicOrbitalSelectionScore(CanonicalModel):
+    """Evidence for one orbital selected by an automatic active-space policy."""
+
+    orbital_index: int = Field(ge=0)
+    occupation: float = Field(ge=0, le=2)
+    target_projection_score: float = Field(ge=0)
+
+    @field_validator("occupation", "target_projection_score")
+    @classmethod
+    def validate_values(cls, value: float) -> float:
+        return _finite(value, label="Active-space selection value")
+
+
+class ElectronicActiveSpaceSelection(CanonicalModel):
+    """Automatic canonical-RHF orbital selection for active-space construction."""
+
+    schema_version: CapabilityVersion
+    selection_identifier: str
+    molecule_identifier: str
+    hartree_fock_result_identifier: str
+    selection_method: Literal["frontier", "target_ao_projection"]
+    active_electron_count: int = Field(gt=0, le=64)
+    active_spatial_orbital_count: int = Field(gt=0, le=32)
+    active_orbital_indices: tuple[int, ...] = Field(min_length=1)
+    target_atom_indices: tuple[int, ...] = ()
+    orbital_scores: tuple[ElectronicOrbitalSelectionScore, ...] = Field(
+        min_length=1
+    )
+
+    @field_validator("schema_version")
+    @classmethod
+    def validate_schema_version(
+        cls,
+        value: CapabilityVersion,
+    ) -> CapabilityVersion:
+        return _validate_schema_version(value)
+
+    @field_validator(
+        "selection_identifier",
+        "molecule_identifier",
+        "hartree_fock_result_identifier",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(
+            value,
+            label="active-space selection identifier",
+        )
+
+    @field_validator("active_orbital_indices", "target_atom_indices")
+    @classmethod
+    def validate_indices(
+        cls,
+        value: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if any(index < 0 for index in value):
+            raise ValueError(
+                "Active-space selection indices cannot be negative."
+            )
+        if len(value) != len(set(value)):
+            raise ValueError(
+                "Active-space selection indices must be unique."
+            )
+        return tuple(sorted(value))
+
+    @field_validator("orbital_scores")
+    @classmethod
+    def validate_scores(
+        cls,
+        value: tuple[ElectronicOrbitalSelectionScore, ...],
+    ) -> tuple[ElectronicOrbitalSelectionScore, ...]:
+        indices = [score.orbital_index for score in value]
+        if len(indices) != len(set(indices)):
+            raise ValueError(
+                "Active-space orbital scores must have unique indices."
+            )
+        return tuple(
+            sorted(value, key=lambda item: item.orbital_index)
+        )
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> Self:
+        if (
+            len(self.active_orbital_indices)
+            != self.active_spatial_orbital_count
+        ):
+            raise ValueError(
+                "Selected orbital count does not match active-space size."
+            )
+
+        if tuple(
+            score.orbital_index for score in self.orbital_scores
+        ) != self.active_orbital_indices:
+            raise ValueError(
+                "Selection evidence must cover exactly the selected orbitals."
+            )
+
+        resolved_electrons = sum(
+            score.occupation for score in self.orbital_scores
+        )
+        if not math.isclose(
+            resolved_electrons,
+            self.active_electron_count,
+            rel_tol=0,
+            abs_tol=1e-7,
+        ):
+            raise ValueError(
+                "Selected occupations do not match active-electron count."
+            )
+
+        if (
+            self.selection_method == "target_ao_projection"
+            and not self.target_atom_indices
+        ):
+            raise ValueError(
+                "Target-AO selection requires target atoms."
+            )
+
+        if (
+            self.selection_method == "frontier"
+            and self.target_atom_indices
+        ):
+            raise ValueError(
+                "Frontier selection cannot declare target atoms."
+            )
+
+        return self
+
+
 class ElectronicActiveSpace(CanonicalModel):
     """Spin-restricted active-space Hamiltonian in generic integral form."""
 

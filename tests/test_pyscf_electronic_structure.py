@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from cgr.electronic_structure import (
     ACTIVE_SPACE_CONSTRUCT,
+    ACTIVE_SPACE_SELECT,
     CONFIGURATION_DEFINE,
     HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
@@ -17,6 +18,7 @@ from cgr.electronic_structure import (
     QMMM_EMBEDDING_PREPARE,
     REFERENCE_CALCULATE,
     ElectronicActiveSpace,
+    ElectronicActiveSpaceSelection,
     ElectronicHartreeFockResult,
     ElectronicMolecule,
     ElectronicOrbitalSet,
@@ -251,13 +253,14 @@ def test_declaration_exposes_phase4_capabilities_without_importing_pyscf() -> No
     envelopes = pyscf_capability_envelopes()
     after = set(sys.modules)
 
-    assert len(envelopes) == 7
+    assert len(envelopes) == 8
     assert {envelope.descriptor.capability_name for envelope in envelopes} == {
         MOLECULE_CONSTRUCT,
         CONFIGURATION_DEFINE,
         HARTREE_FOCK,
         ORBITALS_GENERATE,
         REFERENCE_CALCULATE,
+        ACTIVE_SPACE_SELECT,
         ACTIVE_SPACE_CONSTRUCT,
         QMMM_EMBEDDING_PREPARE,
     }
@@ -552,15 +555,44 @@ def test_real_pyscf_h2_pipeline_produces_generic_artifacts() -> None:
     assert reference.correlation_energy_hartree < 0
     assert reference.total_energy_hartree < hartree_fock.total_energy_hartree
 
+    selection_result = adapter.invoke(
+        _invocation(
+            adapter,
+            ACTIVE_SPACE_SELECT,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+                hf_reference,
+            ),
+            parameters={
+                "active_electron_count": 2,
+                "active_spatial_orbital_count": 2,
+                "selection_method": "frontier",
+            },
+            execution_identifier="execution.phase8-active-selection",
+        )
+    )
+    assert selection_result.status is ExecutionStatus.SUCCESS
+
+    selection = ElectronicActiveSpaceSelection.model_validate_json(
+        store.read(selection_result.output_artifacts[0])
+    )
+    assert selection.active_electron_count == 2
+    assert selection.active_spatial_orbital_count == 2
+    assert selection.active_orbital_indices == (0, 1)
+    assert selection.selection_method == "frontier"
+
     active_result = adapter.invoke(
         _invocation(
             adapter,
             ACTIVE_SPACE_CONSTRUCT,
-            inputs=(molecule_reference, configuration_reference, hf_reference),
-            parameters={
-                "active_electron_count": 2,
-                "active_orbital_indices": "0,1",
-            },
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+                hf_reference,
+                selection_result.output_artifacts[0],
+            ),
+            parameters={},
             execution_identifier="execution.phase4-active",
         )
     )
@@ -573,3 +605,110 @@ def test_real_pyscf_h2_pipeline_produces_generic_artifacts() -> None:
     assert active.one_body_integrals.shape == (2, 2)
     assert active.two_body_integrals.shape == (2, 2, 2, 2)
     assert "pyscf" not in active.to_canonical_json().lower()
+
+def test_target_ao_projection_selects_without_manual_orbital_indices() -> None:
+    pytest.importorskip("pyscf")
+
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    molecule_reference = _construct_h2(adapter, store)
+    configuration_reference = _configure_h2(
+        adapter,
+        molecule_reference,
+    )
+
+    hf_result = adapter.invoke(
+        _invocation(
+            adapter,
+            HARTREE_FOCK,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+            ),
+            execution_identifier="execution.phase8-target-hf",
+        )
+    )
+    assert hf_result.status is ExecutionStatus.SUCCESS
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            ACTIVE_SPACE_SELECT,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+                hf_result.output_artifacts[0],
+            ),
+            parameters={
+                "active_electron_count": 2,
+                "active_spatial_orbital_count": 2,
+                "selection_method": "target_ao_projection",
+                "target_atom_indices": "0",
+            },
+            execution_identifier="execution.phase8-target-select",
+        )
+    )
+
+    assert result.status is ExecutionStatus.SUCCESS
+    assert result.failure is None
+
+    selection = ElectronicActiveSpaceSelection.model_validate_json(
+        store.read(result.output_artifacts[0])
+    )
+
+    assert selection.selection_method == "target_ao_projection"
+    assert selection.target_atom_indices == (0,)
+    assert selection.active_orbital_indices == (0, 1)
+    assert len(selection.orbital_scores) == 2
+    assert all(
+        score.target_projection_score >= 0
+        for score in selection.orbital_scores
+    )
+
+
+def test_automatic_selection_rejects_impossible_electron_count() -> None:
+    pytest.importorskip("pyscf")
+
+    store = MemoryPayloadStore()
+    adapter = PySCFElectronicStructureAdapter(store)
+
+    molecule_reference = _construct_h2(adapter, store)
+    configuration_reference = _configure_h2(
+        adapter,
+        molecule_reference,
+    )
+
+    hf_result = adapter.invoke(
+        _invocation(
+            adapter,
+            HARTREE_FOCK,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+            ),
+        )
+    )
+    assert hf_result.status is ExecutionStatus.SUCCESS
+
+    result = adapter.invoke(
+        _invocation(
+            adapter,
+            ACTIVE_SPACE_SELECT,
+            inputs=(
+                molecule_reference,
+                configuration_reference,
+                hf_result.output_artifacts[0],
+            ),
+            parameters={
+                "active_electron_count": 4,
+                "active_spatial_orbital_count": 2,
+                "selection_method": "frontier",
+            },
+        )
+    )
+
+    assert result.status is ExecutionStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.code == "electronic_input_invalid"
+
