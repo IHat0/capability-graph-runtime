@@ -64,6 +64,17 @@ def test_runtime_executes_composed_plan_through_persisted_cgr_graph(tmp_path) ->
             artifact_type="molecular_structure",
             artifact_identifier="molecule-artifact",
         ),),
+        artifact_references=(ArtifactReference(
+            artifact_identifier="molecule-artifact",
+            schema_version=CapabilityVersion(major=1, minor=0, patch=0),
+            artifact_type="molecular_structure",
+            media_type="chemical/x-mdl-molfile",
+            content_sha256="a" * 64,
+            provenance=CreationProvenance(
+                producer="test.fixture",
+                producer_version=CapabilityVersion(major=1, minor=0, patch=0),
+            ),
+        ),),
     ))
     handler = EvidenceHandler()
     registry = ScientistCapabilityRegistry({

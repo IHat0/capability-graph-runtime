@@ -76,6 +76,10 @@ from .scientific_executions import (
     ScientificExecutionRepository,
     ScientificObjectiveCompileRequest,
 )
+from .scientific_runtime import (
+    ScientificCapabilityFailure,
+    ScientificObjectiveRuntime,
+)
 from .runs import (
     ArtifactUnavailableError,
     ExistingQuantumPreflightExecutor,
@@ -379,6 +383,7 @@ def create_app(
     security_services: SecurityServices | None = None,
     workflow_service: WorkflowService | None = None,
     scientific_execution_repository: ScientificExecutionRepository | None = None,
+    scientific_objective_runtime: ScientificObjectiveRuntime | None = None,
 ) -> FastAPI:
     security_services = security_services or SecurityServices.from_environment()
     runtime_configuration = getattr(security_services, "configuration", None)
@@ -562,6 +567,8 @@ def create_app(
                 run_coordinator.start()
                 workflow_service.start()
                 scientific_execution_repository.start()
+                if scientific_objective_runtime is not None:
+                    scientific_objective_runtime.start()
                 if molecular_project_repository is not None:
                     molecular_project_repository.start()
                 if molecular_scene_service is not None:
@@ -595,6 +602,8 @@ def create_app(
                             molecular_project_repository.close()
                     finally:
                         try:
+                            if scientific_objective_runtime is not None:
+                                scientific_objective_runtime.close()
                             scientific_execution_repository.close()
                         finally:
                             try:
@@ -690,6 +699,7 @@ def create_app(
     application.state.scientific_execution_repository = (
         scientific_execution_repository
     )
+    application.state.scientific_objective_runtime = scientific_objective_runtime
     application.state.lifecycle_ready = False
 
     @application.exception_handler(SecurityBoundaryError)
@@ -976,6 +986,33 @@ def create_app(
                 503,
                 "scientific_execution_unavailable",
                 "Scientific execution persistence is unavailable.",
+            ) from None
+
+    @application.post(
+        "/api/v1/scientific/executions/{execution_identifier}/execute"
+    )
+    def execute_scientific_objective(execution_identifier: str):
+        if scientific_objective_runtime is None:
+            raise _typed_error(
+                503,
+                "scientific_runtime_unavailable",
+                "Scientific objective execution is unavailable.",
+            )
+        try:
+            return scientific_objective_runtime.execute(execution_identifier)
+        except KeyError:
+            raise _typed_error(
+                404,
+                "scientific_execution_not_found",
+                "Scientific execution was not found.",
+            ) from None
+        except ScientificCapabilityFailure as error:
+            raise _typed_error(409, error.code, error.public_message) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "scientific_execution_failed",
+                "Scientific execution failed safely without fabricated results.",
             ) from None
 
     @application.get("/live")

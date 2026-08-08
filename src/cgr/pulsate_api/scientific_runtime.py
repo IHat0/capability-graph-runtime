@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from cgr.science import ArtifactReference
+from cgr.kernel.contracts import ExecutionContext, ExecutionStatus
+from cgr.science import (
+    ArtifactPointer,
+    ArtifactReference,
+    CapabilityInvocation as EngineCapabilityInvocation,
+    CapabilityResult as EngineCapabilityResult,
+)
 from cgr.workflow_graph import (
     CapabilityAdapterRegistry,
     CapabilityInvocation,
@@ -93,6 +99,118 @@ class ScientistCapabilityRegistry:
 
     def identities(self) -> tuple[str, ...]:
         return tuple(sorted(self._handlers))
+
+
+@runtime_checkable
+class ScientificEngineAdapter(Protocol):
+    @property
+    def declaration(self): ...
+
+    def invoke(self, invocation: EngineCapabilityInvocation) -> EngineCapabilityResult: ...
+
+
+ScientificParameterProvider = Callable[
+    [StructuredScientificObjective, ScientificExecutionRecord], Mapping[str, object]
+]
+
+
+class ScientificEngineHandler:
+    """Bridge a generic scientific engine adapter into objective orchestration."""
+
+    def __init__(
+        self,
+        adapter: ScientificEngineAdapter,
+        capability_name: str,
+        *,
+        parameters: Mapping[str, object] | ScientificParameterProvider | None = None,
+    ) -> None:
+        if not isinstance(adapter, ScientificEngineAdapter):
+            raise TypeError("Scientific engine handlers require a declared adapter.")
+        self.adapter = adapter
+        self.capability_name = capability_name
+        self.parameters = parameters or {}
+        self.envelope = next(
+            (
+                item
+                for item in adapter.declaration.capabilities
+                if item.descriptor.capability_name == capability_name
+            ),
+            None,
+        )
+        if self.envelope is None:
+            raise ValueError("Scientific engine adapter does not declare the capability.")
+
+    def execute(
+        self,
+        *,
+        invocation: CapabilityInvocation,
+        objective: StructuredScientificObjective,
+        record: ScientificExecutionRecord,
+    ) -> ScientificCapabilityOutcome:
+        step = next(
+            item for item in record.plan.steps
+            if item.step_identifier == invocation.node_identifier
+        )
+        dependency_artifact_ids = {
+            artifact_identifier
+            for dependency in step.depends_on
+            for node in record.node_executions
+            if node.step_identifier == dependency
+            for artifact_identifier in node.output_artifact_identifiers
+        }
+        objective_artifact_ids = {
+            item.artifact_identifier for item in objective.input_references
+        }
+        allowed_ids = dependency_artifact_ids | objective_artifact_ids
+        accepted = set(self.envelope.descriptor.accepted_artifact_types)
+        inputs = tuple(
+            artifact
+            for artifact in record.artifact_references
+            if artifact.artifact_identifier in allowed_ids
+            and (not accepted or artifact.artifact_type in accepted)
+        )
+        parameter_values = (
+            self.parameters(objective, record)
+            if callable(self.parameters)
+            else self.parameters
+        )
+        objective_sha = hashlib.sha256(
+            objective.model_dump_json().encode("utf-8")
+        ).hexdigest()
+        result = self.adapter.invoke(EngineCapabilityInvocation(
+            capability=self.envelope.descriptor,
+            input_artifacts=inputs,
+            experiment=ArtifactPointer(
+                artifact_identifier=objective.objective_identifier,
+                content_sha256=objective_sha,
+            ),
+            context=ExecutionContext(execution_id=invocation.invocation_identifier),
+            parameters=dict(parameter_values),
+        ))
+        if result.status is not ExecutionStatus.SUCCESS:
+            failure = result.failure
+            raise ScientificCapabilityFailure(
+                failure.code if failure is not None else "scientific_engine_failed",
+                (
+                    failure.message
+                    if failure is not None
+                    else "Scientific engine execution failed without valid evidence."
+                ),
+                retryable=failure.retryable if failure is not None else False,
+            )
+        verification_passed = (
+            bool(result.verification_results)
+            and not any(item.has_blocking_failure for item in result.verification_results)
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=result.output_artifacts,
+            evidence_artifacts=result.output_artifacts,
+            verified=verification_passed or None,
+            scientific_summary=(
+                f"{self.capability_name} completed with "
+                f"{len(result.output_artifacts)} persisted artifact(s)."
+            ),
+        )
 
 
 def scientific_plan_graph(record: ScientificExecutionRecord) -> WorkflowGraphDefinition:
@@ -254,6 +372,19 @@ class ScientificObjectiveRuntime:
                 raise ScientificCapabilityFailure(
                     "scientific_execution_blocked",
                     "Scientific execution is blocked by clarification or authorization.",
+                )
+            declared_inputs = {
+                item.artifact_identifier for item in record.objective.input_references
+            }
+            persisted_inputs = {
+                item.artifact_identifier for item in record.artifact_references
+            }
+            missing_inputs = tuple(sorted(declared_inputs - persisted_inputs))
+            if missing_inputs:
+                raise ScientificCapabilityFailure(
+                    "scientific_input_artifact_unavailable",
+                    "Exact scientific input artifacts are unavailable: "
+                    + ", ".join(missing_inputs),
                 )
             missing = tuple(
                 sorted(

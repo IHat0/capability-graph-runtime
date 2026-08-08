@@ -376,6 +376,15 @@ ROUTE_PROTECTIONS: dict[tuple[str, str], RouteProtection] = {
         "scientific-execution",
         "path:execution_identifier",
     ),
+    (
+        "POST",
+        "/api/v1/scientific/executions/{execution_identifier}/execute",
+    ): RouteProtection(
+        (ProtectedAction.EXECUTION_REQUEST,),
+        "scientific-execution",
+        "path:execution_identifier",
+        True,
+    ),
     ("GET", "/api/v1/molecular/scenes/projected"): RouteProtection(
         (ProtectedAction.PROJECT_READ, ProtectedAction.SCENE_READ),
         "project",

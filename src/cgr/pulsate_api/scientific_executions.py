@@ -137,7 +137,20 @@ class ScientificObjectiveCompileRequest(BaseModel):
 
     question: str = Field(min_length=1, max_length=8192)
     input_references: tuple[ScientificInputReference, ...] = Field(default=(), max_length=64)
+    artifact_references: tuple[ArtifactReference, ...] = Field(default=(), max_length=64)
     budget: ScientificExecutionBudget = Field(default_factory=ScientificExecutionBudget)
+
+    @model_validator(mode="after")
+    def bind_artifact_identities(self) -> "ScientificObjectiveCompileRequest":
+        declared = {item.artifact_identifier for item in self.input_references}
+        supplied = {item.artifact_identifier for item in self.artifact_references}
+        if len(supplied) != len(self.artifact_references):
+            raise ValueError("Scientific input artifact identities must be unique.")
+        if supplied and supplied != declared:
+            raise ValueError(
+                "Every semantic scientific input must bind one exact artifact reference."
+            )
+        return self
 
 
 class ScientificExecutionRepository:
@@ -183,6 +196,7 @@ class ScientificExecutionRepository:
             status=status, objective=objective, plan=plan,
             scientist_summary=summary,
             limitations=("This record contains a plan, not fabricated calculation results.",),
+            artifact_references=request.artifact_references,
             node_executions=tuple(
                 ScientificNodeExecutionRecord(
                     step_identifier=step.step_identifier,
