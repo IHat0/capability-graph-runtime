@@ -1303,8 +1303,9 @@ def _metal_coordination(payload: bytes) -> dict[str, object]:
         "selected_spin": selected[2] - 1,
         "selected_d_electron_count": selected[1],
         "selection_assumption": (
-            "Oxidation follows the explicit PDB formal charge; the unique curated "
-            "Cu(II) d9 doublet is selected. Alternatives remain evidence."
+            f"Oxidation {oxidation:+d} follows the explicit PDB formal charge; "
+            f"the curated {metal['element']} d{selected[1]} multiplicity "
+            f"{selected[2]} state is selected. Alternatives remain evidence."
         ),
     }
 
@@ -1664,6 +1665,66 @@ def metal_active_site_registry(
     pyscf_adapter: PySCFElectronicStructureAdapter,
     qiskit_adapter: QiskitQuantumWorkflowAdapter,
 ) -> ScientistCapabilityRegistry:
+    def active_space_parameters(
+        objective: StructuredScientificObjective,
+        record: ScientificExecutionRecord,
+    ) -> Mapping[str, object]:
+        del objective
+        import json
+
+        semantic_reference = next(
+            item for item in record.artifact_references
+            if item.artifact_type == "semantic_target_selection"
+        )
+        semantic = json.loads(store.read(semantic_reference))
+        selected_spin = int(semantic["selected_spin"])
+        molecules = tuple(
+            ElectronicMolecule.model_validate_json(store.read(item))
+            for item in record.artifact_references
+            if item.artifact_type == "electronic_molecule"
+        )
+        molecule = next(item for item in molecules if item.spin == selected_spin)
+        metal_source_index = int(semantic["metal_particle_index"])
+        source_targets = {
+            metal_source_index,
+            *(int(item["particle_index"]) for item in semantic["donors"]),
+        }
+        local_targets = tuple(
+            atom.atom_index
+            for atom in molecule.atoms
+            if atom.source_atom_index in source_targets
+        )
+        if len(local_targets) < 2:
+            raise ScientificCapabilityFailure(
+                "metal_ligand_targeting_failed",
+                "The selected QM molecule does not preserve the resolved metal-ligand atom provenance.",
+            )
+        metal_atom = next(
+            atom for atom in molecule.atoms
+            if atom.source_atom_index == metal_source_index
+        )
+        d_shell = (
+            3
+            if metal_atom.atomic_number <= 30
+            else 4
+            if metal_atom.atomic_number <= 48
+            else 5
+        )
+        ligand_shells = {"N": "2p", "O": "2p", "S": "3p"}
+        target_labels = [f"{semantic['metal_element']} {d_shell}d"]
+        target_labels.extend(
+            f"{element} {ligand_shells[element]}"
+            for element in sorted({str(item["element"]) for item in semantic["donors"]})
+        )
+        return {
+            "active_electron_count": 3,
+            "active_spatial_orbital_count": 3,
+            "selection_method": "metal_ligand_projection",
+            "target_atom_indices": ",".join(str(index) for index in local_targets),
+            "target_ao_labels": ";".join(target_labels),
+            "projection_threshold": 0.005,
+        }
+
     registry = ScientistCapabilityRegistry(
         {
             "molecular.structure_ingestion": ProteinInputValidationHandler(store),
@@ -1697,14 +1758,7 @@ def metal_active_site_registry(
         "electronic.active_space_select": ScientificEngineHandler(
             pyscf_adapter,
             ACTIVE_SPACE_SELECT,
-            parameters={
-                "active_electron_count": 3,
-                "active_spatial_orbital_count": 3,
-                "selection_method": "metal_ligand_projection",
-                "target_atom_indices": "0,1,5",
-                "target_ao_labels": "Cu 3d;N 2p",
-                "projection_threshold": 0.005,
-            },
+            parameters=active_space_parameters,
         ),
         "electronic.active_space_construct": ScientificEngineHandler(
             pyscf_adapter, ACTIVE_SPACE_CONSTRUCT

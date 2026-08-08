@@ -50,7 +50,12 @@ def _input(identifier: str, kind: str) -> ScientificInputReference:
             "Discover and optimize a drug candidate for this protein.",
             (_input("protein-1", "protein_structure"),),
             "protein_ligand_discovery",
-            {"discovery.campaign_initialize", "molecular.docking_pose_generate", "discovery.campaign_iterate", "molecular.scene_project"},
+            {
+                "molecular.binding_pocket_resolve",
+                "discovery.campaign_initialize",
+                "discovery.campaign_iterate",
+                "molecular.scene_project",
+            },
         ),
     ),
 )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.metadata
 import tempfile
 from collections.abc import Mapping
@@ -82,6 +83,18 @@ class VinaDockingAdapter:
                 status=HealthStatus.UNAVAILABLE, reason_code="dependency_missing",
                 message="The optional AutoDock Vina dependency is unavailable.",
                 diagnostics={"expected_version": _EXPECTED_VINA_VERSION},
+            )
+        try:
+            importlib.import_module("vina")
+        except Exception as exc:
+            return ScientificEngineHealthReport(
+                status=HealthStatus.UNAVAILABLE,
+                reason_code="dependency_import_failed",
+                message="The AutoDock Vina Python module cannot be imported.",
+                diagnostics={
+                    "installed_version": version,
+                    "exception_class": type(exc).__name__,
+                },
             )
         if version != _EXPECTED_VINA_VERSION:
             return ScientificEngineHealthReport(
