@@ -2606,6 +2606,7 @@ class TSTransitionSearchHandler:
             region_selection_method=initial["region_selection_method"],
             restraint_force_constant_hartree_per_bohr2=None,
             hybrid_gradient_evaluation_count=potential.evaluation_count,
+            hybrid_scf_recovery_count=potential.scf_recovery_count,
             energy_history_hartree=tuple(potential.energy_history_hartree),
             gradient_norm_history_hartree_per_bohr=tuple(
                 potential.gradient_norm_history_hartree_per_bohr
@@ -2624,6 +2625,7 @@ class TSTransitionSearchHandler:
             metadata={
                 "optimization_surface": "hybrid_qmmm",
                 "hybrid_gradient_evaluation_count": potential.evaluation_count,
+                "hybrid_scf_recovery_count": potential.scf_recovery_count,
                 "movable_particle_count": len(movable),
                 "frozen_particle_count": len(frozen),
             },

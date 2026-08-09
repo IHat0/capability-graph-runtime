@@ -219,6 +219,7 @@ class ElectronicTransitionStateSearch(CanonicalModel):
         default=None, ge=0
     )
     hybrid_gradient_evaluation_count: int = Field(default=0, ge=0)
+    hybrid_scf_recovery_count: int = Field(default=0, ge=0)
     energy_history_hartree: tuple[float, ...] = ()
     gradient_norm_history_hartree_per_bohr: tuple[float, ...] = ()
     optimization_iteration_count: int = Field(default=0, ge=0)

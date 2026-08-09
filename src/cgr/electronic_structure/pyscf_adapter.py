@@ -552,6 +552,8 @@ class HybridQMMMPotential:
     evaluation_count: int = 0
     energy_history_hartree: list[float] = field(default_factory=list)
     gradient_norm_history_hartree_per_bohr: list[float] = field(default_factory=list)
+    previous_density_matrix: object | None = field(default=None, repr=False)
+    scf_recovery_count: int = 0
 
     formulation: str = "electrostatic_embedding_subtractive_openmm_pyscf"
 
@@ -3091,9 +3093,26 @@ class PySCFElectronicStructureAdapter:
             tuple(site.charge_e for site in dynamic_sites),
             unit="Angstrom",
         )
-        embedded_energy = float(native_scf.kernel())
+        embedded_energy = float(
+            native_scf.kernel(dm0=potential.previous_density_matrix)
+            if potential.previous_density_matrix is not None
+            else native_scf.kernel()
+        )
+        if not bool(native_scf.converged):
+            # Geometry optimizations normally continue the electronic state from
+            # the preceding point.  If DIIS still stalls, retry once from its
+            # best density with bounded damping and a level shift; unsupported
+            # or genuinely unstable points continue to fail closed below.
+            recovery_density = native_scf.make_rdm1()
+            native_scf.max_cycle = max(2 * potential.configuration.maximum_iterations, 200)
+            native_scf.damp = 0.35
+            native_scf.level_shift = 0.5
+            native_scf.diis_start_cycle = 1
+            embedded_energy = float(native_scf.kernel(dm0=recovery_density))
+            potential.scf_recovery_count += 1
         if not bool(native_scf.converged):
             raise ValueError("The hybrid QM/MM embedded SCF calculation did not converge.")
+        potential.previous_density_matrix = numpy.asarray(native_scf.make_rdm1()).copy()
         positions_nm = tuple(tuple(float(value) / 10.0 for value in row) for row in coordinates)
         full_energy_kj, full_gradient = self._openmm_energy_gradient(
             potential.full_system, positions_nm

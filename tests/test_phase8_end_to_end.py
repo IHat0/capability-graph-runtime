@@ -421,6 +421,7 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
     assert search.optimization_surface == "hybrid_qmmm"
     assert search.hybrid_formulation_identifier == hybrid.formulation
     assert search.hybrid_gradient_evaluation_count > 1
+    assert search.hybrid_scf_recovery_count >= 0
     assert len(search.energy_history_hartree) == search.hybrid_gradient_evaluation_count
     assert search.final_energy_hartree == search.energy_history_hartree[-1]
     assert search.full_particle_count == hybrid.particle_count
