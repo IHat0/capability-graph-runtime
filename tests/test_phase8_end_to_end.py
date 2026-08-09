@@ -422,20 +422,46 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
     assert search.hybrid_formulation_identifier == hybrid.formulation
     assert search.hybrid_gradient_evaluation_count > 1
     assert search.hybrid_scf_recovery_count >= 0
+    assert search.initial_hessian_method == (
+        "finite_difference_hybrid_gradients_reaction_mode_guided"
+    )
+    assert search.initial_hessian_hybrid_gradient_evaluation_count == 6 * len(
+        (*search.movable_particle_indices, *search.restrained_particle_indices)
+    )
+    assert search.initial_reaction_mode_overlap is not None
+    assert search.initial_reaction_mode_overlap > 0.1
     assert len(search.energy_history_hartree) == search.hybrid_gradient_evaluation_count
     assert search.final_energy_hartree == search.energy_history_hartree[-1]
     assert search.full_particle_count == hybrid.particle_count
     assert search.optimized_full_geometry_angstrom.shape == (hybrid.particle_count, 3)
     assert search.final_full_gradient_hartree_per_bohr.shape == (hybrid.particle_count, 3)
-    assert len(search.movable_particle_indices) == 6
-    assert not search.restrained_particle_indices
+    assert search.final_density_matrix_ao is not None
+    assert search.final_density_matrix_ao.unit == "electron"
+    assert len(search.movable_particle_indices) == 3
+    assert len(search.restrained_particle_indices) == 3
     assert search.frozen_particle_indices
-    assert set(search.movable_particle_indices) | set(search.frozen_particle_indices) == set(
-        range(hybrid.particle_count)
+    regions = (
+        set(search.movable_particle_indices),
+        set(search.restrained_particle_indices),
+        set(search.frozen_particle_indices),
     )
+    assert not any(
+        left & right
+        for index, left in enumerate(regions)
+        for right in regions[index + 1:]
+    )
+    assert set().union(*regions) == set(range(hybrid.particle_count))
     assert search.region_selection_method == (
-        "semantic_reacting_triad_and_electrophile_hydrogens_movable_"
-        "full_environment_frozen"
+        "semantic_reacting_triad_transversely_restrained_"
+        "electrophile_hydrogens_movable_full_environment_frozen"
+    )
+    assert search.restraint_kind == "transverse_harmonic_reaction_axis"
+    assert search.restraint_force_constant_hartree_per_bohr2 == pytest.approx(0.5)
+    assert search.restraint_axis is not None
+    assert search.restraint_reference_full_geometry_angstrom is not None
+    assert search.restraint_reference_full_geometry_angstrom.shape == (
+        hybrid.particle_count,
+        3,
     )
     frequency_reference = next(
         item for item in completed.artifact_references
@@ -445,8 +471,12 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
     assert frequency.characterization_surface == "hybrid_qmmm"
     assert frequency.hessian_method == "finite_difference_hybrid_gradients"
     assert frequency.hybrid_gradient_evaluation_count == 6 * len(
-        search.movable_particle_indices
+        (*search.movable_particle_indices, *search.restrained_particle_indices)
     )
+    assert frequency.movable_particle_indices == tuple(
+        sorted((*search.movable_particle_indices, *search.restrained_particle_indices))
+    )
+    assert frequency.frozen_particle_indices == search.frozen_particle_indices
     assert frequency.exactly_one_significant_imaginary_mode
     imaginary = next(mode for mode in frequency.modes if mode.significant_imaginary)
     assert imaginary.reaction_coordinate_participation is not None
@@ -459,8 +489,17 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
     assert path.path_surface == "hybrid_qmmm"
     assert path.method == "hybrid_qmmm_mass_weighted_steepest_descent"
     assert path.hybrid_gradient_evaluation_count >= len(path.points)
-    assert path.forward_endpoint_hybrid_energy_hartree < search.final_energy_hartree
-    assert path.reverse_endpoint_hybrid_energy_hartree < search.final_energy_hartree
+    assert path.transition_state_hybrid_energy_hartree == pytest.approx(
+        search.final_energy_hartree, abs=1e-7
+    )
+    assert (
+        path.forward_endpoint_hybrid_energy_hartree
+        < path.transition_state_hybrid_energy_hartree
+    )
+    assert (
+        path.reverse_endpoint_hybrid_energy_hartree
+        < path.transition_state_hybrid_energy_hartree
+    )
     assert all(point.hybrid_energy_hartree == point.energy_hartree for point in path.points)
     assert all(point.full_geometry_angstrom is not None for point in path.points)
     assert path.path_confirmation_passed

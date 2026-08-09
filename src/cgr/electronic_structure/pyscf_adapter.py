@@ -6,7 +6,7 @@ import hashlib
 import importlib.metadata
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
 from pydantic import ValidationError
@@ -531,6 +531,7 @@ class HybridQMMMPotentialEvaluation:
     qm_model_mm_energy_hartree: float
     classical_cross_electrostatic_energy_hartree: float
     molecule: ElectronicMolecule
+    restraint_energy_hartree: float = 0.0
 
 
 @dataclass
@@ -554,8 +555,50 @@ class HybridQMMMPotential:
     gradient_norm_history_hartree_per_bohr: list[float] = field(default_factory=list)
     previous_density_matrix: object | None = field(default=None, repr=False)
     scf_recovery_count: int = 0
+    restrained_particle_indices: tuple[int, ...] = ()
+    restraint_reference_coordinates_angstrom: object | None = field(
+        default=None, repr=False
+    )
+    restraint_axis: object | None = field(default=None, repr=False)
+    restraint_force_constant_hartree_per_bohr2: float | None = None
 
     formulation: str = "electrostatic_embedding_subtractive_openmm_pyscf"
+
+    def configure_transverse_restraints(
+        self,
+        *,
+        particle_indices: tuple[int, ...],
+        reference_coordinates_angstrom: object,
+        axis: object,
+        force_constant_hartree_per_bohr2: float,
+    ) -> None:
+        import numpy
+
+        coordinates = numpy.asarray(reference_coordinates_angstrom, dtype=float)
+        direction = numpy.asarray(axis, dtype=float)
+        if (
+            not particle_indices
+            or len(set(particle_indices)) != len(particle_indices)
+            or any(
+                index < 0 or index >= self.system_manifest.particle_count
+                for index in particle_indices
+            )
+            or coordinates.shape != (self.system_manifest.particle_count, 3)
+            or not numpy.all(numpy.isfinite(coordinates))
+            or direction.shape != (3,)
+            or not numpy.all(numpy.isfinite(direction))
+            or force_constant_hartree_per_bohr2 <= 0.0
+        ):
+            raise ValueError("Hybrid QM/MM transverse restraint configuration is invalid.")
+        norm = float(numpy.linalg.norm(direction))
+        if norm <= 1.0e-12:
+            raise ValueError("Hybrid QM/MM transverse restraint axis is undefined.")
+        self.restrained_particle_indices = tuple(sorted(particle_indices))
+        self.restraint_reference_coordinates_angstrom = coordinates.copy()
+        self.restraint_axis = direction / norm
+        self.restraint_force_constant_hartree_per_bohr2 = float(
+            force_constant_hartree_per_bohr2
+        )
 
     def evaluate(self, coordinates_angstrom: object) -> HybridQMMMPotentialEvaluation:
         evaluation = self.adapter._evaluate_hybrid_qmmm_potential(
@@ -565,6 +608,29 @@ class HybridQMMMPotential:
         import numpy
 
         gradient = numpy.asarray(evaluation.gradient_hartree_per_bohr, dtype=float)
+        if self.restrained_particle_indices:
+            coordinates = numpy.asarray(coordinates_angstrom, dtype=float)
+            reference = numpy.asarray(
+                self.restraint_reference_coordinates_angstrom, dtype=float
+            )
+            axis = numpy.asarray(self.restraint_axis, dtype=float)
+            restrained = list(self.restrained_particle_indices)
+            delta_bohr = (coordinates[restrained] - reference[restrained]) / 0.529177210903
+            transverse = delta_bohr - numpy.outer(delta_bohr @ axis, axis)
+            force_constant = float(self.restraint_force_constant_hartree_per_bohr2)
+            restraint_energy = 0.5 * force_constant * float(
+                numpy.sum(transverse * transverse)
+            )
+            gradient = gradient.copy()
+            gradient[restrained] += force_constant * transverse
+            evaluation = replace(
+                evaluation,
+                total_energy_hartree=(
+                    evaluation.total_energy_hartree + restraint_energy
+                ),
+                gradient_hartree_per_bohr=gradient,
+                restraint_energy_hartree=restraint_energy,
+            )
         self.evaluation_count += 1
         self.energy_history_hartree.append(evaluation.total_energy_hartree)
         self.gradient_norm_history_hartree_per_bohr.append(
@@ -3100,16 +3166,27 @@ class PySCFElectronicStructureAdapter:
         )
         if not bool(native_scf.converged):
             # Geometry optimizations normally continue the electronic state from
-            # the preceding point.  If DIIS still stalls, retry once from its
-            # best density with bounded damping and a level shift; unsupported
-            # or genuinely unstable points continue to fail closed below.
+            # the preceding point.  If DIIS still stalls, retry from its best
+            # density with bounded damping and a level shift, followed by
+            # PySCF's second-order solver below; genuinely unstable points
+            # continue to fail closed.
             recovery_density = native_scf.make_rdm1()
-            native_scf.max_cycle = max(2 * potential.configuration.maximum_iterations, 200)
+            native_scf.max_cycle = potential.configuration.maximum_iterations
             native_scf.damp = 0.35
             native_scf.level_shift = 0.5
             native_scf.diis_start_cycle = 1
             embedded_energy = float(native_scf.kernel(dm0=recovery_density))
             potential.scf_recovery_count += 1
+        if not bool(native_scf.converged):
+            recovery_density = native_scf.make_rdm1()
+            second_order_scf = native_scf.newton()
+            second_order_scf.max_cycle = min(
+                potential.configuration.maximum_iterations, 100
+            )
+            second_order_scf.conv_tol = potential.configuration.convergence_tolerance
+            embedded_energy = float(second_order_scf.kernel(dm0=recovery_density))
+            potential.scf_recovery_count += 1
+            native_scf = second_order_scf
         if not bool(native_scf.converged):
             raise ValueError("The hybrid QM/MM embedded SCF calculation did not converge.")
         potential.previous_density_matrix = numpy.asarray(native_scf.make_rdm1()).copy()

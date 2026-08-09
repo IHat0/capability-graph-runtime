@@ -2396,11 +2396,11 @@ class TSInitialPathHandler:
         leaving = indices["leaving_sulfur"]
         axis = coordinates[leaving] - coordinates[nucleophile]
         axis /= numpy.linalg.norm(axis)
-        distance = 0.5 * (
+        resolved_distance = 0.5 * (
             numpy.linalg.norm(coordinates[nucleophile] - coordinates[electrophile])
             + numpy.linalg.norm(coordinates[leaving] - coordinates[electrophile])
         )
-        distance = float(min(2.5, max(1.8, distance)))
+        distance = float(min(2.6, max(2.3, 1.2 * resolved_distance)))
         coordinates[nucleophile] = coordinates[electrophile] - distance * axis
         coordinates[leaving] = coordinates[electrophile] + distance * axis
         electrophile_hydrogens = {
@@ -2417,13 +2417,14 @@ class TSInitialPathHandler:
                 else bond.atom_index_a
             ].atomic_number == 1
         }
-        movable = tuple(sorted({
-            nucleophile,
-            electrophile,
-            leaving,
-            *electrophile_hydrogens,
-        }))
-        frozen = tuple(index for index in range(len(environment.atoms)) if index not in movable)
+        restrained = tuple(sorted((nucleophile, electrophile, leaving)))
+        movable = tuple(sorted(electrophile_hydrogens))
+        if not movable:
+            movable = (electrophile,)
+            restrained = tuple(index for index in restrained if index != electrophile)
+        active = set((*movable, *restrained))
+        frozen = tuple(index for index in range(len(environment.atoms)) if index not in active)
+        restraint_force_constant = 0.5
         path = self.runner.write_json(
             artifact_type="transition_state_initial_path",
             payload=json.dumps(
@@ -2431,18 +2432,24 @@ class TSInitialPathHandler:
                     "method": "semantic_full_system_symmetric_s_c_s_interpolation",
                     "optimization_surface": "hybrid_qmmm",
                     "initial_full_geometry_angstrom": coordinates.tolist(),
+                    "resolved_reaction_distance_angstrom": float(resolved_distance),
+                    "initial_reaction_distance_angstrom": distance,
+                    "reaction_distance_scaling": 1.2,
                     "movable_particle_indices": list(movable),
-                    "restrained_particle_indices": [],
+                    "restrained_particle_indices": list(restrained),
                     "frozen_particle_indices": list(frozen),
                     "region_selection_method": (
-                        "semantic_reacting_triad_and_electrophile_hydrogens_movable_"
-                        "full_environment_frozen"
+                        "semantic_reacting_triad_transversely_restrained_"
+                        "electrophile_hydrogens_movable_full_environment_frozen"
                     ),
-                    "restraint_force_constant_hartree_per_bohr2": None,
+                    "restraint_kind": "transverse_harmonic_reaction_axis",
+                    "restraint_axis": axis.tolist(),
+                    "restraint_reference_full_geometry_angstrom": coordinates.tolist(),
+                    "restraint_force_constant_hartree_per_bohr2": restraint_force_constant,
                     "region_rationale": (
-                        "The resolved nucleophile, electrophile, leaving group, and hydrogens "
-                        "directly bonded to the electrophile move so reaction-axis and methyl "
-                        "bending modes are represented; "
+                        "The resolved S-C-S triad remains active along the reaction axis with "
+                        "an explicit transverse harmonic restraint, while hydrogens directly "
+                        "bonded to the electrophile move freely; "
                         "all other real particles remain frozen but contribute to every hybrid evaluation."
                     ),
                     "hybrid_qmmm_evidence_identifier": hybrid_reference.artifact_identifier,
@@ -2460,8 +2467,8 @@ class TSInitialPathHandler:
             output_artifacts=(path,), evidence_artifacts=(path,),
             scientific_summary=(
                 "Built a semantic full-system hybrid QM/MM saddle guess with "
-                f"{len(movable)} movable reaction particles and {len(frozen)} frozen "
-                "environment particles."
+                f"{len(movable)} freely movable, {len(restrained)} transversely restrained, "
+                f"and {len(frozen)} frozen environment particles."
             ),
         )
 
@@ -2491,12 +2498,26 @@ class TSTransitionSearchHandler:
         movable = tuple(int(value) for value in initial["movable_particle_indices"])
         restrained = tuple(int(value) for value in initial["restrained_particle_indices"])
         frozen = tuple(int(value) for value in initial["frozen_particle_indices"])
+        active = tuple(sorted((*movable, *restrained)))
+        restraint_reference = numpy.asarray(
+            initial["restraint_reference_full_geometry_angstrom"], dtype=float
+        )
+        restraint_axis = numpy.asarray(initial["restraint_axis"], dtype=float)
+        restraint_force_constant = float(
+            initial["restraint_force_constant_hartree_per_bohr2"]
+        )
+        potential.configure_transverse_restraints(
+            particle_indices=restrained,
+            reference_coordinates_angstrom=restraint_reference,
+            axis=restraint_axis,
+            force_constant_hartree_per_bohr2=restraint_force_constant,
+        )
 
         active_molecule = Molecule()
         active_molecule.elem = [
-            potential.environment.atoms[index].element_symbol for index in movable
+            potential.environment.atoms[index].element_symbol for index in active
         ]
-        active_molecule.xyzs = [base_coordinates[list(movable)].copy()]
+        active_molecule.xyzs = [base_coordinates[list(active)].copy()]
         active_molecule.comms = ["CGR hybrid QM/MM movable reaction region"]
         active_molecule.build_topology()
 
@@ -2507,20 +2528,81 @@ class TSTransitionSearchHandler:
             def calc_new(self, coords, dirname):
                 del dirname
                 full_coordinates = base_coordinates.copy()
-                full_coordinates[list(movable)] = (
+                full_coordinates[list(active)] = (
                     numpy.asarray(coords, dtype=float).reshape((-1, 3))
                     * 0.529177210903
                 )
                 evaluation = potential.evaluate(full_coordinates)
                 gradient = numpy.asarray(
                     evaluation.gradient_hartree_per_bohr, dtype=float
-                )[list(movable)]
+                )[list(active)]
                 return {
                     "energy": evaluation.total_energy_hartree,
                     "gradient": gradient.reshape(-1),
                 }
 
-        maximum_steps = 40
+        # geomeTRIC follows the lowest Hessian root for a transition search.  A
+        # raw compact active-site Hessian can contain several environmental or
+        # bending instabilities, so identify the exact hybrid eigenvector with
+        # maximum overlap to the resolved forming-minus-breaking coordinate and
+        # make only that root negative in the optimizer's initial model.  The
+        # energy and every optimizer gradient remain the hybrid potential plus
+        # the declared transverse restraint, and final frequencies are
+        # independently recomputed on that same restrained hybrid surface.
+        initial_hessian_displacement = 0.005
+        active_dof = 3 * len(active)
+        initial_hessian = numpy.zeros((active_dof, active_dof))
+        for column in range(active_dof):
+            particle_offset, component = divmod(column, 3)
+            particle_index = active[particle_offset]
+            plus = base_coordinates.copy()
+            minus = base_coordinates.copy()
+            displacement_angstrom = initial_hessian_displacement * 0.529177210903
+            plus[particle_index, component] += displacement_angstrom
+            minus[particle_index, component] -= displacement_angstrom
+            plus_gradient = numpy.asarray(
+                potential.evaluate(plus).gradient_hartree_per_bohr, dtype=float
+            )[list(active)].reshape(-1)
+            minus_gradient = numpy.asarray(
+                potential.evaluate(minus).gradient_hartree_per_bohr, dtype=float
+            )[list(active)].reshape(-1)
+            initial_hessian[:, column] = (
+                plus_gradient - minus_gradient
+            ) / (2.0 * initial_hessian_displacement)
+        initial_hessian = 0.5 * (initial_hessian + initial_hessian.T)
+        _, indices, _ = _ts_environment(record, self.runner.store)
+        active_offset = {particle: offset for offset, particle in enumerate(active)}
+        reaction_vector = numpy.zeros((len(active), 3))
+        forming_axis = (
+            base_coordinates[indices["electrophile"]]
+            - base_coordinates[indices["nucleophile"]]
+        )
+        forming_axis /= numpy.linalg.norm(forming_axis)
+        breaking_axis = (
+            base_coordinates[indices["leaving_sulfur"]]
+            - base_coordinates[indices["electrophile"]]
+        )
+        breaking_axis /= numpy.linalg.norm(breaking_axis)
+        reaction_vector[active_offset[indices["nucleophile"]]] -= forming_axis
+        reaction_vector[active_offset[indices["electrophile"]]] += (
+            forming_axis + breaking_axis
+        )
+        reaction_vector[active_offset[indices["leaving_sulfur"]]] -= breaking_axis
+        reaction_vector = reaction_vector.reshape(-1)
+        reaction_vector /= numpy.linalg.norm(reaction_vector)
+        eigenvalues, eigenvectors = numpy.linalg.eigh(initial_hessian)
+        overlaps = numpy.abs(eigenvectors.T @ reaction_vector)
+        reaction_mode_index = int(numpy.argmax(overlaps))
+        reaction_mode_overlap = float(overlaps[reaction_mode_index])
+        guided_eigenvalues = numpy.maximum(numpy.abs(eigenvalues), 0.005)
+        guided_eigenvalues[reaction_mode_index] = -max(
+            abs(float(eigenvalues[reaction_mode_index])), 0.05
+        )
+        guided_hessian = (
+            eigenvectors @ numpy.diag(guided_eigenvalues) @ eigenvectors.T
+        )
+
+        maximum_steps = 120
         try:
             with tempfile.TemporaryDirectory(prefix="cgr-hybrid-qmmm-ts-") as directory:
                 progress = run_optimizer(
@@ -2528,8 +2610,11 @@ class TSTransitionSearchHandler:
                     input="cgr-hybrid-qmmm",
                     prefix=str(Path(directory) / "hybrid-qmmm-ts"),
                     transition=True,
-                    hessian="first",
+                    hessian="never",
+                    hess_data=guided_hessian.tolist(),
                     maxiter=maximum_steps,
+                    trust=0.005,
+                    tmax=0.01,
                     coordsys="cart",
                     bothre=0.0,
                     subfrctor=0,
@@ -2544,12 +2629,12 @@ class TSTransitionSearchHandler:
                 retryable=True,
             ) from error
         final_coordinates = base_coordinates.copy()
-        final_coordinates[list(movable)] = numpy.asarray(progress.xyzs[-1], dtype=float)
+        final_coordinates[list(active)] = numpy.asarray(progress.xyzs[-1], dtype=float)
         final_evaluation = potential.evaluate(final_coordinates)
         final_gradient = numpy.asarray(
             final_evaluation.gradient_hartree_per_bohr, dtype=float
         )
-        active_gradient = final_gradient[list(movable)]
+        active_gradient = final_gradient[list(active)]
         rms = float(numpy.sqrt(numpy.mean(active_gradient * active_gradient)))
         maximum = float(numpy.max(numpy.abs(active_gradient)))
         optimized_identifier = _stable_identifier(
@@ -2568,7 +2653,9 @@ class TSTransitionSearchHandler:
             "configuration_identifier": configuration_identifier,
             "molecule_identifier": optimized_identifier,
         })
-        _, indices, _ = _ts_environment(record, self.runner.store)
+        final_density_matrix = numpy.asarray(
+            potential.previous_density_matrix, dtype=float
+        )
         search = ElectronicTransitionStateSearch(
             schema_version=_VERSION,
             search_identifier=_stable_identifier(
@@ -2599,14 +2686,36 @@ class TSTransitionSearchHandler:
             final_full_gradient_hartree_per_bohr=_ts_tensor(
                 final_gradient, unit="hartree_per_bohr", index_convention="real_particle_by_cartesian"
             ),
+            final_density_matrix_ao=_ts_tensor(
+                final_density_matrix,
+                unit="electron",
+                index_convention=(
+                    "spin_component_by_ao_pair"
+                    if final_density_matrix.ndim == 3
+                    else "ao_pair"
+                ),
+            ),
             full_particle_count=potential.system_manifest.particle_count,
             movable_particle_indices=movable,
             restrained_particle_indices=restrained,
             frozen_particle_indices=frozen,
             region_selection_method=initial["region_selection_method"],
-            restraint_force_constant_hartree_per_bohr2=None,
+            restraint_force_constant_hartree_per_bohr2=restraint_force_constant,
+            restraint_kind=initial["restraint_kind"],
+            restraint_axis=tuple(float(value) for value in restraint_axis),
+            restraint_reference_full_geometry_angstrom=_ts_tensor(
+                restraint_reference,
+                unit="angstrom",
+                index_convention="real_particle_by_cartesian",
+            ),
             hybrid_gradient_evaluation_count=potential.evaluation_count,
             hybrid_scf_recovery_count=potential.scf_recovery_count,
+            initial_hessian_method=(
+                "finite_difference_hybrid_gradients_reaction_mode_guided"
+            ),
+            initial_hessian_displacement_bohr=initial_hessian_displacement,
+            initial_hessian_hybrid_gradient_evaluation_count=2 * active_dof,
+            initial_reaction_mode_overlap=reaction_mode_overlap,
             energy_history_hartree=tuple(potential.energy_history_hartree),
             gradient_norm_history_hartree_per_bohr=tuple(
                 potential.gradient_norm_history_hartree_per_bohr
@@ -2626,7 +2735,9 @@ class TSTransitionSearchHandler:
                 "optimization_surface": "hybrid_qmmm",
                 "hybrid_gradient_evaluation_count": potential.evaluation_count,
                 "hybrid_scf_recovery_count": potential.scf_recovery_count,
+                "initial_reaction_mode_overlap": reaction_mode_overlap,
                 "movable_particle_count": len(movable),
+                "restrained_particle_count": len(restrained),
                 "frozen_particle_count": len(frozen),
             },
         )
@@ -2713,34 +2824,52 @@ class TSHybridFrequencyHandler:
             search.optimized_full_geometry_angstrom.values, dtype=float
         ).reshape(search.optimized_full_geometry_angstrom.shape)
         movable = search.movable_particle_indices
+        restrained = search.restrained_particle_indices
+        active = tuple(sorted((*movable, *restrained)))
+        restraint_reference = numpy.asarray(
+            search.restraint_reference_full_geometry_angstrom.values, dtype=float
+        ).reshape(search.restraint_reference_full_geometry_angstrom.shape)
+        potential.configure_transverse_restraints(
+            particle_indices=restrained,
+            reference_coordinates_angstrom=restraint_reference,
+            axis=numpy.asarray(search.restraint_axis, dtype=float),
+            force_constant_hartree_per_bohr2=float(
+                search.restraint_force_constant_hartree_per_bohr2
+            ),
+        )
+        search_density = numpy.asarray(
+            search.final_density_matrix_ao.values, dtype=float
+        ).reshape(search.final_density_matrix_ao.shape)
         displacement = 0.005
-        active_dof = 3 * len(movable)
+        active_dof = 3 * len(active)
         hessian_flat = numpy.zeros((active_dof, active_dof))
         for column in range(active_dof):
             particle_offset, component = divmod(column, 3)
-            particle_index = movable[particle_offset]
+            particle_index = active[particle_offset]
             plus = coordinates.copy()
             minus = coordinates.copy()
             delta_angstrom = displacement * 0.529177210903
             plus[particle_index, component] += delta_angstrom
             minus[particle_index, component] -= delta_angstrom
+            potential.previous_density_matrix = search_density.copy()
             plus_gradient = numpy.asarray(
                 potential.evaluate(plus).gradient_hartree_per_bohr, dtype=float
-            )[list(movable)].reshape(-1)
+            )[list(active)].reshape(-1)
+            potential.previous_density_matrix = search_density.copy()
             minus_gradient = numpy.asarray(
                 potential.evaluate(minus).gradient_hartree_per_bohr, dtype=float
-            )[list(movable)].reshape(-1)
+            )[list(active)].reshape(-1)
             hessian_flat[:, column] = (
                 plus_gradient - minus_gradient
             ) / (2.0 * displacement)
         hessian_flat = 0.5 * (hessian_flat + hessian_flat.T)
-        hessian = hessian_flat.reshape(len(movable), 3, len(movable), 3).transpose(0, 2, 1, 3)
+        hessian = hessian_flat.reshape(len(active), 3, len(active), 3).transpose(0, 2, 1, 3)
         table = GetPeriodicTable()
         masses = numpy.asarray(
-            [table.GetAtomicWeight(potential.environment.atoms[index].atomic_number) for index in movable],
+            [table.GetAtomicWeight(potential.environment.atoms[index].atomic_number) for index in active],
             dtype=float,
         )
-        active_coordinates_bohr = coordinates[list(movable)] / 0.529177210903
+        active_coordinates_bohr = coordinates[list(active)] / 0.529177210903
 
         class ActiveMolecule:
             def atom_mass_list(self, isotope_avg=True):
@@ -2762,7 +2891,7 @@ class TSHybridFrequencyHandler:
         modes: list[ElectronicFrequencyMode] = []
         for mode_index, wavenumber in enumerate(wavenumbers.tolist()):
             full_displacement = numpy.zeros((search.full_particle_count, 3))
-            full_displacement[list(movable)] = displacements[mode_index]
+            full_displacement[list(active)] = displacements[mode_index]
             forming = coordinates[indices["electrophile"]] - coordinates[indices["nucleophile"]]
             breaking = coordinates[indices["leaving_sulfur"]] - coordinates[indices["electrophile"]]
             forming /= numpy.linalg.norm(forming)
@@ -2809,10 +2938,8 @@ class TSHybridFrequencyHandler:
             finite_difference_displacement_bohr=displacement,
             hybrid_gradient_evaluation_count=potential.evaluation_count,
             full_particle_count=search.full_particle_count,
-            movable_particle_indices=movable,
-            frozen_particle_indices=tuple(
-                sorted((*search.restrained_particle_indices, *search.frozen_particle_indices))
-            ),
+            movable_particle_indices=active,
+            frozen_particle_indices=search.frozen_particle_indices,
         )
         reference = self.runner.write_json(
             artifact_type="electronic_frequency_analysis",
@@ -2859,6 +2986,21 @@ class TSReactionPathHandler:
         frequency_model = ElectronicFrequencyAnalysis.model_validate_json(self.runner.store.read(frequency))
         references = _ts_hybrid_references(record)
         potential = self.adapter.build_hybrid_qmmm_potential(references)
+        restraint_reference = numpy.asarray(
+            search_model.restraint_reference_full_geometry_angstrom.values,
+            dtype=float,
+        ).reshape(search_model.restraint_reference_full_geometry_angstrom.shape)
+        potential.configure_transverse_restraints(
+            particle_indices=search_model.restrained_particle_indices,
+            reference_coordinates_angstrom=restraint_reference,
+            axis=numpy.asarray(search_model.restraint_axis, dtype=float),
+            force_constant_hartree_per_bohr2=float(
+                search_model.restraint_force_constant_hartree_per_bohr2
+            ),
+        )
+        search_density = numpy.asarray(
+            search_model.final_density_matrix_ao.values, dtype=float
+        ).reshape(search_model.final_density_matrix_ao.shape)
         imaginary = next(item for item in frequency_model.modes if item.significant_imaginary)
         mode = numpy.asarray(imaginary.normalized_displacements.values, dtype=float).reshape(
             imaginary.normalized_displacements.shape
@@ -2869,24 +3011,46 @@ class TSReactionPathHandler:
             dtype=float,
         )
         movable = search_model.movable_particle_indices
+        active = tuple(sorted((*movable, *search_model.restrained_particle_indices)))
         weighted_mode = mode / numpy.sqrt(masses)[:, None]
         weighted_mode[list(search_model.frozen_particle_indices)] = 0.0
-        weighted_mode[list(search_model.restrained_particle_indices)] = 0.0
-        weighted_mode /= numpy.linalg.norm(weighted_mode[list(movable)])
+        weighted_mode /= numpy.linalg.norm(weighted_mode[list(active)])
         transition_coordinates = numpy.asarray(
             search_model.optimized_full_geometry_angstrom.values, dtype=float
         ).reshape(search_model.optimized_full_geometry_angstrom.shape) / 0.529177210903
+        potential.previous_density_matrix = search_density.copy()
+        transition_evaluation = potential.evaluate(
+            transition_coordinates * 0.529177210903
+        )
+        transition_energy = transition_evaluation.total_energy_hartree
         step_size = 0.08
         step_count = 8
         points: list[ElectronicReactionPathPoint] = []
         endpoints: dict[str, object] = {}
         endpoint_energies: dict[str, float] = {}
         for direction, sign in (("forward", 1.0), ("reverse", -1.0)):
-            coordinates = transition_coordinates + sign * step_size * weighted_mode
+            initial_candidates: list[tuple[float, object, object, object]] = []
+            for scale in (0.5, 1.0, 1.5, 2.0):
+                potential.previous_density_matrix = search_density.copy()
+                candidate_coordinates = (
+                    transition_coordinates
+                    + sign * scale * step_size * weighted_mode
+                )
+                candidate_evaluation = potential.evaluate(
+                    candidate_coordinates * 0.529177210903
+                )
+                initial_candidates.append((
+                    candidate_evaluation.total_energy_hartree,
+                    candidate_coordinates,
+                    candidate_evaluation,
+                    numpy.asarray(potential.previous_density_matrix).copy(),
+                ))
+            _, coordinates, evaluation, current_density = min(
+                initial_candidates, key=lambda item: item[0]
+            )
             for step_index in range(step_count):
-                evaluation = potential.evaluate(coordinates * 0.529177210903)
                 gradient = numpy.asarray(evaluation.gradient_hartree_per_bohr, dtype=float)
-                active_gradient = gradient[list(movable)]
+                active_gradient = gradient[list(active)]
                 rms = float(numpy.sqrt(numpy.mean(active_gradient * active_gradient)))
                 point_molecule = evaluation.molecule.model_copy(update={
                     "molecule_identifier": _stable_identifier(
@@ -2908,23 +3072,60 @@ class TSReactionPathHandler:
                     hybrid_energy_hartree=evaluation.total_energy_hartree,
                 ))
                 if step_index + 1 < step_count:
-                    weighted_gradient = active_gradient / masses[list(movable), None]
+                    weighted_gradient = active_gradient / masses[list(active), None]
                     norm = float(numpy.linalg.norm(weighted_gradient))
                     if norm <= 1e-14:
                         raise ScientificCapabilityFailure(
                             "hybrid_path_zero_gradient",
                             "The hybrid reaction path reached an undefined zero-gradient step.",
                         )
-                    coordinates[list(movable)] -= step_size * weighted_gradient / norm
+                    trial_step = step_size
+                    accepted = None
+                    for _ in range(12):
+                        trial_coordinates = coordinates.copy()
+                        trial_coordinates[list(active)] -= (
+                            trial_step * weighted_gradient / norm
+                        )
+                        potential.previous_density_matrix = current_density.copy()
+                        trial_evaluation = potential.evaluate(
+                            trial_coordinates * 0.529177210903
+                        )
+                        if (
+                            trial_evaluation.total_energy_hartree
+                            < evaluation.total_energy_hartree - 1.0e-10
+                        ):
+                            accepted = (
+                                trial_coordinates,
+                                trial_evaluation,
+                                numpy.asarray(
+                                    potential.previous_density_matrix
+                                ).copy(),
+                            )
+                            break
+                        trial_step *= 0.5
+                    if accepted is None:
+                        if step_index == 0:
+                            raise ScientificCapabilityFailure(
+                                "hybrid_path_descent_failed",
+                                "The hybrid reaction path could not take a downhill step "
+                                f"in the {direction} direction.",
+                                retryable=True,
+                            )
+                        break
+                    coordinates, evaluation, current_density = accepted
             endpoints[direction] = coordinates.copy()
             endpoint_energies[direction] = evaluation.total_energy_hartree
         endpoint_rmsd = float(numpy.sqrt(numpy.mean(
-            (numpy.asarray(endpoints["forward"])[list(movable)]
-             - numpy.asarray(endpoints["reverse"])[list(movable)]) ** 2
+            (numpy.asarray(endpoints["forward"])[list(active)]
+             - numpy.asarray(endpoints["reverse"])[list(active)]) ** 2
         )))
-        forward_decreased = endpoint_energies["forward"] < search_model.final_energy_hartree
-        reverse_decreased = endpoint_energies["reverse"] < search_model.final_energy_hartree
-        distinct = endpoint_rmsd > step_size
+        endpoint_separation = float(numpy.linalg.norm(
+            numpy.asarray(endpoints["forward"])[list(active)]
+            - numpy.asarray(endpoints["reverse"])[list(active)]
+        ))
+        forward_decreased = endpoint_energies["forward"] < transition_energy
+        reverse_decreased = endpoint_energies["reverse"] < transition_energy
+        distinct = endpoint_separation > step_size
         model = ElectronicReactionPathResult(
             schema_version=_VERSION,
             path_identifier=_stable_identifier(
@@ -2942,14 +3143,18 @@ class TSReactionPathHandler:
             path_confirmation_passed=forward_decreased and reverse_decreased and distinct,
             path_surface="hybrid_qmmm",
             hybrid_gradient_evaluation_count=potential.evaluation_count,
-            transition_state_hybrid_energy_hartree=search_model.final_energy_hartree,
+            transition_state_hybrid_energy_hartree=transition_energy,
             forward_endpoint_hybrid_energy_hartree=endpoint_energies["forward"],
             reverse_endpoint_hybrid_energy_hartree=endpoint_energies["reverse"],
         )
         if not model.path_confirmation_passed:
             raise ScientificCapabilityFailure(
                 "reaction_path_not_confirmed",
-                "Forward/reverse descent did not connect distinct lower-energy endpoints.",
+                "Forward/reverse descent did not connect distinct lower-energy endpoints: "
+                f"energy changes {endpoint_energies['forward'] - transition_energy:.6e} "
+                f"and {endpoint_energies['reverse'] - transition_energy:.6e} Ha; "
+                f"endpoint separation {endpoint_separation:.6e} Bohr "
+                f"(RMSD {endpoint_rmsd:.6e} Bohr).",
                 retryable=True,
             )
         reference = self.runner.write_json(
@@ -2962,6 +3167,7 @@ class TSReactionPathHandler:
                 "path_surface": "hybrid_qmmm",
                 "hybrid_gradient_evaluation_count": potential.evaluation_count,
                 "endpoint_rmsd_bohr": endpoint_rmsd,
+                "endpoint_separation_bohr": endpoint_separation,
             },
         )
         return ScientificCapabilityOutcome(
@@ -3004,9 +3210,24 @@ class TSTransitionVerificationHandler:
             metadata={"passed": report.overall_outcome is VerificationOutcome.PASSED},
         )
         if report.overall_outcome is not VerificationOutcome.PASSED:
+            failures = "; ".join(
+                f"{finding.finding_identifier} "
+                f"(expected {finding.expected}, observed {finding.observed})"
+                for dimension in report.dimension_results
+                for finding in dimension.findings
+                if finding.blocking
+            )
+            mode_detail = ", ".join(
+                f"{mode.wavenumber_cm_inverse:.3f} cm^-1"
+                f"{' significant' if mode.significant_imaginary else ''}"
+                for mode in frequency.modes
+                if mode.imaginary
+            )
             raise ScientificCapabilityFailure(
                 "scientific_verification_failed",
-                "The saddle failed gradient, imaginary-mode, or path verification.",
+                "The saddle failed gradient, imaginary-mode, or path verification"
+                f"{f': {failures}' if failures else '.'}"
+                f" Imaginary modes: {mode_detail or 'none'}.",
             )
         imaginary = next(mode for mode in frequency.modes if mode.significant_imaginary)
         return ScientificCapabilityOutcome(

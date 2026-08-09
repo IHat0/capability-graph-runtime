@@ -189,6 +189,7 @@ class ElectronicTensor(CanonicalModel):
     values: tuple[float, ...]
     unit: Literal[
         "dimensionless",
+        "angstrom",
         "hartree",
         "electron",
         "hartree_per_bohr",

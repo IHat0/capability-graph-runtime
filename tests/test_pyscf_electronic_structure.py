@@ -1899,3 +1899,38 @@ def test_native_hybrid_qmmm_energy_gradient_has_no_electrostatic_double_counting
         + 0.001
     )
 
+    restrained_index = preparation.selected_particle_indices[0]
+    transverse_coordinates = coordinates.copy()
+    transverse_coordinates[restrained_index, 1] += 0.01
+    unrestrained_transverse = potential.evaluate(transverse_coordinates)
+    potential.configure_transverse_restraints(
+        particle_indices=(restrained_index,),
+        reference_coordinates_angstrom=coordinates,
+        axis=numpy.asarray((1.0, 0.0, 0.0)),
+        force_constant_hartree_per_bohr2=0.2,
+    )
+    restrained_transverse = potential.evaluate(transverse_coordinates)
+    restrained_reference = potential.evaluate(coordinates)
+    displacement_bohr = 0.01 / 0.529177210903
+    expected_restraint_energy = 0.5 * 0.2 * displacement_bohr**2
+    expected_restraint_gradient = 0.2 * displacement_bohr
+
+    assert restrained_reference.restraint_energy_hartree == pytest.approx(0.0)
+    assert restrained_transverse.restraint_energy_hartree == pytest.approx(
+        expected_restraint_energy, abs=1e-12
+    )
+    assert restrained_transverse.total_energy_hartree == pytest.approx(
+        unrestrained_transverse.total_energy_hartree + expected_restraint_energy,
+        abs=1e-9,
+    )
+    restrained_gradient = numpy.asarray(
+        restrained_transverse.gradient_hartree_per_bohr
+    )
+    unrestrained_gradient = numpy.asarray(
+        unrestrained_transverse.gradient_hartree_per_bohr
+    )
+    assert restrained_gradient[restrained_index, 1] == pytest.approx(
+        unrestrained_gradient[restrained_index, 1] + expected_restraint_gradient,
+        abs=1e-6,
+    )
+

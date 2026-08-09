@@ -210,6 +210,7 @@ class ElectronicTransitionStateSearch(CanonicalModel):
     boundary_treatment: str | None = None
     optimized_full_geometry_angstrom: ElectronicTensor | None = None
     final_full_gradient_hartree_per_bohr: ElectronicTensor | None = None
+    final_density_matrix_ao: ElectronicTensor | None = None
     full_particle_count: int | None = Field(default=None, gt=0)
     movable_particle_indices: tuple[int, ...] = ()
     restrained_particle_indices: tuple[int, ...] = ()
@@ -218,8 +219,17 @@ class ElectronicTransitionStateSearch(CanonicalModel):
     restraint_force_constant_hartree_per_bohr2: float | None = Field(
         default=None, ge=0
     )
+    restraint_kind: Literal["transverse_harmonic_reaction_axis"] | None = None
+    restraint_axis: tuple[float, float, float] | None = None
+    restraint_reference_full_geometry_angstrom: ElectronicTensor | None = None
     hybrid_gradient_evaluation_count: int = Field(default=0, ge=0)
     hybrid_scf_recovery_count: int = Field(default=0, ge=0)
+    initial_hessian_method: Literal[
+        "finite_difference_hybrid_gradients_reaction_mode_guided"
+    ] | None = None
+    initial_hessian_displacement_bohr: float | None = Field(default=None, gt=0)
+    initial_hessian_hybrid_gradient_evaluation_count: int = Field(default=0, ge=0)
+    initial_reaction_mode_overlap: float | None = Field(default=None, ge=0, le=1)
     energy_history_hartree: tuple[float, ...] = ()
     gradient_norm_history_hartree_per_bohr: tuple[float, ...] = ()
     optimization_iteration_count: int = Field(default=0, ge=0)
@@ -264,15 +274,39 @@ class ElectronicTransitionStateSearch(CanonicalModel):
             self.boundary_treatment,
             self.optimized_full_geometry_angstrom,
             self.final_full_gradient_hartree_per_bohr,
+            self.final_density_matrix_ao,
             self.full_particle_count,
             self.region_selection_method,
             self.coordinate_converged,
             self.termination_reason,
+            self.initial_hessian_method,
+            self.initial_hessian_displacement_bohr,
+            self.initial_reaction_mode_overlap,
         )
         if any(value is None for value in required):
             raise ValueError("Hybrid TS searches require complete surface and region evidence.")
         if self.hybrid_gradient_evaluation_count <= 1:
             raise ValueError("Hybrid TS optimization must evaluate the hybrid gradient iteratively.")
+        if self.initial_hessian_hybrid_gradient_evaluation_count <= 0:
+            raise ValueError("Hybrid TS optimization requires hybrid initial-Hessian evidence.")
+        if self.restrained_particle_indices and (
+            self.restraint_force_constant_hartree_per_bohr2 is None
+            or self.restraint_kind is None
+            or self.restraint_axis is None
+            or self.restraint_reference_full_geometry_angstrom is None
+        ):
+            raise ValueError("Restrained hybrid TS regions require complete restraint evidence.")
+        if self.restrained_particle_indices:
+            if self.restraint_reference_full_geometry_angstrom.shape != (
+                self.full_particle_count,
+                3,
+            ):
+                raise ValueError("Hybrid TS restraint reference dimensions are inconsistent.")
+            if not all(math.isfinite(value) for value in self.restraint_axis):
+                raise ValueError("Hybrid TS restraint axis must be finite.")
+            axis_norm = math.sqrt(sum(value * value for value in self.restraint_axis))
+            if axis_norm <= 1.0e-12:
+                raise ValueError("Hybrid TS restraint axis must be nonzero.")
         if len(self.energy_history_hartree) != self.hybrid_gradient_evaluation_count:
             raise ValueError("Hybrid TS energy history must cover every potential evaluation.")
         if len(self.gradient_norm_history_hartree_per_bohr) != self.hybrid_gradient_evaluation_count:
@@ -292,6 +326,13 @@ class ElectronicTransitionStateSearch(CanonicalModel):
             raise ValueError("Hybrid TS full geometry has inconsistent dimensions.")
         if self.final_full_gradient_hartree_per_bohr.shape != (self.full_particle_count, 3):
             raise ValueError("Hybrid TS full gradient has inconsistent dimensions.")
+        if (
+            self.final_density_matrix_ao.unit != "electron"
+            or len(self.final_density_matrix_ao.shape) not in (2, 3)
+            or self.final_density_matrix_ao.shape[-1]
+            != self.final_density_matrix_ao.shape[-2]
+        ):
+            raise ValueError("Hybrid TS final AO density matrix is inconsistent.")
         return self
 
 
