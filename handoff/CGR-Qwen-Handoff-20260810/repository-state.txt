@@ -1,0 +1,47 @@
+Repository: IHat0/capability-graph-runtime
+Remote: https://github.com/IHat0/capability-graph-runtime.git
+Handoff branch: qwen/pulsate-text-resolution-handoff-v1
+Base branch: feat/pulsate-scientific-autonomy-v1
+Base commit: 4344155c83aabd0a9a6773f114b19d56afae0b2f
+Base commit title: Stabilize hybrid QM MM transition verification
+Snapshot created: 2026-08-10 Africa/Johannesburg
+
+Tracked working-tree diff:
+21 files changed, 665 insertions(+), 100 deletions(-)
+
+Tracked modified files included in the patch and snapshot:
+.github/workflows/ci.yml
+docs/architecture/pulsate-phase1-3-enterprise-readiness-v1.md
+docs/operations/pulsate-enterprise-readiness-v1.md
+pyproject.toml
+src/cgr/molecular/scientific_selection.py
+src/cgr/pulsate_api/app.py
+src/cgr/pulsate_api/deployment.py
+src/cgr/pulsate_api/enterprise_gate.py
+src/cgr/pulsate_api/phase8_scientific_handlers.py
+src/cgr/pulsate_api/recovery.py
+src/cgr/pulsate_api/scientific_executions.py
+src/cgr/pulsate_api/scientific_objectives.py
+src/cgr/pulsate_api/scientific_runtime.py
+src/cgr/pulsate_api/security.py
+tests/conftest.py
+tests/test_phase8_end_to_end.py
+tests/test_pulsate_deployment.py
+tests/test_pulsate_enterprise_gate.py
+tests/test_pulsate_recovery.py
+tests/test_scientific_objectives.py
+tests/test_scientific_runtime.py
+
+New untracked source/test files included in the snapshot:
+src/cgr/pulsate_api/scientific_acquisition.py
+src/cgr/pulsate_api/scientific_cli.py
+src/cgr/pulsate_api/scientific_production.py
+tests/test_cross_phase_scientific_integration.py
+tests/test_scientific_acquisition.py
+
+Unrelated untracked installers, caches, generated runs, old patch archives,
+frontend temporary directories, local configuration, and diagnostic output
+were intentionally omitted from this handoff branch.
+
+This is a WIP handoff snapshot only. It was not merged or deployed. The original
+working checkout remained unstaged and uncommitted.

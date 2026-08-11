@@ -24,9 +24,12 @@ from cgr.workflow_graph import (
     CapabilityInvocationResult,
     CapabilityInvocationStatus,
     EdgeKind,
+    FailureAction,
+    FailureRecoveryPolicy,
     GraphRunRepository,
     GraphStatus,
     NodeKind,
+    RetryPolicy,
     WorkflowEdge,
     WorkflowGraphDefinition,
     WorkflowGraphMetadata,
@@ -255,6 +258,23 @@ class ScientificEngineHandler:
 def scientific_plan_graph(record: ScientificExecutionRecord) -> WorkflowGraphDefinition:
     """Compile one validated scientific plan into an immutable CGR graph."""
 
+    retry_policy = (
+        RetryPolicy(
+            max_attempts=record.objective.budget.maximum_replans + 1,
+            retry_delay_seconds=0.0,
+        )
+        if record.objective.budget.maximum_replans > 0
+        else None
+    )
+    recovery_policy = (
+        FailureRecoveryPolicy(
+            on_failure=FailureAction.RETRY,
+            retry_policy=retry_policy,
+            recovery_checkpoint_required=False,
+        )
+        if retry_policy is not None
+        else None
+    )
     nodes = tuple(
         WorkflowNode(
             node_identifier=step.step_identifier,
@@ -269,12 +289,15 @@ def scientific_plan_graph(record: ScientificExecutionRecord) -> WorkflowGraphDef
                 if step.capability_name.startswith(("quantum.", "quantum_workflow."))
                 else "local_scientific_runtime"
             ),
+            retry_policy=retry_policy,
+            failure_recovery_policy=recovery_policy,
             verification_requirements=(
                 ("scientific_verification",) if step.verification_required else ()
             ),
             metadata={
                 "objective_identifier": record.objective.objective_identifier,
                 "scientific_task": record.objective.task_type,
+                "recovery_model": "bounded-whole-capability-retry",
             },
         )
         for step in record.plan.steps
@@ -517,6 +540,8 @@ class ScientificObjectiveRuntime:
                 node.model_copy(update={
                     "status": "running",
                     "attempt_count": invocation.attempt_number,
+                    "error_code": None,
+                    "error_message": None,
                 }),
             )
             handler = self.capability_registry.get(capability_name)
@@ -581,6 +606,8 @@ class ScientificObjectiveRuntime:
             updated_node = node.model_copy(update={
                 "status": "succeeded",
                 "attempt_count": invocation.attempt_number,
+                "error_code": None,
+                "error_message": None,
                 "output_artifact_identifiers": tuple(
                     artifact.artifact_identifier for artifact in outcome.output_artifacts
                 ),

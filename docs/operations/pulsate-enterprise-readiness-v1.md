@@ -40,7 +40,7 @@ not copied into records.
 
 ## Authoritative producer map
 
-The 71 mandatory gates are derived from `ENTERPRISE_GATE_PRODUCERS`; there is
+The 72 mandatory gates are derived from `ENTERPRISE_GATE_PRODUCERS`; there is
 no independent gate list.
 
 | Workflow job | Actual command families | Mandatory evidence |

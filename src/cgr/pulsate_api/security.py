@@ -362,6 +362,12 @@ PUBLIC_ROUTES = frozenset({
 })
 
 ROUTE_PROTECTIONS: dict[tuple[str, str], RouteProtection] = {
+    ("POST", "/api/v1/scientific/artifacts"): RouteProtection(
+        (ProtectedAction.EXECUTION_REQUEST,),
+        "scientific-execution",
+        "static:collection",
+        True,
+    ),
     ("POST", "/api/v1/scientific/objectives/compile"): RouteProtection(
         (ProtectedAction.PLANNING_EVALUATE,),
         "scientific-execution",
@@ -709,7 +715,12 @@ class SecurityServices:
                     resource_identifier="*",
                     allowed_actions=development_actions,
                 )
-                for kind in ("project", "run", "experiment")
+                for kind in (
+                    "project",
+                    "run",
+                    "experiment",
+                    "scientific-execution",
+                )
             ]
             return cls(
                 authenticator=DevelopmentAuthenticator(token, principal),

@@ -26,6 +26,10 @@ def validate_application_data_layout(data_root: Path) -> None:
         "molecular-artifacts",
         "molecular-projects",
         "runs",
+        "scientific-artifacts",
+        "scientific-executions",
+        "scientific-private-state",
+        "scientific-workflows",
         "security",
         "workflows",
     )

@@ -57,26 +57,19 @@ from cgr.electronic_structure import (
     IMPLICIT_SOLVENT_HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
     ElectronicActiveSpace,
-    ElectronicAtom,
     ElectronicFrequencyAnalysis,
     ElectronicFrequencyMode,
     ElectronicImplicitSolventResult,
     ElectronicMolecule,
-    ElectronicQMRegionPreparation,
     ElectronicReactionPathPoint,
     ElectronicReactionPathResult,
-    ElectronicStructureConfiguration,
     ElectronicTensor,
     ElectronicTransitionStateSearch,
-    FREQUENCY_ANALYZE,
-    GRADIENT_CALCULATE,
     PySCFElectronicStructureAdapter,
     QM_REGION_PREPARE,
     QMMM_EMBEDDING_PREPARE,
     QMMM_HARTREE_FOCK,
     QMMM_HYBRID_EXECUTE,
-    REACTION_PATH_CONFIRM,
-    TRANSITION_STATE_SEARCH,
     transition_state_verification_request,
 )
 from cgr.quantum_workflow import (
@@ -88,7 +81,6 @@ from cgr.quantum_workflow import (
     VariationalGroundStateResult,
 )
 from cgr.science import (
-    ArtifactPointer,
     ArtifactPointer,
     ArtifactReference,
     CapabilityInvocation,
@@ -1831,47 +1823,71 @@ def _ts_ligand(record: ScientificExecutionRecord, store: ScientificPayloadStore)
     return source, molecule
 
 
-def _cysteine_reaction_selection(
+def _covalent_reaction_selection(
     record: ScientificExecutionRecord,
     store: ScientificPayloadStore,
 ) -> dict[str, object]:
-    """Resolve a unique Cys sulfur and methyl-thioether electrophile by chemistry."""
+    """Resolve one explicitly reviewed protein atom and mapped ligand reaction pair."""
 
+    target = record.objective.covalent_reaction_target
+    if target is None:
+        raise ScientificCapabilityFailure(
+            "reaction_semantics_missing",
+            "Covalent execution requires reviewed reaction-atom, charge, and spin semantics.",
+        )
     protein = _objective_input(record, kinds=("protein_structure",))
     protein_atoms = _pdb_atoms(store.read(protein))
     nucleophiles = tuple(
         (index, atom)
         for index, atom in enumerate(protein_atoms)
-        if str(atom["residue_name"]).upper() == "CYS"
-        and str(atom["atom_name"]).upper() == "SG"
-        and str(atom["element"]) == "S"
+        if str(atom["chain"]) == target.protein_chain_label
+        and str(atom["sequence"]) == target.protein_residue_sequence
+        and str(atom["atom_name"]).upper() == target.protein_atom_name.upper()
+        and (
+            target.protein_residue_name is None
+            or str(atom["residue_name"]).upper()
+            == target.protein_residue_name.upper()
+        )
     )
     if len(nucleophiles) != 1:
         raise ScientificCapabilityFailure(
             "catalytic_nucleophile_ambiguous",
-            "Exactly one cysteine SG nucleophile must resolve from the supplied active-site structure.",
+            "The reviewed protein reaction-atom identity did not resolve exactly once.",
         )
     ligand_reference, ligand = _ts_ligand(record, store)
-    candidates: list[tuple[int, int]] = []
-    for atom in ligand.GetAtoms():
-        if atom.GetAtomicNum() != 6:
-            continue
-        sulfur_neighbors = tuple(
-            neighbor.GetIdx() for neighbor in atom.GetNeighbors()
-            if neighbor.GetAtomicNum() == 16
+    from rdkit import Chem
+
+    query = Chem.MolFromSmarts(target.ligand_reaction_smarts)
+    if query is None:
+        raise ScientificCapabilityFailure(
+            "ligand_reaction_smarts_invalid",
+            "The reviewed ligand reaction SMARTS could not be parsed.",
         )
-        hydrogen_count = sum(
-            neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors()
+    mapped_query_atoms = {
+        atom.GetAtomMapNum(): atom.GetIdx()
+        for atom in query.GetAtoms()
+        if atom.GetAtomMapNum()
+    }
+    if set(mapped_query_atoms) != {1, 2}:
+        raise ScientificCapabilityFailure(
+            "ligand_reaction_smarts_invalid",
+            "Ligand reaction SMARTS must map :1 electrophile and :2 leaving group.",
         )
-        if len(sulfur_neighbors) == 1 and hydrogen_count == 3:
-            candidates.append((atom.GetIdx(), sulfur_neighbors[0]))
-    if len(candidates) != 1:
+    matches = ligand.GetSubstructMatches(query, uniquify=True, maxMatches=2)
+    if len(matches) != 1:
         raise ScientificCapabilityFailure(
             "ligand_electrophile_ambiguous",
-            "A unique methyl carbon with a sulfur leaving group could not be resolved.",
+            "The reviewed ligand reaction SMARTS did not resolve exactly once.",
         )
     protein_index, nucleophile = nucleophiles[0]
-    electrophile, leaving_sulfur = candidates[0]
+    match = matches[0]
+    electrophile = match[mapped_query_atoms[1]]
+    leaving_group = match[mapped_query_atoms[2]]
+    if ligand.GetBondBetweenAtoms(electrophile, leaving_group) is None:
+        raise ScientificCapabilityFailure(
+            "ligand_reaction_bond_missing",
+            "The mapped electrophile and leaving group are not directly bonded.",
+        )
     return {
         "protein_artifact_identifier": protein.artifact_identifier,
         "ligand_artifact_identifier": ligand_reference.artifact_identifier,
@@ -1883,15 +1899,13 @@ def _cysteine_reaction_selection(
         },
         "protein_nucleophile_source_index": protein_index,
         "ligand_electrophile_source_index": electrophile,
-        "ligand_leaving_sulfur_source_index": leaving_sulfur,
-        "reaction_family": "symmetric_sulfur_substitution_model",
-        "resolution_method": "unique_cysteine_sg_plus_methyl_thioether_connectivity",
-        "protonation_alternatives": [
-            {"state": "neutral_cysteine", "selected": False},
-            {"state": "cysteine_thiolate", "selected": True},
-        ],
-        "selected_total_qm_charge": -1,
-        "selected_spin": 0,
+        "ligand_leaving_group_source_index": leaving_group,
+        "reaction_family": target.reaction_family,
+        "ligand_reaction_smarts": target.ligand_reaction_smarts,
+        "resolution_method": "reviewed_protein_identity_plus_unique_mapped_smarts",
+        "protein_nucleophile_formal_charge": target.protein_nucleophile_formal_charge,
+        "selected_total_qm_charge": target.selected_total_qm_charge,
+        "selected_spin": target.selected_spin,
     }
 
 
@@ -1943,7 +1957,7 @@ class TSForceFieldSelectionHandler:
         return ScientificCapabilityOutcome(output_artifacts=(reference,))
 
 
-class TSCysteinePreparationHandler:
+class TSReactionAtomPreparationHandler:
     def __init__(self, store: ScientificPayloadStore) -> None:
         self.runner = _NativeRunner(store)
 
@@ -1951,7 +1965,7 @@ class TSCysteinePreparationHandler:
         del objective
         import json
 
-        selection = _cysteine_reaction_selection(record, self.runner.store)
+        selection = _covalent_reaction_selection(record, self.runner.store)
         source = next(
             item for item in record.artifact_references
             if item.artifact_type == "molecular_structure"
@@ -1963,13 +1977,14 @@ class TSCysteinePreparationHandler:
                     "target_ph": 7.4,
                     "exact_pka_calculated": False,
                     "resolved_residue": selection["catalytic_residue"],
-                    "state_alternatives": selection["protonation_alternatives"],
-                    "selected_state": "cysteine_thiolate",
-                    "selected_qm_charge": -1,
-                    "selected_spin": 0,
+                    "selected_nucleophile_formal_charge": selection[
+                        "protein_nucleophile_formal_charge"
+                    ],
+                    "selected_qm_charge": selection["selected_total_qm_charge"],
+                    "selected_spin": selection["selected_spin"],
                     "assumption": (
-                        "The covalent-reaction objective selects the nucleophilic thiolate "
-                        "hypothesis from the retained neutral/thiolate alternatives."
+                        "The charge and spin state are explicit scientist-reviewed "
+                        "reaction semantics; no residue-specific protonation state was inferred."
                     ),
                 },
                 sort_keys=True,
@@ -1999,7 +2014,7 @@ class TSSemanticResolutionHandler:
         del objective
         import json
 
-        selection = _cysteine_reaction_selection(record, self.runner.store)
+        selection = _covalent_reaction_selection(record, self.runner.store)
         reference = self.runner.write_json(
             artifact_type="semantic_target_selection",
             payload=json.dumps(selection, sort_keys=True, separators=(",", ":")).encode(),
@@ -2009,8 +2024,8 @@ class TSSemanticResolutionHandler:
         return ScientificCapabilityOutcome(
             output_artifacts=(reference,), evidence_artifacts=(reference,),
             scientific_summary=(
-                "Resolved one catalytic Cys SG nucleophile and one methyl-thioether "
-                "electrophile/leaving-sulfur pair without scientist-supplied atom indices."
+                "Resolved the reviewed protein reaction atom and one unique mapped "
+                "ligand electrophile/leaving-group pair without computational indices."
             ),
         )
 
@@ -2024,7 +2039,7 @@ def _ts_environment(
     protein = _objective_input(record, kinds=("protein_structure",))
     protein_atoms = _pdb_atoms(store.read(protein))
     _, ligand = _ts_ligand(record, store)
-    selection = _cysteine_reaction_selection(record, store)
+    selection = _covalent_reaction_selection(record, store)
     conformer = ligand.GetConformer()
     offset = len(protein_atoms)
     atom_rows: list[dict[str, object]] = [dict(item) for item in protein_atoms]
@@ -2072,9 +2087,9 @@ def _ts_environment(
     chain_index = {value: index for index, value in enumerate(chain_values)}
     nucleophile_index = int(selection["protein_nucleophile_source_index"])
     electrophile_index = offset + int(selection["ligand_electrophile_source_index"])
-    leaving_index = offset + int(selection["ligand_leaving_sulfur_source_index"])
+    leaving_index = offset + int(selection["ligand_leaving_group_source_index"])
     charges = [0.0] * len(atom_rows)
-    charges[nucleophile_index] = -0.8
+    charges[nucleophile_index] = float(selection["protein_nucleophile_formal_charge"])
     # A small charge-separated peptide scaffold supplies non-zero auditable MM charges.
     for index, row in enumerate(atom_rows[:len(protein_atoms)]):
         name = str(row["atom_name"]).upper()
@@ -2084,7 +2099,14 @@ def _ts_environment(
             charges[index] = 0.5
         elif name == "O":
             charges[index] = -0.8
-    correction = -1.0 - sum(charges)
+    environment_total_charge = sum(
+        int(row["formal_charge"]) for row in atom_rows
+    )
+    environment_total_charge += (
+        int(selection["protein_nucleophile_formal_charge"])
+        - int(atom_rows[nucleophile_index]["formal_charge"])
+    )
+    correction = float(environment_total_charge) - sum(charges)
     charges[-1] += correction
     digest = hashlib.sha256(
         (protein.content_sha256 + _objective_input(record, kinds=("ligand_structure",)).content_sha256).encode()
@@ -2109,7 +2131,11 @@ def _ts_environment(
                 chain_index=chain_index[str(row["chain"])],
                 chain_identifier=f"chain-{str(row['chain']).lower()}",
                 source_atom_index=index,
-                formal_charge=(-1 if index == nucleophile_index else int(row["formal_charge"])),
+                formal_charge=(
+                    int(selection["protein_nucleophile_formal_charge"])
+                    if index == nucleophile_index
+                    else int(row["formal_charge"])
+                ),
             )
             for index, row in enumerate(atom_rows)
         ),
@@ -2135,7 +2161,7 @@ def _ts_environment(
     return environment, {
         "nucleophile": nucleophile_index,
         "electrophile": electrophile_index,
-        "leaving_sulfur": leaving_index,
+        "leaving_group": leaving_index,
     }, tuple(charges)
 
 
@@ -2357,10 +2383,24 @@ class TSQMRegionHandler:
         )
         preparation = next(item for item in results if item.artifact_type == "electronic_qm_region_preparation")
         molecules = tuple(item for item in results if item.artifact_type == "electronic_molecule")
-        selected = next(
-            item for item in molecules
-            if ElectronicMolecule.model_validate_json(self.runner.store.read(item)).spin == int(semantic["selected_spin"])
+        selected_candidates = tuple(
+            item
+            for item in molecules
+            if (
+                (model := ElectronicMolecule.model_validate_json(
+                    self.runner.store.read(item)
+                )).spin
+                == int(semantic["selected_spin"])
+                and model.molecular_charge
+                == int(semantic["selected_total_qm_charge"])
+            )
         )
+        if len(selected_candidates) != 1:
+            raise ScientificCapabilityFailure(
+                "reviewed_charge_spin_unavailable",
+                "The prepared QM region does not realize the reviewed total charge and spin.",
+            )
+        selected = selected_candidates[0]
         return ScientificCapabilityOutcome(
             output_artifacts=(preparation, selected),
             evidence_artifacts=results,
@@ -2393,7 +2433,7 @@ class TSInitialPathHandler:
         )
         nucleophile = indices["nucleophile"]
         electrophile = indices["electrophile"]
-        leaving = indices["leaving_sulfur"]
+        leaving = indices["leaving_group"]
         axis = coordinates[leaving] - coordinates[nucleophile]
         axis /= numpy.linalg.norm(axis)
         resolved_distance = 0.5 * (
@@ -2429,7 +2469,7 @@ class TSInitialPathHandler:
             artifact_type="transition_state_initial_path",
             payload=json.dumps(
                 {
-                    "method": "semantic_full_system_symmetric_s_c_s_interpolation",
+                    "method": "semantic_full_system_substitution_interpolation",
                     "optimization_surface": "hybrid_qmmm",
                     "initial_full_geometry_angstrom": coordinates.tolist(),
                     "resolved_reaction_distance_angstrom": float(resolved_distance),
@@ -2447,7 +2487,8 @@ class TSInitialPathHandler:
                     "restraint_reference_full_geometry_angstrom": coordinates.tolist(),
                     "restraint_force_constant_hartree_per_bohr2": restraint_force_constant,
                     "region_rationale": (
-                        "The resolved S-C-S triad remains active along the reaction axis with "
+                        "The resolved nucleophile-electrophile-leaving-group triad remains "
+                        "active along the reaction axis with "
                         "an explicit transverse harmonic restraint, while hydrogens directly "
                         "bonded to the electrophile move freely; "
                         "all other real particles remain frozen but contribute to every hybrid evaluation."
@@ -2579,7 +2620,7 @@ class TSTransitionSearchHandler:
         )
         forming_axis /= numpy.linalg.norm(forming_axis)
         breaking_axis = (
-            base_coordinates[indices["leaving_sulfur"]]
+            base_coordinates[indices["leaving_group"]]
             - base_coordinates[indices["electrophile"]]
         )
         breaking_axis /= numpy.linalg.norm(breaking_axis)
@@ -2587,7 +2628,7 @@ class TSTransitionSearchHandler:
         reaction_vector[active_offset[indices["electrophile"]]] += (
             forming_axis + breaking_axis
         )
-        reaction_vector[active_offset[indices["leaving_sulfur"]]] -= breaking_axis
+        reaction_vector[active_offset[indices["leaving_group"]]] -= breaking_axis
         reaction_vector = reaction_vector.reshape(-1)
         reaction_vector /= numpy.linalg.norm(reaction_vector)
         eigenvalues, eigenvectors = numpy.linalg.eigh(initial_hessian)
@@ -2602,7 +2643,10 @@ class TSTransitionSearchHandler:
             eigenvectors @ numpy.diag(guided_eigenvalues) @ eigenvectors.T
         )
 
-        maximum_steps = 120
+        # A retry is a complete, auditable optimizer attempt.  The first run
+        # preserves the validated Phase 8 budget; bounded workflow recovery may
+        # grant more iterations without silently changing the scientific method.
+        maximum_steps = 120 + (80 * max(invocation.attempt_number - 1, 0))
         try:
             with tempfile.TemporaryDirectory(prefix="cgr-hybrid-qmmm-ts-") as directory:
                 progress = run_optimizer(
@@ -2893,7 +2937,7 @@ class TSHybridFrequencyHandler:
             full_displacement = numpy.zeros((search.full_particle_count, 3))
             full_displacement[list(active)] = displacements[mode_index]
             forming = coordinates[indices["electrophile"]] - coordinates[indices["nucleophile"]]
-            breaking = coordinates[indices["leaving_sulfur"]] - coordinates[indices["electrophile"]]
+            breaking = coordinates[indices["leaving_group"]] - coordinates[indices["electrophile"]]
             forming /= numpy.linalg.norm(forming)
             breaking /= numpy.linalg.norm(breaking)
             forming_change = numpy.dot(
@@ -2901,7 +2945,7 @@ class TSHybridFrequencyHandler:
                 forming,
             )
             breaking_change = numpy.dot(
-                full_displacement[indices["leaving_sulfur"]] - full_displacement[indices["electrophile"]],
+                full_displacement[indices["leaving_group"]] - full_displacement[indices["electrophile"]],
                 breaking,
             )
             mode_norm = numpy.linalg.norm(full_displacement)
@@ -2962,6 +3006,49 @@ class TSHybridFrequencyHandler:
         )
 
 
+def _reaction_path_endpoint_evidence(
+    *,
+    transition_coordinates: object,
+    forward_endpoint: object,
+    reverse_endpoint: object,
+    normalized_mode: object,
+    active_indices: tuple[int, ...],
+    step_size_bohr: float,
+) -> dict[str, float | bool]:
+    """Evaluate two-sided endpoint identity along the verified imaginary mode."""
+
+    import numpy
+
+    transition = numpy.asarray(transition_coordinates, dtype=float)
+    forward = numpy.asarray(forward_endpoint, dtype=float)
+    reverse = numpy.asarray(reverse_endpoint, dtype=float)
+    mode = numpy.asarray(normalized_mode, dtype=float)
+    active = list(active_indices)
+    forward_projection = float(numpy.sum((forward - transition)[active] * mode[active]))
+    reverse_projection = float(numpy.sum((reverse - transition)[active] * mode[active]))
+    separation = float(numpy.linalg.norm(forward[active] - reverse[active]))
+    rmsd = float(numpy.sqrt(numpy.mean((forward[active] - reverse[active]) ** 2)))
+    minimum_excursion = 0.25 * step_size_bohr
+    minimum_separation = 0.5 * step_size_bohr
+    opposed = forward_projection * reverse_projection < 0.0
+    distinct = bool(
+        opposed
+        and min(abs(forward_projection), abs(reverse_projection))
+        >= minimum_excursion
+        and separation >= minimum_separation
+    )
+    return {
+        "forward_mode_projection_bohr": forward_projection,
+        "reverse_mode_projection_bohr": reverse_projection,
+        "endpoint_separation_bohr": separation,
+        "endpoint_rmsd_bohr": rmsd,
+        "minimum_mode_excursion_bohr": minimum_excursion,
+        "minimum_endpoint_separation_bohr": minimum_separation,
+        "opposed_mode_projections": opposed,
+        "distinct_endpoints": distinct,
+    }
+
+
 class TSReactionPathHandler:
     def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
         self.runner = _NativeRunner(store)
@@ -3001,7 +3088,16 @@ class TSReactionPathHandler:
         search_density = numpy.asarray(
             search_model.final_density_matrix_ao.values, dtype=float
         ).reshape(search_model.final_density_matrix_ao.shape)
-        imaginary = next(item for item in frequency_model.modes if item.significant_imaginary)
+        significant_modes = tuple(
+            item for item in frequency_model.modes if item.significant_imaginary
+        )
+        if len(significant_modes) != 1:
+            raise ScientificCapabilityFailure(
+                "transition_state_not_first_order_saddle",
+                "Reaction-path confirmation requires exactly one significant "
+                f"imaginary mode; frequency analysis found {len(significant_modes)}.",
+            )
+        imaginary = significant_modes[0]
         mode = numpy.asarray(imaginary.normalized_displacements.values, dtype=float).reshape(
             imaginary.normalized_displacements.shape
         )
@@ -3115,17 +3211,19 @@ class TSReactionPathHandler:
                     coordinates, evaluation, current_density = accepted
             endpoints[direction] = coordinates.copy()
             endpoint_energies[direction] = evaluation.total_energy_hartree
-        endpoint_rmsd = float(numpy.sqrt(numpy.mean(
-            (numpy.asarray(endpoints["forward"])[list(active)]
-             - numpy.asarray(endpoints["reverse"])[list(active)]) ** 2
-        )))
-        endpoint_separation = float(numpy.linalg.norm(
-            numpy.asarray(endpoints["forward"])[list(active)]
-            - numpy.asarray(endpoints["reverse"])[list(active)]
-        ))
+        endpoint_evidence = _reaction_path_endpoint_evidence(
+            transition_coordinates=transition_coordinates,
+            forward_endpoint=endpoints["forward"],
+            reverse_endpoint=endpoints["reverse"],
+            normalized_mode=weighted_mode,
+            active_indices=active,
+            step_size_bohr=step_size,
+        )
+        endpoint_rmsd = float(endpoint_evidence["endpoint_rmsd_bohr"])
+        endpoint_separation = float(endpoint_evidence["endpoint_separation_bohr"])
         forward_decreased = endpoint_energies["forward"] < transition_energy
         reverse_decreased = endpoint_energies["reverse"] < transition_energy
-        distinct = endpoint_separation > step_size
+        distinct = bool(endpoint_evidence["distinct_endpoints"])
         model = ElectronicReactionPathResult(
             schema_version=_VERSION,
             path_identifier=_stable_identifier(
@@ -3154,7 +3252,9 @@ class TSReactionPathHandler:
                 f"energy changes {endpoint_energies['forward'] - transition_energy:.6e} "
                 f"and {endpoint_energies['reverse'] - transition_energy:.6e} Ha; "
                 f"endpoint separation {endpoint_separation:.6e} Bohr "
-                f"(RMSD {endpoint_rmsd:.6e} Bohr).",
+                f"(RMSD {endpoint_rmsd:.6e} Bohr); imaginary-mode projections "
+                f"{float(endpoint_evidence['forward_mode_projection_bohr']):.6e} and "
+                f"{float(endpoint_evidence['reverse_mode_projection_bohr']):.6e} Bohr.",
                 retryable=True,
             )
         reference = self.runner.write_json(
@@ -3168,6 +3268,18 @@ class TSReactionPathHandler:
                 "hybrid_gradient_evaluation_count": potential.evaluation_count,
                 "endpoint_rmsd_bohr": endpoint_rmsd,
                 "endpoint_separation_bohr": endpoint_separation,
+                "forward_mode_projection_bohr": endpoint_evidence[
+                    "forward_mode_projection_bohr"
+                ],
+                "reverse_mode_projection_bohr": endpoint_evidence[
+                    "reverse_mode_projection_bohr"
+                ],
+                "minimum_mode_excursion_bohr": endpoint_evidence[
+                    "minimum_mode_excursion_bohr"
+                ],
+                "minimum_endpoint_separation_bohr": endpoint_evidence[
+                    "minimum_endpoint_separation_bohr"
+                ],
             },
         )
         return ScientificCapabilityOutcome(
@@ -3250,7 +3362,7 @@ def covalent_transition_state_registry(
     registry = ScientistCapabilityRegistry({
         "molecular.structure_ingestion": TSStructureIngestionHandler(store),
         "molecular.force_field_select": TSForceFieldSelectionHandler(store),
-        "molecular.protein_protonation_prepare": TSCysteinePreparationHandler(store),
+        "molecular.protein_protonation_prepare": TSReactionAtomPreparationHandler(store),
         "molecular.semantic_target_resolve": TSSemanticResolutionHandler(store),
         "molecular.protein_system_construct": TSSystemConstructionHandler(store, private_store),
         "electronic.qm_region_prepare": TSQMRegionHandler(store, pyscf_adapter),

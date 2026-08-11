@@ -13,10 +13,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cgr.quantum_preflight.artifacts import write_json_atomic
-from cgr.science.canonical import validate_identifier
+from cgr.science.canonical import validate_identifier, validate_sha256
 from cgr.science import ArtifactReference
 
 from .scientific_objectives import (
+    CovalentReactionTarget,
     ScientificExecutionBudget,
     ScientificInputReference,
     ScientificWorkflowPlan,
@@ -81,6 +82,7 @@ class ScientificExecutionRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     execution_identifier: str
+    tenant_identifier_sha256: str | None = None
     created_at: datetime
     updated_at: datetime
     status: Literal[
@@ -111,6 +113,11 @@ class ScientificExecutionRecord(BaseModel):
             raise ValueError("Scientific execution identifier is invalid.")
         return value
 
+    @field_validator("tenant_identifier_sha256")
+    @classmethod
+    def tenant_identity(cls, value: str | None) -> str | None:
+        return validate_sha256(value) if value is not None else None
+
     @model_validator(mode="after")
     def consistent(self) -> "ScientificExecutionRecord":
         if self.updated_at < self.created_at:
@@ -138,6 +145,7 @@ class ScientificObjectiveCompileRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8192)
     input_references: tuple[ScientificInputReference, ...] = Field(default=(), max_length=64)
     artifact_references: tuple[ArtifactReference, ...] = Field(default=(), max_length=64)
+    covalent_reaction_target: CovalentReactionTarget | None = None
     budget: ScientificExecutionBudget = Field(default_factory=ScientificExecutionBudget)
 
     @model_validator(mode="after")
@@ -173,11 +181,17 @@ class ScientificExecutionRepository:
         with self._lock:
             self._started = False
 
-    def create(self, request: ScientificObjectiveCompileRequest) -> ScientificExecutionRecord:
+    def create(
+        self,
+        request: ScientificObjectiveCompileRequest,
+        *,
+        tenant_identifier_sha256: str | None = None,
+    ) -> ScientificExecutionRecord:
         objective = compile_scientific_objective(
             request.question,
             input_references=request.input_references,
             budget=request.budget,
+            covalent_reaction_target=request.covalent_reaction_target,
         )
         plan = plan_scientific_objective(objective)
         identifier = f"scientific-execution-{objective.objective_identifier.rsplit('-', 1)[-1]}"
@@ -192,7 +206,9 @@ class ScientificExecutionRepository:
             status = "planned"
             summary = "The request was compiled into a validated scientific capability plan; execution has not started."
         record = ScientificExecutionRecord(
-            execution_identifier=identifier, created_at=now, updated_at=now,
+            execution_identifier=identifier,
+            tenant_identifier_sha256=tenant_identifier_sha256,
+            created_at=now, updated_at=now,
             status=status, objective=objective, plan=plan,
             scientist_summary=summary,
             limitations=("This record contains a plan, not fabricated calculation results.",),
@@ -212,7 +228,10 @@ class ScientificExecutionRepository:
             directory = self.root / identifier
             if directory.exists():
                 existing = self.get(identifier)
-                if existing.objective != objective:
+                if (
+                    existing.objective != objective
+                    or existing.tenant_identifier_sha256 != tenant_identifier_sha256
+                ):
                     raise RuntimeError("Scientific execution identity conflict.")
                 return existing
             directory.mkdir()

@@ -50,6 +50,7 @@ cgr-pulsate-backup-verify = "cgr.pulsate_api.recovery:verify_main"
 cgr-pulsate-restore = "cgr.pulsate_api.recovery:restore_main"
 cgr-pulsate-evidence-run = "cgr.pulsate_api.enterprise_gate:evidence_run_main"
 cgr-pulsate-enterprise-gate = "cgr.pulsate_api.enterprise_gate:enterprise_gate_main"
+cgr-scientist = "cgr.pulsate_api.scientific_cli:scientist_main"
 
 [project.optional-dependencies]
 dev=["pytest","pytest-asyncio","ruff","black","mypy"]

@@ -30,7 +30,10 @@ from cgr.pulsate_api.scientific_executions import (
     ScientificExecutionRepository,
     ScientificObjectiveCompileRequest,
 )
-from cgr.pulsate_api.scientific_objectives import ScientificInputReference
+from cgr.pulsate_api.scientific_objectives import (
+    CovalentReactionTarget,
+    ScientificInputReference,
+)
 from cgr.pulsate_api.scientific_runtime import ScientificObjectiveRuntime
 from cgr.science import ArtifactReference, CreationProvenance
 
@@ -373,6 +376,16 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
                 ),
             ),
             artifact_references=(protein_reference, ligand_reference),
+            covalent_reaction_target=CovalentReactionTarget(
+                protein_chain_label="A",
+                protein_residue_sequence="1",
+                protein_residue_name="CYS",
+                protein_atom_name="SG",
+                protein_nucleophile_formal_charge=-1,
+                ligand_reaction_smarts="[C;H3:1]-[S:2]-[C;H2]",
+                selected_total_qm_charge=-1,
+                selected_spin=0,
+            ),
         )
     )
     adapter = PySCFElectronicStructureAdapter(store, private_state_store=private)

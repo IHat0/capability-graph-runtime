@@ -39,6 +39,10 @@ def test_production_startup_validates_before_listener(tmp_path: Path) -> None:
     ) == 0
     assert events == ["validate", "listen"]
     assert (data / "molecular-artifacts").is_dir()
+    assert (data / "scientific-artifacts").is_dir()
+    assert (data / "scientific-executions").is_dir()
+    assert (data / "scientific-private-state").is_dir()
+    assert (data / "scientific-workflows").is_dir()
     assert (data / "workflows").is_dir()
 
 

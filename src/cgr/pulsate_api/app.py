@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
 import os
@@ -24,7 +26,7 @@ from cgr.quantum_preflight.contracts import ManifestEnvelope
 from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
 from cgr.quantum_preflight.manifests import load_manifest
-from cgr.science import ScientificCapabilityCatalog
+from cgr.science import ArtifactReference, ScientificCapabilityCatalog
 from cgr.workflow_graph import CapabilityAdapterRegistry
 
 from .approved_experiments import (
@@ -80,6 +82,11 @@ from .scientific_runtime import (
     ScientificCapabilityFailure,
     ScientificObjectiveRuntime,
 )
+from .scientific_production import (
+    DurableScientificPayloadStore,
+    ScientificProductionComposition,
+    create_scientific_production_composition,
+)
 from .runs import (
     ArtifactUnavailableError,
     ExistingQuantumPreflightExecutor,
@@ -102,6 +109,7 @@ from .security import (
     ROUTE_PROTECTIONS,
     SecurityBoundaryError,
     SecurityServices,
+    current_security_context,
     monotonic_time,
     request_identifier as new_request_identifier,
     route_resource_identifier,
@@ -113,6 +121,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MANIFEST_ROOT = REPO_ROOT / "benchmark-manifests" / "quantum-preflight"
 
 _PRESET_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,126}$")
+
+
+def _scientific_tenant_identity(tenant_identifier: str) -> str:
+    """Return a non-reversible full tenant identity for persisted ownership."""
+
+    return hashlib.sha256(tenant_identifier.encode("utf-8")).hexdigest()
+
 
 def _manifest_paths() -> tuple[Path, ...]:
     """Discover every declared quantum-preflight preset."""
@@ -384,6 +399,7 @@ def create_app(
     workflow_service: WorkflowService | None = None,
     scientific_execution_repository: ScientificExecutionRepository | None = None,
     scientific_objective_runtime: ScientificObjectiveRuntime | None = None,
+    scientific_payload_store: DurableScientificPayloadStore | None = None,
 ) -> FastAPI:
     security_services = security_services or SecurityServices.from_environment()
     runtime_configuration = getattr(security_services, "configuration", None)
@@ -542,6 +558,15 @@ def create_app(
             scientific_execution_root
         )
 
+    scientific_production_composition: ScientificProductionComposition | None = None
+    if scientific_objective_runtime is None and application_data_root is not None:
+        scientific_production_composition = create_scientific_production_composition(
+            application_data_root=application_data_root,
+            execution_repository=scientific_execution_repository,
+        )
+        scientific_objective_runtime = scientific_production_composition.runtime
+        scientific_payload_store = scientific_production_composition.payload_store
+
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         _application.state.lifecycle_ready = False
@@ -567,8 +592,13 @@ def create_app(
                 run_coordinator.start()
                 workflow_service.start()
                 scientific_execution_repository.start()
-                if scientific_objective_runtime is not None:
-                    scientific_objective_runtime.start()
+                if scientific_production_composition is not None:
+                    scientific_production_composition.start()
+                else:
+                    if scientific_payload_store is not None:
+                        scientific_payload_store.start()
+                    if scientific_objective_runtime is not None:
+                        scientific_objective_runtime.start()
                 if molecular_project_repository is not None:
                     molecular_project_repository.start()
                 if molecular_scene_service is not None:
@@ -602,9 +632,18 @@ def create_app(
                             molecular_project_repository.close()
                     finally:
                         try:
-                            if scientific_objective_runtime is not None:
-                                scientific_objective_runtime.close()
-                            scientific_execution_repository.close()
+                            try:
+                                if scientific_production_composition is not None:
+                                    scientific_production_composition.close()
+                                else:
+                                    try:
+                                        if scientific_objective_runtime is not None:
+                                            scientific_objective_runtime.close()
+                                    finally:
+                                        if scientific_payload_store is not None:
+                                            scientific_payload_store.close()
+                            finally:
+                                scientific_execution_repository.close()
                         finally:
                             try:
                                 workflow_service.close()
@@ -700,6 +739,7 @@ def create_app(
         scientific_execution_repository
     )
     application.state.scientific_objective_runtime = scientific_objective_runtime
+    application.state.scientific_payload_store = scientific_payload_store
     application.state.lifecycle_ready = False
 
     @application.exception_handler(SecurityBoundaryError)
@@ -939,6 +979,67 @@ def create_app(
             "service": "pulsate-api", "status": "healthy", "version": "0.2.0",
         }
 
+    @application.post("/api/v1/scientific/artifacts", status_code=201)
+    async def upload_scientific_artifact(request: Request):
+        if scientific_payload_store is None:
+            raise _typed_error(
+                503,
+                "scientific_artifact_store_unavailable",
+                "Scientific artifact persistence is unavailable.",
+            )
+        payload = await _read_bounded_json_object(
+            request,
+            maximum_bytes=24 * 1024 * 1024,
+            error_code="scientific_artifact_invalid",
+            error_message="Scientific artifact upload is invalid.",
+            too_large_code="scientific_artifact_too_large",
+            too_large_message="Scientific artifact upload exceeds its size limit.",
+        )
+        try:
+            if set(payload) != {"reference", "payload_base64"}:
+                raise ValueError
+            reference = ArtifactReference.model_validate(payload["reference"])
+            encoded = payload["payload_base64"]
+            if not isinstance(encoded, str):
+                raise ValueError
+            artifact_payload = base64.b64decode(encoded, validate=True)
+            if len(artifact_payload) > 16 * 1024 * 1024:
+                raise ValueError
+            context = current_security_context()
+            if context is None or "tenant_identifier_sha256" in reference.metadata:
+                raise ValueError
+            tenant_identity = _scientific_tenant_identity(
+                context.principal.tenant_identifier
+            )
+            pointer_digest = hashlib.sha256(
+                reference.pointer.to_canonical_json().encode("utf-8")
+            ).hexdigest()
+            owned_reference = reference.model_copy(
+                update={
+                    "artifact_identifier": (
+                        f"scientific-input-{tenant_identity[:16]}-{pointer_digest[:32]}"
+                    ),
+                    "metadata": {
+                        **reference.metadata,
+                        "tenant_identifier_sha256": tenant_identity,
+                    },
+                }
+            )
+            scientific_payload_store.write(owned_reference, artifact_payload)
+            return owned_reference
+        except (ValidationError, ValueError, TypeError):
+            raise _typed_error(
+                422,
+                "scientific_artifact_invalid",
+                "Scientific artifact upload is invalid.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "scientific_artifact_store_unavailable",
+                "Scientific artifact persistence is unavailable.",
+            ) from None
+
     @application.post("/api/v1/scientific/objectives/compile", status_code=201)
     async def compile_scientific_request(request: Request):
         payload = await _read_bounded_json_object(
@@ -951,13 +1052,40 @@ def create_app(
         )
         try:
             compile_request = ScientificObjectiveCompileRequest.model_validate(payload)
-            return scientific_execution_repository.create(compile_request)
         except ValidationError:
             raise _typed_error(
                 422,
                 "scientific_objective_invalid",
                 "Scientific objective request is invalid.",
             ) from None
+        if scientific_payload_store is not None:
+            try:
+                context = current_security_context()
+                if context is None:
+                    raise ValueError
+                tenant_identity = _scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                )
+                for reference in compile_request.artifact_references:
+                    if reference.metadata.get("tenant_identifier_sha256") != tenant_identity:
+                        raise ValueError
+                    scientific_payload_store.read(reference)
+            except (ValueError, KeyError, RuntimeError):
+                raise _typed_error(
+                    422,
+                    "scientific_input_artifact_unavailable",
+                    "An exact scientific input artifact is unavailable.",
+                ) from None
+        try:
+            context = current_security_context()
+            if context is None:
+                raise RuntimeError
+            return scientific_execution_repository.create(
+                compile_request,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
         except ValueError:
             raise _typed_error(
                 422,
@@ -974,7 +1102,15 @@ def create_app(
     @application.get("/api/v1/scientific/executions/{execution_identifier}")
     def get_scientific_execution(execution_identifier: str):
         try:
-            return scientific_execution_repository.get(execution_identifier)
+            record = scientific_execution_repository.get(execution_identifier)
+            context = current_security_context()
+            if (
+                context is None
+                or record.tenant_identifier_sha256
+                != _scientific_tenant_identity(context.principal.tenant_identifier)
+            ):
+                raise KeyError("Scientific execution not found.")
+            return record
         except KeyError:
             raise _typed_error(
                 404,
@@ -999,6 +1135,14 @@ def create_app(
                 "Scientific objective execution is unavailable.",
             )
         try:
+            record = scientific_execution_repository.get(execution_identifier)
+            context = current_security_context()
+            if (
+                context is None
+                or record.tenant_identifier_sha256
+                != _scientific_tenant_identity(context.principal.tenant_identifier)
+            ):
+                raise KeyError("Scientific execution not found.")
             return scientific_objective_runtime.execute(execution_identifier)
         except KeyError:
             raise _typed_error(
@@ -1031,6 +1175,8 @@ def create_app(
             molecular_planning_service,
             workflow_service,
             scientific_execution_repository,
+            scientific_payload_store,
+            scientific_objective_runtime,
         )
         repositories_ready = all(
             service is None or bool(getattr(service, "_started", True))

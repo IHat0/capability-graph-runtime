@@ -74,6 +74,49 @@ class ScientificSemanticTarget(BaseModel):
         return normalized
 
 
+class CovalentReactionTarget(BaseModel):
+    """Scientist-reviewed chemical semantics for a covalent substitution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reaction_family: Literal["covalent_substitution"] = "covalent_substitution"
+    protein_chain_label: str
+    protein_residue_sequence: str
+    protein_residue_name: str | None = None
+    protein_atom_name: str
+    protein_nucleophile_formal_charge: int = Field(ge=-8, le=8)
+    ligand_reaction_smarts: str = Field(min_length=1, max_length=2048)
+    selected_total_qm_charge: int = Field(ge=-32, le=32)
+    selected_spin: int = Field(ge=0, le=12)
+
+    @field_validator(
+        "protein_chain_label",
+        "protein_residue_sequence",
+        "protein_residue_name",
+        "protein_atom_name",
+    )
+    @classmethod
+    def bounded_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized or len(normalized) > 32:
+            raise ValueError("Reaction atom identities must be bounded nonblank text.")
+        return normalized
+
+    @field_validator("ligand_reaction_smarts")
+    @classmethod
+    def mapped_reaction_smarts(cls, value: str) -> str:
+        normalized = value.strip()
+        maps = tuple(int(item) for item in re.findall(r":(\d+)\]", normalized))
+        if sorted(maps) != [1, 2]:
+            raise ValueError(
+                "Ligand reaction SMARTS must contain exactly atom maps :1 "
+                "(electrophile) and :2 (leaving group)."
+            )
+        return normalized
+
+
 class ScientificExecutionBudget(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -93,6 +136,7 @@ class StructuredScientificObjective(BaseModel):
     task_type: ScientificTask
     input_references: tuple[ScientificInputReference, ...] = ()
     semantic_target: ScientificSemanticTarget
+    covalent_reaction_target: CovalentReactionTarget | None = None
     solvent: str | None = None
     scan_point_count: int | None = Field(default=None, ge=3, le=101)
     scan_start_angstrom: float | None = Field(default=None, gt=0)
@@ -134,6 +178,8 @@ class StructuredScientificObjective(BaseModel):
             raise ValueError("Only bond scans may carry scan controls.")
         if self.task_type == "solvated_conformer_comparison" and self.solvent is None:
             raise ValueError("Solvated conformer comparison requires a solvent.")
+        if self.task_type != "covalent_transition_state" and self.covalent_reaction_target:
+            raise ValueError("Only covalent transition states may carry reaction semantics.")
         return self
 
 
@@ -191,6 +237,7 @@ def compile_scientific_objective(
     *,
     input_references: tuple[ScientificInputReference, ...] = (),
     budget: ScientificExecutionBudget | None = None,
+    covalent_reaction_target: CovalentReactionTarget | None = None,
 ) -> StructuredScientificObjective:
     """Classify broad molecular intent without making it directly executable."""
 
@@ -233,6 +280,13 @@ def compile_scientific_objective(
         ambiguities.append("Exactly one protein structure must be resolved.")
     if needs_ligand and len(ligand_refs) != 1:
         ambiguities.append("Exactly one ligand structure must be resolved.")
+    if task == "covalent_transition_state" and covalent_reaction_target is None:
+        ambiguities.append(
+            "The protein reaction atom, mapped ligand reaction SMARTS, charge, "
+            "and spin must be explicitly reviewed."
+        )
+    if task != "covalent_transition_state" and covalent_reaction_target is not None:
+        raise ValueError("Reaction semantics are only valid for covalent transition states.")
 
     scan_count = scan_start = scan_end = None
     if task == "bond_dissociation_scan":
@@ -258,7 +312,14 @@ def compile_scientific_objective(
     quantum = "none"
     if task == "metal_active_site_quantum":
         quantum = "ibm_quantum" if "ibm" in lowered else "local_simulator"
-    digest = hashlib.sha256((normalized + repr(input_references)).encode()).hexdigest()[:32]
+    digest = hashlib.sha256(
+        (
+            normalized
+            + repr(input_references)
+            + repr(covalent_reaction_target)
+            + repr(budget)
+        ).encode()
+    ).hexdigest()[:32]
     active_policy = (
         "reaction_center_automatic" if task in {"covalent_transition_state", "bond_dissociation_scan"}
         else "metal_ligand_automatic" if task == "metal_active_site_quantum"
@@ -271,7 +332,8 @@ def compile_scientific_objective(
             protein_reference_identifier=protein_refs[0] if len(protein_refs) == 1 else None,
             ligand_reference_identifier=ligand_refs[0] if len(ligand_refs) == 1 else None,
             target_kind=target_kind, target_label=target_label,
-        ), solvent=solvent, scan_point_count=scan_count,
+        ), covalent_reaction_target=covalent_reaction_target,
+        solvent=solvent, scan_point_count=scan_count,
         scan_start_angstrom=scan_start, scan_end_angstrom=scan_end,
         active_space_policy=active_policy, quantum_execution_target=quantum,
         budget=budget or ScientificExecutionBudget(),

@@ -354,6 +354,46 @@ def production_persistence_inventory() -> tuple[RecoveryComponentRecord, ...]:
             restore_validation_method="bounded-json-tree",
         ),
         RecoveryComponentRecord(
+            component_identifier="scientific-artifacts",
+            component_type="immutable-repository",
+            schema_version="scientific-artifacts/v1",
+            required=True,
+            relative_storage_identity="scientific-artifacts",
+            validation_provider="molecular-artifact-repository",
+            snapshot_method="deterministic-file-copy",
+            restore_validation_method="molecular-artifact-repository",
+        ),
+        RecoveryComponentRecord(
+            component_identifier="scientific-executions",
+            component_type="directory",
+            schema_version="scientific-executions/v1",
+            required=True,
+            relative_storage_identity="scientific-executions",
+            validation_provider="scientific-execution-repository",
+            snapshot_method="deterministic-file-copy",
+            restore_validation_method="bounded-json-tree",
+        ),
+        RecoveryComponentRecord(
+            component_identifier="scientific-private-state",
+            component_type="immutable-repository",
+            schema_version="scientific-private-state/v1",
+            required=True,
+            relative_storage_identity="scientific-private-state",
+            validation_provider="molecular-artifact-repository",
+            snapshot_method="deterministic-file-copy",
+            restore_validation_method="molecular-artifact-repository",
+        ),
+        RecoveryComponentRecord(
+            component_identifier="scientific-workflows",
+            component_type="directory",
+            schema_version="scientific-workflows/v1",
+            required=True,
+            relative_storage_identity="scientific-workflows",
+            validation_provider="workflow-graph-repositories",
+            snapshot_method="deterministic-file-copy",
+            restore_validation_method="bounded-json-tree",
+        ),
+        RecoveryComponentRecord(
             component_identifier="workflows",
             component_type="directory",
             schema_version="pulsate-workflows/v1",
@@ -748,7 +788,11 @@ def _validate_component_tree(
         if component.component_type == "sqlite":
             path = base if restored_layout else base / "database.sqlite3"
             _verify_sqlite(path, component.component_identifier)
-        elif component.component_identifier == "molecular-artifacts":
+        elif component.component_identifier in {
+            "molecular-artifacts",
+            "scientific-artifacts",
+            "scientific-private-state",
+        }:
             _verify_artifact_repository(base)
         elif component.component_identifier == "molecular-projects":
             _verify_project_repository(base)

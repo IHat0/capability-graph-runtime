@@ -59,6 +59,7 @@ PHASE_1_4_BACKEND_CORE_FILES = frozenset(
         "test_molecular_planning.py",
         "test_molecular_project_repository.py",
         "test_molecular_scene_projection.py",
+        "test_cross_phase_scientific_integration.py",
         "test_pulsate_api.py",
         "test_pulsate_experiments.py",
         "test_pulsate_deployment.py",

@@ -156,6 +156,7 @@ jobs:
           - { gate: authorization, tests: tests/test_pulsate_security.py }
           - { gate: catalogue-determinism, tests: tests/test_pulsate_production_catalogue.py }
           - { gate: correlation-identity, tests: tests/test_pulsate_security.py }
+          - { gate: cross-phase-scientific-integration, tests: tests/test_cross_phase_scientific_integration.py }
           - { gate: durable-audit, tests: tests/test_pulsate_security.py }
           - { gate: durable-grants, tests: tests/test_pulsate_security.py }
           - { gate: enumeration-resistance, tests: tests/test_pulsate_production_security.py }
