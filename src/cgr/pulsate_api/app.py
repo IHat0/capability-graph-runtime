@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
 import os
@@ -24,7 +26,7 @@ from cgr.quantum_preflight.contracts import ManifestEnvelope
 from cgr.quantum_preflight.environment import require_dependencies
 from cgr.quantum_preflight.errors import QuantumDependencyError
 from cgr.quantum_preflight.manifests import load_manifest
-from cgr.science import ScientificCapabilityCatalog
+from cgr.science import ArtifactReference, ScientificCapabilityCatalog
 from cgr.workflow_graph import CapabilityAdapterRegistry
 
 from .approved_experiments import (
@@ -52,6 +54,28 @@ from .natural_language import (
     NaturalLanguageInterpretationStore,
     NaturalLanguageUnavailableError,
 )
+from .research_sessions import (
+    ResearchSession,
+    ResearchSessionController,
+    ResearchSessionCreateRequest,
+    ResearchSessionReplyRequest,
+    ResearchSessionRepository,
+)
+from .research_scene import (
+    ResearchSceneError,
+    project_research_complex_scene,
+    project_research_scene,
+)
+from .research_visualization import (
+    ResearchVisualizationError,
+    build_research_visualization,
+)
+from .scientific_conversation import (
+    ProviderNeutralScientificEvidenceInterpreter,
+    ProviderNeutralScientificIntentInterpreter,
+    ProviderNeutralScientificQuestionWriter,
+)
+from .scientific_requirements import ProviderNeutralScientificRequirementInterpreter
 from .molecular_scenes import (
     NativeMolecularSceneError,
     NativeMolecularSceneNotFoundError,
@@ -80,6 +104,12 @@ from .scientific_runtime import (
     ScientificCapabilityFailure,
     ScientificObjectiveRuntime,
 )
+from .scientific_production import (
+    DurableScientificPayloadStore,
+    ScientificProductionComposition,
+    create_scientific_production_composition,
+)
+from .scientific_session_resolution import PersistedStructureEvidenceResolver
 from .runs import (
     ArtifactUnavailableError,
     ExistingQuantumPreflightExecutor,
@@ -102,6 +132,7 @@ from .security import (
     ROUTE_PROTECTIONS,
     SecurityBoundaryError,
     SecurityServices,
+    current_security_context,
     monotonic_time,
     request_identifier as new_request_identifier,
     route_resource_identifier,
@@ -113,6 +144,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MANIFEST_ROOT = REPO_ROOT / "benchmark-manifests" / "quantum-preflight"
 
 _PRESET_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,126}$")
+
+
+def _scientific_tenant_identity(tenant_identifier: str) -> str:
+    """Return a non-reversible full tenant identity for persisted ownership."""
+
+    return hashlib.sha256(tenant_identifier.encode("utf-8")).hexdigest()
+
 
 def _manifest_paths() -> tuple[Path, ...]:
     """Discover every declared quantum-preflight preset."""
@@ -384,6 +422,9 @@ def create_app(
     workflow_service: WorkflowService | None = None,
     scientific_execution_repository: ScientificExecutionRepository | None = None,
     scientific_objective_runtime: ScientificObjectiveRuntime | None = None,
+    scientific_payload_store: DurableScientificPayloadStore | None = None,
+    research_session_repository: ResearchSessionRepository | None = None,
+    research_session_controller: ResearchSessionController | None = None,
 ) -> FastAPI:
     security_services = security_services or SecurityServices.from_environment()
     runtime_configuration = getattr(security_services, "configuration", None)
@@ -542,6 +583,59 @@ def create_app(
             scientific_execution_root
         )
 
+    scientific_production_composition: ScientificProductionComposition | None = None
+    if scientific_objective_runtime is None and application_data_root is not None:
+        scientific_production_composition = create_scientific_production_composition(
+            application_data_root=application_data_root,
+            execution_repository=scientific_execution_repository,
+            language_model_provider=natural_language_store.provider,
+            quantum_capability_provider=run_coordinator.capability,
+        )
+        scientific_objective_runtime = scientific_production_composition.runtime
+        scientific_payload_store = scientific_production_composition.payload_store
+
+    if research_session_repository is None and research_session_controller is not None:
+        research_session_repository = research_session_controller.repository
+    if research_session_repository is None:
+        research_session_root = (
+            application_data_root / "research-sessions"
+            if application_data_root is not None
+            else Path(
+                os.environ.get(
+                    "PULSATE_RESEARCH_SESSION_ROOT",
+                    str(REPO_ROOT / ".pulsate-research-sessions"),
+                )
+            )
+        )
+        research_session_repository = ResearchSessionRepository(
+            research_session_root
+        )
+    if research_session_controller is None:
+        research_session_controller = ResearchSessionController(
+            repository=research_session_repository,
+            execution_repository=scientific_execution_repository,
+            question_writer=ProviderNeutralScientificQuestionWriter(
+                natural_language_store.provider
+            ),
+            requirement_interpreter=ProviderNeutralScientificRequirementInterpreter(
+                natural_language_store.provider
+            ),
+            intent_interpreter=ProviderNeutralScientificIntentInterpreter(
+                natural_language_store.provider
+            ),
+            evidence_interpreter=ProviderNeutralScientificEvidenceInterpreter(
+                natural_language_store.provider
+            ),
+            evidence_resolver=PersistedStructureEvidenceResolver(
+                scientific_payload_store
+            ),
+            runtime=scientific_objective_runtime,
+        )
+    elif research_session_controller.repository is not research_session_repository:
+        raise ValueError(
+            "Research session controller and repository must share one persistence boundary."
+        )
+
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         _application.state.lifecycle_ready = False
@@ -567,8 +661,14 @@ def create_app(
                 run_coordinator.start()
                 workflow_service.start()
                 scientific_execution_repository.start()
-                if scientific_objective_runtime is not None:
-                    scientific_objective_runtime.start()
+                research_session_repository.start()
+                if scientific_production_composition is not None:
+                    scientific_production_composition.start()
+                else:
+                    if scientific_payload_store is not None:
+                        scientific_payload_store.start()
+                    if scientific_objective_runtime is not None:
+                        scientific_objective_runtime.start()
                 if molecular_project_repository is not None:
                     molecular_project_repository.start()
                 if molecular_scene_service is not None:
@@ -602,9 +702,21 @@ def create_app(
                             molecular_project_repository.close()
                     finally:
                         try:
-                            if scientific_objective_runtime is not None:
-                                scientific_objective_runtime.close()
-                            scientific_execution_repository.close()
+                            try:
+                                if scientific_production_composition is not None:
+                                    scientific_production_composition.close()
+                                else:
+                                    try:
+                                        if scientific_objective_runtime is not None:
+                                            scientific_objective_runtime.close()
+                                    finally:
+                                        if scientific_payload_store is not None:
+                                            scientific_payload_store.close()
+                            finally:
+                                try:
+                                    research_session_repository.close()
+                                finally:
+                                    scientific_execution_repository.close()
                         finally:
                             try:
                                 workflow_service.close()
@@ -700,6 +812,9 @@ def create_app(
         scientific_execution_repository
     )
     application.state.scientific_objective_runtime = scientific_objective_runtime
+    application.state.scientific_payload_store = scientific_payload_store
+    application.state.research_session_repository = research_session_repository
+    application.state.research_session_controller = research_session_controller
     application.state.lifecycle_ready = False
 
     @application.exception_handler(SecurityBoundaryError)
@@ -939,6 +1054,495 @@ def create_app(
             "service": "pulsate-api", "status": "healthy", "version": "0.2.0",
         }
 
+    def _verify_scientific_artifact_ownership(
+        references: tuple[ArtifactReference, ...],
+        *,
+        tenant_identifier: str,
+    ) -> None:
+        if not references:
+            return
+        if scientific_payload_store is None:
+            raise ValueError("Scientific artifact persistence is unavailable.")
+        tenant_identity = _scientific_tenant_identity(tenant_identifier)
+        for reference in references:
+            if reference.metadata.get("tenant_identifier_sha256") != tenant_identity:
+                raise ValueError("Scientific artifact ownership is invalid.")
+            scientific_payload_store.read(reference)
+
+    @application.post("/api/v1/scientific/artifacts", status_code=201)
+    async def upload_scientific_artifact(request: Request):
+        if scientific_payload_store is None:
+            raise _typed_error(
+                503,
+                "scientific_artifact_store_unavailable",
+                "Scientific artifact persistence is unavailable.",
+            )
+        payload = await _read_bounded_json_object(
+            request,
+            maximum_bytes=24 * 1024 * 1024,
+            error_code="scientific_artifact_invalid",
+            error_message="Scientific artifact upload is invalid.",
+            too_large_code="scientific_artifact_too_large",
+            too_large_message="Scientific artifact upload exceeds its size limit.",
+        )
+        try:
+            if set(payload) != {"reference", "payload_base64"}:
+                raise ValueError
+            reference = ArtifactReference.model_validate(payload["reference"])
+            encoded = payload["payload_base64"]
+            if not isinstance(encoded, str):
+                raise ValueError
+            artifact_payload = base64.b64decode(encoded, validate=True)
+            if len(artifact_payload) > 16 * 1024 * 1024:
+                raise ValueError
+            context = current_security_context()
+            if context is None or "tenant_identifier_sha256" in reference.metadata:
+                raise ValueError
+            tenant_identity = _scientific_tenant_identity(
+                context.principal.tenant_identifier
+            )
+            pointer_digest = hashlib.sha256(
+                reference.pointer.to_canonical_json().encode("utf-8")
+            ).hexdigest()
+            owned_reference = reference.model_copy(
+                update={
+                    "artifact_identifier": (
+                        f"scientific-input-{tenant_identity[:16]}-{pointer_digest[:32]}"
+                    ),
+                    "metadata": {
+                        **reference.metadata,
+                        "tenant_identifier_sha256": tenant_identity,
+                    },
+                }
+            )
+            scientific_payload_store.write(owned_reference, artifact_payload)
+            return owned_reference
+        except (ValidationError, ValueError, TypeError):
+            raise _typed_error(
+                422,
+                "scientific_artifact_invalid",
+                "Scientific artifact upload is invalid.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "scientific_artifact_store_unavailable",
+                "Scientific artifact persistence is unavailable.",
+            ) from None
+
+    def _research_session_artifacts(
+        session: ResearchSession,
+    ) -> tuple[ArtifactReference, ...]:
+        merged = {
+            item.artifact_identifier: item for item in session.artifact_references
+        }
+        if session.compilation is not None:
+            try:
+                execution = scientific_execution_repository.get(
+                    session.compilation.execution_identifier
+                )
+            except KeyError:
+                if session.execution_status is not None:
+                    raise RuntimeError(
+                        "Research execution evidence is unavailable."
+                    ) from None
+            else:
+                if (
+                    execution.tenant_identifier_sha256 is not None
+                    and execution.tenant_identifier_sha256
+                    != session.tenant_identifier_sha256
+                ):
+                    raise KeyError
+                for reference in execution.artifact_references:
+                    existing = merged.get(reference.artifact_identifier)
+                    if existing is not None and existing != reference:
+                        raise RuntimeError(
+                            "Research artifact identity is inconsistent."
+                        )
+                    merged[reference.artifact_identifier] = reference
+        return tuple(sorted(merged.values(), key=lambda item: item.artifact_identifier))
+
+    @application.get("/api/v1/research/capability")
+    def unified_research_capability() -> dict[str, object]:
+        return research_session_controller.capability()
+
+    @application.post("/api/v1/research/sessions", status_code=201)
+    async def create_research_session(request: Request):
+        payload = await _read_bounded_json_object(
+            request,
+            maximum_bytes=2 * 1024 * 1024,
+            error_code="research_session_invalid",
+            error_message="Research session request is invalid.",
+            too_large_code="research_session_too_large",
+            too_large_message="Research session request exceeds its size limit.",
+        )
+        try:
+            session_request = ResearchSessionCreateRequest.model_validate(payload)
+            context = current_security_context()
+            if context is None:
+                raise RuntimeError
+            _verify_scientific_artifact_ownership(
+                session_request.artifact_references,
+                tenant_identifier=context.principal.tenant_identifier,
+            )
+            return research_session_controller.create(
+                session_request,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+        except ValidationError:
+            raise _typed_error(
+                422,
+                "research_session_invalid",
+                "Research session request is invalid.",
+            ) from None
+        except (ValueError, TypeError):
+            raise _typed_error(
+                422,
+                "research_input_unavailable",
+                "An exact research input is unavailable or invalid.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "research_session_unavailable",
+                "Research session persistence is unavailable.",
+            ) from None
+
+    @application.get("/api/v1/research/sessions/{session_identifier}")
+    def get_research_session(session_identifier: str):
+        try:
+            context = current_security_context()
+            if context is None:
+                raise KeyError
+            return research_session_controller.get(
+                session_identifier,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+        except KeyError:
+            raise _typed_error(
+                404,
+                "research_session_not_found",
+                "Research session was not found.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "research_session_unavailable",
+                "Research session persistence is unavailable.",
+            ) from None
+
+    @application.get("/api/v1/research/sessions/{session_identifier}/scene")
+    def get_research_session_scene(
+        session_identifier: str,
+        artifact_identifier: str,
+        conformation_index: int = 0,
+    ):
+        try:
+            context = current_security_context()
+            if context is None:
+                raise KeyError
+            session = research_session_controller.get(
+                session_identifier,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+            reference = next(
+                item
+                for item in _research_session_artifacts(session)
+                if item.artifact_identifier == artifact_identifier
+            )
+            if scientific_payload_store is None:
+                raise RuntimeError
+            return project_research_scene(
+                session_identifier=session.session_identifier,
+                reference=reference,
+                payload=scientific_payload_store.read(reference),
+                conformation_index=conformation_index,
+            )
+        except (KeyError, StopIteration):
+            raise _typed_error(
+                404,
+                "research_scene_not_found",
+                "Research scene evidence was not found.",
+            ) from None
+        except ResearchSceneError as error:
+            raise _typed_error(
+                422,
+                "research_scene_unsupported",
+                str(error),
+            ) from None
+        except (RuntimeError, ValueError):
+            raise _typed_error(
+                503,
+                "research_scene_unavailable",
+                "Research scene evidence is unavailable.",
+            ) from None
+
+    @application.get(
+        "/api/v1/research/sessions/{session_identifier}/visualization"
+    )
+    def get_research_session_visualization(session_identifier: str):
+        try:
+            context = current_security_context()
+            if context is None:
+                raise KeyError
+            session = research_session_controller.get(
+                session_identifier,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+            if scientific_payload_store is None:
+                raise RuntimeError
+            return build_research_visualization(
+                session=session,
+                store=scientific_payload_store,
+                artifact_references=_research_session_artifacts(session),
+            )
+        except KeyError:
+            raise _typed_error(
+                404,
+                "research_session_not_found",
+                "Research session was not found.",
+            ) from None
+        except ResearchVisualizationError as error:
+            raise _typed_error(
+                422,
+                "research_visualization_invalid",
+                str(error),
+            ) from None
+        except (RuntimeError, ValueError):
+            raise _typed_error(
+                503,
+                "research_visualization_unavailable",
+                "Research visualization evidence is unavailable.",
+            ) from None
+
+    @application.get(
+        "/api/v1/research/sessions/{session_identifier}/visualization/complex"
+    )
+    def get_research_session_complex_scene(
+        session_identifier: str,
+        primary_artifact_identifier: str,
+        secondary_artifact_identifier: str | None = None,
+        primary_conformation_index: int = 0,
+        secondary_conformation_index: int = 0,
+    ):
+        try:
+            context = current_security_context()
+            if context is None:
+                raise KeyError
+            session = research_session_controller.get(
+                session_identifier,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+            requested = (primary_artifact_identifier,) + (
+                (secondary_artifact_identifier,)
+                if secondary_artifact_identifier is not None
+                else ()
+            )
+            if len(set(requested)) != len(requested):
+                raise ValueError
+            available_references = _research_session_artifacts(session)
+            references = tuple(
+                next(
+                    item
+                    for item in available_references
+                    if item.artifact_identifier == identifier
+                )
+                for identifier in requested
+            )
+            if scientific_payload_store is None:
+                raise RuntimeError
+            return project_research_complex_scene(
+                session_identifier=session.session_identifier,
+                evidence=tuple(
+                    (reference, scientific_payload_store.read(reference))
+                    for reference in references
+                ),
+                conformation_indices=(primary_conformation_index,) + (
+                    (secondary_conformation_index,)
+                    if secondary_artifact_identifier is not None
+                    else ()
+                ),
+            )
+        except (KeyError, StopIteration):
+            raise _typed_error(
+                404,
+                "research_scene_not_found",
+                "Research comparison scene evidence was not found.",
+            ) from None
+        except ResearchSceneError as error:
+            raise _typed_error(
+                422,
+                "research_scene_unsupported",
+                str(error),
+            ) from None
+        except ValueError:
+            raise _typed_error(
+                422,
+                "research_scene_invalid",
+                "Research comparison scene request is invalid.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "research_scene_unavailable",
+                "Research comparison scene evidence is unavailable.",
+            ) from None
+
+    @application.get(
+        "/api/v1/research/sessions/{session_identifier}/artifacts/"
+        "{artifact_identifier}"
+    )
+    def download_research_session_artifact(
+        session_identifier: str,
+        artifact_identifier: str,
+    ) -> Response:
+        try:
+            context = current_security_context()
+            if context is None:
+                raise KeyError
+            session = research_session_controller.get(
+                session_identifier,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+            reference = next(
+                item
+                for item in _research_session_artifacts(session)
+                if item.artifact_identifier == artifact_identifier
+            )
+            if scientific_payload_store is None:
+                raise RuntimeError
+            payload = scientific_payload_store.read(reference)
+            suffix = {
+                "chemical/x-pdb": "pdb",
+                "chemical/x-pdbqt": "pdbqt",
+                "chemical/x-mdl-molfile": "mol",
+                "chemical/x-mdl-sdfile": "sdf",
+                "chemical/x-mol2": "mol2",
+                "application/json": "json",
+            }.get(reference.media_type, "bin")
+            filename = f"{reference.artifact_identifier}.{suffix}"
+            return Response(
+                content=payload,
+                media_type=reference.media_type,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-Content-SHA256": reference.content_sha256,
+                },
+            )
+        except (KeyError, StopIteration):
+            raise _typed_error(
+                404,
+                "research_artifact_not_found",
+                "Research artifact was not found.",
+            ) from None
+        except (RuntimeError, ValueError):
+            raise _typed_error(
+                503,
+                "research_artifact_unavailable",
+                "Research artifact is unavailable.",
+            ) from None
+
+    @application.post("/api/v1/research/sessions/{session_identifier}/reply")
+    async def reply_to_research_session(
+        session_identifier: str,
+        request: Request,
+    ):
+        payload = await _read_bounded_json_object(
+            request,
+            maximum_bytes=2 * 1024 * 1024,
+            error_code="research_reply_invalid",
+            error_message="Research session reply is invalid.",
+            too_large_code="research_reply_too_large",
+            too_large_message="Research session reply exceeds its size limit.",
+        )
+        try:
+            reply = ResearchSessionReplyRequest.model_validate(payload)
+        except ValidationError:
+            raise _typed_error(
+                422,
+                "research_reply_invalid",
+                "Research session reply is invalid.",
+            ) from None
+        try:
+            context = current_security_context()
+            if context is None:
+                raise KeyError
+            if reply.artifact_references is not None:
+                _verify_scientific_artifact_ownership(
+                    reply.artifact_references,
+                    tenant_identifier=context.principal.tenant_identifier,
+                )
+            return research_session_controller.reply(
+                session_identifier,
+                reply,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+        except KeyError:
+            raise _typed_error(
+                404,
+                "research_session_not_found",
+                "Research session was not found.",
+            ) from None
+        except (ValueError, TypeError):
+            raise _typed_error(
+                422,
+                "research_input_unavailable",
+                "An exact research input is unavailable or invalid.",
+            ) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "research_session_unavailable",
+                "Research session persistence is unavailable.",
+            ) from None
+
+    @application.post("/api/v1/research/sessions/{session_identifier}/execute")
+    def execute_research_session(session_identifier: str):
+        try:
+            context = current_security_context()
+            if context is None:
+                raise KeyError
+            return research_session_controller.execute(
+                session_identifier,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
+        except KeyError:
+            raise _typed_error(
+                404,
+                "research_session_not_found",
+                "Research session was not found.",
+            ) from None
+        except ValueError as error:
+            raise _typed_error(
+                409,
+                "research_session_not_ready",
+                str(error),
+            ) from None
+        except ScientificCapabilityFailure as error:
+            raise _typed_error(409, error.code, error.public_message) from None
+        except RuntimeError:
+            raise _typed_error(
+                503,
+                "research_execution_unavailable",
+                "Unified research execution is unavailable.",
+            ) from None
+
     @application.post("/api/v1/scientific/objectives/compile", status_code=201)
     async def compile_scientific_request(request: Request):
         payload = await _read_bounded_json_object(
@@ -951,13 +1555,37 @@ def create_app(
         )
         try:
             compile_request = ScientificObjectiveCompileRequest.model_validate(payload)
-            return scientific_execution_repository.create(compile_request)
         except ValidationError:
             raise _typed_error(
                 422,
                 "scientific_objective_invalid",
                 "Scientific objective request is invalid.",
             ) from None
+        if scientific_payload_store is not None:
+            try:
+                context = current_security_context()
+                if context is None:
+                    raise ValueError
+                _verify_scientific_artifact_ownership(
+                    compile_request.artifact_references,
+                    tenant_identifier=context.principal.tenant_identifier,
+                )
+            except (ValueError, KeyError, RuntimeError):
+                raise _typed_error(
+                    422,
+                    "scientific_input_artifact_unavailable",
+                    "An exact scientific input artifact is unavailable.",
+                ) from None
+        try:
+            context = current_security_context()
+            if context is None:
+                raise RuntimeError
+            return scientific_execution_repository.create(
+                compile_request,
+                tenant_identifier_sha256=_scientific_tenant_identity(
+                    context.principal.tenant_identifier
+                ),
+            )
         except ValueError:
             raise _typed_error(
                 422,
@@ -974,7 +1602,15 @@ def create_app(
     @application.get("/api/v1/scientific/executions/{execution_identifier}")
     def get_scientific_execution(execution_identifier: str):
         try:
-            return scientific_execution_repository.get(execution_identifier)
+            record = scientific_execution_repository.get(execution_identifier)
+            context = current_security_context()
+            if (
+                context is None
+                or record.tenant_identifier_sha256
+                != _scientific_tenant_identity(context.principal.tenant_identifier)
+            ):
+                raise KeyError("Scientific execution not found.")
+            return record
         except KeyError:
             raise _typed_error(
                 404,
@@ -999,6 +1635,14 @@ def create_app(
                 "Scientific objective execution is unavailable.",
             )
         try:
+            record = scientific_execution_repository.get(execution_identifier)
+            context = current_security_context()
+            if (
+                context is None
+                or record.tenant_identifier_sha256
+                != _scientific_tenant_identity(context.principal.tenant_identifier)
+            ):
+                raise KeyError("Scientific execution not found.")
             return scientific_objective_runtime.execute(execution_identifier)
         except KeyError:
             raise _typed_error(
@@ -1030,7 +1674,10 @@ def create_app(
             molecular_scene_service,
             molecular_planning_service,
             workflow_service,
+            research_session_repository,
             scientific_execution_repository,
+            scientific_payload_store,
+            scientific_objective_runtime,
         )
         repositories_ready = all(
             service is None or bool(getattr(service, "_started", True))

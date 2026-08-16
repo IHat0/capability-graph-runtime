@@ -652,7 +652,7 @@ outside this checkpoint.
 
 ## E7 command-derived readiness evidence
 
-At the Phase 1-3 foundation checkpoint, E7 retained one registry of 67 mandatory gate producers. Product Phase 4 subsequently extends the current registry to 71 without changing the historical checkpoint evidence. CI, supply-chain, and
+At the Phase 1-3 foundation checkpoint, E7 retained one registry of 67 mandatory gate producers. Product Phase 4 and the cross-phase scientific integration subsequently extend the current registry to 72 without changing the historical checkpoint evidence. CI, supply-chain, and
 deployment jobs invoke `cgr-pulsate-evidence-run` with an explicit registry
 gate and workflow-job identity. The runner executes the real child argv without
 shell interpolation, except for narrowly bounded multi-operation Bash commands

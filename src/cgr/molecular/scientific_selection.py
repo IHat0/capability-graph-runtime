@@ -1,4 +1,4 @@
-﻿"""Deterministic scientific entity resolution over generic molecular topology.
+"""Deterministic scientific entity resolution over generic molecular topology.
 
 This module converts chemically meaningful structural selectors into stable
 topology identities without depending on RDKit, OpenMM, PySCF, or Qiskit.

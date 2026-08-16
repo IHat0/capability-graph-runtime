@@ -362,6 +362,81 @@ PUBLIC_ROUTES = frozenset({
 })
 
 ROUTE_PROTECTIONS: dict[tuple[str, str], RouteProtection] = {
+    ("GET", "/api/v1/research/capability"): RouteProtection(
+        (ProtectedAction.RUN_READ,),
+        "scientific-execution",
+        "static:capability",
+    ),
+    ("POST", "/api/v1/research/sessions"): RouteProtection(
+        (ProtectedAction.PLANNING_EVALUATE,),
+        "scientific-execution",
+        "static:collection",
+        True,
+    ),
+    (
+        "GET",
+        "/api/v1/research/sessions/{session_identifier}",
+    ): RouteProtection(
+        (ProtectedAction.RUN_READ,),
+        "scientific-execution",
+        "path:session_identifier",
+    ),
+    (
+        "GET",
+        "/api/v1/research/sessions/{session_identifier}/scene",
+    ): RouteProtection(
+        (ProtectedAction.RUN_READ,),
+        "scientific-execution",
+        "path:session_identifier",
+    ),
+    (
+        "GET",
+        "/api/v1/research/sessions/{session_identifier}/visualization",
+    ): RouteProtection(
+        (ProtectedAction.RUN_READ, ProtectedAction.SCENE_READ),
+        "scientific-execution",
+        "path:session_identifier",
+    ),
+    (
+        "GET",
+        "/api/v1/research/sessions/{session_identifier}/visualization/complex",
+    ): RouteProtection(
+        (ProtectedAction.RUN_READ, ProtectedAction.SCENE_READ),
+        "scientific-execution",
+        "path:session_identifier",
+    ),
+    (
+        "GET",
+        "/api/v1/research/sessions/{session_identifier}/artifacts/{artifact_identifier}",
+    ): RouteProtection(
+        (ProtectedAction.RUN_READ, ProtectedAction.ARTIFACT_READ),
+        "scientific-execution",
+        "path:session_identifier",
+    ),
+    (
+        "POST",
+        "/api/v1/research/sessions/{session_identifier}/reply",
+    ): RouteProtection(
+        (ProtectedAction.PLANNING_EVALUATE,),
+        "scientific-execution",
+        "path:session_identifier",
+        True,
+    ),
+    (
+        "POST",
+        "/api/v1/research/sessions/{session_identifier}/execute",
+    ): RouteProtection(
+        (ProtectedAction.EXECUTION_REQUEST,),
+        "scientific-execution",
+        "path:session_identifier",
+        True,
+    ),
+    ("POST", "/api/v1/scientific/artifacts"): RouteProtection(
+        (ProtectedAction.EXECUTION_REQUEST,),
+        "scientific-execution",
+        "static:collection",
+        True,
+    ),
     ("POST", "/api/v1/scientific/objectives/compile"): RouteProtection(
         (ProtectedAction.PLANNING_EVALUATE,),
         "scientific-execution",
@@ -709,7 +784,12 @@ class SecurityServices:
                     resource_identifier="*",
                     allowed_actions=development_actions,
                 )
-                for kind in ("project", "run", "experiment")
+                for kind in (
+                    "project",
+                    "run",
+                    "experiment",
+                    "scientific-execution",
+                )
             ]
             return cls(
                 authenticator=DevelopmentAuthenticator(token, principal),

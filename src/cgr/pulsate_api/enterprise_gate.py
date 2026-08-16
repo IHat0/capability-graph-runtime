@@ -80,6 +80,7 @@ ENTERPRISE_GATE_PRODUCERS = (
     _producer("container-startup-duration", "enterprise-readiness.yml:deployment-and-recovery", "container-startup-duration", blocked_exit_statuses=(78,)),
     _producer("container-vulnerability-scan", "supply-chain-security.yml:container-supply-chain", "trivy-0.58.2-container-scan"),
     _producer("correlation-identity", "ci.yml:backend-evidence", "pytest-correlation-identity"),
+    _producer("cross-phase-scientific-integration", "ci.yml:backend-evidence", "pytest-cross-phase-scientific-integration"),
     _producer("durable-audit", "ci.yml:backend-evidence", "pytest-durable-audit"),
     _producer("durable-grants", "ci.yml:backend-evidence", "pytest-durable-grants"),
     _producer("enumeration-resistance", "ci.yml:backend-evidence", "pytest-enumeration-resistance"),

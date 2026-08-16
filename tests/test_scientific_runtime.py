@@ -11,9 +11,11 @@ from cgr.pulsate_api.scientific_executions import (
 )
 from cgr.pulsate_api.scientific_objectives import ScientificInputReference
 from cgr.pulsate_api.scientific_runtime import (
+    ScientificCapabilityFailure,
     ScientificCapabilityOutcome,
     ScientificObjectiveRuntime,
     ScientistCapabilityRegistry,
+    ScientistResultAssembler,
     scientific_engine_registry,
 )
 from cgr.science import ArtifactReference, CreationProvenance
@@ -64,6 +66,26 @@ class EvidenceHandler:
             scene_identifier=(
                 "scientific-scene-runtime" if invocation.capability_identity == "molecular.scene_project" else None
             ),
+        )
+
+
+class RetryOnceHandler(EvidenceHandler):
+    def __init__(self) -> None:
+        self.attempts: dict[str, int] = {}
+
+    def execute(self, *, invocation, objective, record):
+        attempt = self.attempts.get(invocation.node_identifier, 0) + 1
+        self.attempts[invocation.node_identifier] = attempt
+        if attempt == 1:
+            raise ScientificCapabilityFailure(
+                "temporary_scientific_failure",
+                "The bounded first attempt failed.",
+                retryable=True,
+            )
+        return super().execute(
+            invocation=invocation,
+            objective=objective,
+            record=record,
         )
 
 
@@ -126,3 +148,122 @@ def test_runtime_executes_composed_plan_through_persisted_cgr_graph(tmp_path) ->
     assert all(node.status == "succeeded" for node in completed.node_executions)
     assert completed.scene_identifier == "scientific-scene-runtime"
     assert completed.evidence_artifact_identifiers
+
+
+def test_runtime_retries_a_retryable_scientific_capability(tmp_path) -> None:
+    repository = ScientificExecutionRepository(tmp_path / "executions")
+    repository.start()
+    record = repository.create(ScientificObjectiveCompileRequest(
+        question="Which conformer is preferred in water: axial or equatorial?",
+        input_references=(ScientificInputReference(
+            reference_identifier="molecule-project",
+            artifact_type="molecular_structure",
+            artifact_identifier="molecule-artifact",
+        ),),
+        artifact_references=(ArtifactReference(
+            artifact_identifier="molecule-artifact",
+            schema_version=CapabilityVersion(major=1, minor=0, patch=0),
+            artifact_type="molecular_structure",
+            media_type="chemical/x-mdl-molfile",
+            content_sha256="a" * 64,
+            provenance=CreationProvenance(
+                producer="test.fixture",
+                producer_version=CapabilityVersion(major=1, minor=0, patch=0),
+            ),
+        ),),
+    ))
+    retrying = RetryOnceHandler()
+    registry = ScientistCapabilityRegistry({
+        step.capability_name: retrying
+        for step in record.plan.steps
+        if step.capability_name != "scientist.result_assemble"
+    })
+    runtime = ScientificObjectiveRuntime(
+        root=tmp_path / "workflow",
+        execution_repository=repository,
+        capability_registry=registry,
+    )
+    runtime.start()
+
+    completed = runtime.execute(record.execution_identifier)
+
+    assert completed.status == "succeeded"
+    assert all(node.status == "succeeded" for node in completed.node_executions)
+    assert all(
+        node.attempt_count == 2
+        for node in completed.node_executions
+        if node.capability_name != "scientist.result_assemble"
+    )
+
+
+def test_answer_synthesis_rejects_model_authored_or_omitted_evidence(tmp_path) -> None:
+    class Provider:
+        provider_kind = "controlled_test_provider"
+        model_name = "replaceable-model"
+
+        def complete(self, _messages):
+            return '{"answer":"invented result"}'
+
+    repository = ScientificExecutionRepository(tmp_path / "executions")
+    repository.start()
+    record = repository.create(
+        ScientificObjectiveCompileRequest(
+            question="Which conformer is preferred in water: axial or equatorial?",
+            input_references=(
+                ScientificInputReference(
+                    reference_identifier="molecule-project",
+                    artifact_type="molecular_structure",
+                    artifact_identifier="molecule-artifact",
+                ),
+            ),
+            artifact_references=(
+                ArtifactReference(
+                    artifact_identifier="molecule-artifact",
+                    schema_version=CapabilityVersion(major=1, minor=0, patch=0),
+                    artifact_type="molecular_structure",
+                    media_type="chemical/x-mdl-molfile",
+                    content_sha256="a" * 64,
+                    metadata={
+                        "acquisition_source_kind": "trusted-test-source",
+                        "acquisition_source_identifier": "SOURCE-1",
+                        "evidence_resolution_confidence": "high",
+                    },
+                    provenance=CreationProvenance(
+                        producer="test.fixture",
+                        producer_version=CapabilityVersion(major=1, minor=0, patch=0),
+                    ),
+                ),
+            ),
+        )
+    )
+    handler = EvidenceHandler()
+    registry = ScientistCapabilityRegistry(
+        {
+            step.capability_name: handler
+            for step in record.plan.steps
+            if step.capability_name != "scientist.result_assemble"
+        }
+    )
+    runtime = ScientificObjectiveRuntime(
+        root=tmp_path / "workflow",
+        execution_repository=repository,
+        capability_registry=registry,
+        result_assembler=ScientistResultAssembler(
+            provider=Provider(),  # type: ignore[arg-type]
+        ),
+    )
+    runtime.start()
+
+    completed = runtime.execute(record.execution_identifier)
+
+    result = completed.scientist_result
+    assert result is not None
+    assert "invented result" not in result.scientific_result
+    assert result.principal_result == (
+        "The bounded scientific calculation completed with verified evidence."
+    )
+    assert completed.verified_scientific_summaries == (
+        "The bounded scientific calculation completed with verified evidence.",
+    )
+    assert result.evidence_artifact_identifiers
+    assert "trusted-test-source" in result.structures_and_entities[0]

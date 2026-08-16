@@ -797,9 +797,8 @@ class WorkflowRunSnapshot(CanonicalModel):
         cls, value: tuple[ExternalInputState, ...]
     ) -> tuple[ExternalInputState, ...]:
         identifiers = [item.input_identifier for item in value]
-        ports = [(item.node_id, item.port_id) for item in value]
-        if len(identifiers) != len(set(identifiers)) or len(ports) != len(set(ports)):
-            raise ValueError("External workflow inputs must be unique by identity and port.")
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("External workflow input identities must be unique.")
         return tuple(sorted(value, key=lambda item: item.input_identifier))
 
     @field_validator("snapshot_fingerprint")

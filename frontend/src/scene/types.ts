@@ -7,6 +7,9 @@ export interface MolecularAtom {
   label?: string
   fragmentId?: string
   residueId?: string
+  sourceAtomId?: string
+  structureArtifactId?: string
+  partialCharge?: number
   provenance?: Record<string, unknown>
 }
 

@@ -30,7 +30,10 @@ from cgr.pulsate_api.scientific_executions import (
     ScientificExecutionRepository,
     ScientificObjectiveCompileRequest,
 )
-from cgr.pulsate_api.scientific_objectives import ScientificInputReference
+from cgr.pulsate_api.scientific_objectives import (
+    CovalentReactionTarget,
+    ScientificInputReference,
+)
 from cgr.pulsate_api.scientific_runtime import ScientificObjectiveRuntime
 from cgr.science import ArtifactReference, CreationProvenance
 
@@ -373,6 +376,16 @@ def test_acceptance_1_covalent_qmmm_transition_state(tmp_path) -> None:
                 ),
             ),
             artifact_references=(protein_reference, ligand_reference),
+            covalent_reaction_target=CovalentReactionTarget(
+                protein_chain_label="A",
+                protein_residue_sequence="1",
+                protein_residue_name="CYS",
+                protein_atom_name="SG",
+                protein_nucleophile_formal_charge=-1,
+                ligand_reaction_smarts="[C;H3:1]-[S:2]-[C;H2]",
+                selected_total_qm_charge=-1,
+                selected_spin=0,
+            ),
         )
     )
     adapter = PySCFElectronicStructureAdapter(store, private_state_store=private)
@@ -692,6 +705,48 @@ END
     assert campaign.state.lineage.edges
     assert campaign.state.generations[-1].selected_candidate_identifiers
     assert completed.checkpoint_identifiers == (campaign.checkpoint.checkpoint_identifier,)
+    trace_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "discovery_design_loop_trace"
+    )
+    trace = json.loads(store.read(trace_reference))
+    contract_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "discovery_design_loop_contract"
+    )
+    contract = json.loads(store.read(contract_reference))
+    assert {
+        item["phase"] for item in contract["phase_bindings"]
+    } == {"phase_3_4", "phase_5", "phase_6", "phase_7"}
+    assert contract_reference.pointer in trace_reference.parents
+    assert trace["loop_complete"] is True
+    assert [item["stage"] for item in trace["stages"]] == [
+        "generate_molecule",
+        "validate_structure",
+        "prepare_molecule_and_target",
+        "dock_or_simulate",
+        "refine_selected_candidates",
+        "verify_evidence",
+        "rank_candidates",
+        "design_next_generation",
+    ]
+    assert trace["lineage"]
+    assert all(
+        set(candidate) >= {
+            "candidate_identifier",
+            "parent_candidate_identifiers",
+            "transformation",
+            "properties_and_calculations",
+            "verification",
+            "selection",
+        }
+        for candidate in trace["candidates"]
+    )
+    verification_reference = next(
+        item for item in completed.artifact_references
+        if item.artifact_type == "scientific_verification_report"
+    )
+    assert trace_reference.pointer in verification_reference.parents
     docking_evidence = [
         json.loads(store.read(item))
         for item in completed.artifact_references
@@ -703,6 +758,53 @@ END
     assert any(
         item.artifact_type == "molecular_candidate_docking_poses_pdbqt"
         for item in completed.artifact_references
+    )
+    interaction_reference = next(
+        item
+        for item in completed.artifact_references
+        if item.artifact_type == "molecular_interaction_analysis"
+    )
+    interaction_analysis = json.loads(store.read(interaction_reference))
+    assert interaction_analysis["schema"] == (
+        "pulsate.molecular-interaction-analysis/v1"
+    )
+    assert interaction_analysis["method"] == (
+        "deterministic_element_charge_and_distance_rules"
+    )
+    assert interaction_analysis["interactions"]
+    assert all(
+        item["calculation_method"]
+        and len(item["structure_artifact_identifiers"]) == 2
+        and len(item["atom_identifiers"]) == 2
+        for item in interaction_analysis["interactions"]
+    )
+    overlay_reference = next(
+        item
+        for item in completed.artifact_references
+        if item.artifact_type == "molecular_computational_overlay"
+    )
+    computational_overlay = json.loads(store.read(overlay_reference))
+    assert computational_overlay["schema"] == (
+        "pulsate.molecular-computational-overlay/v1"
+    )
+    assert computational_overlay["overlays"]
+    assert all(
+        item["candidate_identifier"]
+        and item["method"]
+        and item["verification_status"] in {"verified", "failed"}
+        for item in computational_overlay["overlays"]
+    )
+    scene_reference = next(
+        item
+        for item in completed.artifact_references
+        if item.artifact_type == "molecular_scene_state"
+    )
+    scene_state = json.loads(store.read(scene_reference))
+    assert scene_state["interaction_artifact_identifier"] == (
+        interaction_reference.artifact_identifier
+    )
+    assert scene_state["computational_overlay_artifact_identifier"] == (
+        overlay_reference.artifact_identifier
     )
     assert all(
         forbidden not in record.objective.model_dump_json()

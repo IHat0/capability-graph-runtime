@@ -295,6 +295,13 @@ export interface RawAtomResponse {
   atom_identifier: string
   element: string
   coordinates: Vector3Tuple
+  atom_name?: string | null
+  residue_name?: string | null
+  chain_identifier?: string | null
+  residue_sequence?: string | null
+  partial_charge?: number | null
+  source_atom_identifier?: string | null
+  structure_artifact_identifier?: string | null
 }
 
 export interface RawBondResponse {
@@ -338,6 +345,284 @@ export interface SceneResponse {
   scientific_model?: RawScientificModelResponse
   provenance?: Record<string, unknown>
   artifact_references?: string[]
+}
+
+export type ResearchInputArtifactType =
+  | 'protein_structure'
+  | 'ligand_structure'
+  | 'molecular_structure'
+  | 'prepared_receptor'
+  | 'prepared_ligand'
+
+export interface ResearchInputReference {
+  reference_identifier: string
+  artifact_type: ResearchInputArtifactType
+  artifact_identifier: string
+}
+
+export interface ResearchArtifactReference {
+  artifact_identifier: string
+  schema_version: { major: number; minor: number; patch: number }
+  artifact_type: string
+  media_type: string
+  content_sha256: string
+  byte_size: number | null
+  storage_location: string | null
+  metadata: Record<string, unknown>
+  provenance: {
+    producer: string
+    producer_version: { major: number; minor: number; patch: number } | null
+    execution_identifier: string | null
+    source: string
+  }
+  parents: unknown[]
+}
+
+export interface ResearchClarificationPrompt {
+  requirement_identifier: string
+  question: string
+}
+
+export interface ResearchConversationTurn {
+  turn_identifier: string
+  role: 'scientist' | 'pulsate'
+  content: string
+  created_at: string
+  requirement_identifier: string | null
+}
+
+export interface ResearchIntentProposal {
+  task_type: string
+  supporting_quote: string
+  provider_kind: string
+  model_name: string
+}
+
+export interface ResearchRequirement {
+  operation: string
+  requested_output: string
+  supporting_quote: string
+}
+
+export interface ResearchRequirementProposal {
+  proposal_identifier: string
+  requirements: ResearchRequirement[]
+  summary: string
+  provider_kind: string
+  model_name: string
+}
+
+export interface ValidatedResearchRequirements {
+  operations: string[]
+  requested_outputs: string[]
+  required_artifact_types: string[]
+  capability_profile: string
+  source_proposal_identifier: string
+}
+
+export interface ResearchEvidenceQuote {
+  field_name: string
+  turn_identifier: string
+  supporting_quote: string
+}
+
+export interface ResearchEvidenceProposal {
+  proposal_identifier: string
+  source_kind: 'conversation_extraction' | 'deterministic_structure_resolution' | 'exact_identifier_acquisition' | 'named_identifier_acquisition' | 'entity_resolution_candidates'
+  summary: string
+  input_references: ResearchInputReference[]
+  artifact_references: ResearchArtifactReference[]
+  covalent_reaction_target: Record<string, unknown> | null
+  partial_covalent_reaction_target: Record<string, unknown> | null
+  supporting_quotes: ResearchEvidenceQuote[]
+  provider_kind: string | null
+  model_name: string | null
+  reason: string | null
+  entity_candidates: Array<{
+    entity_type: 'protein' | 'ligand'
+    source_kind: 'uniprot' | 'pubchem'
+    source_identifier: string
+    display_label: string
+    structure_identifier: string | null
+    confidence: 'high' | 'ambiguous'
+  }>
+}
+
+export interface ScientistFacingResult {
+  original_request: string
+  resolved_interpretation: string
+  structures_and_entities: string[]
+  methods: string[]
+  assumptions: string[]
+  scientific_result: string
+  verification_status: 'passed' | 'failed' | 'inconclusive'
+  uncertainty: string[]
+  replanning_history: string[]
+  important_limitations: string[]
+  evidence_artifact_identifiers: string[]
+  scene_identifiers: string[]
+  principal_result: string | null
+  candidate_ranking: string[]
+  confidence_and_uncertainty: string[]
+  recommended_next_step: string | null
+  synthesis_provider_kind: string | null
+  synthesis_model_name: string | null
+}
+
+export type ResearchSessionStatus =
+  | 'understanding'
+  | 'awaiting_clarification'
+  | 'awaiting_approval'
+  | 'planned'
+  | 'running'
+  | 'verifying'
+  | 'replanning'
+  | 'completed'
+  | 'failed'
+
+export interface ResearchCompilationResponse {
+  compilation_identifier: string
+  execution_identifier: string
+  effective_question: string
+  canonical_objective: Record<string, unknown>
+  canonical_plan: Record<string, unknown>
+  canonical_graph: Record<string, unknown>
+}
+
+export interface ResearchSessionResponse {
+  session_identifier: string
+  created_at: string
+  updated_at: string
+  revision: number
+  status: ResearchSessionStatus
+  conversation: ResearchConversationTurn[]
+  input_references: ResearchInputReference[]
+  artifact_references: ResearchArtifactReference[]
+  unapproved_input_artifact_identifiers: string[]
+  next_questions: ResearchClarificationPrompt[]
+  clarification_attempts: Record<string, number>
+  intent_proposal: ResearchIntentProposal | null
+  requirement_proposal: ResearchRequirementProposal | null
+  accepted_research_requirements: ValidatedResearchRequirements | null
+  evidence_proposal: ResearchEvidenceProposal | null
+  accepted_partial_covalent_reaction_target: Record<string, unknown> | null
+  accepted_evidence: ResearchEvidenceProposal[]
+  compilation: ResearchCompilationResponse | null
+  execution_status: string | null
+  scene_identifier: string | null
+  scientist_result: ScientistFacingResult | null
+  scientist_summary: string
+}
+
+export interface ResearchVisualizationStructure {
+  artifact_identifier: string
+  artifact_type: string
+  media_type: string
+  label: string
+  role: 'protein' | 'ligand_or_candidate' | 'molecular_structure'
+  candidate_identifier: string | null
+  generation: number | null
+  selected: boolean
+  conformation_count: number
+  source_kind: string | null
+  source_identifier: string | null
+  confidence: string | null
+  content_sha256: string
+}
+
+export interface ResearchVisualizationSelection {
+  selection_identifier: string
+  label: string
+  kind: string
+  structure_artifact_identifier: string | null
+  atom_identifiers: string[]
+  residue_identifiers: string[]
+  evidence_artifact_identifier: string
+}
+
+export interface ResearchVisualizationInteraction {
+  interaction_identifier: string
+  interaction_type: string
+  candidate_identifier: string | null
+  structure_artifact_identifiers: string[]
+  atom_identifiers: string[]
+  residue_identifiers: string[]
+  distance_angstrom: number | null
+  angle_degree: number | null
+  calculation_method: string
+  evidence_artifact_identifier: string
+}
+
+export interface ResearchVisualizationOverlay {
+  overlay_identifier: string
+  kind: string
+  label: string
+  structure_artifact_identifier: string | null
+  candidate_identifier: string | null
+  value: unknown
+  unit: string | null
+  atom_identifiers: string[]
+  residue_identifiers: string[]
+  verification_status: string
+  uncertainty: string | null
+  evidence_artifact_identifier: string
+  method: string | null
+}
+
+export interface ResearchVisualizationCandidate {
+  candidate_identifier: string
+  generation: number
+  parent_candidate_identifiers: string[]
+  transformation: Record<string, unknown> | null
+  properties_and_calculations: Array<Record<string, unknown>>
+  verification: Array<Record<string, unknown>>
+  selection_rationale: string | null
+  selected: boolean
+  structure_artifact_identifiers: string[]
+}
+
+export interface ResearchVisualizationComparison {
+  comparison_identifier: string
+  kind: string
+  left_identifier: string
+  right_identifier: string
+  differences: unknown
+  evidence_artifact_identifier: string | null
+}
+
+export interface ResearchVisualizationExportItem {
+  artifact_identifier: string
+  artifact_type: string
+  media_type: string
+  content_sha256: string
+  category: 'structure' | 'evidence' | 'report'
+}
+
+export interface ResearchVisualizationWorkspace {
+  schema_version: 'pulsate.research-visualization/v1'
+  session_identifier: string
+  revision: number
+  scene_identifier: string | null
+  structures: ResearchVisualizationStructure[]
+  selections: ResearchVisualizationSelection[]
+  interactions: ResearchVisualizationInteraction[]
+  overlays: ResearchVisualizationOverlay[]
+  candidates: ResearchVisualizationCandidate[]
+  lineage: Array<Record<string, unknown>>
+  comparisons: ResearchVisualizationComparison[]
+  verification_artifact_identifiers: string[]
+  export_items: ResearchVisualizationExportItem[]
+  grounding_policy: 'persisted_artifact_or_deterministic_computation_only'
+}
+
+export interface ResearchInputUpload {
+  artifactType: ResearchInputArtifactType
+  file: File
+}
+
+export interface UploadedResearchInput {
+  inputReference: ResearchInputReference
+  artifactReference: ResearchArtifactReference
 }
 
 export interface RawMolecularSystem {

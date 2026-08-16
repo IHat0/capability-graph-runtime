@@ -867,8 +867,21 @@ class WorkflowOrchestrator:
                 )
             )
         supplied_ports = {(item.node_id, item.port_id) for item in normalized}
+        supplied_port_counts: dict[tuple[str, str], int] = {}
+        for item in normalized:
+            key = (item.node_id, item.port_id)
+            supplied_port_counts[key] = supplied_port_counts.get(key, 0) + 1
         for node in runtime_graph.nodes:
             for port in node.input_ports:
+                if (
+                    not port.multiple
+                    and supplied_port_counts.get(
+                        (node.node_identifier, port.port_identifier), 0
+                    ) > 1
+                ):
+                    raise WorkflowStateIntegrityError(
+                        "A singular external workflow port received multiple inputs."
+                    )
                 if (
                     port.external
                     and port.required

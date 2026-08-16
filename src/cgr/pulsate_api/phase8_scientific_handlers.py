@@ -27,6 +27,7 @@ from cgr.discovery import (
     DiscoveryStoppingPolicy,
     MolecularCandidateEvidenceVerifier,
     ObjectiveDirection,
+    RDKitDeNovoMolecularCandidateGenerator,
     RDKitMolecularCandidateGenerator,
     RDKitMolecularDescriptorEvaluator,
     RDKitMolecularValidityChecker,
@@ -57,26 +58,19 @@ from cgr.electronic_structure import (
     IMPLICIT_SOLVENT_HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
     ElectronicActiveSpace,
-    ElectronicAtom,
     ElectronicFrequencyAnalysis,
     ElectronicFrequencyMode,
     ElectronicImplicitSolventResult,
     ElectronicMolecule,
-    ElectronicQMRegionPreparation,
     ElectronicReactionPathPoint,
     ElectronicReactionPathResult,
-    ElectronicStructureConfiguration,
     ElectronicTensor,
     ElectronicTransitionStateSearch,
-    FREQUENCY_ANALYZE,
-    GRADIENT_CALCULATE,
     PySCFElectronicStructureAdapter,
     QM_REGION_PREPARE,
     QMMM_EMBEDDING_PREPARE,
     QMMM_HARTREE_FOCK,
     QMMM_HYBRID_EXECUTE,
-    REACTION_PATH_CONFIRM,
-    TRANSITION_STATE_SEARCH,
     transition_state_verification_request,
 )
 from cgr.quantum_workflow import (
@@ -87,8 +81,13 @@ from cgr.quantum_workflow import (
     QiskitQuantumWorkflowAdapter,
     VariationalGroundStateResult,
 )
+from cgr.protein_design import (
+    ExternalProteinEngineAdapter,
+    ProteinDesignSpecification,
+    ProteinDesignVerificationReport,
+    resolve_protein_residue_count,
+)
 from cgr.science import (
-    ArtifactPointer,
     ArtifactPointer,
     ArtifactReference,
     CapabilityInvocation,
@@ -443,6 +442,305 @@ class MolecularInputValidationHandler:
         )
 
 
+def _pdb_coordinate_inventory(payload: bytes) -> tuple[dict[str, object], ...]:
+    """Parse a bounded PDB coordinate inventory without inferring chemistry."""
+
+    atoms: list[dict[str, object]] = []
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ScientificCapabilityFailure(
+            "structure_analysis_input_invalid",
+            "The structure is not valid UTF-8 PDB coordinate data.",
+        ) from error
+    for line in lines:
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        try:
+            element = line[76:78].strip()
+            if not element:
+                element = "".join(
+                    character for character in line[12:16] if character.isalpha()
+                )[:2]
+            if not element:
+                raise ValueError
+            element = element[0].upper() + element[1:].lower()
+            atoms.append(
+                {
+                    "record_type": line[:6].strip(),
+                    "serial": int(line[6:11]),
+                    "atom_name": line[12:16].strip(),
+                    "residue_name": line[17:20].strip() or "UNK",
+                    "chain": line[21:22].strip() or "blank",
+                    "sequence": line[22:26].strip() or str(len(atoms) + 1),
+                    "x": float(line[30:38]),
+                    "y": float(line[38:46]),
+                    "z": float(line[46:54]),
+                    "element": element,
+                }
+            )
+        except (IndexError, ValueError):
+            raise ScientificCapabilityFailure(
+                "structure_analysis_input_invalid",
+                "The PDB coordinate records are malformed.",
+            ) from None
+    if not atoms:
+        raise ScientificCapabilityFailure(
+            "structure_analysis_input_invalid",
+            "The PDB structure contains no coordinate atoms.",
+        )
+    return tuple(atoms)
+
+
+class GeneralStructureIngestionHandler:
+    """Validate one molecule or protein input and expose one canonical structure."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        source = _objective_input(
+            record,
+            kinds=(
+                "molecular_structure",
+                "ligand_structure",
+                "protein_structure",
+                "prepared_ligand",
+                "prepared_receptor",
+            ),
+        )
+        payload = self.runner.store.read(source)
+        media_type = source.media_type.lower()
+        is_pdb = "pdb" in media_type
+        if is_pdb:
+            _pdb_coordinate_inventory(payload)
+        else:
+            _molecule_from_structure_payload(source, payload)
+        if source.artifact_type == "molecular_structure":
+            structure = source
+        else:
+            structure = self.runner.write_bytes(
+                artifact_type="molecular_structure",
+                media_type=source.media_type,
+                payload=payload,
+                producer="molecular.structure_ingestion",
+                execution_identifier=invocation.invocation_identifier,
+                parents=(source,),
+                metadata={
+                    "source_artifact_type": source.artifact_type,
+                    "validation_kind": (
+                        "pdb_coordinate_inventory" if is_pdb else "rdkit_structure"
+                    ),
+                },
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(structure,),
+            evidence_artifacts=(structure,),
+            scientific_summary="Validated one exact structure for descriptive analysis.",
+        )
+
+
+class StructureAnalysisHandler:
+    """Produce deterministic descriptive evidence for a molecule or PDB structure."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        structures = tuple(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "molecular_structure"
+        )
+        if len(structures) != 1:
+            raise ScientificCapabilityFailure(
+                "structure_analysis_input_ambiguous",
+                "Structure analysis requires exactly one canonical structure.",
+            )
+        structure = structures[0]
+        payload = self.runner.store.read(structure)
+        if "pdb" in structure.media_type.lower():
+            atoms = _pdb_coordinate_inventory(payload)
+            residues = {
+                (str(item["chain"]), str(item["sequence"]), str(item["residue_name"]))
+                for item in atoms
+            }
+            chains = {str(item["chain"]) for item in atoms}
+            element_counts: dict[str, int] = {}
+            for item in atoms:
+                element = str(item["element"])
+                element_counts[element] = element_counts.get(element, 0) + 1
+            coordinates = {
+                axis: [float(item[axis]) for item in atoms]
+                for axis in ("x", "y", "z")
+            }
+            analysis: dict[str, object] = {
+                "schema": "pulsate.structure-analysis/v1",
+                "analysis_kind": "pdb_coordinate_inventory",
+                "source_structure_artifact_identifier": structure.artifact_identifier,
+                "atom_count": len(atoms),
+                "hetero_atom_record_count": sum(
+                    item["record_type"] == "HETATM" for item in atoms
+                ),
+                "residue_count": len(residues),
+                "chain_count": len(chains),
+                "element_counts": dict(sorted(element_counts.items())),
+                "bounding_box_angstrom": {
+                    axis: {
+                        "minimum": min(values),
+                        "maximum": max(values),
+                    }
+                    for axis, values in coordinates.items()
+                },
+                "method": "deterministic_pdb_coordinate_inventory",
+                "limitations": [
+                    "Coordinate inventory does not establish function, stability, or binding affinity."
+                ],
+            }
+            summary = (
+                f"Analyzed a PDB coordinate structure containing {len(atoms)} atoms, "
+                f"{len(residues)} residues, and {len(chains)} chains."
+            )
+        else:
+            from rdkit import Chem
+            from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors
+
+            molecule = _molecule_from_structure_payload(structure, payload)
+            element_counts: dict[str, int] = {}
+            for atom in molecule.GetAtoms():
+                element = atom.GetSymbol()
+                element_counts[element] = element_counts.get(element, 0) + 1
+            analysis = {
+                "schema": "pulsate.structure-analysis/v1",
+                "analysis_kind": "molecular_graph_descriptors",
+                "source_structure_artifact_identifier": structure.artifact_identifier,
+                "canonical_smiles": Chem.MolToSmiles(molecule, canonical=True),
+                "formula": rdMolDescriptors.CalcMolFormula(molecule),
+                "atom_count": molecule.GetNumAtoms(),
+                "heavy_atom_count": molecule.GetNumHeavyAtoms(),
+                "bond_count": molecule.GetNumBonds(),
+                "formal_charge": sum(
+                    atom.GetFormalCharge() for atom in molecule.GetAtoms()
+                ),
+                "molecular_weight_da": float(Descriptors.MolWt(molecule)),
+                "ring_count": int(rdMolDescriptors.CalcNumRings(molecule)),
+                "rotatable_bond_count": int(Lipinski.NumRotatableBonds(molecule)),
+                "hydrogen_bond_donor_count": int(Lipinski.NumHDonors(molecule)),
+                "hydrogen_bond_acceptor_count": int(Lipinski.NumHAcceptors(molecule)),
+                "element_counts": dict(sorted(element_counts.items())),
+                "method": "rdkit_graph_and_descriptor_analysis",
+                "limitations": [
+                    "Graph descriptors do not establish activity, selectivity, or experimental behavior."
+                ],
+            }
+            summary = (
+                f"Analyzed molecular formula {analysis['formula']} with "
+                f"{analysis['heavy_atom_count']} heavy atoms and "
+                f"formal charge {analysis['formal_charge']}."
+            )
+        reference = self.runner.write_json(
+            artifact_type="molecular_structure_analysis",
+            payload=json.dumps(
+                analysis,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            producer="molecular.structure_analyze",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(structure,),
+            metadata={"analysis_kind": str(analysis["analysis_kind"])},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,),
+            evidence_artifacts=(reference,),
+            scientific_summary=summary,
+            limitations=tuple(str(item) for item in analysis["limitations"]),
+        )
+
+
+class StructureAnalysisVerificationHandler:
+    """Verify descriptive structure evidence without expanding its claims."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        reference = next(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "molecular_structure_analysis"
+        )
+        analysis = json.loads(self.runner.store.read(reference))
+        kind = analysis.get("analysis_kind")
+        passed = bool(
+            analysis.get("schema") == "pulsate.structure-analysis/v1"
+            and kind in {"pdb_coordinate_inventory", "molecular_graph_descriptors"}
+            and isinstance(analysis.get("atom_count"), int)
+            and int(analysis["atom_count"]) > 0
+            and isinstance(analysis.get("source_structure_artifact_identifier"), str)
+            and analysis.get("method")
+        )
+        if kind == "pdb_coordinate_inventory":
+            passed = bool(
+                passed
+                and isinstance(analysis.get("residue_count"), int)
+                and int(analysis["residue_count"]) > 0
+                and isinstance(analysis.get("chain_count"), int)
+                and int(analysis["chain_count"]) > 0
+            )
+        elif kind == "molecular_graph_descriptors":
+            passed = bool(
+                passed
+                and isinstance(analysis.get("formula"), str)
+                and isinstance(analysis.get("heavy_atom_count"), int)
+                and int(analysis["heavy_atom_count"]) > 0
+                and isinstance(analysis.get("molecular_weight_da"), (int, float))
+                and math.isfinite(float(analysis["molecular_weight_da"]))
+            )
+        report = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=json.dumps(
+                {
+                    "verification_family": "structure_analysis",
+                    "passed": passed,
+                    "analysis_kind": kind,
+                    "checks": [
+                        "source_identity_bound",
+                        "positive_structural_counts",
+                        "finite_declared_descriptors",
+                        "claim_scope_remains_descriptive",
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            producer="scientific_verification.structure_analysis",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(reference,),
+            metadata={"passed": passed},
+        )
+        if not passed:
+            raise ScientificCapabilityFailure(
+                "scientific_verification_failed",
+                "The structure analysis failed deterministic verification.",
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report,),
+            evidence_artifacts=(report,),
+            verified=True,
+            scientific_summary=(
+                "Verified the descriptive structure analysis and its bounded claim scope."
+            ),
+        )
+
+
 _SOLVENT_DIELECTRIC = {
     "water": 78.3553,
     "acetonitrile": 35.688,
@@ -476,7 +774,12 @@ class ImplicitSolventConformerComparisonHandler:
             if item.artifact_type == "molecular_conformer_classification"
         )
         classification = json.loads(self.runner.store.read(classification_reference))
-        solvent = objective.solvent or "water"
+        solvent = objective.solvent
+        if solvent is None:
+            raise ScientificCapabilityFailure(
+                "scientific_clarification_required",
+                "The solvent must be supplied by the scientist before execution.",
+            )
         results: dict[str, ElectronicImplicitSolventResult] = {}
         artifacts: list[ArtifactReference] = []
         for label in ("axial", "equatorial"):
@@ -708,6 +1011,369 @@ class MinimalSceneHandler:
             evidence_artifacts=(scene,),
             scene_identifier=scene.artifact_identifier,
         )
+
+
+class ProteinDesignSpecificationHandler:
+    """Materialize only scientist-stated protein length plus operational policy."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del record
+        residue_count, quote, reason = resolve_protein_residue_count(
+            objective.original_request
+        )
+        if reason is not None or residue_count is None or quote is None:
+            raise ScientificCapabilityFailure(
+                "protein_design_specification_incomplete",
+                reason or "The protein design specification is incomplete.",
+            )
+        objective_digest = hashlib.sha256(
+            objective.original_request.encode("utf-8")
+        ).hexdigest()
+        random_seed = (
+            int(hashlib.sha256(objective.objective_identifier.encode()).hexdigest()[:8], 16)
+            % 2_147_483_646
+        ) + 1
+        specification = ProteinDesignSpecification(
+            schema_version=_VERSION,
+            specification_identifier=_stable_identifier(
+                "protein-design-specification",
+                objective.objective_identifier,
+                residue_count,
+            ),
+            residue_count=residue_count,
+            candidate_count=min(objective.budget.maximum_candidates, 8),
+            random_seed=random_seed,
+            residue_count_supporting_quote=quote,
+            original_objective_sha256=objective_digest,
+            operational_policy_identifier="policy.protein_design_v1",
+            limitations=(
+                "Candidate count is a bounded operational search policy, not a scientific claim.",
+                "Generated candidates require independent computational and experimental validation.",
+            ),
+        )
+        reference = self.runner.write_json(
+            artifact_type="protein_design_specification",
+            payload=specification.to_canonical_json().encode("utf-8"),
+            producer="protein.design_specification",
+            execution_identifier=invocation.invocation_identifier,
+            metadata={
+                "residue_count": residue_count,
+                "candidate_count": specification.candidate_count,
+                "operational_policy_identifier": (
+                    specification.operational_policy_identifier
+                ),
+            },
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,),
+            evidence_artifacts=(reference,),
+            scientific_summary=(
+                f"Prepared a de novo protein design specification for exactly "
+                f"{residue_count} residues."
+            ),
+            limitations=specification.limitations,
+        )
+
+
+def _fasta_sequence(payload: bytes) -> str:
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ScientificCapabilityFailure(
+            "protein_design_sequence_invalid",
+            "A generated protein sequence is not valid UTF-8 FASTA.",
+        ) from error
+    sequence = "".join(line.strip() for line in lines if not line.startswith(">"))
+    allowed = set("ACDEFGHIKLMNPQRSTVWY")
+    if not sequence or any(character not in allowed for character in sequence.upper()):
+        raise ScientificCapabilityFailure(
+            "protein_design_sequence_invalid",
+            "A generated protein sequence contains unsupported residue symbols.",
+        )
+    return sequence.upper()
+
+
+def _pdb_residue_count(payload: bytes) -> int:
+    atoms = _pdb_coordinate_inventory(payload)
+    return len(
+        {
+            (str(item["chain"]), str(item["sequence"]), str(item["residue_name"]))
+            for item in atoms
+        }
+    )
+
+
+class ProteinDesignVerificationHandler:
+    """Verify stage completeness, length, content, confidence, and lineage."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        by_type: dict[str, tuple[ArtifactReference, ...]] = {
+            artifact_type: tuple(
+                item
+                for item in record.artifact_references
+                if item.artifact_type == artifact_type
+            )
+            for artifact_type in (
+                "protein_design_specification",
+                "protein_backbone_candidate",
+                "protein_sequence_candidate",
+                "predicted_protein_structure",
+                "protein_prediction_confidence",
+            )
+        }
+        if len(by_type["protein_design_specification"]) != 1:
+            raise ScientificCapabilityFailure(
+                "protein_design_verification_failed",
+                "Protein design verification requires one exact specification.",
+            )
+        specification_reference = by_type["protein_design_specification"][0]
+        specification = ProteinDesignSpecification.model_validate_json(
+            self.runner.store.read(specification_reference)
+        )
+        backbones = by_type["protein_backbone_candidate"]
+        sequences = by_type["protein_sequence_candidate"]
+        structures = by_type["predicted_protein_structure"]
+        confidences = by_type["protein_prediction_confidence"]
+        counts = tuple(map(len, (backbones, sequences, structures, confidences)))
+        if (
+            not all(counts)
+            or len(set(counts)) != 1
+            or counts[0] > specification.candidate_count
+        ):
+            raise ScientificCapabilityFailure(
+                "protein_design_verification_failed",
+                "Protein design stages did not return one complete evidence chain per candidate.",
+            )
+        if any(
+            item.media_type != "chemical/x-pdb"
+            or _pdb_residue_count(self.runner.store.read(item))
+            != specification.residue_count
+            for item in (*backbones, *structures)
+        ):
+            raise ScientificCapabilityFailure(
+                "protein_design_verification_failed",
+                "A generated protein coordinate artifact does not match the requested residue count.",
+            )
+        if any(
+            len(_fasta_sequence(self.runner.store.read(item)))
+            != specification.residue_count
+            for item in sequences
+        ):
+            raise ScientificCapabilityFailure(
+                "protein_design_verification_failed",
+                "A designed protein sequence does not match the requested residue count.",
+            )
+        for confidence in confidences:
+            try:
+                document = json.loads(self.runner.store.read(confidence))
+                score = document["confidence_score"]
+                metric = document["metric_name"]
+                if (
+                    not isinstance(score, (int, float))
+                    or isinstance(score, bool)
+                    or not 0 <= float(score) <= 1
+                    or not isinstance(metric, str)
+                    or not metric.strip()
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raise ScientificCapabilityFailure(
+                    "protein_design_verification_failed",
+                    "Protein structure prediction confidence is missing or invalid.",
+                ) from None
+        backbone_ids = {item.artifact_identifier for item in backbones}
+        sequence_ids = {item.artifact_identifier for item in sequences}
+        lineage_complete = (
+            all(
+                specification_reference.artifact_identifier
+                in {parent.artifact_identifier for parent in item.parents}
+                for item in backbones
+            )
+            and all(
+                bool(
+                    backbone_ids
+                    & {parent.artifact_identifier for parent in item.parents}
+                )
+                for item in sequences
+            )
+            and all(
+                bool(
+                    sequence_ids
+                    & {parent.artifact_identifier for parent in item.parents}
+                )
+                for item in (*structures, *confidences)
+            )
+        )
+        if not lineage_complete:
+            raise ScientificCapabilityFailure(
+                "protein_design_verification_failed",
+                "Protein candidate parentage is incomplete.",
+            )
+        report = ProteinDesignVerificationReport(
+            schema_version=_VERSION,
+            report_identifier=_stable_identifier(
+                "protein-design-verification",
+                specification_reference.content_sha256,
+                *(item.content_sha256 for item in structures),
+            ),
+            specification_artifact_identifier=(
+                specification_reference.artifact_identifier
+            ),
+            backbone_artifact_identifiers=tuple(backbone_ids),
+            sequence_artifact_identifiers=tuple(sequence_ids),
+            predicted_structure_artifact_identifiers=tuple(
+                item.artifact_identifier for item in structures
+            ),
+            lineage_complete=True,
+            limitations=(
+                "Model confidence is not experimental validation.",
+                "Designed candidates may not fold, express, remain stable, or perform a requested function experimentally.",
+            ),
+        )
+        payload = report.to_canonical_json().encode("utf-8")
+        parents = (
+            specification_reference,
+            *backbones,
+            *sequences,
+            *structures,
+            *confidences,
+        )
+        design_report = self.runner.write_json(
+            artifact_type="protein_design_verification_report",
+            payload=payload,
+            producer="scientific_verification.protein_design",
+            execution_identifier=invocation.invocation_identifier,
+            parents=parents,
+            metadata={"passed": True, "candidate_count": len(structures)},
+        )
+        general_report = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=payload,
+            producer="scientific_verification.protein_design",
+            execution_identifier=invocation.invocation_identifier,
+            parents=parents,
+            metadata={"passed": True, "verification_family": "protein_design"},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(design_report, general_report),
+            evidence_artifacts=(design_report, general_report, *confidences),
+            verified=True,
+            scientific_summary=(
+                f"Verified {len(structures)} complete computational protein "
+                "candidate evidence chains."
+            ),
+            limitations=report.limitations,
+        )
+
+
+class ProteinDesignSceneHandler:
+    """Project predicted protein candidates and their exact parentage."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        structures = tuple(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "predicted_protein_structure"
+        )
+        report = next(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "protein_design_verification_report"
+        )
+        scene_payload = {
+            "objective_identifier": objective.objective_identifier,
+            "scene_kind": "de_novo_protein_design",
+            "computational_state": "verified" if record.verified else "computed",
+            "structure_artifact_identifiers": [
+                item.artifact_identifier for item in structures
+            ],
+            "candidate_lineage": [
+                {
+                    "artifact_identifier": item.artifact_identifier,
+                    "parent_artifact_identifiers": [
+                        parent.artifact_identifier for parent in item.parents
+                    ],
+                }
+                for item in structures
+            ],
+            "verification_artifact_identifier": report.artifact_identifier,
+            "experimental_evidence": False,
+        }
+        scene = self.runner.write_json(
+            artifact_type="molecular_scene_state",
+            payload=json.dumps(
+                scene_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            producer="molecular.scene_project",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(report, *structures),
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(scene,),
+            evidence_artifacts=(scene,),
+            scene_identifier=scene.artifact_identifier,
+        )
+
+
+def protein_design_registry(
+    *,
+    store: ScientificPayloadStore,
+    adapters: tuple[ExternalProteinEngineAdapter, ...],
+) -> ScientistCapabilityRegistry:
+    """Build the configured three-stage de novo protein-design slice."""
+
+    registry = ScientistCapabilityRegistry(
+        {
+            "protein.design_specification": ProteinDesignSpecificationHandler(store),
+            "scientific_verification.protein_design": (
+                ProteinDesignVerificationHandler(store)
+            ),
+            "molecular.scene_project": ProteinDesignSceneHandler(store),
+        }
+    )
+    for adapter in adapters:
+        capability_name = (
+            adapter.declaration.capabilities[0].descriptor.capability_name
+        )
+        registry.register(
+            capability_name,
+            ScientificEngineHandler(adapter, capability_name),
+        )
+    return registry
+
+
+def structure_analysis_registry(
+    *,
+    store: ScientificPayloadStore,
+) -> ScientistCapabilityRegistry:
+    """Build the general molecule/protein descriptive-analysis vertical slice."""
+
+    return ScientistCapabilityRegistry(
+        {
+            "molecular.structure_ingestion": GeneralStructureIngestionHandler(store),
+            "molecular.structure_analyze": StructureAnalysisHandler(store),
+            "scientific_verification.structure_analysis": (
+                StructureAnalysisVerificationHandler(store)
+            ),
+            "molecular.scene_project": MinimalSceneHandler(store),
+        }
+    )
 
 
 def aqueous_conformer_registry(
@@ -1831,47 +2497,71 @@ def _ts_ligand(record: ScientificExecutionRecord, store: ScientificPayloadStore)
     return source, molecule
 
 
-def _cysteine_reaction_selection(
+def _covalent_reaction_selection(
     record: ScientificExecutionRecord,
     store: ScientificPayloadStore,
 ) -> dict[str, object]:
-    """Resolve a unique Cys sulfur and methyl-thioether electrophile by chemistry."""
+    """Resolve one explicitly reviewed protein atom and mapped ligand reaction pair."""
 
+    target = record.objective.covalent_reaction_target
+    if target is None:
+        raise ScientificCapabilityFailure(
+            "reaction_semantics_missing",
+            "Covalent execution requires reviewed reaction-atom, charge, and spin semantics.",
+        )
     protein = _objective_input(record, kinds=("protein_structure",))
     protein_atoms = _pdb_atoms(store.read(protein))
     nucleophiles = tuple(
         (index, atom)
         for index, atom in enumerate(protein_atoms)
-        if str(atom["residue_name"]).upper() == "CYS"
-        and str(atom["atom_name"]).upper() == "SG"
-        and str(atom["element"]) == "S"
+        if str(atom["chain"]) == target.protein_chain_label
+        and str(atom["sequence"]) == target.protein_residue_sequence
+        and str(atom["atom_name"]).upper() == target.protein_atom_name.upper()
+        and (
+            target.protein_residue_name is None
+            or str(atom["residue_name"]).upper()
+            == target.protein_residue_name.upper()
+        )
     )
     if len(nucleophiles) != 1:
         raise ScientificCapabilityFailure(
             "catalytic_nucleophile_ambiguous",
-            "Exactly one cysteine SG nucleophile must resolve from the supplied active-site structure.",
+            "The reviewed protein reaction-atom identity did not resolve exactly once.",
         )
     ligand_reference, ligand = _ts_ligand(record, store)
-    candidates: list[tuple[int, int]] = []
-    for atom in ligand.GetAtoms():
-        if atom.GetAtomicNum() != 6:
-            continue
-        sulfur_neighbors = tuple(
-            neighbor.GetIdx() for neighbor in atom.GetNeighbors()
-            if neighbor.GetAtomicNum() == 16
+    from rdkit import Chem
+
+    query = Chem.MolFromSmarts(target.ligand_reaction_smarts)
+    if query is None:
+        raise ScientificCapabilityFailure(
+            "ligand_reaction_smarts_invalid",
+            "The reviewed ligand reaction SMARTS could not be parsed.",
         )
-        hydrogen_count = sum(
-            neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors()
+    mapped_query_atoms = {
+        atom.GetAtomMapNum(): atom.GetIdx()
+        for atom in query.GetAtoms()
+        if atom.GetAtomMapNum()
+    }
+    if set(mapped_query_atoms) != {1, 2}:
+        raise ScientificCapabilityFailure(
+            "ligand_reaction_smarts_invalid",
+            "Ligand reaction SMARTS must map :1 electrophile and :2 leaving group.",
         )
-        if len(sulfur_neighbors) == 1 and hydrogen_count == 3:
-            candidates.append((atom.GetIdx(), sulfur_neighbors[0]))
-    if len(candidates) != 1:
+    matches = ligand.GetSubstructMatches(query, uniquify=True, maxMatches=2)
+    if len(matches) != 1:
         raise ScientificCapabilityFailure(
             "ligand_electrophile_ambiguous",
-            "A unique methyl carbon with a sulfur leaving group could not be resolved.",
+            "The reviewed ligand reaction SMARTS did not resolve exactly once.",
         )
     protein_index, nucleophile = nucleophiles[0]
-    electrophile, leaving_sulfur = candidates[0]
+    match = matches[0]
+    electrophile = match[mapped_query_atoms[1]]
+    leaving_group = match[mapped_query_atoms[2]]
+    if ligand.GetBondBetweenAtoms(electrophile, leaving_group) is None:
+        raise ScientificCapabilityFailure(
+            "ligand_reaction_bond_missing",
+            "The mapped electrophile and leaving group are not directly bonded.",
+        )
     return {
         "protein_artifact_identifier": protein.artifact_identifier,
         "ligand_artifact_identifier": ligand_reference.artifact_identifier,
@@ -1883,15 +2573,13 @@ def _cysteine_reaction_selection(
         },
         "protein_nucleophile_source_index": protein_index,
         "ligand_electrophile_source_index": electrophile,
-        "ligand_leaving_sulfur_source_index": leaving_sulfur,
-        "reaction_family": "symmetric_sulfur_substitution_model",
-        "resolution_method": "unique_cysteine_sg_plus_methyl_thioether_connectivity",
-        "protonation_alternatives": [
-            {"state": "neutral_cysteine", "selected": False},
-            {"state": "cysteine_thiolate", "selected": True},
-        ],
-        "selected_total_qm_charge": -1,
-        "selected_spin": 0,
+        "ligand_leaving_group_source_index": leaving_group,
+        "reaction_family": target.reaction_family,
+        "ligand_reaction_smarts": target.ligand_reaction_smarts,
+        "resolution_method": "reviewed_protein_identity_plus_unique_mapped_smarts",
+        "protein_nucleophile_formal_charge": target.protein_nucleophile_formal_charge,
+        "selected_total_qm_charge": target.selected_total_qm_charge,
+        "selected_spin": target.selected_spin,
     }
 
 
@@ -1943,7 +2631,7 @@ class TSForceFieldSelectionHandler:
         return ScientificCapabilityOutcome(output_artifacts=(reference,))
 
 
-class TSCysteinePreparationHandler:
+class TSReactionAtomPreparationHandler:
     def __init__(self, store: ScientificPayloadStore) -> None:
         self.runner = _NativeRunner(store)
 
@@ -1951,7 +2639,7 @@ class TSCysteinePreparationHandler:
         del objective
         import json
 
-        selection = _cysteine_reaction_selection(record, self.runner.store)
+        selection = _covalent_reaction_selection(record, self.runner.store)
         source = next(
             item for item in record.artifact_references
             if item.artifact_type == "molecular_structure"
@@ -1963,13 +2651,14 @@ class TSCysteinePreparationHandler:
                     "target_ph": 7.4,
                     "exact_pka_calculated": False,
                     "resolved_residue": selection["catalytic_residue"],
-                    "state_alternatives": selection["protonation_alternatives"],
-                    "selected_state": "cysteine_thiolate",
-                    "selected_qm_charge": -1,
-                    "selected_spin": 0,
+                    "selected_nucleophile_formal_charge": selection[
+                        "protein_nucleophile_formal_charge"
+                    ],
+                    "selected_qm_charge": selection["selected_total_qm_charge"],
+                    "selected_spin": selection["selected_spin"],
                     "assumption": (
-                        "The covalent-reaction objective selects the nucleophilic thiolate "
-                        "hypothesis from the retained neutral/thiolate alternatives."
+                        "The charge and spin state are explicit scientist-reviewed "
+                        "reaction semantics; no residue-specific protonation state was inferred."
                     ),
                 },
                 sort_keys=True,
@@ -1999,7 +2688,7 @@ class TSSemanticResolutionHandler:
         del objective
         import json
 
-        selection = _cysteine_reaction_selection(record, self.runner.store)
+        selection = _covalent_reaction_selection(record, self.runner.store)
         reference = self.runner.write_json(
             artifact_type="semantic_target_selection",
             payload=json.dumps(selection, sort_keys=True, separators=(",", ":")).encode(),
@@ -2009,8 +2698,8 @@ class TSSemanticResolutionHandler:
         return ScientificCapabilityOutcome(
             output_artifacts=(reference,), evidence_artifacts=(reference,),
             scientific_summary=(
-                "Resolved one catalytic Cys SG nucleophile and one methyl-thioether "
-                "electrophile/leaving-sulfur pair without scientist-supplied atom indices."
+                "Resolved the reviewed protein reaction atom and one unique mapped "
+                "ligand electrophile/leaving-group pair without computational indices."
             ),
         )
 
@@ -2019,126 +2708,49 @@ def _ts_environment(
     record: ScientificExecutionRecord,
     store: ScientificPayloadStore,
 ) -> tuple[MolecularEnvironment, dict[str, int], tuple[float, ...]]:
-    from rdkit.Chem import GetPeriodicTable
+    from .scientific_qmmm_state import (
+        CovalentQMMMSelection,
+        CovalentQMMMStateError,
+        build_covalent_qmmm_environment,
+    )
 
     protein = _objective_input(record, kinds=("protein_structure",))
-    protein_atoms = _pdb_atoms(store.read(protein))
-    _, ligand = _ts_ligand(record, store)
-    selection = _cysteine_reaction_selection(record, store)
-    conformer = ligand.GetConformer()
-    offset = len(protein_atoms)
-    atom_rows: list[dict[str, object]] = [dict(item) for item in protein_atoms]
-    for atom in ligand.GetAtoms():
-        point = conformer.GetAtomPosition(atom.GetIdx())
-        atom_rows.append({
-            "atomic_number": atom.GetAtomicNum(),
-            "element": atom.GetSymbol(),
-            "atom_name": f"L{atom.GetIdx() + 1}",
-            "residue_name": "LIG",
-            "sequence": "2",
-            "chain": "L",
-            "formal_charge": atom.GetFormalCharge(),
-            "x": point.x,
-            "y": point.y,
-            "z": point.z,
-        })
-    bonds: set[tuple[int, int, int | None]] = set()
-    for left in range(len(protein_atoms)):
-        for right in range(left + 1, len(protein_atoms)):
-            distance = math.dist(
-                tuple(float(protein_atoms[left][axis]) for axis in ("x", "y", "z")),
-                tuple(float(protein_atoms[right][axis]) for axis in ("x", "y", "z")),
-            )
-            radii = {
-                "H": 0.37, "C": 0.77, "N": 0.75, "O": 0.73, "S": 1.02,
-            }
-            cutoff = 1.25 * (
-                radii.get(str(protein_atoms[left]["element"]), 0.8)
-                + radii.get(str(protein_atoms[right]["element"]), 0.8)
-            )
-            if distance <= cutoff:
-                bonds.add((left, right, 1))
-    for bond in ligand.GetBonds():
-        bonds.add((
-            offset + bond.GetBeginAtomIdx(), offset + bond.GetEndAtomIdx(),
-            int(round(bond.GetBondTypeAsDouble())),
-        ))
-    residue_values = tuple(dict.fromkeys(
-        (str(row["chain"]), str(row["sequence"]), str(row["residue_name"]))
-        for row in atom_rows
-    ))
-    chain_values = tuple(dict.fromkeys(str(row["chain"]) for row in atom_rows))
-    residue_index = {value: index for index, value in enumerate(residue_values)}
-    chain_index = {value: index for index, value in enumerate(chain_values)}
-    nucleophile_index = int(selection["protein_nucleophile_source_index"])
-    electrophile_index = offset + int(selection["ligand_electrophile_source_index"])
-    leaving_index = offset + int(selection["ligand_leaving_sulfur_source_index"])
-    charges = [0.0] * len(atom_rows)
-    charges[nucleophile_index] = -0.8
-    # A small charge-separated peptide scaffold supplies non-zero auditable MM charges.
-    for index, row in enumerate(atom_rows[:len(protein_atoms)]):
-        name = str(row["atom_name"]).upper()
-        if name == "CA":
-            charges[index] = 0.1
-        elif name == "C":
-            charges[index] = 0.5
-        elif name == "O":
-            charges[index] = -0.8
-    correction = -1.0 - sum(charges)
-    charges[-1] += correction
-    digest = hashlib.sha256(
-        (protein.content_sha256 + _objective_input(record, kinds=("ligand_structure",)).content_sha256).encode()
-    ).hexdigest()
-    environment = MolecularEnvironment(
-        schema_version=_VERSION,
-        environment_identifier=_stable_identifier("covalent-ts-environment", digest),
-        environment_type="vacuum",
-        source_conformer_set_identifier=_stable_identifier("covalent-ts-coordinates", digest),
-        source_conformer_index=0,
-        force_field_selection_identifier="compact-active-site-openmm-force-field",
-        atoms=tuple(
-            MolecularSimulationAtom(
-                particle_index=index,
-                particle_kind="atom",
-                atomic_number=int(row["atomic_number"]),
-                element_symbol=str(row["element"]),
-                atom_name=str(row["atom_name"]),
-                residue_index=residue_index[(str(row["chain"]), str(row["sequence"]), str(row["residue_name"]))],
-                residue_name=str(row["residue_name"]),
-                residue_identifier=f"residue-{str(row['chain']).lower()}-{str(row['sequence']).lower()}-{str(row['residue_name']).lower()}",
-                chain_index=chain_index[str(row["chain"])],
-                chain_identifier=f"chain-{str(row['chain']).lower()}",
-                source_atom_index=index,
-                formal_charge=(-1 if index == nucleophile_index else int(row["formal_charge"])),
-            )
-            for index, row in enumerate(atom_rows)
-        ),
-        bonds=tuple(
-            MolecularSimulationBond(atom_index_a=min(a, b), atom_index_b=max(a, b), order=order)
-            for a, b, order in sorted(bonds)
-        ),
-        positions=tuple(
-            MolecularVector3(
-                x=float(row["x"]) / 10.0,
-                y=float(row["y"]) / 10.0,
-                z=float(row["z"]) / 10.0,
-            )
-            for row in atom_rows
-        ),
-        source_solute_atom_count=len(atom_rows),
+    ligand = _objective_input(record, kinds=("ligand_structure",))
+    selection = _covalent_reaction_selection(record, store)
+
+    try:
+        result = build_covalent_qmmm_environment(
+            protein_payload=store.read(protein),
+            protein_content_sha256=protein.content_sha256,
+            ligand_payload=store.read(ligand),
+            ligand_media_type=ligand.media_type,
+            ligand_content_sha256=ligand.content_sha256,
+            selection=CovalentQMMMSelection(
+                protein_nucleophile_source_index=int(
+                    selection["protein_nucleophile_source_index"]
+                ),
+                ligand_electrophile_source_index=int(
+                    selection["ligand_electrophile_source_index"]
+                ),
+                ligand_leaving_group_source_index=int(
+                    selection["ligand_leaving_group_source_index"]
+                ),
+                protein_nucleophile_formal_charge=int(
+                    selection["protein_nucleophile_formal_charge"]
+                ),
+            ),
+        )
+    except CovalentQMMMStateError as error:
+        raise ScientificCapabilityFailure(
+            "covalent_qmmm_state_invalid",
+            str(error),
+        ) from None
+
+    return (
+        result.environment,
+        dict(result.indices),
+        result.partial_charges,
     )
-    # Accessing the periodic table here also validates every source element before OpenMM.
-    table = GetPeriodicTable()
-    for row in atom_rows:
-        if table.GetAtomicWeight(int(row["atomic_number"])) <= 0:
-            raise ScientificCapabilityFailure("unsupported_element", "The active site has an unsupported element.")
-    return environment, {
-        "nucleophile": nucleophile_index,
-        "electrophile": electrophile_index,
-        "leaving_sulfur": leaving_index,
-    }, tuple(charges)
-
-
 def _ts_node_artifact(
     record: ScientificExecutionRecord,
     *,
@@ -2357,10 +2969,24 @@ class TSQMRegionHandler:
         )
         preparation = next(item for item in results if item.artifact_type == "electronic_qm_region_preparation")
         molecules = tuple(item for item in results if item.artifact_type == "electronic_molecule")
-        selected = next(
-            item for item in molecules
-            if ElectronicMolecule.model_validate_json(self.runner.store.read(item)).spin == int(semantic["selected_spin"])
+        selected_candidates = tuple(
+            item
+            for item in molecules
+            if (
+                (model := ElectronicMolecule.model_validate_json(
+                    self.runner.store.read(item)
+                )).spin
+                == int(semantic["selected_spin"])
+                and model.molecular_charge
+                == int(semantic["selected_total_qm_charge"])
+            )
         )
+        if len(selected_candidates) != 1:
+            raise ScientificCapabilityFailure(
+                "reviewed_charge_spin_unavailable",
+                "The prepared QM region does not realize the reviewed total charge and spin.",
+            )
+        selected = selected_candidates[0]
         return ScientificCapabilityOutcome(
             output_artifacts=(preparation, selected),
             evidence_artifacts=results,
@@ -2393,7 +3019,7 @@ class TSInitialPathHandler:
         )
         nucleophile = indices["nucleophile"]
         electrophile = indices["electrophile"]
-        leaving = indices["leaving_sulfur"]
+        leaving = indices["leaving_group"]
         axis = coordinates[leaving] - coordinates[nucleophile]
         axis /= numpy.linalg.norm(axis)
         resolved_distance = 0.5 * (
@@ -2429,7 +3055,7 @@ class TSInitialPathHandler:
             artifact_type="transition_state_initial_path",
             payload=json.dumps(
                 {
-                    "method": "semantic_full_system_symmetric_s_c_s_interpolation",
+                    "method": "semantic_full_system_substitution_interpolation",
                     "optimization_surface": "hybrid_qmmm",
                     "initial_full_geometry_angstrom": coordinates.tolist(),
                     "resolved_reaction_distance_angstrom": float(resolved_distance),
@@ -2447,7 +3073,8 @@ class TSInitialPathHandler:
                     "restraint_reference_full_geometry_angstrom": coordinates.tolist(),
                     "restraint_force_constant_hartree_per_bohr2": restraint_force_constant,
                     "region_rationale": (
-                        "The resolved S-C-S triad remains active along the reaction axis with "
+                        "The resolved nucleophile-electrophile-leaving-group triad remains "
+                        "active along the reaction axis with "
                         "an explicit transverse harmonic restraint, while hydrogens directly "
                         "bonded to the electrophile move freely; "
                         "all other real particles remain frozen but contribute to every hybrid evaluation."
@@ -2579,7 +3206,7 @@ class TSTransitionSearchHandler:
         )
         forming_axis /= numpy.linalg.norm(forming_axis)
         breaking_axis = (
-            base_coordinates[indices["leaving_sulfur"]]
+            base_coordinates[indices["leaving_group"]]
             - base_coordinates[indices["electrophile"]]
         )
         breaking_axis /= numpy.linalg.norm(breaking_axis)
@@ -2587,7 +3214,7 @@ class TSTransitionSearchHandler:
         reaction_vector[active_offset[indices["electrophile"]]] += (
             forming_axis + breaking_axis
         )
-        reaction_vector[active_offset[indices["leaving_sulfur"]]] -= breaking_axis
+        reaction_vector[active_offset[indices["leaving_group"]]] -= breaking_axis
         reaction_vector = reaction_vector.reshape(-1)
         reaction_vector /= numpy.linalg.norm(reaction_vector)
         eigenvalues, eigenvectors = numpy.linalg.eigh(initial_hessian)
@@ -2602,7 +3229,10 @@ class TSTransitionSearchHandler:
             eigenvectors @ numpy.diag(guided_eigenvalues) @ eigenvectors.T
         )
 
-        maximum_steps = 120
+        # A retry is a complete, auditable optimizer attempt.  The first run
+        # preserves the validated Phase 8 budget; bounded workflow recovery may
+        # grant more iterations without silently changing the scientific method.
+        maximum_steps = 120 + (80 * max(invocation.attempt_number - 1, 0))
         try:
             with tempfile.TemporaryDirectory(prefix="cgr-hybrid-qmmm-ts-") as directory:
                 progress = run_optimizer(
@@ -2893,7 +3523,7 @@ class TSHybridFrequencyHandler:
             full_displacement = numpy.zeros((search.full_particle_count, 3))
             full_displacement[list(active)] = displacements[mode_index]
             forming = coordinates[indices["electrophile"]] - coordinates[indices["nucleophile"]]
-            breaking = coordinates[indices["leaving_sulfur"]] - coordinates[indices["electrophile"]]
+            breaking = coordinates[indices["leaving_group"]] - coordinates[indices["electrophile"]]
             forming /= numpy.linalg.norm(forming)
             breaking /= numpy.linalg.norm(breaking)
             forming_change = numpy.dot(
@@ -2901,7 +3531,7 @@ class TSHybridFrequencyHandler:
                 forming,
             )
             breaking_change = numpy.dot(
-                full_displacement[indices["leaving_sulfur"]] - full_displacement[indices["electrophile"]],
+                full_displacement[indices["leaving_group"]] - full_displacement[indices["electrophile"]],
                 breaking,
             )
             mode_norm = numpy.linalg.norm(full_displacement)
@@ -2962,6 +3592,49 @@ class TSHybridFrequencyHandler:
         )
 
 
+def _reaction_path_endpoint_evidence(
+    *,
+    transition_coordinates: object,
+    forward_endpoint: object,
+    reverse_endpoint: object,
+    normalized_mode: object,
+    active_indices: tuple[int, ...],
+    step_size_bohr: float,
+) -> dict[str, float | bool]:
+    """Evaluate two-sided endpoint identity along the verified imaginary mode."""
+
+    import numpy
+
+    transition = numpy.asarray(transition_coordinates, dtype=float)
+    forward = numpy.asarray(forward_endpoint, dtype=float)
+    reverse = numpy.asarray(reverse_endpoint, dtype=float)
+    mode = numpy.asarray(normalized_mode, dtype=float)
+    active = list(active_indices)
+    forward_projection = float(numpy.sum((forward - transition)[active] * mode[active]))
+    reverse_projection = float(numpy.sum((reverse - transition)[active] * mode[active]))
+    separation = float(numpy.linalg.norm(forward[active] - reverse[active]))
+    rmsd = float(numpy.sqrt(numpy.mean((forward[active] - reverse[active]) ** 2)))
+    minimum_excursion = 0.25 * step_size_bohr
+    minimum_separation = 0.5 * step_size_bohr
+    opposed = forward_projection * reverse_projection < 0.0
+    distinct = bool(
+        opposed
+        and min(abs(forward_projection), abs(reverse_projection))
+        >= minimum_excursion
+        and separation >= minimum_separation
+    )
+    return {
+        "forward_mode_projection_bohr": forward_projection,
+        "reverse_mode_projection_bohr": reverse_projection,
+        "endpoint_separation_bohr": separation,
+        "endpoint_rmsd_bohr": rmsd,
+        "minimum_mode_excursion_bohr": minimum_excursion,
+        "minimum_endpoint_separation_bohr": minimum_separation,
+        "opposed_mode_projections": opposed,
+        "distinct_endpoints": distinct,
+    }
+
+
 class TSReactionPathHandler:
     def __init__(self, store: ScientificPayloadStore, adapter: PySCFElectronicStructureAdapter) -> None:
         self.runner = _NativeRunner(store)
@@ -3001,7 +3674,16 @@ class TSReactionPathHandler:
         search_density = numpy.asarray(
             search_model.final_density_matrix_ao.values, dtype=float
         ).reshape(search_model.final_density_matrix_ao.shape)
-        imaginary = next(item for item in frequency_model.modes if item.significant_imaginary)
+        significant_modes = tuple(
+            item for item in frequency_model.modes if item.significant_imaginary
+        )
+        if len(significant_modes) != 1:
+            raise ScientificCapabilityFailure(
+                "transition_state_not_first_order_saddle",
+                "Reaction-path confirmation requires exactly one significant "
+                f"imaginary mode; frequency analysis found {len(significant_modes)}.",
+            )
+        imaginary = significant_modes[0]
         mode = numpy.asarray(imaginary.normalized_displacements.values, dtype=float).reshape(
             imaginary.normalized_displacements.shape
         )
@@ -3115,17 +3797,19 @@ class TSReactionPathHandler:
                     coordinates, evaluation, current_density = accepted
             endpoints[direction] = coordinates.copy()
             endpoint_energies[direction] = evaluation.total_energy_hartree
-        endpoint_rmsd = float(numpy.sqrt(numpy.mean(
-            (numpy.asarray(endpoints["forward"])[list(active)]
-             - numpy.asarray(endpoints["reverse"])[list(active)]) ** 2
-        )))
-        endpoint_separation = float(numpy.linalg.norm(
-            numpy.asarray(endpoints["forward"])[list(active)]
-            - numpy.asarray(endpoints["reverse"])[list(active)]
-        ))
+        endpoint_evidence = _reaction_path_endpoint_evidence(
+            transition_coordinates=transition_coordinates,
+            forward_endpoint=endpoints["forward"],
+            reverse_endpoint=endpoints["reverse"],
+            normalized_mode=weighted_mode,
+            active_indices=active,
+            step_size_bohr=step_size,
+        )
+        endpoint_rmsd = float(endpoint_evidence["endpoint_rmsd_bohr"])
+        endpoint_separation = float(endpoint_evidence["endpoint_separation_bohr"])
         forward_decreased = endpoint_energies["forward"] < transition_energy
         reverse_decreased = endpoint_energies["reverse"] < transition_energy
-        distinct = endpoint_separation > step_size
+        distinct = bool(endpoint_evidence["distinct_endpoints"])
         model = ElectronicReactionPathResult(
             schema_version=_VERSION,
             path_identifier=_stable_identifier(
@@ -3154,7 +3838,9 @@ class TSReactionPathHandler:
                 f"energy changes {endpoint_energies['forward'] - transition_energy:.6e} "
                 f"and {endpoint_energies['reverse'] - transition_energy:.6e} Ha; "
                 f"endpoint separation {endpoint_separation:.6e} Bohr "
-                f"(RMSD {endpoint_rmsd:.6e} Bohr).",
+                f"(RMSD {endpoint_rmsd:.6e} Bohr); imaginary-mode projections "
+                f"{float(endpoint_evidence['forward_mode_projection_bohr']):.6e} and "
+                f"{float(endpoint_evidence['reverse_mode_projection_bohr']):.6e} Bohr.",
                 retryable=True,
             )
         reference = self.runner.write_json(
@@ -3168,6 +3854,18 @@ class TSReactionPathHandler:
                 "hybrid_gradient_evaluation_count": potential.evaluation_count,
                 "endpoint_rmsd_bohr": endpoint_rmsd,
                 "endpoint_separation_bohr": endpoint_separation,
+                "forward_mode_projection_bohr": endpoint_evidence[
+                    "forward_mode_projection_bohr"
+                ],
+                "reverse_mode_projection_bohr": endpoint_evidence[
+                    "reverse_mode_projection_bohr"
+                ],
+                "minimum_mode_excursion_bohr": endpoint_evidence[
+                    "minimum_mode_excursion_bohr"
+                ],
+                "minimum_endpoint_separation_bohr": endpoint_evidence[
+                    "minimum_endpoint_separation_bohr"
+                ],
             },
         )
         return ScientificCapabilityOutcome(
@@ -3250,7 +3948,7 @@ def covalent_transition_state_registry(
     registry = ScientistCapabilityRegistry({
         "molecular.structure_ingestion": TSStructureIngestionHandler(store),
         "molecular.force_field_select": TSForceFieldSelectionHandler(store),
-        "molecular.protein_protonation_prepare": TSCysteinePreparationHandler(store),
+        "molecular.protein_protonation_prepare": TSReactionAtomPreparationHandler(store),
         "molecular.semantic_target_resolve": TSSemanticResolutionHandler(store),
         "molecular.protein_system_construct": TSSystemConstructionHandler(store, private_store),
         "electronic.qm_region_prepare": TSQMRegionHandler(store, pyscf_adapter),
@@ -3504,7 +4202,11 @@ class DiscoveryCampaignInitializeHandler:
         self.runner = _NativeRunner(store)
 
     @staticmethod
-    def campaign(objective: StructuredScientificObjective) -> DiscoveryCampaign:
+    def campaign(
+        objective: StructuredScientificObjective,
+        *,
+        generator_identifier: str,
+    ) -> DiscoveryCampaign:
         return DiscoveryCampaign(
             campaign_identifier=_stable_identifier("protein-ligand-campaign", objective.objective_identifier),
             description="Bounded protein-ligand discovery with RDKit preparation and native Vina pose evaluation.",
@@ -3541,14 +4243,25 @@ class DiscoveryCampaignInitializeHandler:
                 maximum_consecutive_invalid_generations=2,
             ),
             metadata={
-                "generator": "rdkit_scaffold_transform",
+                "generator": generator_identifier,
                 "docking_engine": "autodock_vina",
                 "minimum_generations": 2,
             },
         )
 
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
-        campaign = self.campaign(objective)
+        has_scientist_seed = any(
+            item.artifact_type in {"ligand_structure", "prepared_ligand"}
+            for item in record.artifact_references
+        )
+        campaign = self.campaign(
+            objective,
+            generator_identifier=(
+                "generator.rdkit_scaffold_transform"
+                if has_scientist_seed
+                else "generator.rdkit_de_novo_fragment_assembly"
+            ),
+        )
         parents = tuple(
             item for item in record.artifact_references
             if item.artifact_type in {"binding_pocket", "docking_receptor_pdbqt"}
@@ -3563,6 +4276,93 @@ class DiscoveryCampaignInitializeHandler:
         return ScientificCapabilityOutcome(output_artifacts=(reference,), evidence_artifacts=(reference,))
 
 
+class DiscoveryDesignLoopBindingHandler:
+    """Bind the canonical graph to the real Phase 5, 6, and 7 components."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        parents = tuple(
+            item
+            for item in record.artifact_references
+            if item.artifact_type
+            in {
+                "discovery_campaign",
+                "docking_receptor_pdbqt",
+                "binding_pocket",
+            }
+        )
+        if {item.artifact_type for item in parents} != {
+            "discovery_campaign",
+            "docking_receptor_pdbqt",
+            "binding_pocket",
+        }:
+            raise ScientificCapabilityFailure(
+                "discovery_design_loop_unbound",
+                "The molecular design loop is missing a campaign, prepared target, or binding region.",
+            )
+        payload = {
+            "schema": "pulsate.discovery-design-loop-contract/v1",
+            "phase_bindings": [
+                {
+                    "phase": "phase_3_4",
+                    "responsibility": "canonical_objective_plan_and_workflow_graph",
+                    "component": "cgr.workflow_graph.WorkflowOrchestrator",
+                },
+                {
+                    "phase": "phase_5",
+                    "responsibility": "structure_validation_conformer_preparation_and_pose_evaluation",
+                    "components": [
+                        "RDKitMolecularValidityChecker",
+                        "RDKitMolecularDescriptorEvaluator",
+                        "VinaMolecularDockingEvaluator",
+                    ],
+                },
+                {
+                    "phase": "phase_6",
+                    "responsibility": "candidate_scoped_evidence_verification",
+                    "component": "MolecularCandidateEvidenceVerifier",
+                },
+                {
+                    "phase": "phase_7",
+                    "responsibility": "generation_lineage_ranking_and_next_generation",
+                    "components": [
+                        "RDKitDeNovoMolecularCandidateGenerator",
+                        "RDKitMolecularCandidateGenerator",
+                        "DiscoveryCampaignRuntime",
+                    ],
+                },
+            ],
+            "required_stages": list(DiscoveryDesignLoopTraceHandler._REQUIRED_STAGES),
+            "candidate_lineage_required": True,
+            "candidate_verification_required": True,
+            "authorizes_execution": False,
+        }
+        reference = self.runner.write_json(
+            artifact_type="discovery_design_loop_contract",
+            payload=json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            producer="discovery.design_loop_bind",
+            execution_identifier=invocation.invocation_identifier,
+            parents=parents,
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(reference,),
+            evidence_artifacts=(reference,),
+            scientific_summary=(
+                "Bound candidate generation directly to validated preparation, "
+                "evaluation, verification, ranking, and next-generation components."
+            ),
+        )
+
+
 class DiscoveryCampaignIterationHandler:
     def __init__(self, store: ScientificPayloadStore, bridge: _DiscoveryArtifactBridge) -> None:
         self.runner = _NativeRunner(store)
@@ -3570,6 +4370,7 @@ class DiscoveryCampaignIterationHandler:
 
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
         import json
+        from rdkit import Chem
 
         campaign_reference = next(
             item for item in record.artifact_references if item.artifact_type == "discovery_campaign"
@@ -3580,15 +4381,87 @@ class DiscoveryCampaignIterationHandler:
         pocket_reference = next(
             item for item in record.artifact_references if item.artifact_type == "binding_pocket"
         )
+        contract_reference = next(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "discovery_design_loop_contract"
+        )
+        contract = json.loads(self.runner.store.read(contract_reference))
+        if (
+            contract.get("schema")
+            != "pulsate.discovery-design-loop-contract/v1"
+            or contract.get("candidate_lineage_required") is not True
+            or contract.get("candidate_verification_required") is not True
+            or tuple(contract.get("required_stages", ()))
+            != DiscoveryDesignLoopTraceHandler._REQUIRED_STAGES
+        ):
+            raise ScientificCapabilityFailure(
+                "discovery_design_loop_unbound",
+                "The Phase 3 through 7 molecular design-loop contract is invalid.",
+            )
         campaign = DiscoveryCampaign.model_validate_json(self.runner.store.read(campaign_reference))
         pocket = json.loads(self.runner.store.read(pocket_reference))
         receptor_pointer = self.bridge.register(receptor_reference)
-        generator = RDKitMolecularCandidateGenerator(
-            self.bridge,
-            # One generic aromatic seed is a starting scaffold, not a pre-ranked candidate list.
-            seed_smiles=("c1ccncc1",),
-            allowed_substituents=("C", "F"),
+        ligand_reference = next(
+            (
+                item
+                for item in record.artifact_references
+                if item.artifact_type in {"ligand_structure", "prepared_ligand"}
+            ),
+            None,
         )
+        if ligand_reference is not None:
+            ligand_payload = self.runner.store.read(ligand_reference)
+            try:
+                ligand_block = ligand_payload.decode("utf-8").split("$$$$", 1)[0]
+            except UnicodeDecodeError as error:
+                raise ScientificCapabilityFailure(
+                    "discovery_seed_invalid",
+                    "The reviewed molecular seed is not valid UTF-8 structure data.",
+                ) from error
+            molecule = Chem.MolFromMolBlock(
+                ligand_block,
+                removeHs=True,
+                sanitize=True,
+            )
+            if molecule is None:
+                raise ScientificCapabilityFailure(
+                    "discovery_seed_invalid",
+                    "The reviewed molecular seed could not be converted into one exact molecular identity.",
+                )
+            seed_smiles = (
+                str(
+                    Chem.MolToSmiles(
+                        molecule,
+                        canonical=True,
+                        isomericSmiles=True,
+                    )
+                ),
+            )
+            generator = RDKitMolecularCandidateGenerator(
+                self.bridge,
+                seed_smiles=seed_smiles,
+                allowed_substituents=("C", "F"),
+            )
+            generation_mode = "scientist_seeded_scaffold_optimization"
+            generation_source = ligand_reference.artifact_identifier
+        else:
+            generator = RDKitDeNovoMolecularCandidateGenerator(
+                self.bridge,
+                construction_fragments=(
+                    "C1CCCCC1",
+                    "C1CCNCC1",
+                    "c1ccccc1",
+                    "c1ccncc1",
+                ),
+                allowed_extensions=("C", "N", "O", "F"),
+                assembly_depth=2,
+                construction_policy_identifier=(
+                    "policy.rdkit_de_novo_fragments_v1"
+                ),
+            )
+            generation_mode = "de_novo_fragment_assembly"
+            generation_source = "policy.rdkit_de_novo_fragments_v1"
         checker = RDKitMolecularValidityChecker(self.bridge)
         descriptor = RDKitMolecularDescriptorEvaluator(
             self.bridge,
@@ -3629,11 +4502,19 @@ class DiscoveryCampaignIterationHandler:
             payload=run.to_canonical_json().encode(),
             producer="discovery.campaign_iterate",
             execution_identifier=invocation.invocation_identifier,
-            parents=(campaign_reference, receptor_reference, pocket_reference),
+            parents=(
+                campaign_reference,
+                contract_reference,
+                receptor_reference,
+                pocket_reference,
+            ),
             metadata={
                 "generation_count": len(run.state.generations),
                 "candidate_count": run.state.usage.candidates_generated,
                 "native_vina_evaluations": run.state.usage.expensive_evaluations,
+                "generation_mode": generation_mode,
+                "generation_source": generation_source,
+                "design_loop_contract": contract_reference.artifact_identifier,
             },
         )
         checkpoint_reference = self.runner.write_json(
@@ -3660,7 +4541,15 @@ class DiscoveryCampaignIterationHandler:
             ),
             limitations=(
                 "Vina scores rank generated poses and are not binding free energies.",
-                "This compact campaign samples bounded scaffold substitutions rather than exhaustive chemical space.",
+                (
+                    "This compact campaign samples bounded scientist-seeded scaffold "
+                    "transformations rather than exhaustive chemical space."
+                    if ligand_reference is not None
+                    else (
+                        "This compact campaign samples a declared de novo fragment-assembly "
+                        "policy rather than exhaustive chemical space or global novelty."
+                    )
+                ),
             ),
         )
 
@@ -3677,6 +4566,12 @@ class DiscoveryRankingVerificationHandler:
             item for item in record.artifact_references if item.artifact_type == "discovery_campaign_result"
         )
         run = DiscoveryCampaignRun.model_validate_json(self.runner.store.read(result_reference))
+        trace_reference = next(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "discovery_design_loop_trace"
+        )
+        trace = json.loads(self.runner.store.read(trace_reference))
         generations = run.state.generations
         verification_passed = (
             run.completed
@@ -3689,6 +4584,8 @@ class DiscoveryRankingVerificationHandler:
                 if record.candidate.candidate_identifier in generation.valid_candidate_identifiers
             )
             and all(generation.ranking is not None for generation in generations)
+            and trace.get("loop_complete") is True
+            and trace.get("run_fingerprint") == run.fingerprint
         )
         report_payload = {
             "objective_family": "candidate_ranking",
@@ -3709,7 +4606,7 @@ class DiscoveryRankingVerificationHandler:
             payload=json.dumps(report_payload, sort_keys=True, separators=(",", ":")).encode(),
             producer="scientific_verification.candidate_ranking",
             execution_identifier=invocation.invocation_identifier,
-            parents=(result_reference,),
+            parents=(result_reference, trace_reference),
             metadata={"passed": verification_passed},
         )
         if not verification_passed:
@@ -3720,6 +4617,351 @@ class DiscoveryRankingVerificationHandler:
         return ScientificCapabilityOutcome(
             output_artifacts=(report,), evidence_artifacts=(report,), verified=True
         )
+
+
+class DiscoveryDesignLoopTraceHandler:
+    """Project the Phase 7 run into a complete, candidate-scoped design-loop trace."""
+
+    _REQUIRED_STAGES = (
+        "generate_molecule",
+        "validate_structure",
+        "prepare_molecule_and_target",
+        "dock_or_simulate",
+        "refine_selected_candidates",
+        "verify_evidence",
+        "rank_candidates",
+        "design_next_generation",
+    )
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del objective
+        import json
+
+        result_reference = next(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "discovery_campaign_result"
+        )
+        checkpoint_reference = next(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "discovery_campaign_checkpoint"
+        )
+        contract_reference = next(
+            item
+            for item in record.artifact_references
+            if item.artifact_type == "discovery_design_loop_contract"
+        )
+        run = DiscoveryCampaignRun.model_validate_json(
+            self.runner.store.read(result_reference)
+        )
+        candidates: list[dict[str, object]] = []
+        selected_identifiers: list[str] = []
+        for generation in run.state.generations:
+            selected_identifiers.extend(generation.selected_candidate_identifiers)
+            for candidate_record in generation.candidate_records:
+                candidate = candidate_record.candidate
+                assessment = candidate_record.assessment
+                decision = candidate_record.selection_decision
+                candidates.append(
+                    {
+                        "candidate_identifier": candidate.candidate_identifier,
+                        "candidate_sha256": candidate.fingerprint,
+                        "generation": candidate.generation,
+                        "parent_candidate_identifiers": list(
+                            candidate.parent_candidate_identifiers
+                        ),
+                        "transformation": (
+                            candidate.transformation.model_dump(mode="json")
+                            if candidate.transformation is not None
+                            else None
+                        ),
+                        "properties_and_calculations": (
+                            [
+                                {
+                                    "objective_identifier": score.objective_identifier,
+                                    "value": score.value,
+                                    "normalized_value": score.normalized_value,
+                                    "uncertainty": score.uncertainty,
+                                    "evidence_identifiers": list(
+                                        score.evidence_identifiers
+                                    ),
+                                }
+                                for score in assessment.objective_scores
+                            ]
+                            if assessment is not None
+                            else []
+                        ),
+                        "evidence": (
+                            [item.model_dump(mode="json") for item in assessment.evidence_records]
+                            if assessment is not None
+                            else []
+                        ),
+                        "verification": (
+                            [item.model_dump(mode="json") for item in assessment.verification_records]
+                            if assessment is not None
+                            else []
+                        ),
+                        "selection": (
+                            decision.model_dump(mode="json")
+                            if decision is not None
+                            else None
+                        ),
+                    }
+                )
+        stages = [
+            {"stage": "generate_molecule", "evidence": "candidate identity and representation artifacts"},
+            {"stage": "validate_structure", "evidence": "hard candidate constraint results"},
+            {"stage": "prepare_molecule_and_target", "evidence": "RDKit conformer and prepared receptor artifacts"},
+            {"stage": "dock_or_simulate", "evidence": "native Vina pose artifacts and scores"},
+            {"stage": "refine_selected_candidates", "evidence": "ranked parent selection"},
+            {"stage": "verify_evidence", "evidence": "candidate-scoped verification reports"},
+            {"stage": "rank_candidates", "evidence": "multi-objective ranking and rationale"},
+            {"stage": "design_next_generation", "evidence": "parent transformations and lineage edges"},
+        ]
+        loop_complete = (
+            run.completed
+            and bool(candidates)
+            and bool(run.state.lineage.edges)
+            and all(generation.ranking is not None for generation in run.state.generations)
+            and tuple(item["stage"] for item in stages) == self._REQUIRED_STAGES
+        )
+        payload = {
+            "schema": "pulsate.discovery-design-loop/v1",
+            "run_fingerprint": run.fingerprint,
+            "design_loop_contract_identifier": (
+                contract_reference.artifact_identifier
+            ),
+            "loop_complete": loop_complete,
+            "stages": stages,
+            "candidates": candidates,
+            "lineage": [
+                item.model_dump(mode="json") for item in run.state.lineage.edges
+            ],
+            "selected_candidate_identifiers": sorted(set(selected_identifiers)),
+            "selection_policy": "verified_multi_objective_ranking",
+            "authorizes_execution": False,
+        }
+        if not loop_complete:
+            raise ScientificCapabilityFailure(
+                "discovery_design_loop_incomplete",
+                "Candidate generation, evaluation, ranking, or next-generation lineage is incomplete.",
+            )
+        trace = self.runner.write_json(
+            artifact_type="discovery_design_loop_trace",
+            payload=json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ).encode(),
+            producer="discovery.design_loop_trace",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(contract_reference, result_reference, checkpoint_reference),
+            metadata={
+                "generation_count": len(run.state.generations),
+                "candidate_count": len(candidates),
+                "lineage_edge_count": len(run.state.lineage.edges),
+            },
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(trace,),
+            evidence_artifacts=(trace,),
+            scientific_summary=(
+                "Persisted the complete generate, validate, prepare, dock, refine, "
+                "verify, rank, and next-generation design trace."
+            ),
+        )
+
+
+def _pdbqt_pose_atoms(payload: bytes) -> tuple[dict[str, object], ...]:
+    """Read the first persisted Vina pose without inferring missing atoms."""
+
+    atoms: list[dict[str, object]] = []
+    for line in payload.decode("utf-8").splitlines():
+        record = line[:6].strip().upper()
+        if record == "ENDMDL" and atoms:
+            break
+        if record not in {"ATOM", "HETATM"}:
+            continue
+        fields = line.split()
+        if len(line) < 54 or len(fields) < 2:
+            raise ScientificCapabilityFailure(
+                "discovery_pose_invalid",
+                "A persisted docking pose contains an invalid atom record.",
+            )
+        atom_type = fields[-1]
+        element = {
+            "A": "C",
+            "HD": "H",
+            "NA": "N",
+            "NS": "N",
+            "OA": "O",
+            "OS": "O",
+            "SA": "S",
+        }.get(atom_type, atom_type)
+        element = "".join(item for item in element if item.isalpha())
+        if not element:
+            raise ScientificCapabilityFailure(
+                "discovery_pose_invalid",
+                "A persisted docking pose has no resolvable atom element.",
+            )
+        try:
+            charge = float(fields[-2])
+            atom = {
+                "serial": int(line[6:11]),
+                "atom_name": line[12:16].strip(),
+                "element": element[0].upper() + element[1:].lower(),
+                "x": float(line[30:38]),
+                "y": float(line[38:46]),
+                "z": float(line[46:54]),
+                "partial_charge": charge,
+            }
+        except ValueError as error:
+            raise ScientificCapabilityFailure(
+                "discovery_pose_invalid",
+                "A persisted docking pose contains invalid coordinates or charge.",
+            ) from error
+        atoms.append(atom)
+    if not atoms:
+        raise ScientificCapabilityFailure(
+            "discovery_pose_invalid",
+            "A persisted docking pose contains no atoms.",
+        )
+    return tuple(atoms)
+
+
+def _candidate_pose_references(
+    run: DiscoveryCampaignRun,
+    references: Mapping[str, ArtifactReference],
+) -> tuple[tuple[str, ArtifactReference, float], ...]:
+    resolved: list[tuple[str, ArtifactReference, float]] = []
+    for generation in run.state.generations:
+        for candidate_record in generation.candidate_records:
+            assessment = candidate_record.assessment
+            if assessment is None:
+                continue
+            scores = {
+                item.objective_identifier: float(item.value)
+                for item in assessment.objective_scores
+            }
+            for evidence in assessment.evidence_records:
+                if evidence.stage_identifier != "autodock_vina_pose_generation":
+                    continue
+                for pointer in evidence.artifacts:
+                    reference = references.get(pointer.artifact_identifier)
+                    if (
+                        reference is not None
+                        and reference.artifact_type
+                        == "molecular_candidate_docking_poses_pdbqt"
+                    ):
+                        resolved.append(
+                            (
+                                candidate_record.candidate.candidate_identifier,
+                                reference,
+                                scores.get("vina_pose_score", 0.0),
+                            )
+                        )
+    return tuple(resolved)
+
+
+def _candidate_interactions(
+    *,
+    candidate_identifier: str,
+    protein_artifact_identifier: str,
+    protein_atoms: tuple[dict[str, object], ...],
+    pose_artifact_identifier: str,
+    pose_atoms: tuple[dict[str, object], ...],
+) -> list[dict[str, object]]:
+    metals = {"Ca", "Co", "Cu", "Fe", "Mg", "Mn", "Ni", "Zn"}
+    charged_positive = {"ARG", "HIS", "LYS"}
+    charged_negative = {"ASP", "GLU"}
+    contacts: list[dict[str, object]] = []
+    for protein_index, protein in enumerate(protein_atoms, start=1):
+        protein_element = str(protein["element"])
+        protein_charge = (
+            1
+            if protein["residue_name"] in charged_positive
+            else -1
+            if protein["residue_name"] in charged_negative
+            else 0
+        )
+        for pose_index, ligand in enumerate(pose_atoms, start=1):
+            ligand_element = str(ligand["element"])
+            distance = math.dist(
+                (float(protein["x"]), float(protein["y"]), float(protein["z"])),
+                (float(ligand["x"]), float(ligand["y"]), float(ligand["z"])),
+            )
+            interaction_type: str | None = None
+            method: str | None = None
+            if (
+                protein_element in metals
+                and ligand_element in {"N", "O", "S"}
+                and distance <= 2.8
+            ):
+                interaction_type = "metal_coordination"
+                method = "explicit_metal_donor_distance_le_2_8_angstrom"
+            elif (
+                protein_charge
+                and protein_charge * float(ligand["partial_charge"]) < 0
+                and abs(float(ligand["partial_charge"])) >= 0.2
+                and distance <= 4.0
+            ):
+                interaction_type = "ionic_contact"
+                method = "opposite_charge_and_distance_le_4_0_angstrom"
+            elif (
+                protein_element in {"N", "O", "S"}
+                and ligand_element in {"N", "O", "S"}
+                and distance <= 3.5
+            ):
+                interaction_type = "hydrogen_bond_compatible_contact"
+                method = "polar_atom_distance_le_3_5_angstrom"
+            elif (
+                protein_element in {"C", "S"}
+                and ligand_element in {"C", "S"}
+                and distance <= 4.5
+            ):
+                interaction_type = "hydrophobic_contact"
+                method = "nonpolar_atom_distance_le_4_5_angstrom"
+            if interaction_type is None:
+                continue
+            residue_identifier = (
+                f"chain-{str(protein['chain']).lower()}-residue-"
+                f"{str(protein['sequence']).lower()}-"
+                f"{str(protein['residue_name']).lower()}"
+            )
+            contacts.append(
+                {
+                    "interaction_identifier": _stable_identifier(
+                        "interaction",
+                        candidate_identifier,
+                        protein["serial"],
+                        ligand["serial"],
+                        interaction_type,
+                    ),
+                    "interaction_type": interaction_type,
+                    "candidate_identifier": candidate_identifier,
+                    "structure_artifact_identifiers": [
+                        protein_artifact_identifier,
+                        pose_artifact_identifier,
+                    ],
+                    "atom_identifiers": [
+                        f"atom-{protein_index:06d}-{protein['serial']}",
+                        f"atom-{pose_index:06d}-{ligand['serial']}",
+                    ],
+                    "residue_identifiers": [residue_identifier],
+                    "distance_angstrom": distance,
+                    "angle_degree": None,
+                    "calculation_method": method,
+                }
+            )
+    return sorted(
+        contacts,
+        key=lambda item: (
+            float(item["distance_angstrom"]),
+            str(item["interaction_identifier"]),
+        ),
+    )[:256]
 
 
 class DiscoverySceneHandler:
@@ -3735,9 +4977,111 @@ class DiscoverySceneHandler:
         )
         run = DiscoveryCampaignRun.model_validate_json(self.runner.store.read(result_reference))
         last = run.state.generations[-1]
+        protein_reference = _objective_input(record, kinds=("protein_structure",))
+        reference_map = {
+            item.artifact_identifier: item for item in record.artifact_references
+        }
+        pose_references = _candidate_pose_references(run, reference_map)
+        interactions: list[dict[str, object]] = []
+        for candidate_identifier, pose_reference, _score in pose_references:
+            interactions.extend(
+                _candidate_interactions(
+                    candidate_identifier=candidate_identifier,
+                    protein_artifact_identifier=protein_reference.artifact_identifier,
+                    protein_atoms=_pdb_atoms(self.runner.store.read(protein_reference)),
+                    pose_artifact_identifier=pose_reference.artifact_identifier,
+                    pose_atoms=_pdbqt_pose_atoms(
+                        self.runner.store.read(pose_reference)
+                    ),
+                )
+            )
+        interaction_payload = {
+            "schema": "pulsate.molecular-interaction-analysis/v1",
+            "method": "deterministic_element_charge_and_distance_rules",
+            "interaction_count": len(interactions),
+            "interactions": interactions,
+            "limitations": [
+                "Hydrogen-bond-compatible contacts require directional refinement before being called hydrogen bonds.",
+                "Hydrophobic and ionic contacts are geometry and charge-rule classifications, not free-energy decompositions.",
+            ],
+            "authorizes_execution": False,
+        }
+        interaction_reference = self.runner.write_json(
+            artifact_type="molecular_interaction_analysis",
+            payload=json.dumps(
+                interaction_payload, sort_keys=True, separators=(",", ":")
+            ).encode(),
+            producer="molecular.interaction_analyze",
+            execution_identifier=invocation.invocation_identifier,
+            parents=tuple(
+                {
+                    item.artifact_identifier: item
+                    for item in (
+                        protein_reference,
+                        *(pose_item[1] for pose_item in pose_references),
+                    )
+                }.values()
+            ),
+            metadata={"interaction_count": len(interactions)},
+        )
+        overlay_records: list[dict[str, object]] = []
+        for generation in run.state.generations:
+            for candidate_record in generation.candidate_records:
+                assessment = candidate_record.assessment
+                if assessment is None:
+                    continue
+                for score in assessment.objective_scores:
+                    overlay_records.append(
+                        {
+                            "overlay_identifier": score.score_identifier,
+                            "kind": "candidate_property",
+                            "label": score.objective_identifier.replace("_", " "),
+                            "structure_artifact_identifier": None,
+                            "candidate_identifier": candidate_record.candidate.candidate_identifier,
+                            "value": score.value,
+                            "unit": (
+                                "kcal/mol"
+                                if score.objective_identifier == "vina_pose_score"
+                                else None
+                            ),
+                            "atom_identifiers": [],
+                            "residue_identifiers": [],
+                            "verification_status": (
+                                "verified"
+                                if assessment.scientific_quality_passed
+                                else "failed"
+                            ),
+                            "uncertainty": score.uncertainty,
+                            "method": next(
+                                (
+                                    evidence.evaluator_identifier
+                                    for evidence in assessment.evidence_records
+                                    if evidence.evidence_identifier
+                                    in score.evidence_identifiers
+                                ),
+                                None,
+                            ),
+                        }
+                    )
+        overlay_reference = self.runner.write_json(
+            artifact_type="molecular_computational_overlay",
+            payload=json.dumps(
+                {
+                    "schema": "pulsate.molecular-computational-overlay/v1",
+                    "overlays": overlay_records,
+                    "authorizes_execution": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            producer="molecular.computational_overlay_project",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(result_reference,),
+            metadata={"overlay_count": len(overlay_records)},
+        )
         scene_payload = {
             "scene_kind": "autonomous_molecular_discovery",
-            "protein_artifact_identifier": _objective_input(record, kinds=("protein_structure",)).artifact_identifier,
+            "protein_artifact_identifier": protein_reference.artifact_identifier,
             "binding_pocket_artifact_identifier": next(
                 item.artifact_identifier for item in record.artifact_references if item.artifact_type == "binding_pocket"
             ),
@@ -3749,6 +5093,8 @@ class DiscoverySceneHandler:
                 item.artifact_identifier for item in record.artifact_references
                 if item.artifact_type == "molecular_candidate_docking_poses_pdbqt"
             ],
+            "interaction_artifact_identifier": interaction_reference.artifact_identifier,
+            "computational_overlay_artifact_identifier": overlay_reference.artifact_identifier,
             "computational_state": "verified_campaign_complete",
         }
         scene = self.runner.write_json(
@@ -3756,10 +5102,11 @@ class DiscoverySceneHandler:
             payload=json.dumps(scene_payload, sort_keys=True, separators=(",", ":")).encode(),
             producer="molecular.scene_project",
             execution_identifier=invocation.invocation_identifier,
-            parents=(result_reference,),
+            parents=(result_reference, interaction_reference, overlay_reference),
         )
         return ScientificCapabilityOutcome(
-            output_artifacts=(scene,), evidence_artifacts=(scene,),
+            output_artifacts=(interaction_reference, overlay_reference, scene),
+            evidence_artifacts=(interaction_reference, overlay_reference, scene),
             scene_identifier=scene.artifact_identifier,
         )
 
@@ -3778,7 +5125,9 @@ def protein_ligand_discovery_registry(
         "molecular.binding_pocket_resolve": BindingPocketResolutionHandler(store),
         "molecular.docking_receptor_prepare": DiscoveryReceptorPreparationHandler(store, meeko_adapter),
         "discovery.campaign_initialize": DiscoveryCampaignInitializeHandler(store),
+        "discovery.design_loop_bind": DiscoveryDesignLoopBindingHandler(store),
         "discovery.campaign_iterate": DiscoveryCampaignIterationHandler(store, bridge),
+        "discovery.design_loop_trace": DiscoveryDesignLoopTraceHandler(store),
         "scientific_verification.candidate_ranking": DiscoveryRankingVerificationHandler(store),
         "molecular.scene_project": DiscoverySceneHandler(store),
     })

@@ -14,6 +14,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from cgr.protein_design import resolve_protein_residue_count
 from cgr.science.canonical import validate_identifier
 
 from .scientific_capability_catalogue import (
@@ -21,6 +22,7 @@ from .scientific_capability_catalogue import (
     phase8_scientific_capability_catalogue,
     public_capability_name,
 )
+from .scientific_requirements import ValidatedResearchRequirements
 
 ScientificTask = Literal[
     "covalent_transition_state",
@@ -28,6 +30,7 @@ ScientificTask = Literal[
     "bond_dissociation_scan",
     "solvated_conformer_comparison",
     "protein_ligand_discovery",
+    "composed_research",
 ]
 
 
@@ -54,7 +57,7 @@ class ScientificSemanticTarget(BaseModel):
     ligand_reference_identifier: str | None = None
     target_kind: Literal[
         "catalytic_nucleophile", "metal_coordination_shell", "named_bond",
-        "conformer_labels", "binding_pocket",
+        "conformer_labels", "binding_pocket", "whole_structure", "designed_protein",
     ]
     target_label: str
     chain_label: str | None = None
@@ -69,8 +72,51 @@ class ScientificSemanticTarget(BaseModel):
         normalized = value.strip()
         if not normalized or len(normalized) > 256:
             raise ValueError("Semantic target labels must be bounded nonblank text.")
-        if re.search(r"\b(?:atom|orbital|particle)[_-]?index\b", normalized, re.I):
+        if re.search(r"\b(?:atom|orbital|particle)[_-]?index\b", normalized, re.IGNORECASE):
             raise ValueError("Scientist intent cannot inject internal computational indices.")
+        return normalized
+
+
+class CovalentReactionTarget(BaseModel):
+    """Scientist-reviewed chemical semantics for a covalent substitution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reaction_family: Literal["covalent_substitution"] = "covalent_substitution"
+    protein_chain_label: str
+    protein_residue_sequence: str
+    protein_residue_name: str | None = None
+    protein_atom_name: str
+    protein_nucleophile_formal_charge: int = Field(ge=-8, le=8)
+    ligand_reaction_smarts: str = Field(min_length=1, max_length=2048)
+    selected_total_qm_charge: int = Field(ge=-32, le=32)
+    selected_spin: int = Field(ge=0, le=12)
+
+    @field_validator(
+        "protein_chain_label",
+        "protein_residue_sequence",
+        "protein_residue_name",
+        "protein_atom_name",
+    )
+    @classmethod
+    def bounded_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized or len(normalized) > 32:
+            raise ValueError("Reaction atom identities must be bounded nonblank text.")
+        return normalized
+
+    @field_validator("ligand_reaction_smarts")
+    @classmethod
+    def mapped_reaction_smarts(cls, value: str) -> str:
+        normalized = value.strip()
+        maps = tuple(int(item) for item in re.findall(r":(\d+)\]", normalized))
+        if sorted(maps) != [1, 2]:
+            raise ValueError(
+                "Ligand reaction SMARTS must contain exactly atom maps :1 "
+                "(electrophile) and :2 (leaving group)."
+            )
         return normalized
 
 
@@ -91,8 +137,10 @@ class StructuredScientificObjective(BaseModel):
     objective_identifier: str
     original_request: str = Field(min_length=1, max_length=8192)
     task_type: ScientificTask
+    research_requirements: ValidatedResearchRequirements | None = None
     input_references: tuple[ScientificInputReference, ...] = ()
     semantic_target: ScientificSemanticTarget
+    covalent_reaction_target: CovalentReactionTarget | None = None
     solvent: str | None = None
     scan_point_count: int | None = Field(default=None, ge=3, le=101)
     scan_start_angstrom: float | None = Field(default=None, gt=0)
@@ -124,16 +172,39 @@ class StructuredScientificObjective(BaseModel):
 
     @model_validator(mode="after")
     def consistent(self) -> Self:
+        if self.research_requirements is not None and self.task_type != "composed_research":
+            raise ValueError("Validated general requirements require composed research.")
+        if self.task_type == "composed_research" and self.research_requirements is None:
+            raise ValueError("Composed research requires validated general requirements.")
+        capability_profile = (
+            self.research_requirements.capability_profile
+            if self.research_requirements is not None
+            else self.task_type
+        )
         scan_values = (self.scan_point_count, self.scan_start_angstrom, self.scan_end_angstrom)
-        if self.task_type == "bond_dissociation_scan":
-            if any(value is None for value in scan_values):
+        if capability_profile == "bond_dissociation_scan":
+            if any(value is None for value in scan_values) and not (
+                self.clarification_required and all(value is None for value in scan_values)
+            ):
                 raise ValueError("Bond scans require point count and both endpoints.")
-            if self.scan_start_angstrom >= self.scan_end_angstrom:  # type: ignore[operator]
+            if (
+                self.scan_start_angstrom is not None
+                and self.scan_end_angstrom is not None
+                and self.scan_start_angstrom >= self.scan_end_angstrom
+            ):
                 raise ValueError("Bond-scan endpoints must increase.")
         elif any(value is not None for value in scan_values):
             raise ValueError("Only bond scans may carry scan controls.")
-        if self.task_type == "solvated_conformer_comparison" and self.solvent is None:
+        if (
+            self.task_type == "solvated_conformer_comparison"
+            or capability_profile == "solvated_conformer_comparison"
+        ) and (
+            self.solvent is None
+            and not self.clarification_required
+        ):
             raise ValueError("Solvated conformer comparison requires a solvent.")
+        if capability_profile != "covalent_transition_state" and self.covalent_reaction_target:
+            raise ValueError("Only covalent transition states may carry reaction semantics.")
         return self
 
 
@@ -181,9 +252,9 @@ class ScientificWorkflowPlan(BaseModel):
 _DISTANCE_RANGE = re.compile(
     r"(?P<start>\d+(?:\.\d+)?)\s*(?:å|a|angstroms?)?\s+to\s+"
     r"(?P<end>\d+(?:\.\d+)?)\s*(?:å|a|angstroms?)?",
-    re.I,
+    re.IGNORECASE,
 )
-_POINTS = re.compile(r"\b(?P<count>\d{1,3})[-\s]?point\b", re.I)
+_POINTS = re.compile(r"\b(?P<count>\d{1,3})[-\s]?point\b", re.IGNORECASE)
 
 
 def compile_scientific_objective(
@@ -191,6 +262,8 @@ def compile_scientific_objective(
     *,
     input_references: tuple[ScientificInputReference, ...] = (),
     budget: ScientificExecutionBudget | None = None,
+    covalent_reaction_target: CovalentReactionTarget | None = None,
+    research_requirements: ValidatedResearchRequirements | None = None,
 ) -> StructuredScientificObjective:
     """Classify broad molecular intent without making it directly executable."""
 
@@ -201,7 +274,24 @@ def compile_scientific_objective(
     if re.search(r"\b(?:atom|orbital|particle)[_-]?index\s*[:=]", lowered):
         raise ValueError("Natural-language intent cannot inject internal indices.")
 
-    if "transition state" in lowered or ("covalent" in lowered and "reaction" in lowered):
+    if research_requirements is not None:
+        task: ScientificTask = "composed_research"
+        target_kind = (
+            "binding_pocket"
+            if research_requirements.capability_profile == "protein_ligand_discovery"
+            else (
+                "whole_structure"
+                if research_requirements.capability_profile == "structure_analysis"
+                else (
+                    "designed_protein"
+                    if research_requirements.capability_profile
+                    == "de_novo_protein_design"
+                    else "conformer_labels"
+                )
+            )
+        )
+        target_label = "scientist-confirmed general research requirements"
+    elif "transition state" in lowered or ("covalent" in lowered and "reaction" in lowered):
         task: ScientificTask = "covalent_transition_state"
         target_kind = "catalytic_nucleophile"
         target_label = "covalent bond formation at catalytic nucleophile"
@@ -226,21 +316,50 @@ def compile_scientific_objective(
 
     protein_refs = [item.reference_identifier for item in input_references if item.artifact_type in {"protein_structure", "prepared_receptor"}]
     ligand_refs = [item.reference_identifier for item in input_references if item.artifact_type in {"ligand_structure", "prepared_ligand"}]
+    structure_refs = [
+        item.reference_identifier
+        for item in input_references
+        if item.artifact_type
+        in {
+            "protein_structure",
+            "ligand_structure",
+            "molecular_structure",
+            "prepared_receptor",
+            "prepared_ligand",
+        }
+    ]
     ambiguities: list[str] = []
-    needs_protein = task in {"covalent_transition_state", "metal_active_site_quantum", "protein_ligand_discovery"}
-    needs_ligand = task == "covalent_transition_state"
+    capability_profile = (
+        research_requirements.capability_profile
+        if research_requirements is not None
+        else task
+    )
+    needs_protein = capability_profile in {"covalent_transition_state", "metal_active_site_quantum", "protein_ligand_discovery"}
+    needs_ligand = capability_profile == "covalent_transition_state"
     if needs_protein and len(protein_refs) != 1:
         ambiguities.append("Exactly one protein structure must be resolved.")
     if needs_ligand and len(ligand_refs) != 1:
         ambiguities.append("Exactly one ligand structure must be resolved.")
+    if capability_profile == "structure_analysis" and len(structure_refs) != 1:
+        ambiguities.append("Exactly one structure must be resolved for analysis.")
+    if capability_profile == "de_novo_protein_design":
+        _, _, residue_count_reason = resolve_protein_residue_count(normalized)
+        if residue_count_reason is not None:
+            ambiguities.append(residue_count_reason)
+    if capability_profile == "covalent_transition_state" and covalent_reaction_target is None:
+        ambiguities.append(
+            "The protein reaction atom, mapped ligand reaction SMARTS, charge, "
+            "and spin must be explicitly reviewed."
+        )
+    if capability_profile != "covalent_transition_state" and covalent_reaction_target is not None:
+        raise ValueError("Reaction semantics are only valid for covalent transition states.")
 
     scan_count = scan_start = scan_end = None
-    if task == "bond_dissociation_scan":
+    if capability_profile == "bond_dissociation_scan":
         points = _POINTS.search(normalized)
         distance = _DISTANCE_RANGE.search(normalized)
         if points is None or distance is None:
             ambiguities.append("Bond scan point count and distance endpoints are required.")
-            scan_count, scan_start, scan_end = 15, 1.2, 2.8
         else:
             scan_count = int(points.group("count"))
             scan_start = float(distance.group("start"))
@@ -251,27 +370,40 @@ def compile_scientific_objective(
         if any(alias in lowered for alias in aliases):
             solvent = name
             break
-    if task == "solvated_conformer_comparison" and solvent is None:
+    if capability_profile == "solvated_conformer_comparison" and solvent is None:
         ambiguities.append("A solvent identity is required for solvated comparison.")
-        solvent = "water"
 
     quantum = "none"
-    if task == "metal_active_site_quantum":
+    if capability_profile == "metal_active_site_quantum":
         quantum = "ibm_quantum" if "ibm" in lowered else "local_simulator"
-    digest = hashlib.sha256((normalized + repr(input_references)).encode()).hexdigest()[:32]
+    digest = hashlib.sha256(
+        (
+            normalized
+            + repr(input_references)
+            + repr(covalent_reaction_target)
+            + repr(budget)
+            + (
+                research_requirements.model_dump_json()
+                if research_requirements is not None
+                else ""
+            )
+        ).encode()
+    ).hexdigest()[:32]
     active_policy = (
-        "reaction_center_automatic" if task in {"covalent_transition_state", "bond_dissociation_scan"}
-        else "metal_ligand_automatic" if task == "metal_active_site_quantum"
+        "reaction_center_automatic" if capability_profile in {"covalent_transition_state", "bond_dissociation_scan"}
+        else "metal_ligand_automatic" if capability_profile == "metal_active_site_quantum"
         else "not_requested"
     )
     return StructuredScientificObjective(
         objective_identifier=f"scientific-objective-{digest}", original_request=normalized,
         task_type=task, input_references=input_references,
+        research_requirements=research_requirements,
         semantic_target=ScientificSemanticTarget(
             protein_reference_identifier=protein_refs[0] if len(protein_refs) == 1 else None,
             ligand_reference_identifier=ligand_refs[0] if len(ligand_refs) == 1 else None,
             target_kind=target_kind, target_label=target_label,
-        ), solvent=solvent, scan_point_count=scan_count,
+        ), covalent_reaction_target=covalent_reaction_target,
+        solvent=solvent, scan_point_count=scan_count,
         scan_start_angstrom=scan_start, scan_end_angstrom=scan_end,
         active_space_policy=active_policy, quantum_execution_target=quantum,
         budget=budget or ScientificExecutionBudget(),
@@ -288,11 +420,19 @@ def plan_scientific_objective(
     """Compose a capability DAG by recursively satisfying artifact requirements."""
 
     catalogue = catalogue or phase8_scientific_capability_catalogue()
-    required = ["scientist_facing_result"]
+    required = list(
+        objective.research_requirements.required_artifact_types
+        if objective.research_requirements is not None
+        else ("scientist_facing_result",)
+    )
     if objective.quantum_execution_target == "ibm_quantum":
         required.append("authorization_request")
     definitions = catalogue.compose(
-        task_type=objective.task_type,
+        task_type=(
+            objective.research_requirements.capability_profile
+            if objective.research_requirements is not None
+            else objective.task_type
+        ),
         available_artifact_types=("scientist_input",),
         required_artifact_types=tuple(required),
     )

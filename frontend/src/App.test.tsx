@@ -13,7 +13,7 @@ const hooks = vi.hoisted(() => ({
   existingRun: vi.fn(),
   molecularProject: vi.fn(),
   molecularPlanning: vi.fn(),
-  naturalLanguage: vi.fn(),
+  research: vi.fn(),
   presetRun: vi.fn(),
 }))
 
@@ -21,7 +21,7 @@ vi.mock('./hooks/useExperimentWorkspace', () => ({ useExperimentWorkspace: hooks
 vi.mock('./hooks/useExistingRun', () => ({ useExistingRun: hooks.existingRun }))
 vi.mock('./hooks/useMolecularProjectScene', () => ({ useMolecularProjectScene: hooks.molecularProject }))
 vi.mock('./hooks/useMolecularPlanning', () => ({ useMolecularPlanning: hooks.molecularPlanning }))
-vi.mock('./hooks/useNaturalLanguageExperiment', () => ({ useNaturalLanguageExperiment: hooks.naturalLanguage }))
+vi.mock('./hooks/useResearchSession', () => ({ useResearchSession: hooks.research }))
 vi.mock('./hooks/usePresetRun', () => ({ usePresetRun: hooks.presetRun }))
 vi.mock('./components/Header', () => ({ Header: ({ runControl }: { runControl: React.ReactNode }) => <header>{runControl}</header> }))
 vi.mock('./components/ErrorNotice', () => ({ ErrorNotice: () => null }))
@@ -35,7 +35,7 @@ vi.mock('./components/MolecularViewer', () => ({
 }))
 vi.mock('./components/MolecularProjectPanel', () => ({ MolecularProjectPanel: () => <aside>Project inspector</aside> }))
 vi.mock('./components/ScientificPanel', () => ({ ScientificPanel: () => <aside>Run evidence</aside> }))
-vi.mock('./components/NaturalLanguageWorkspace', () => ({ NaturalLanguageWorkspace: () => null }))
+vi.mock('./components/ResearchWorkspace', () => ({ ResearchWorkspace: () => null }))
 vi.mock('./components/EmptyInspector', () => ({ EmptyInspector: () => null }))
 
 const coordinateScene = normalizeScene(currentFixtureScene)
@@ -97,7 +97,7 @@ function states() {
   hooks.existingRun.mockImplementation(() => existing)
   hooks.molecularProject.mockImplementation(() => project)
   hooks.molecularPlanning.mockReturnValue({ result: null, loading: false, error: null, evaluate: vi.fn() })
-  hooks.naturalLanguage.mockReturnValue({})
+  hooks.research.mockReturnValue({ scene: null })
   hooks.presetRun.mockReturnValue({ error: null })
   return { workspace, existing, project }
 }

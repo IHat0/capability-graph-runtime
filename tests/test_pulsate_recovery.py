@@ -33,7 +33,15 @@ def _hold_recovery_lock(root: str, ready: object, release: object) -> None:
 
 def _state(root: Path) -> Path:
     root.mkdir()
-    for name in ("experiments", "interpretations", "runs", "workflows"):
+    for name in (
+        "experiments",
+        "interpretations",
+        "research-sessions",
+        "runs",
+        "scientific-executions",
+        "scientific-workflows",
+        "workflows",
+    ):
         directory = root / name
         directory.mkdir()
         (directory / "state.json").write_text(
@@ -43,6 +51,12 @@ def _state(root: Path) -> Path:
     artifacts = MolecularArtifactRepository(root / "molecular-artifacts")
     artifacts.start()
     artifacts.close()
+    scientific_artifacts = MolecularArtifactRepository(root / "scientific-artifacts")
+    scientific_artifacts.start()
+    scientific_artifacts.close()
+    private_state = MolecularArtifactRepository(root / "scientific-private-state")
+    private_state.start()
+    private_state.close()
     projects = MolecularProjectRepository(root / "molecular-projects")
     projects.start()
     projects.close()
@@ -67,7 +81,12 @@ def test_inventory_matches_actual_production_data_layout() -> None:
                 "interpretations",
                 "molecular-artifacts",
                 "molecular-projects",
+                "research-sessions",
                 "runs",
+                "scientific-artifacts",
+                "scientific-executions",
+                "scientific-private-state",
+                "scientific-workflows",
                 "security-audit",
                 "workflows",
             )

@@ -9,12 +9,35 @@ function finiteNumber(value: unknown): number | undefined {
 
 export function normalizeScene(raw: SceneResponse, detail?: PresetDetailResponse): MolecularScene {
   coordinateUnit(raw.coordinate_unit)
-  const atoms = raw.atoms.map((atom) => ({
-    id: atom.atom_identifier,
-    element: atom.element,
-    position: [...atom.coordinates] as [number, number, number],
-    label: atom.atom_identifier,
-  }))
+  const atoms = raw.atoms.map((atom) => {
+    const residueId = atom.residue_sequence && atom.residue_name
+      ? `chain-${(atom.chain_identifier ?? 'blank').toLowerCase()}-residue-${atom.residue_sequence.toLowerCase()}-${atom.residue_name.toLowerCase()}`
+      : undefined
+    const partialCharge = finiteNumber(atom.partial_charge)
+    const hasStructureMetadata = Boolean(
+      atom.atom_name || atom.residue_name || atom.chain_identifier || atom.residue_sequence
+      || atom.source_atom_identifier || atom.structure_artifact_identifier
+      || partialCharge !== undefined,
+    )
+    return {
+      id: atom.atom_identifier,
+      element: atom.element,
+      position: [...atom.coordinates] as [number, number, number],
+      label: atom.atom_name ?? atom.atom_identifier,
+      ...(residueId ? { residueId } : {}),
+      ...(atom.source_atom_identifier ? { sourceAtomId: atom.source_atom_identifier } : {}),
+      ...(atom.structure_artifact_identifier || raw.structure_identifier
+        ? { structureArtifactId: atom.structure_artifact_identifier ?? raw.structure_identifier }
+        : {}),
+      ...(partialCharge === undefined ? {} : { partialCharge }),
+      ...(hasStructureMetadata ? { provenance: {
+        atom_name: atom.atom_name,
+        residue_name: atom.residue_name,
+        chain_identifier: atom.chain_identifier,
+        residue_sequence: atom.residue_sequence,
+      } } : {}),
+    }
+  })
   const atomById = new Map(atoms.map((atom) => [atom.id, atom]))
   const explicitBonds: MolecularBond[] = (raw.bonds ?? []).flatMap((bond) => {
     if (bond.atom_identifiers.length < 2) return []

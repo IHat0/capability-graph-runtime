@@ -9,7 +9,11 @@ from pydantic import Field, field_validator, model_validator
 
 from cgr.science.capabilities import CapabilityEstimateType
 from cgr.science.canonical import CanonicalModel, sha256_fingerprint, validate_identifier
-from cgr.science.planning import CandidatePlanAssignment, CandidateResearchPlan
+from cgr.science.planning import (
+    CandidatePlanArtifactFlow,
+    CandidatePlanAssignment,
+    CandidateResearchPlan,
+)
 
 from .contracts import (
     ApprovalRequirement,
@@ -111,7 +115,9 @@ class WorkflowGraphCompiler:
             graph_identifier, label="workflow graph identifier"
         )
 
-        assignments = self._ordered_assignments(plan, policy.ordering)
+        assignments = self._ordered_assignments(
+            plan, policy.ordering, artifact_flows=plan.artifact_flows
+        )
         if not assignments:
             raise WorkflowCompilationError(
                 "A candidate plan without selected assignments cannot be compiled."
@@ -122,13 +128,23 @@ class WorkflowGraphCompiler:
             for assignment in assignments
             for artifact_type in assignment.input_artifact_types
         }
-        ambiguous = tuple(
-            sorted(
-                artifact_type
-                for artifact_type, producer_assignments in producers.items()
-                if artifact_type in consumed_types and len(producer_assignments) > 1
+        explicit_sources = {
+            (flow.destination_assignment_identifier, flow.artifact_type): (
+                flow.source_assignment_identifier
             )
-        )
+            for flow in plan.artifact_flows
+        }
+        ambiguous = tuple(sorted({
+            artifact_type
+            for assignment in assignments
+            for artifact_type in assignment.input_artifact_types
+            if (
+                artifact_type in consumed_types
+                and len(producers.get(artifact_type, ())) > 1
+                and (assignment.assignment_identifier, artifact_type)
+                not in explicit_sources
+            )
+        }))
         if ambiguous:
             raise WorkflowCompilationError(
                 "Candidate plan artifact flow is ambiguous for: " + ",".join(ambiguous)
@@ -151,6 +167,10 @@ class WorkflowGraphCompiler:
                     port_type=PortType.ARTIFACT,
                     artifact_kind=artifact_type,
                     required=True,
+                    multiple=(
+                        artifact_type not in producers
+                        and len(assignment.input_artifacts) > 1
+                    ),
                     external=artifact_type not in producers,
                 )
                 for artifact_type in assignment.input_artifact_types
@@ -257,7 +277,18 @@ class WorkflowGraphCompiler:
                 producer_assignments = producers.get(artifact_type, ())
                 if not producer_assignments:
                     continue
-                producer_assignment = producer_assignments[0]
+                explicit_source = explicit_sources.get(
+                    (assignment.assignment_identifier, artifact_type)
+                )
+                producer_assignment = (
+                    next(
+                        item
+                        for item in producer_assignments
+                        if item.assignment_identifier == explicit_source
+                    )
+                    if explicit_source is not None
+                    else producer_assignments[0]
+                )
                 if producer_assignment.assignment_identifier == assignment.assignment_identifier:
                     raise WorkflowCompilationError(
                         "Candidate plan artifact flow contains a self-dependency."
@@ -382,7 +413,11 @@ class WorkflowGraphCompiler:
 
     @classmethod
     def _ordered_assignments(
-        cls, plan: CandidateResearchPlan, ordering: AssignmentOrdering
+        cls,
+        plan: CandidateResearchPlan,
+        ordering: AssignmentOrdering,
+        *,
+        artifact_flows: tuple[CandidatePlanArtifactFlow, ...] = (),
     ) -> tuple[CandidatePlanAssignment, ...]:
         assignments = plan.selected_assignments
         if ordering is AssignmentOrdering.PLAN_ORDER or len(assignments) < 2:
@@ -391,8 +426,22 @@ class WorkflowGraphCompiler:
         by_identifier = {item.assignment_identifier: item for item in assignments}
         prerequisites: dict[str, set[str]] = {identifier: set() for identifier in by_identifier}
         successors: dict[str, set[str]] = {identifier: set() for identifier in by_identifier}
+        explicit_destinations = {
+            (flow.destination_assignment_identifier, flow.artifact_type)
+            for flow in artifact_flows
+        }
+        for flow in artifact_flows:
+            producer = flow.source_assignment_identifier
+            destination = flow.destination_assignment_identifier
+            prerequisites[destination].add(producer)
+            successors[producer].add(destination)
         for assignment in assignments:
             for artifact_type in assignment.input_artifact_types:
+                if (
+                    assignment.assignment_identifier,
+                    artifact_type,
+                ) in explicit_destinations:
+                    continue
                 candidates = producers.get(artifact_type, ())
                 if len(candidates) != 1:
                     continue

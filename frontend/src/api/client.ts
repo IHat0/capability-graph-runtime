@@ -17,6 +17,13 @@ import type {
   FetchedMolecularResource,
   ProjectedMolecularSceneMetadata,
   ProjectedMolecularStructureMetadata,
+  ResearchArtifactReference,
+  ResearchInputArtifactType,
+  ResearchInputReference,
+  ResearchInputUpload,
+  ResearchSessionResponse,
+  ResearchVisualizationWorkspace,
+  UploadedResearchInput,
 } from './types'
 import {
   MOLECULAR_RESOURCE_MAXIMUM_BYTES,
@@ -348,6 +355,248 @@ function parseScene(value: unknown): SceneResponse {
   return value as unknown as SceneResponse
 }
 
+const researchStatuses = new Set([
+  'understanding', 'awaiting_clarification', 'awaiting_approval', 'planned',
+  'running', 'verifying', 'replanning', 'completed', 'failed',
+])
+
+function isResearchArtifactReference(value: unknown): value is ResearchArtifactReference {
+  return isRecord(value)
+    && hasString(value, 'artifact_identifier')
+    && hasString(value, 'artifact_type')
+    && hasString(value, 'media_type')
+    && hasString(value, 'content_sha256')
+    && (value.byte_size === null || (isFiniteNumber(value.byte_size) && Number.isInteger(value.byte_size) && value.byte_size >= 0))
+    && isRecord(value.schema_version)
+    && isRecord(value.provenance)
+    && isRecord(value.metadata)
+    && Array.isArray(value.parents)
+}
+
+function parseResearchArtifact(value: unknown): ResearchArtifactReference {
+  if (!isResearchArtifactReference(value) || containsCredentialField(value)) {
+    malformed('The backend returned malformed or unsafe research artifact evidence.')
+  }
+  return value
+}
+
+function isResearchInputReference(value: unknown): value is ResearchInputReference {
+  return isRecord(value)
+    && hasString(value, 'reference_identifier')
+    && hasString(value, 'artifact_type')
+    && hasString(value, 'artifact_identifier')
+}
+
+function isResearchEvidenceProposal(value: unknown): boolean {
+  return isRecord(value)
+    && hasString(value, 'proposal_identifier')
+    && hasString(value, 'source_kind')
+    && hasString(value, 'summary')
+    && Array.isArray(value.input_references)
+    && value.input_references.every(isResearchInputReference)
+    && Array.isArray(value.artifact_references)
+    && value.artifact_references.every(isResearchArtifactReference)
+    && Array.isArray(value.supporting_quotes)
+    && value.supporting_quotes.every((quote) => isRecord(quote)
+      && hasString(quote, 'field_name')
+      && hasString(quote, 'turn_identifier')
+      && hasString(quote, 'supporting_quote'))
+    && (value.provider_kind === null || typeof value.provider_kind === 'string')
+    && (value.model_name === null || typeof value.model_name === 'string')
+    && (value.reason === null || typeof value.reason === 'string')
+    && (value.covalent_reaction_target === null || isRecord(value.covalent_reaction_target))
+    && (value.partial_covalent_reaction_target === null || isRecord(value.partial_covalent_reaction_target))
+    && Array.isArray(value.entity_candidates)
+    && value.entity_candidates.every((candidate) => isRecord(candidate)
+      && ['protein', 'ligand'].includes(String(candidate.entity_type))
+      && ['uniprot', 'pubchem'].includes(String(candidate.source_kind))
+      && hasString(candidate, 'source_identifier')
+      && hasString(candidate, 'display_label')
+      && (candidate.structure_identifier === null || hasString(candidate, 'structure_identifier'))
+      && ['high', 'ambiguous'].includes(String(candidate.confidence)))
+}
+
+function parseResearchSession(value: unknown): ResearchSessionResponse {
+  if (!isRecord(value)
+    || !hasString(value, 'session_identifier')
+    || !hasString(value, 'created_at')
+    || !hasString(value, 'updated_at')
+    || !isFiniteNumber(value.revision)
+    || !Number.isInteger(value.revision)
+    || value.revision < 1
+    || !researchStatuses.has(String(value.status))
+    || !hasString(value, 'scientist_summary')
+    || !Array.isArray(value.conversation)
+    || !value.conversation.every((turn) => isRecord(turn)
+      && hasString(turn, 'turn_identifier')
+      && ['scientist', 'pulsate'].includes(String(turn.role))
+      && hasString(turn, 'content')
+      && hasString(turn, 'created_at'))
+    || !Array.isArray(value.input_references)
+    || !value.input_references.every(isResearchInputReference)
+    || !Array.isArray(value.artifact_references)
+    || !value.artifact_references.every(isResearchArtifactReference)
+    || !Array.isArray(value.unapproved_input_artifact_identifiers)
+    || !value.unapproved_input_artifact_identifiers.every((item) => typeof item === 'string')
+    || !Array.isArray(value.next_questions)
+    || !value.next_questions.every((prompt) => isRecord(prompt)
+      && hasString(prompt, 'requirement_identifier')
+      && hasString(prompt, 'question'))
+    || !isRecord(value.clarification_attempts)
+    || !(value.intent_proposal === null || (isRecord(value.intent_proposal)
+      && hasString(value.intent_proposal, 'task_type')
+      && hasString(value.intent_proposal, 'supporting_quote')
+      && hasString(value.intent_proposal, 'provider_kind')
+      && hasString(value.intent_proposal, 'model_name')))
+    || !(value.requirement_proposal === null || (isRecord(value.requirement_proposal)
+      && hasString(value.requirement_proposal, 'proposal_identifier')
+      && hasString(value.requirement_proposal, 'summary')
+      && hasString(value.requirement_proposal, 'provider_kind')
+      && hasString(value.requirement_proposal, 'model_name')
+      && Array.isArray(value.requirement_proposal.requirements)
+      && value.requirement_proposal.requirements.every((requirement) => isRecord(requirement)
+        && hasString(requirement, 'operation')
+        && hasString(requirement, 'requested_output')
+        && hasString(requirement, 'supporting_quote'))))
+    || !(value.accepted_research_requirements === null
+      || (isRecord(value.accepted_research_requirements)
+        && isStringArray(value.accepted_research_requirements.operations)
+        && isStringArray(value.accepted_research_requirements.requested_outputs)
+        && isStringArray(value.accepted_research_requirements.required_artifact_types)
+        && hasString(value.accepted_research_requirements, 'capability_profile')
+        && hasString(value.accepted_research_requirements, 'source_proposal_identifier')))
+    || !(value.evidence_proposal === null || isResearchEvidenceProposal(value.evidence_proposal))
+    || !(value.accepted_partial_covalent_reaction_target === null
+      || isRecord(value.accepted_partial_covalent_reaction_target))
+    || !Array.isArray(value.accepted_evidence)
+    || !value.accepted_evidence.every(isResearchEvidenceProposal)
+    || !(value.compilation === null || (isRecord(value.compilation)
+      && hasString(value.compilation, 'compilation_identifier')
+      && hasString(value.compilation, 'execution_identifier')
+      && hasString(value.compilation, 'effective_question')
+      && isRecord(value.compilation.canonical_objective)
+      && isRecord(value.compilation.canonical_plan)
+      && isRecord(value.compilation.canonical_graph)))
+    || !(value.execution_status === null || typeof value.execution_status === 'string')
+    || !(value.scene_identifier === null || typeof value.scene_identifier === 'string')
+    || !(value.scientist_result === null || (isRecord(value.scientist_result)
+      && hasString(value.scientist_result, 'original_request')
+      && hasString(value.scientist_result, 'resolved_interpretation')
+      && hasString(value.scientist_result, 'scientific_result')
+      && ['passed', 'failed', 'inconclusive'].includes(String(value.scientist_result.verification_status))
+      && isStringArray(value.scientist_result.structures_and_entities)
+      && isStringArray(value.scientist_result.methods)
+      && isStringArray(value.scientist_result.assumptions)
+      && isStringArray(value.scientist_result.uncertainty)
+      && isStringArray(value.scientist_result.replanning_history)
+      && isStringArray(value.scientist_result.important_limitations)
+      && isStringArray(value.scientist_result.evidence_artifact_identifiers)
+      && isStringArray(value.scientist_result.scene_identifiers)
+      && (value.scientist_result.principal_result === null || hasString(value.scientist_result, 'principal_result'))
+      && isStringArray(value.scientist_result.candidate_ranking)
+      && isStringArray(value.scientist_result.confidence_and_uncertainty)
+      && (value.scientist_result.recommended_next_step === null || hasString(value.scientist_result, 'recommended_next_step'))
+      && (value.scientist_result.synthesis_provider_kind === null || hasString(value.scientist_result, 'synthesis_provider_kind'))
+      && (value.scientist_result.synthesis_model_name === null || hasString(value.scientist_result, 'synthesis_model_name'))))) {
+    malformed('The backend returned a malformed research session.')
+  }
+  if (containsCredentialField(value)) malformed('The backend returned unsafe research-session data.')
+  return value as unknown as ResearchSessionResponse
+}
+
+function parseResearchVisualization(value: unknown): ResearchVisualizationWorkspace {
+  if (!isRecord(value)
+    || value.schema_version !== 'pulsate.research-visualization/v1'
+    || !hasString(value, 'session_identifier')
+    || !Number.isInteger(value.revision)
+    || !(value.scene_identifier === null || typeof value.scene_identifier === 'string')
+    || value.grounding_policy !== 'persisted_artifact_or_deterministic_computation_only'
+    || !Array.isArray(value.structures)
+    || !value.structures.every((item) => isRecord(item)
+      && hasString(item, 'artifact_identifier')
+      && hasString(item, 'artifact_type')
+      && hasString(item, 'media_type')
+      && hasString(item, 'label')
+      && ['protein', 'ligand_or_candidate', 'molecular_structure'].includes(String(item.role))
+      && (item.candidate_identifier === null || hasString(item, 'candidate_identifier'))
+      && (item.generation === null || Number.isInteger(item.generation))
+      && typeof item.selected === 'boolean'
+      && Number.isInteger(item.conformation_count)
+      && Number(item.conformation_count) >= 1
+      && (item.source_kind === null || hasString(item, 'source_kind'))
+      && (item.source_identifier === null || hasString(item, 'source_identifier'))
+      && (item.confidence === null || hasString(item, 'confidence'))
+      && hasString(item, 'content_sha256'))
+    || !Array.isArray(value.selections)
+    || !value.selections.every((item) => isRecord(item)
+      && hasString(item, 'selection_identifier')
+      && hasString(item, 'label')
+      && hasString(item, 'kind')
+      && (item.structure_artifact_identifier === null || hasString(item, 'structure_artifact_identifier'))
+      && isStringArray(item.atom_identifiers)
+      && isStringArray(item.residue_identifiers)
+      && hasString(item, 'evidence_artifact_identifier'))
+    || !Array.isArray(value.interactions)
+    || !value.interactions.every((item) => isRecord(item)
+      && hasString(item, 'interaction_identifier')
+      && hasString(item, 'interaction_type')
+      && (item.candidate_identifier === null || hasString(item, 'candidate_identifier'))
+      && isStringArray(item.structure_artifact_identifiers)
+      && isStringArray(item.atom_identifiers)
+      && isStringArray(item.residue_identifiers)
+      && (item.distance_angstrom === null || isFiniteNumber(item.distance_angstrom))
+      && (item.angle_degree === null || isFiniteNumber(item.angle_degree))
+      && hasString(item, 'calculation_method')
+      && hasString(item, 'evidence_artifact_identifier'))
+    || !Array.isArray(value.overlays)
+    || !value.overlays.every((item) => isRecord(item)
+      && hasString(item, 'overlay_identifier')
+      && hasString(item, 'kind')
+      && hasString(item, 'label')
+      && (item.structure_artifact_identifier === null || hasString(item, 'structure_artifact_identifier'))
+      && (item.candidate_identifier === null || hasString(item, 'candidate_identifier'))
+      && (item.unit === null || hasString(item, 'unit'))
+      && isStringArray(item.atom_identifiers)
+      && isStringArray(item.residue_identifiers)
+      && hasString(item, 'verification_status')
+      && (item.uncertainty === null || hasString(item, 'uncertainty'))
+      && hasString(item, 'evidence_artifact_identifier')
+      && (item.method === null || hasString(item, 'method')))
+    || !Array.isArray(value.candidates)
+    || !value.candidates.every((item) => isRecord(item)
+      && hasString(item, 'candidate_identifier')
+      && Number.isInteger(item.generation)
+      && isStringArray(item.parent_candidate_identifiers)
+      && (item.transformation === null || isRecord(item.transformation))
+      && Array.isArray(item.properties_and_calculations)
+      && item.properties_and_calculations.every(isRecord)
+      && Array.isArray(item.verification)
+      && item.verification.every(isRecord)
+      && (item.selection_rationale === null || hasString(item, 'selection_rationale'))
+      && typeof item.selected === 'boolean'
+      && isStringArray(item.structure_artifact_identifiers))
+    || !Array.isArray(value.lineage) || !value.lineage.every(isRecord)
+    || !Array.isArray(value.comparisons)
+    || !value.comparisons.every((item) => isRecord(item)
+      && hasString(item, 'comparison_identifier')
+      && hasString(item, 'kind')
+      && hasString(item, 'left_identifier')
+      && hasString(item, 'right_identifier')
+      && (item.evidence_artifact_identifier === null || hasString(item, 'evidence_artifact_identifier')))
+    || !isStringArray(value.verification_artifact_identifiers)
+    || !Array.isArray(value.export_items)
+    || !value.export_items.every((item) => isRecord(item)
+      && hasString(item, 'artifact_identifier')
+      && hasString(item, 'artifact_type')
+      && hasString(item, 'media_type')
+      && hasString(item, 'content_sha256')
+      && ['structure', 'evidence', 'report'].includes(String(item.category)))) {
+    malformed('The backend returned a malformed research visualization workspace.')
+  }
+  if (containsCredentialField(value)) malformed('The backend returned unsafe visualization data.')
+  return value as unknown as ResearchVisualizationWorkspace
+}
+
 function parseExperimentPlan(value: unknown): ExperimentPlanResponse {
   if (!isRecord(value) || !hasString(value, 'schema_version')
     || !hasString(value, 'experiment_identifier') || !hasString(value, 'original_question')
@@ -470,6 +719,29 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('')
 }
 
+const RESEARCH_INPUT_MAXIMUM_BYTES = 16 * 1024 * 1024
+
+function researchInputMediaType(fileName: string): string {
+  const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase()
+  return {
+    '.pdb': 'chemical/x-pdb',
+    '.sdf': 'chemical/x-mdl-sdfile',
+    '.mol': 'chemical/x-mdl-molfile',
+    '.mol2': 'chemical/x-mol2',
+    '.pdbqt': 'chemical/x-pdbqt',
+    '.smi': 'chemical/x-daylight-smiles',
+    '.smiles': 'chemical/x-daylight-smiles',
+  }[extension] ?? 'application/octet-stream'
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (let offset = 0; offset < bytes.length; offset += 32_768) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32_768))
+  }
+  return btoa(binary)
+}
+
 async function readBoundedMolecularResource(
   response: Response,
   maximumBytes: number,
@@ -563,6 +835,34 @@ async function requestMolecularResource(
   }
 }
 
+async function requestResearchArtifact(
+  path: string,
+  artifactIdentifier: string,
+  contentSha256: string,
+  mediaType: string,
+  accessTokenProvider: AccessTokenProvider,
+  signal?: AbortSignal,
+): Promise<FetchedMolecularResource> {
+  let response: Response
+  try {
+    const headers = await authenticatedHeaders(path, { Accept: mediaType }, accessTokenProvider)
+    response = await fetch(path, { method: 'GET', signal, headers })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    if (error instanceof ApiError) throw error
+    throw new ApiError('Unable to download research evidence.', undefined, error)
+  }
+  if (!response.ok) {
+    throw controlledHttpError(response.status, `Research artifact request failed (${response.status}).`)
+  }
+  const bytes = await readBoundedMolecularResource(response, 32 * 1024 * 1024)
+  const computedHash = await sha256Hex(bytes)
+  if (computedHash !== contentSha256) {
+    throw new ApiError('The research artifact content hash is inconsistent.')
+  }
+  return { bytes, mediaType, contentSha256, artifactIdentifier }
+}
+
 export interface PulsateApi {
   getHealth(signal?: AbortSignal): Promise<HealthResponse>
   getPresets(signal?: AbortSignal): Promise<PresetListResponse>
@@ -571,6 +871,16 @@ export interface PulsateApi {
   planExperiment(question: string, signal?: AbortSignal): Promise<ExperimentPlanResponse>
   interpretQuestion(question: string, signal?: AbortSignal): Promise<InterpretationResponse>
   approveInterpretation(identifier: string, specification: InterpretedScientificSpecification, acceptedAssumptions: boolean, signal?: AbortSignal): Promise<ApprovedExperimentResponse>
+  uploadResearchInput(input: ResearchInputUpload, position: number, signal?: AbortSignal): Promise<UploadedResearchInput>
+  createResearchSession(question: string, inputs?: ResearchInputReference[], artifacts?: ResearchArtifactReference[], signal?: AbortSignal): Promise<ResearchSessionResponse>
+  getResearchSession(sessionIdentifier: string, signal?: AbortSignal): Promise<ResearchSessionResponse>
+  replyResearchSession(sessionIdentifier: string, message: string, acceptIntentProposal?: boolean, acceptRequirementProposal?: boolean, acceptEvidenceProposal?: boolean, acceptAcquiredInputEvidence?: boolean, inputs?: ResearchInputReference[], artifacts?: ResearchArtifactReference[], signal?: AbortSignal): Promise<ResearchSessionResponse>
+  executeResearchSession(sessionIdentifier: string, signal?: AbortSignal): Promise<ResearchSessionResponse>
+  getResearchScene(sessionIdentifier: string, artifactIdentifier: string, signal?: AbortSignal): Promise<SceneResponse>
+  getResearchConformationScene(sessionIdentifier: string, artifactIdentifier: string, conformationIndex: number, signal?: AbortSignal): Promise<SceneResponse>
+  getResearchComplexScene(sessionIdentifier: string, primaryArtifactIdentifier: string, secondaryArtifactIdentifier?: string, signal?: AbortSignal): Promise<SceneResponse>
+  getResearchVisualization(sessionIdentifier: string, signal?: AbortSignal): Promise<ResearchVisualizationWorkspace>
+  downloadResearchArtifact(sessionIdentifier: string, artifactIdentifier: string, contentSha256: string, mediaType: string, signal?: AbortSignal): Promise<FetchedMolecularResource>
   getRunCapability(signal?: AbortSignal): Promise<RunCapabilityResponse>
   createRun(presetIdentifier: string, idempotencyKey: string, signal?: AbortSignal): Promise<RunStateResponse>
   createExperimentRun(experimentIdentifier: string, idempotencyKey: string, signal?: AbortSignal, executionTarget?: 'local_simulator' | 'ibm_quantum'): Promise<RunStateResponse>
@@ -603,10 +913,19 @@ export interface PulsateApiConfiguration {
   accessTokenProvider?: AccessTokenProvider
 }
 
-const noAccessToken: AccessTokenProvider = async () => null
+declare global {
+  interface Window {
+    pulsateAccessTokenProvider?: AccessTokenProvider
+  }
+}
+
+const hostedAccessToken: AccessTokenProvider = async () => {
+  const provider = typeof window === 'undefined' ? undefined : window.pulsateAccessTokenProvider
+  return provider ? provider() : null
+}
 
 export function createPulsateApi(configuration: PulsateApiConfiguration = {}): PulsateApi {
-  const accessTokenProvider = configuration.accessTokenProvider ?? noAccessToken
+  const accessTokenProvider = configuration.accessTokenProvider ?? hostedAccessToken
   const json = <T>(path: string, parser: (value: unknown) => T, signal?: AbortSignal, init?: RequestInit) =>
     requestJson(path, parser, accessTokenProvider, signal, init)
   return {
@@ -634,6 +953,126 @@ export function createPulsateApi(configuration: PulsateApiConfiguration = {}): P
       body: JSON.stringify({ specification, accepted_assumptions: acceptedAssumptions }),
     },
   ),
+    uploadResearchInput: async (input, position, signal) => {
+      if (!Number.isInteger(position) || position < 1 || position > 64) {
+        throw new ApiError('Research input position is invalid.')
+      }
+      if (input.file.size > RESEARCH_INPUT_MAXIMUM_BYTES) {
+        throw new ApiError('A research input file exceeds the 16 MiB limit.')
+      }
+      const bytes = new Uint8Array(await input.file.arrayBuffer())
+      const digest = await sha256Hex(bytes)
+      const localIdentifier = `scientific-input-${digest.slice(0, 32)}`
+      const artifact = await json('/api/v1/scientific/artifacts', parseResearchArtifact, signal, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reference: {
+            artifact_identifier: localIdentifier,
+            schema_version: { major: 1, minor: 0, patch: 0 },
+            artifact_type: input.artifactType,
+            media_type: researchInputMediaType(input.file.name),
+            content_sha256: digest,
+            byte_size: bytes.byteLength,
+            storage_location: null,
+            metadata: {},
+            provenance: {
+              producer: 'pulsate-research-workspace',
+              producer_version: { major: 1, minor: 0, patch: 0 },
+              execution_identifier: `scientific-input-upload-${digest.slice(0, 24)}`,
+              source: 'cgr',
+            },
+            parents: [],
+          },
+          payload_base64: bytesToBase64(bytes),
+        }),
+      })
+      return {
+        inputReference: {
+          reference_identifier: `input-${String(position).padStart(2, '0')}-${input.artifactType.replaceAll('_', '-')}`,
+          artifact_type: input.artifactType as ResearchInputArtifactType,
+          artifact_identifier: artifact.artifact_identifier,
+        },
+        artifactReference: artifact,
+      }
+    },
+    createResearchSession: (question, inputs = [], artifacts = [], signal) => json(
+      '/api/v1/research/sessions',
+      parseResearchSession,
+      signal,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, input_references: inputs, artifact_references: artifacts }),
+      },
+    ),
+    getResearchSession: (sessionIdentifier, signal) => json(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}`,
+      parseResearchSession,
+      signal,
+    ),
+    replyResearchSession: (
+      sessionIdentifier,
+      message,
+      acceptIntentProposal = false,
+      acceptRequirementProposal = false,
+      acceptEvidenceProposal = false,
+      acceptAcquiredInputEvidence = false,
+      inputs = [],
+      artifacts = [],
+      signal,
+    ) => json(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}/reply`,
+      parseResearchSession,
+      signal,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message,
+          accept_intent_proposal: acceptIntentProposal,
+          accept_requirement_proposal: acceptRequirementProposal,
+          accept_evidence_proposal: acceptEvidenceProposal,
+          accept_acquired_input_evidence: acceptAcquiredInputEvidence,
+          input_references: inputs.length > 0 ? inputs : null,
+          artifact_references: artifacts.length > 0 ? artifacts : null,
+        }),
+      },
+    ),
+    executeResearchSession: (sessionIdentifier, signal) => json(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}/execute`,
+      parseResearchSession,
+      signal,
+      { method: 'POST' },
+    ),
+    getResearchScene: (sessionIdentifier, artifactIdentifier, signal) => json(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}/scene?artifact_identifier=${encodeURIComponent(artifactIdentifier)}`,
+      parseScene,
+      signal,
+    ),
+    getResearchConformationScene: (sessionIdentifier, artifactIdentifier, conformationIndex, signal) => json(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}/scene?artifact_identifier=${encodeURIComponent(artifactIdentifier)}&conformation_index=${conformationIndex}`,
+      parseScene,
+      signal,
+    ),
+    getResearchComplexScene: (sessionIdentifier, primaryArtifactIdentifier, secondaryArtifactIdentifier, signal) => json(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}/visualization/complex?primary_artifact_identifier=${encodeURIComponent(primaryArtifactIdentifier)}${secondaryArtifactIdentifier ? `&secondary_artifact_identifier=${encodeURIComponent(secondaryArtifactIdentifier)}` : ''}`,
+      parseScene,
+      signal,
+    ),
+    getResearchVisualization: (sessionIdentifier, signal) => json(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}/visualization`,
+      parseResearchVisualization,
+      signal,
+    ),
+    downloadResearchArtifact: (sessionIdentifier, artifactIdentifier, contentSha256, mediaType, signal) => requestResearchArtifact(
+      `/api/v1/research/sessions/${encodeURIComponent(sessionIdentifier)}/artifacts/${encodeURIComponent(artifactIdentifier)}`,
+      artifactIdentifier,
+      contentSha256,
+      mediaType,
+      accessTokenProvider,
+      signal,
+    ),
     getRunCapability: (signal) => json('/api/v1/runs/capability', parseCapability, signal),
     createRun: (presetIdentifier, idempotencyKey, signal) => json('/api/v1/runs', parseRunState, signal, {
     method: 'POST',

@@ -74,6 +74,7 @@ from .molecular import (
     MolecularStructure,
 )
 from .planning import (
+    CandidatePlanArtifactFlow,
     CandidatePlanAssignment,
     CandidateResearchPlan,
     CapabilityFeasibilityResult,
@@ -128,6 +129,7 @@ __all__ = [
     "CapabilityResult",
     "CapabilityVerificationRequirement",
     "CandidatePlanAssignment",
+    "CandidatePlanArtifactFlow",
     "CandidateResearchPlan",
     "CapabilityFeasibilityResult",
     "CreationProvenance",

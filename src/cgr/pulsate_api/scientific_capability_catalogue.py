@@ -130,6 +130,8 @@ _METAL = ("metal_active_site_quantum",)
 _PES = ("bond_dissociation_scan",)
 _CONFORMER = ("solvated_conformer_comparison",)
 _DISCOVERY = ("protein_ligand_discovery",)
+_ANALYSIS = ("structure_analysis",)
+_PROTEIN_DESIGN = ("de_novo_protein_design",)
 
 
 def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
@@ -445,6 +447,80 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             priority=30,
         ),
         ScientificCapabilityDefinition(
+            capability_name="molecular.structure_analyze",
+            accepted_artifact_types=("molecular_structure",),
+            produced_artifact_types=("molecular_structure_analysis",),
+            supported_task_types=_ANALYSIS,
+            verification_required=True,
+            priority=30,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="scientific_verification.structure_analysis",
+            accepted_artifact_types=("molecular_structure_analysis",),
+            produced_artifact_types=("scientific_verification_report",),
+            supported_task_types=_ANALYSIS,
+            verification_required=True,
+            priority=80,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="protein.design_specification",
+            produced_artifact_types=("protein_design_specification",),
+            supported_task_types=_PROTEIN_DESIGN,
+            priority=10,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="protein.backbone_generate",
+            accepted_artifact_types=("protein_design_specification",),
+            produced_artifact_types=("protein_backbone_candidate",),
+            supported_task_types=_PROTEIN_DESIGN,
+            priority=30,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="protein.sequence_design",
+            accepted_artifact_types=("protein_backbone_candidate",),
+            produced_artifact_types=("protein_sequence_candidate",),
+            supported_task_types=_PROTEIN_DESIGN,
+            priority=45,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="protein.structure_predict",
+            accepted_artifact_types=("protein_sequence_candidate",),
+            produced_artifact_types=(
+                "predicted_protein_structure",
+                "protein_prediction_confidence",
+            ),
+            supported_task_types=_PROTEIN_DESIGN,
+            verification_required=True,
+            priority=60,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="scientific_verification.protein_design",
+            accepted_artifact_types=(
+                "protein_design_specification",
+                "protein_backbone_candidate",
+                "protein_sequence_candidate",
+                "predicted_protein_structure",
+                "protein_prediction_confidence",
+            ),
+            produced_artifact_types=(
+                "protein_design_verification_report",
+                "scientific_verification_report",
+            ),
+            supported_task_types=_PROTEIN_DESIGN,
+            verification_required=True,
+            priority=80,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="molecular.scene_project",
+            accepted_artifact_types=(
+                "protein_design_verification_report",
+                "predicted_protein_structure",
+            ),
+            produced_artifact_types=("molecular_scene_state",),
+            supported_task_types=_PROTEIN_DESIGN,
+            priority=90,
+        ),
+        ScientificCapabilityDefinition(
             capability_name="electronic.implicit_solvent_hartree_fock",
             accepted_artifact_types=("molecular_conformer_set",),
             produced_artifact_types=("electronic_implicit_solvent_result",),
@@ -484,6 +560,18 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             produced_artifact_types=("discovery_campaign",),
             supported_task_types=_DISCOVERY,
             priority=40,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="discovery.design_loop_bind",
+            accepted_artifact_types=(
+                "discovery_campaign",
+                "docking_receptor_pdbqt",
+                "binding_pocket",
+            ),
+            produced_artifact_types=("discovery_design_loop_contract",),
+            supported_task_types=_DISCOVERY,
+            verification_required=True,
+            priority=42,
         ),
         ScientificCapabilityDefinition(
             capability_name="molecular.conformer_generate",
@@ -538,6 +626,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             capability_name="discovery.campaign_iterate",
             accepted_artifact_types=(
                 "discovery_campaign",
+                "discovery_design_loop_contract",
                 "docking_receptor_pdbqt",
                 "binding_pocket",
             ),
@@ -547,8 +636,23 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             priority=70,
         ),
         ScientificCapabilityDefinition(
+            capability_name="discovery.design_loop_trace",
+            accepted_artifact_types=(
+                "discovery_design_loop_contract",
+                "discovery_campaign_result",
+                "discovery_campaign_checkpoint",
+            ),
+            produced_artifact_types=("discovery_design_loop_trace",),
+            supported_task_types=_DISCOVERY,
+            verification_required=True,
+            priority=75,
+        ),
+        ScientificCapabilityDefinition(
             capability_name="scientific_verification.candidate_ranking",
-            accepted_artifact_types=("discovery_campaign_result",),
+            accepted_artifact_types=(
+                "discovery_campaign_result",
+                "discovery_design_loop_trace",
+            ),
             produced_artifact_types=("scientific_verification_report",),
             supported_task_types=_DISCOVERY,
             verification_required=True,
@@ -557,7 +661,11 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
         ScientificCapabilityDefinition(
             capability_name="molecular.scene_project",
             accepted_artifact_types=("scientific_verification_report", "molecular_structure"),
-            produced_artifact_types=("molecular_scene_state",),
+            produced_artifact_types=(
+                "molecular_interaction_analysis",
+                "molecular_computational_overlay",
+                "molecular_scene_state",
+            ),
             priority=90,
         ),
         ScientificCapabilityDefinition(

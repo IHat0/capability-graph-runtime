@@ -509,6 +509,36 @@ class CandidatePlanAssignment(CanonicalModel):
         return self
 
 
+class CandidatePlanArtifactFlow(CanonicalModel):
+    """One explicit artifact dependency between two selected assignments.
+
+    Artifact types alone are not sufficient to identify a producer when a
+    workflow refines the same type more than once.  This contract preserves
+    the planner's exact source and destination without inventing an alias type.
+    """
+
+    flow_identifier: str
+    source_assignment_identifier: str
+    destination_assignment_identifier: str
+    artifact_type: str
+
+    @field_validator(
+        "flow_identifier",
+        "source_assignment_identifier",
+        "destination_assignment_identifier",
+        "artifact_type",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        return validate_identifier(value, label="candidate plan artifact flow")
+
+    @model_validator(mode="after")
+    def reject_self_flow(self) -> Self:
+        if self.source_assignment_identifier == self.destination_assignment_identifier:
+            raise ValueError("Candidate plan artifact flow cannot reference itself.")
+        return self
+
+
 class RejectedCapabilityAlternative(CanonicalModel):
     """One evaluated alternative not selected by deterministic plan construction."""
 
@@ -567,6 +597,7 @@ class CandidateResearchPlan(CanonicalModel):
     resource_snapshot_fingerprint: str
     planning_facts: PlanningFactSet
     selected_assignments: tuple[CandidatePlanAssignment, ...] = ()
+    artifact_flows: tuple[CandidatePlanArtifactFlow, ...] = ()
     rejected_alternatives: tuple[RejectedCapabilityAlternative, ...] = ()
     unresolved_requirement_identifiers: tuple[str, ...] = ()
     unresolved_goal_identifiers: tuple[str, ...] = ()
@@ -621,6 +652,30 @@ class CandidateResearchPlan(CanonicalModel):
         ):
             raise ValueError("Candidate plan assignments must be unique.")
         return tuple(sorted(value, key=lambda item: item.assignment_identifier))
+
+    @field_validator("artifact_flows")
+    @classmethod
+    def order_artifact_flows(
+        cls, value: tuple[CandidatePlanArtifactFlow, ...]
+    ) -> tuple[CandidatePlanArtifactFlow, ...]:
+        identifiers = [item.flow_identifier for item in value]
+        semantic_edges = [
+            (
+                item.source_assignment_identifier,
+                item.destination_assignment_identifier,
+                item.artifact_type,
+            )
+            for item in value
+        ]
+        destinations = [
+            (item.destination_assignment_identifier, item.artifact_type)
+            for item in value
+        ]
+        if len(identifiers) != len(set(identifiers)) or len(semantic_edges) != len(
+            set(semantic_edges)
+        ) or len(destinations) != len(set(destinations)):
+            raise ValueError("Candidate plan artifact flows must be unique.")
+        return tuple(sorted(value, key=lambda item: item.flow_identifier))
 
     @field_validator("rejected_alternatives")
     @classmethod
@@ -688,4 +743,22 @@ class CandidateResearchPlan(CanonicalModel):
             for item in (*self.selected_assignments, *self.rejected_alternatives)
         ):
             raise ValueError("Every plan alternative must reference the plan objective.")
+        assignments = {
+            item.assignment_identifier: item for item in self.selected_assignments
+        }
+        for flow in self.artifact_flows:
+            source = assignments.get(flow.source_assignment_identifier)
+            destination = assignments.get(flow.destination_assignment_identifier)
+            if source is None or destination is None:
+                raise ValueError(
+                    "Every candidate plan artifact flow assignment must resolve."
+                )
+            if flow.artifact_type not in source.produced_artifact_types:
+                raise ValueError(
+                    "Candidate plan artifact flow type is not produced by its source."
+                )
+            if flow.artifact_type not in destination.input_artifact_types:
+                raise ValueError(
+                    "Candidate plan artifact flow type is not consumed by its destination."
+                )
         return self

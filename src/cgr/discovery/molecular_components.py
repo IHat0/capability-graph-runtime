@@ -12,12 +12,13 @@ from typing import Protocol, runtime_checkable
 
 from cgr.kernel.contracts import CapabilityVersion
 from cgr.science import ArtifactPointer
+from cgr.science.canonical import validate_identifier
 from cgr.scientific_verification import (
+    VERIFICATION_DIMENSION_ORDER,
     DimensionVerificationResult,
     ScientificVerificationFinding,
     ScientificVerificationReport,
     ScientificVerificationSeverity,
-    VERIFICATION_DIMENSION_ORDER,
     VerificationDimension,
     VerificationOutcome,
 )
@@ -38,6 +39,7 @@ from .contracts import (
 _VERSION = CapabilityVersion(major=1, minor=0, patch=0)
 _CANDIDATE_TYPE = "small_molecule"
 _GENERATOR = "generator.rdkit_scaffold_transform"
+_DE_NOVO_GENERATOR = "generator.rdkit_de_novo_fragment_assembly"
 _CHECKER = "checker.rdkit_druglike_validity"
 _EVALUATOR = "evaluator.rdkit_3d_descriptors"
 _VERIFIER = "verifier.molecular_candidate_evidence"
@@ -64,7 +66,7 @@ class MolecularCandidateArtifactStore(Protocol):
 
 def _modules() -> tuple[object, object, object, object, object]:
     from rdkit import Chem
-    from rdkit.Chem import AllChem, Crippen, Descriptors, Lipinski, QED
+    from rdkit.Chem import QED, AllChem, Crippen, Descriptors, Lipinski
 
     return Chem, AllChem, Crippen, Descriptors, (Lipinski, QED)
 
@@ -88,6 +90,52 @@ def _read_smiles(store: MolecularCandidateArtifactStore, candidate: DiscoveryCan
     if not isinstance(smiles, str) or not smiles:
         raise ValueError("Candidate representation does not contain canonical SMILES.")
     return smiles
+
+
+def _canonical_smiles(smiles: str) -> str:
+    Chem, _, _, _, _ = _modules()
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        raise ValueError("Seed, fragment, or generated SMILES is invalid.")
+    Chem.SanitizeMol(molecule)
+    return str(Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True))
+
+
+def _single_site_mutations(
+    smiles: str,
+    substituents: tuple[str, ...],
+) -> tuple[tuple[str, str, int], ...]:
+    Chem, _, _, _, _ = _modules()
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        raise ValueError("Parent SMILES is invalid.")
+    generated: dict[str, tuple[str, int]] = {}
+    for atom in molecule.GetAtoms():
+        if atom.GetTotalNumHs() <= 0 or (
+            atom.GetIsAromatic() and atom.GetSymbol() == "N"
+        ):
+            continue
+        for symbol in substituents:
+            editable = Chem.RWMol(molecule)
+            new_index = editable.AddAtom(Chem.Atom(symbol))
+            editable.AddBond(atom.GetIdx(), new_index, Chem.BondType.SINGLE)
+            candidate = editable.GetMol()
+            try:
+                Chem.SanitizeMol(candidate)
+            except Exception:
+                continue
+            canonical = str(
+                Chem.MolToSmiles(
+                    candidate,
+                    canonical=True,
+                    isomericSmiles=True,
+                )
+            )
+            generated.setdefault(canonical, (symbol, int(atom.GetIdx())))
+    return tuple(
+        (canonical, symbol, atom_index)
+        for canonical, (symbol, atom_index) in sorted(generated.items())
+    )
 
 
 class RDKitMolecularCandidateGenerator:
@@ -123,39 +171,10 @@ class RDKitMolecularCandidateGenerator:
 
     @staticmethod
     def _canonical(smiles: str) -> str:
-        Chem, _, _, _, _ = _modules()
-        molecule = Chem.MolFromSmiles(smiles)
-        if molecule is None:
-            raise ValueError("Seed or generated SMILES is invalid.")
-        Chem.SanitizeMol(molecule)
-        return str(Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True))
+        return _canonical_smiles(smiles)
 
     def _mutations(self, smiles: str) -> tuple[tuple[str, str, int], ...]:
-        Chem, _, _, _, _ = _modules()
-        molecule = Chem.MolFromSmiles(smiles)
-        if molecule is None:
-            raise ValueError("Parent SMILES is invalid.")
-        generated: dict[str, tuple[str, int]] = {}
-        for atom in molecule.GetAtoms():
-            if atom.GetTotalNumHs() <= 0 or atom.GetIsAromatic() and atom.GetSymbol() == "N":
-                continue
-            for symbol in self._substituents:
-                editable = Chem.RWMol(molecule)
-                new_index = editable.AddAtom(Chem.Atom(symbol))
-                editable.AddBond(atom.GetIdx(), new_index, Chem.BondType.SINGLE)
-                candidate = editable.GetMol()
-                try:
-                    Chem.SanitizeMol(candidate)
-                except Exception:
-                    continue
-                canonical = str(Chem.MolToSmiles(
-                    candidate, canonical=True, isomericSmiles=True
-                ))
-                generated.setdefault(canonical, (symbol, int(atom.GetIdx())))
-        return tuple(
-            (canonical, symbol, atom_index)
-            for canonical, (symbol, atom_index) in sorted(generated.items())
-        )
+        return _single_site_mutations(smiles, self._substituents)
 
     def propose(self, request: CandidateGenerationRequest) -> CandidateGenerationResult:
         proposals: list[DiscoveryCandidate] = []
@@ -221,6 +240,175 @@ class RDKitMolecularCandidateGenerator:
         return CandidateGenerationResult(
             result_identifier=_identifier(
                 "generation-result", request.request_identifier, *(x.candidate_identifier for x in proposals)
+            ),
+            generator_identifier=self.generator_identifier,
+            request_sha256=request.fingerprint,
+            candidates=tuple(proposals),
+        )
+
+
+class RDKitDeNovoMolecularCandidateGenerator:
+    """Deterministic seedless graph construction from declared fragment policy."""
+
+    def __init__(
+        self,
+        store: MolecularCandidateArtifactStore,
+        *,
+        construction_fragments: tuple[str, ...],
+        allowed_extensions: tuple[str, ...] = ("C", "N", "O", "F"),
+        assembly_depth: int = 2,
+        construction_policy_identifier: str = "policy.rdkit_de_novo_fragments_v1",
+    ) -> None:
+        if not isinstance(store, MolecularCandidateArtifactStore):
+            raise TypeError("Molecular generation requires an artifact store.")
+        if not construction_fragments:
+            raise ValueError("De novo generation requires declared construction fragments.")
+        if not allowed_extensions or any(
+            value not in {"C", "N", "O", "F", "Cl"}
+            for value in allowed_extensions
+        ):
+            raise ValueError("Unsupported de novo molecular extension configuration.")
+        if not 1 <= assembly_depth <= 4:
+            raise ValueError("De novo molecular assembly depth must be between one and four.")
+        self._store = store
+        self._fragments = tuple(
+            sorted({_canonical_smiles(item) for item in construction_fragments})
+        )
+        self._extensions = allowed_extensions
+        self._assembly_depth = assembly_depth
+        self._policy = validate_identifier(
+            construction_policy_identifier,
+            label="de novo construction policy",
+        )
+
+    @property
+    def generator_identifier(self) -> str:
+        return _DE_NOVO_GENERATOR
+
+    @property
+    def supported_candidate_types(self) -> tuple[str, ...]:
+        return (_CANDIDATE_TYPE,)
+
+    def _initial_candidates(self) -> tuple[tuple[str, str, int], ...]:
+        frontier: dict[str, tuple[str, int]] = {
+            fragment: (fragment, 0) for fragment in self._fragments
+        }
+        generated: dict[str, tuple[str, int]] = {}
+        for depth in range(1, self._assembly_depth + 1):
+            following: dict[str, tuple[str, int]] = {}
+            for parent, (root, _) in sorted(frontier.items()):
+                for smiles, _, _ in _single_site_mutations(
+                    parent,
+                    self._extensions,
+                ):
+                    if smiles in self._fragments:
+                        continue
+                    generated.setdefault(smiles, (root, depth))
+                    following.setdefault(smiles, (root, depth))
+            frontier = following
+            if not frontier:
+                break
+        return tuple(
+            (smiles, root, depth)
+            for smiles, (root, depth) in sorted(generated.items())
+        )
+
+    def propose(self, request: CandidateGenerationRequest) -> CandidateGenerationResult:
+        proposals: list[DiscoveryCandidate] = []
+        if request.generation == 0:
+            for smiles, fragment, depth in self._initial_candidates()[
+                : request.max_candidates
+            ]:
+                pointer = self._store.put(
+                    "molecular_candidate_smiles",
+                    _smiles_payload(smiles),
+                )
+                proposals.append(
+                    DiscoveryCandidate(
+                        candidate_identifier=_identifier(
+                            "candidate-molecule",
+                            request.generation,
+                            smiles,
+                        ),
+                        candidate_type=_CANDIDATE_TYPE,
+                        generation=0,
+                        generated_by=self.generator_identifier,
+                        representation_artifacts=(pointer,),
+                        objective_identifiers=request.objective_identifiers,
+                        metadata={
+                            "canonical_smiles": smiles,
+                            "generation_kind": "de_novo_fragment_assembly",
+                            "construction_policy_identifier": self._policy,
+                            "construction_fragment": fragment,
+                            "construction_step_count": depth,
+                        },
+                    )
+                )
+        else:
+            for parent in request.parent_candidates:
+                parent_smiles = _read_smiles(self._store, parent)
+                for smiles, extension, atom_index in _single_site_mutations(
+                    parent_smiles,
+                    self._extensions,
+                ):
+                    pointer = self._store.put(
+                        "molecular_candidate_smiles",
+                        _smiles_payload(smiles),
+                    )
+                    transformation = CandidateTransformation(
+                        transformation_identifier=_identifier(
+                            "transformation-de-novo-extension",
+                            parent.candidate_identifier,
+                            smiles,
+                        ),
+                        transformation_kind="de_novo_graph_extension",
+                        source_candidate_identifiers=(
+                            parent.candidate_identifier,
+                        ),
+                        target_candidate_type=_CANDIDATE_TYPE,
+                        generator_identifier=self.generator_identifier,
+                        rationale=(
+                            "A valence-checked graph extension was applied under "
+                            "the declared de novo construction policy."
+                        ),
+                        parameters={
+                            "extension": extension,
+                            "parent_atom_index": atom_index,
+                            "construction_policy_identifier": self._policy,
+                        },
+                    )
+                    proposals.append(
+                        DiscoveryCandidate(
+                            candidate_identifier=_identifier(
+                                "candidate-molecule",
+                                request.generation,
+                                smiles,
+                            ),
+                            candidate_type=_CANDIDATE_TYPE,
+                            generation=request.generation,
+                            generated_by=self.generator_identifier,
+                            representation_artifacts=(pointer,),
+                            objective_identifiers=request.objective_identifiers,
+                            parent_candidate_identifiers=(
+                                parent.candidate_identifier,
+                            ),
+                            transformation=transformation,
+                            metadata={
+                                "canonical_smiles": smiles,
+                                "generation_kind": "de_novo_graph_extension",
+                                "construction_policy_identifier": self._policy,
+                            },
+                        )
+                    )
+                    if len(proposals) >= request.max_candidates:
+                        break
+                if len(proposals) >= request.max_candidates:
+                    break
+        return CandidateGenerationResult(
+            result_identifier=_identifier(
+                "generation-result",
+                request.request_identifier,
+                *(item.candidate_identifier for item in proposals),
             ),
             generator_identifier=self.generator_identifier,
             request_sha256=request.fingerprint,

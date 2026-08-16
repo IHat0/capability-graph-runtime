@@ -1,12 +1,11 @@
 import { ConditionalNavigation } from './components/ConditionalNavigation'
-import { EmptyInspector } from './components/EmptyInspector'
 import { ErrorNotice } from './components/ErrorNotice'
 import { ExistingRunInput } from './components/ExistingRunInput'
 import { Header } from './components/Header'
 import { MolecularViewer } from './components/MolecularViewer'
 import { MolecularProjectInput } from './components/MolecularProjectInput'
 import { MolecularProjectPanel } from './components/MolecularProjectPanel'
-import { NaturalLanguageWorkspace } from './components/NaturalLanguageWorkspace'
+import { ResearchWorkspace } from './components/ResearchWorkspace'
 import { ScientificPanel } from './components/ScientificPanel'
 import { WorkflowWorkspace } from './components/WorkflowWorkspace'
 import { deriveExistingRunHeaderStatus } from './existingRunHeaderStatus'
@@ -14,7 +13,7 @@ import { useExistingRun } from './hooks/useExistingRun'
 import { useExperimentWorkspace } from './hooks/useExperimentWorkspace'
 import { useMolecularProjectScene } from './hooks/useMolecularProjectScene'
 import { useMolecularPlanning } from './hooks/useMolecularPlanning'
-import { useNaturalLanguageExperiment } from './hooks/useNaturalLanguageExperiment'
+import { useResearchSession } from './hooks/useResearchSession'
 import { usePresetRun } from './hooks/usePresetRun'
 import { useWorkflowRun } from './hooks/useWorkflowRun'
 
@@ -23,9 +22,9 @@ export function App() {
   const existingRun = useExistingRun()
   const molecularProject = useMolecularProjectScene()
   const molecularPlanning = useMolecularPlanning(molecularProject.scene?.metadata.project_identifier ?? null)
-  const naturalLanguage = useNaturalLanguageExperiment()
+  const research = useResearchSession()
   const workflow = useWorkflowRun()
-  const coordinateScene = existingRun.scene ?? workspace.scene
+  const coordinateScene = existingRun.scene ?? research.scene
   const displayedScene = molecularProject.scene ?? coordinateScene
   const hasScene = displayedScene !== null
   const readOnlyLookup = molecularProject.loading || molecularProject.scene !== null || existingRun.loading || existingRun.run !== null
@@ -101,7 +100,7 @@ export function App() {
       <div className="workspace-content">
         <div className="workspace-frame">
         <ConditionalNavigation hasScene={hasScene} />
-        {workspace.initialLoading ? (
+        {workspace.initialLoading && (existingRun.loading || molecularProject.loading) ? (
           <main className="initial-state" aria-live="polite">
             <span aria-hidden="true" />
             <strong>Opening the scientific workspace…</strong>
@@ -110,7 +109,9 @@ export function App() {
         ) : displayedScene ? (
           <main className="loaded-workspace" id="workspace-home">
             <MolecularViewer scene={displayedScene} loading={workspace.presetLoading || existingRun.loading || molecularProject.loading} />
-            {molecularProject.scene ? <MolecularProjectPanel scene={molecularProject.scene} planning={molecularPlanning} /> : <ScientificPanel
+            {molecularProject.scene ? <MolecularProjectPanel scene={molecularProject.scene} planning={molecularPlanning} /> : research.scene && !existingRun.scene ? (
+              <ResearchWorkspace research={research} inspector />
+            ) : <ScientificPanel
               scene={coordinateScene!}
               presets={workspace.presets}
               selectedPresetId={workspace.selectedPresetId}
@@ -130,14 +131,8 @@ export function App() {
             />}
           </main>
         ) : (
-          <div className="empty-layout">
-            <NaturalLanguageWorkspace
-              presets={workspace.presets}
-              loading={workspace.presetLoading}
-              onPresetChange={selectPreset}
-              naturalLanguage={naturalLanguage}
-            />
-            <EmptyInspector />
+          <div className="research-layout">
+            <ResearchWorkspace research={research} />
           </div>
         )}
         </div>

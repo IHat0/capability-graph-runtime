@@ -10,6 +10,7 @@ from cgr.discovery import (
     CandidateAssessment,
     CandidateGenerationRequest,
     MolecularCandidateEvidenceVerifier,
+    RDKitDeNovoMolecularCandidateGenerator,
     RDKitMolecularCandidateGenerator,
     RDKitMolecularDescriptorEvaluator,
     RDKitMolecularValidityChecker,
@@ -74,6 +75,51 @@ def test_molecular_generator_produces_real_seed_and_transformed_lineage() -> Non
     assert all(
         candidate.parent_candidate_identifiers
         == (seeds.candidates[0].candidate_identifier,)
+        for candidate in children.candidates
+    )
+
+
+def test_de_novo_generator_constructs_candidates_without_scientist_seed() -> None:
+    pytest.importorskip("rdkit")
+    store = MemoryCandidateStore()
+    generator = RDKitDeNovoMolecularCandidateGenerator(
+        store,
+        construction_fragments=("C1CCCCC1", "c1ccccc1"),
+        allowed_extensions=("C", "N", "O", "F"),
+        assembly_depth=2,
+        construction_policy_identifier="policy.test_de_novo_fragments_v1",
+    )
+
+    initial = generator.propose(_generation_request(generation=0))
+
+    assert initial.candidates
+    assert all(candidate.generation == 0 for candidate in initial.candidates)
+    assert all(not candidate.parent_candidate_identifiers for candidate in initial.candidates)
+    assert all(candidate.transformation is None for candidate in initial.candidates)
+    assert all(
+        candidate.metadata["generation_kind"] == "de_novo_fragment_assembly"
+        and candidate.metadata["construction_policy_identifier"]
+        == "policy.test_de_novo_fragments_v1"
+        for candidate in initial.candidates
+    )
+    assert all(
+        RDKitMolecularValidityChecker(store).check(candidate).valid
+        for candidate in initial.candidates
+    )
+
+    children = generator.propose(
+        _generation_request(generation=1, parents=(initial.candidates[0],))
+    )
+    assert children.candidates
+    assert all(candidate.transformation is not None for candidate in children.candidates)
+    assert all(
+        candidate.transformation.transformation_kind == "de_novo_graph_extension"
+        for candidate in children.candidates
+        if candidate.transformation is not None
+    )
+    assert all(
+        candidate.parent_candidate_identifiers
+        == (initial.candidates[0].candidate_identifier,)
         for candidate in children.candidates
     )
 

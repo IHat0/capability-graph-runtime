@@ -79,6 +79,10 @@ function api(overrides: Partial<PulsateApi> = {}): PulsateApi {
   return {
     getHealth: vi.fn(), getPresets: vi.fn(), getPreset: vi.fn(), getScene: vi.fn(),
     planExperiment: vi.fn(), interpretQuestion: vi.fn(), approveInterpretation: vi.fn(),
+    uploadResearchInput: vi.fn(), createResearchSession: vi.fn(),
+    getResearchSession: vi.fn(), replyResearchSession: vi.fn(),
+    executeResearchSession: vi.fn(), getResearchScene: vi.fn(), getResearchConformationScene: vi.fn(),
+    getResearchComplexScene: vi.fn(), getResearchVisualization: vi.fn(), downloadResearchArtifact: vi.fn(),
     getRunCapability: vi.fn().mockResolvedValue({
       available: true, execution_targets: ['local_simulator'], reason: null, maximum_run_seconds: 180,
     }),
