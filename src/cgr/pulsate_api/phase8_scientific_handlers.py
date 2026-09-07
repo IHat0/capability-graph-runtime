@@ -5540,7 +5540,12 @@ class DiscoveryCampaignIterationHandler:
             validity_checkers=CandidateValidityCheckerRegistry((checker,)),
             evaluators=CandidateEvaluatorRegistry((descriptor, docking)),
             scientific_verifiers=CandidateScientificVerifierRegistry((MolecularCandidateEvidenceVerifier(),)),
-            selection_policy=SelectionPolicy(max_selected_candidates=1),
+            selection_policy=SelectionPolicy(
+                max_selected_candidates=(objective.research_requirements.candidate_selection.count
+                    if objective.research_requirements and objective.research_requirements.candidate_selection else 1),
+                select_only_first_pareto_front=not bool(objective.research_requirements
+                    and objective.research_requirements.candidate_selection),
+            ),
         )
         run = runtime.run(campaign)
         if not run.completed or len(run.state.generations) < campaign.metadata["minimum_generations"]:

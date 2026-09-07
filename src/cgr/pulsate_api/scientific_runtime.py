@@ -329,6 +329,22 @@ class ScientistResultAssembler:
         except (AttributeError, KeyError, TypeError, ValueError, UnicodeError, RuntimeError):
             return None
 
+    def review_candidate_evidence(self, record, question, previous=None):
+        from .scientific_candidate_evidence import review_candidate_evidence
+        if record.status != "succeeded" or not record.verified:
+            return None
+        trace = self._read_json_evidence(record, "discovery_design_loop_trace")
+        campaign = self._read_json_evidence(record, "discovery_campaign")
+        if trace is None or campaign is None:
+            return None
+        identifiers = {trace[1], campaign[1]}
+        references = tuple(item for item in record.artifact_references if item.artifact_identifier in identifiers)
+        return review_candidate_evidence(
+            document=trace[0], campaign=campaign[0], question=question,
+            provider=self.provider, execution_identifier=record.execution_identifier,
+            references=references, previous=previous,
+        )
+
     def _allowed_statements(
         self,
         objective: StructuredScientificObjective,
@@ -416,6 +432,21 @@ class ScientistResultAssembler:
                         f"{name.replace('_', ' ')} = {value:.4f}" + (" kcal/mol" if name == "vina_pose_score" else "")
                         for name, value in scores.items() if isinstance(value, (int, float)))
                     outcome = selection.get("outcome")
+                    leader = min(candidates, key=lambda item: (item.get("selection") or {}).get("rank") or 1000000)
+                    leader_scores = {item["objective_identifier"]: item["value"]
+                                     for item in leader.get("properties_and_calculations", [])}
+                    if candidate is not leader:
+                        differences = []
+                        for metric in ("vina_pose_score", "drug_likeness"):
+                            if metric in scores and metric in leader_scores:
+                                gap = scores[metric] - leader_scores[metric]
+                                differences.append(
+                                    f"{metric.replace('_', ' ')} differs by {gap:+.4f}"
+                                    + (" kcal/mol (lower is favored)" if metric == "vina_pose_score"
+                                       else " (QED descriptor; not potency)")
+                                )
+                        if differences:
+                            details += ". Compared with " + str(leader.get("display_name", leader["candidate_identifier"])) + ": " + "; ".join(differences)
                     rationale = selection.get("rationale")
                     if (
                         isinstance(rank, int)
@@ -427,6 +458,9 @@ class ScientistResultAssembler:
                             f"Rank {rank}: {label} ({outcome}). {details}. {rationale}",
                             (trace_identifier,),
                         )
+                from .scientific_candidate_evidence import docking_confidence
+                for statement in docking_confidence(document):
+                    add("confidence", statement, (trace_identifier,))
         elif record.verified_scientific_summaries:
             for summary in record.verified_scientific_summaries:
                 add(
@@ -536,6 +570,10 @@ class ScientistResultAssembler:
             if any(item["category"] == "evidence" for item in allowed):
                 required.add("evidence")
             if not required.issubset(categories):
+                return allowed
+            mandatory = {item["statement_identifier"] for item in allowed
+                         if item["category"] in {"ranking", "limitation", "confidence"}}
+            if not mandatory.issubset(set(identifiers)):
                 return allowed
             return selected
         except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):

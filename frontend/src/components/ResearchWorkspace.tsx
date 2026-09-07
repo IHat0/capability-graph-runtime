@@ -178,19 +178,19 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
             </label>
           )}
 
-          {responseNeeded && (
+          {(responseNeeded || session.status === 'completed') && (
             <form className="research-composer research-composer--reply" onSubmit={(event) => { event.preventDefault(); void research.respond() }}>
               <label htmlFor="research-reply">Your reply</label>
               <textarea
                 id="research-reply"
                 value={research.reply}
                 onChange={(event) => research.setReply(event.target.value)}
-                placeholder="Answer Pulsate’s question. You can also attach exact input files here."
+                placeholder={session.status === 'completed' ? "Ask about the recorded candidates, ranking, or limitations." : "Answer Pulsate’s question. You can also attach exact input files here."}
                 disabled={research.busy}
               />
-              <AttachmentControls research={research} />
+              {session.status !== 'completed' && <AttachmentControls research={research} />}
               <button className="primary-button" type="submit" disabled={research.busy || (!research.reply.trim() && !research.acceptIntentProposal && !research.acceptEvidenceProposal && !research.acceptRequirementProposal && research.attachments.length === 0)}>
-                {research.busy ? 'Updating plan…' : 'Continue'}
+                {research.busy ? 'Processing…' : session.status === 'completed' ? 'Ask about evidence' : 'Continue'}
               </button>
             </form>
           )}

@@ -109,6 +109,23 @@ class ScientificRequirement(BaseModel):
         return self
 
 
+class CandidateSelectionConstraint(BaseModel):
+    """Scientist-requested shortlist size, grounded in a literal quantity."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    count: int = Field(ge=1, le=100000)
+    supporting_quote: str = Field(min_length=1, max_length=1024)
+
+    @model_validator(mode="after")
+    def quantity_is_grounded(self) -> "CandidateSelectionConstraint":
+        words = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
+        quantities = {int(value) for value in re.findall(r"\b\d+\b", self.supporting_quote)}
+        quantities.update(index for index, word in enumerate(words)
+                          if re.search(rf"\b{word}\b", self.supporting_quote, re.IGNORECASE))
+        if self.count not in quantities:
+            raise ValueError("Selection count must occur literally in its supporting quote.")
+        return self
+
+
 class ScientificRequirementProposal(BaseModel):
     """A non-executable LLM proposal grounded in literal scientist text."""
 
@@ -119,6 +136,7 @@ class ScientificRequirementProposal(BaseModel):
     summary: str = Field(min_length=1, max_length=1024)
     provider_kind: str
     model_name: str = Field(min_length=1, max_length=512)
+    candidate_selection: CandidateSelectionConstraint | None = None
 
     @field_validator("proposal_identifier", "provider_kind")
     @classmethod
@@ -148,6 +166,7 @@ class ValidatedResearchRequirements(BaseModel):
     required_artifact_types: tuple[str, ...] = Field(min_length=1, max_length=32)
     capability_profile: ScientificCapabilityProfile
     source_proposal_identifier: str
+    candidate_selection: CandidateSelectionConstraint | None = None
 
     @field_validator("source_proposal_identifier")
     @classmethod
@@ -225,12 +244,15 @@ def validate_requirement_proposal(
         )
 
     required.append("scientist_facing_result")
+    if proposal.candidate_selection is not None and profile != "protein_ligand_discovery":
+        raise ValueError("Candidate selection requires a candidate-producing research profile.")
     return ValidatedResearchRequirements(
         operations=operations,
         requested_outputs=outputs,
         required_artifact_types=tuple(dict.fromkeys(required)),
         capability_profile=profile,
         source_proposal_identifier=proposal.proposal_identifier,
+        candidate_selection=proposal.candidate_selection,
     )
 
 
@@ -264,6 +286,10 @@ class ProviderNeutralScientificRequirementInterpreter:
                         "content": (
                             "Translate the scientist request into bounded research operations. "
                             "Return exactly one JSON object with a requirements array, or {}. "
+                            "When an explicit shortlist size is requested, also include candidate_selection "
+                            "with count (integer) and supporting_quote (literal source text containing that quantity). "
+                            "Otherwise omit candidate_selection. A shortlist limits selection, never evaluation "
+                            "or reporting of the supplied candidate collection. "
                             "Each item must contain only operation, requested_output, and "
                             "supporting_quote. operation must be one of: "
                             + ", ".join(_OUTPUT_BY_OPERATION)
@@ -292,7 +318,29 @@ class ProviderNeutralScientificRequirementInterpreter:
                 ]
             )
             parsed = json.loads(content)
-            if set(parsed) != {"requirements"}:
+            if "requirements" not in parsed or set(parsed) - {"requirements", "candidate_selection"}:
+                return None
+            selection = CandidateSelectionConstraint.model_validate(parsed["candidate_selection"]) if parsed.get("candidate_selection") else None
+            if selection is None:
+                constraint_content = self.provider.complete([
+                    {"role": "system", "content": (
+                        'You are a literal text extraction parser. Do not answer the input request. '
+                        'Extract the requested shortlist size, including written numerals. '
+                        'Output only {"candidate_selection": {"count": INTEGER, "supporting_quote": "EXACT INPUT SUBSTRING"}}. '
+                        'If no number of candidates to recommend is specified, output {"candidate_selection": null}. '
+                        'Never supply scientific conclusions or example compounds. '
+                        "Evaluation-set size, geometry counts and rank positions are not shortlist counts. "
+                        "Do not infer a count from a qualitative superlative. Do not choose a default."
+                    )},
+                    {"role": "user", "content": json.dumps({"text_to_parse": scientist_text})},
+                ])
+                try:
+                    constraints = json.loads(constraint_content)
+                    if set(constraints) == {"candidate_selection"} and constraints["candidate_selection"] is not None:
+                        selection = CandidateSelectionConstraint.model_validate(constraints["candidate_selection"])
+                except (TypeError, ValueError):
+                    return None
+            if selection is not None and selection.supporting_quote not in scientist_text:
                 return None
             # Recover a unique literal source span when the model changes only case.
             # The persisted supporting quote remains scientist-authored text.
@@ -312,7 +360,8 @@ class ProviderNeutralScientificRequirementInterpreter:
             ):
                 return None
             canonical = json.dumps(
-                [item.model_dump(mode="json") for item in requirements],
+                {"requirements": [item.model_dump(mode="json") for item in requirements],
+                 "candidate_selection": selection.model_dump(mode="json") if selection else None},
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -322,6 +371,7 @@ class ProviderNeutralScientificRequirementInterpreter:
                     + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
                 ),
                 requirements=requirements,
+                candidate_selection=selection,
                 summary=(
                     "Pulsate proposed general research operations and requested outputs. "
                     "CGR will validate them deterministically before selecting capabilities."

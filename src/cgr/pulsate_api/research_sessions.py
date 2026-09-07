@@ -19,6 +19,7 @@ from cgr.science import ArtifactReference, CandidateResearchPlan, ScientificObje
 from cgr.science.canonical import validate_identifier, validate_sha256
 from cgr.workflow_graph import WorkflowGraphDefinition
 from .scientific_capability_truth import ScientificCapabilityGroundingError
+from .scientific_candidate_evidence import CandidateEvidenceReview
 
 from .scientific_conversation import (
     ClarificationPrompt,
@@ -195,6 +196,7 @@ class ResearchSession(BaseModel):
     scene_identifier: str | None = None
     scientist_result: ScientistFacingResult | None = None
     scientist_summary: str
+    evidence_reviews: tuple[CandidateEvidenceReview, ...] = Field(default=(), max_length=64)
 
     @field_validator("session_identifier")
     @classmethod
@@ -564,6 +566,31 @@ class ResearchSessionController:
             current = self._owned(session_identifier, tenant_identifier_sha256)
             if current.status in {"running", "verifying", "replanning"}:
                 raise ValueError("Research is running. Wait for the result before changing the question.")
+            if current.status == "completed" and current.compilation and self.runtime is not None and not any((
+                request.input_references, request.artifact_references, request.budget,
+                request.covalent_reaction_target, request.accept_intent_proposal,
+                request.accept_requirement_proposal, request.accept_evidence_proposal,
+                request.accept_acquired_input_evidence,
+            )):
+                assembler = self.runtime.capability_registry.get("scientist.result_assemble")
+                reviewer = getattr(assembler, "review_candidate_evidence", None)
+                if reviewer is not None:
+                    record = self.execution_repository.get(current.compilation.execution_identifier)
+                    previous = next((item for item in reversed(current.evidence_reviews) if item.candidate_identifiers), None)
+                    review = reviewer(record, request.message, previous)
+                    if review is not None:
+                        now = self._next_time(current.updated_at)
+                        question_turn = self._turn(session_identifier=session_identifier,
+                            position=len(current.conversation) + 1, role="scientist",
+                            content=request.message, created_at=now)
+                        answer_turn = self._turn(session_identifier=session_identifier,
+                            position=len(current.conversation) + 2, role="pulsate",
+                            content=review.response, created_at=now)
+                        return self.repository.replace(current.model_copy(update={
+                            "updated_at": now, "revision": current.revision + 1,
+                            "conversation": (*current.conversation, question_turn, answer_turn),
+                            "evidence_reviews": (*current.evidence_reviews, review),
+                        }), expected_revision=current.revision)
             now = self._next_time(current.updated_at)
             scientist_turn = self._turn(
                 session_identifier=session_identifier,
