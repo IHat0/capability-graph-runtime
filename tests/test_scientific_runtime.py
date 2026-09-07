@@ -89,6 +89,22 @@ class RetryOnceHandler(EvidenceHandler):
         )
 
 
+class ComputationThenVerificationSummaryHandler(EvidenceHandler):
+    def execute(self, *, invocation, objective, record):
+        outcome = super().execute(
+            invocation=invocation,
+            objective=objective,
+            record=record,
+        )
+        if invocation.capability_identity.startswith("scientific_verification."):
+            return outcome.model_copy(
+                update={"scientific_summary": "The blocking verification passed."}
+            )
+        return outcome.model_copy(
+            update={"scientific_summary": "The persisted computation produced result R."}
+        )
+
+
 def test_native_adapter_declarations_build_exact_scientist_registry() -> None:
     adapter = PySCFElectronicStructureAdapter(PayloadStore())
     registry = scientific_engine_registry((adapter,))
@@ -148,6 +164,89 @@ def test_runtime_executes_composed_plan_through_persisted_cgr_graph(tmp_path) ->
     assert all(node.status == "succeeded" for node in completed.node_executions)
     assert completed.scene_identifier == "scientific-scene-runtime"
     assert completed.evidence_artifact_identifiers
+    assert "This record contains a plan, not fabricated calculation results." not in (
+        completed.limitations
+    )
+    assert "This record contains a plan" not in (
+        completed.scientist_result.scientific_result
+    )
+
+
+def test_verification_promotes_the_preceding_persisted_computation_summary(
+    tmp_path,
+) -> None:
+    repository = ScientificExecutionRepository(tmp_path / "executions")
+    repository.start()
+    record = repository.create(ScientificObjectiveCompileRequest(
+        question="Which conformer is preferred in water: axial or equatorial?",
+        input_references=(ScientificInputReference(
+            reference_identifier="molecule-project",
+            artifact_type="molecular_structure",
+            artifact_identifier="molecule-artifact",
+        ),),
+        artifact_references=(ArtifactReference(
+            artifact_identifier="molecule-artifact",
+            schema_version=CapabilityVersion(major=1, minor=0, patch=0),
+            artifact_type="molecular_structure",
+            media_type="chemical/x-mdl-molfile",
+            content_sha256="a" * 64,
+            provenance=CreationProvenance(
+                producer="test.fixture",
+                producer_version=CapabilityVersion(major=1, minor=0, patch=0),
+            ),
+        ),),
+    ))
+    handler = ComputationThenVerificationSummaryHandler()
+    registry = ScientistCapabilityRegistry({
+        step.capability_name: handler
+        for step in record.plan.steps
+        if step.capability_name != "scientist.result_assemble"
+    })
+    runtime = ScientificObjectiveRuntime(
+        root=tmp_path / "workflow",
+        execution_repository=repository,
+        capability_registry=registry,
+    )
+    runtime.start()
+
+    completed = runtime.execute(record.execution_identifier)
+
+    assert completed.status == "succeeded"
+    assert completed.verified
+    assert completed.scientist_result is not None
+    assert "The persisted computation produced result R." in (
+        completed.verified_scientific_summaries
+    )
+    assert "The blocking verification passed." in (
+        completed.verified_scientific_summaries
+    )
+    assert "The persisted computation produced result R." in (
+        completed.scientist_result.scientific_result
+    )
+
+
+def test_generated_molecular_entity_description_uses_persisted_metadata() -> None:
+    reference = ArtifactReference(
+        artifact_identifier="generated-molecular-structure",
+        schema_version=CapabilityVersion(major=1, minor=0, patch=0),
+        artifact_type="molecular_structure",
+        media_type="application/json",
+        content_sha256="f" * 64,
+        metadata={
+            "molecular_formula": "AB2",
+            "geometry_point_identifier": "geometry-point-001",
+        },
+        provenance=CreationProvenance(
+            producer="test.fixture",
+            producer_version=CapabilityVersion(major=1, minor=0, patch=0),
+        ),
+    )
+
+    description = ScientistResultAssembler._generated_entity_description(reference)
+
+    assert "generated-molecular-structure" in description
+    assert "molecular_formula=AB2" in description
+    assert "geometry_point_identifier=geometry-point-001" in description
 
 
 def test_runtime_retries_a_retryable_scientific_capability(tmp_path) -> None:

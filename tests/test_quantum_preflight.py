@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -541,13 +542,23 @@ def test_missing_dependencies_raise_domain_error(monkeypatch: pytest.MonkeyPatch
 
 @pytest.mark.quantum_unit
 def test_base_imports_do_not_load_quantum_packages() -> None:
-    import cgr
-    import cgr.quixbugs_pilot
-    import cgr.science
+    script = """
+import sys
+import cgr
+import cgr.quixbugs_pilot
+import cgr.science
 
-    del cgr
-    forbidden = ("qiskit", "qiskit_nature", "qiskit_algorithms", "qiskit_aer", "pyscf")
-    assert not any(name.startswith(forbidden) for name in sys.modules)
+forbidden = ("qiskit", "qiskit_nature", "qiskit_algorithms", "qiskit_aer", "pyscf")
+raise SystemExit(any(name.startswith(forbidden) for name in sys.modules))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.quantum_unit

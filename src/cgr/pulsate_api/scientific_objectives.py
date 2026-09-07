@@ -22,6 +22,10 @@ from .scientific_capability_catalogue import (
     phase8_scientific_capability_catalogue,
     public_capability_name,
 )
+from .scientific_molecular_system import (
+    MolecularGroundStateSpecification,
+    resolve_molecular_ground_state_specification,
+)
 from .scientific_requirements import ValidatedResearchRequirements
 
 ScientificTask = Literal[
@@ -58,6 +62,7 @@ class ScientificSemanticTarget(BaseModel):
     target_kind: Literal[
         "catalytic_nucleophile", "metal_coordination_shell", "named_bond",
         "conformer_labels", "binding_pocket", "whole_structure", "designed_protein",
+        "molecular_ground_state",
     ]
     target_label: str
     chain_label: str | None = None
@@ -138,6 +143,7 @@ class StructuredScientificObjective(BaseModel):
     original_request: str = Field(min_length=1, max_length=8192)
     task_type: ScientificTask
     research_requirements: ValidatedResearchRequirements | None = None
+    molecular_ground_state_specification: MolecularGroundStateSpecification | None = None
     input_references: tuple[ScientificInputReference, ...] = ()
     semantic_target: ScientificSemanticTarget
     covalent_reaction_target: CovalentReactionTarget | None = None
@@ -146,7 +152,9 @@ class StructuredScientificObjective(BaseModel):
     scan_start_angstrom: float | None = Field(default=None, gt=0)
     scan_end_angstrom: float | None = Field(default=None, gt=0)
     active_space_policy: Literal[
-        "reaction_center_automatic", "metal_ligand_automatic", "not_requested"
+        "reaction_center_automatic", "metal_ligand_automatic",
+        "frontier_ground_state", "explicit_ground_state",
+        "parameter_sweep_ground_state", "not_requested"
     ]
     quantum_execution_target: Literal["none", "local_simulator", "ibm_quantum"]
     ibm_submission_authorized: Literal[False] = False
@@ -203,6 +211,19 @@ class StructuredScientificObjective(BaseModel):
             and not self.clarification_required
         ):
             raise ValueError("Solvated conformer comparison requires a solvent.")
+        if capability_profile in {
+            "molecular_ground_state_vqe",
+            "molecular_ground_state_vqe_sweep",
+        }:
+            if (
+                self.molecular_ground_state_specification is None
+                and not self.clarification_required
+            ):
+                raise ValueError("Molecular ground-state VQE requires a grounded system specification.")
+        elif self.molecular_ground_state_specification is not None:
+            raise ValueError(
+                "Only molecular ground-state VQE may carry a molecular system specification."
+            )
         if capability_profile != "covalent_transition_state" and self.covalent_reaction_target:
             raise ValueError("Only covalent transition states may carry reaction semantics.")
         return self
@@ -276,20 +297,17 @@ def compile_scientific_objective(
 
     if research_requirements is not None:
         task: ScientificTask = "composed_research"
-        target_kind = (
-            "binding_pocket"
-            if research_requirements.capability_profile == "protein_ligand_discovery"
-            else (
-                "whole_structure"
-                if research_requirements.capability_profile == "structure_analysis"
-                else (
-                    "designed_protein"
-                    if research_requirements.capability_profile
-                    == "de_novo_protein_design"
-                    else "conformer_labels"
-                )
-            )
-        )
+        profile = research_requirements.capability_profile
+        if profile in {"molecular_ground_state_vqe", "molecular_ground_state_vqe_sweep"}:
+            target_kind = "molecular_ground_state"
+        elif profile == "protein_ligand_discovery":
+            target_kind = "binding_pocket"
+        elif profile == "structure_analysis":
+            target_kind = "whole_structure"
+        elif profile == "de_novo_protein_design":
+            target_kind = "designed_protein"
+        else:
+            target_kind = "conformer_labels"
         target_label = "scientist-confirmed general research requirements"
     elif "transition state" in lowered or ("covalent" in lowered and "reaction" in lowered):
         task: ScientificTask = "covalent_transition_state"
@@ -329,17 +347,33 @@ def compile_scientific_objective(
         }
     ]
     ambiguities: list[str] = []
+    molecular_specification = None
     capability_profile = (
         research_requirements.capability_profile
         if research_requirements is not None
         else task
     )
     needs_protein = capability_profile in {"covalent_transition_state", "metal_active_site_quantum", "protein_ligand_discovery"}
+    if capability_profile in {"molecular_ground_state_vqe", "molecular_ground_state_vqe_sweep"}:
+        molecular_specification, molecular_reasons = (
+            resolve_molecular_ground_state_specification(normalized)
+        )
+        ambiguities.extend(molecular_reasons)
+        if molecular_specification is not None:
+            target_label = molecular_specification.system_label
+
     needs_ligand = capability_profile == "covalent_transition_state"
     if needs_protein and len(protein_refs) != 1:
         ambiguities.append("Exactly one protein structure must be resolved.")
     if needs_ligand and len(ligand_refs) != 1:
         ambiguities.append("Exactly one ligand structure must be resolved.")
+    if (
+        capability_profile == "protein_ligand_discovery"
+        and research_requirements is not None
+        and not set(research_requirements.operations) & {"generate_candidates", "design_next_generation"}
+        and not ligand_refs
+    ):
+        ambiguities.append("Candidate ligand structures must be supplied for evaluation; no new molecules were requested.")
     if capability_profile == "structure_analysis" and len(structure_refs) != 1:
         ambiguities.append("Exactly one structure must be resolved for analysis.")
     if capability_profile == "de_novo_protein_design":
@@ -374,7 +408,11 @@ def compile_scientific_objective(
         ambiguities.append("A solvent identity is required for solvated comparison.")
 
     quantum = "none"
-    if capability_profile == "metal_active_site_quantum":
+    if capability_profile in {
+        "metal_active_site_quantum",
+        "molecular_ground_state_vqe",
+        "molecular_ground_state_vqe_sweep",
+    }:
         quantum = "ibm_quantum" if "ibm" in lowered else "local_simulator"
     digest = hashlib.sha256(
         (
@@ -392,12 +430,29 @@ def compile_scientific_objective(
     active_policy = (
         "reaction_center_automatic" if capability_profile in {"covalent_transition_state", "bond_dissociation_scan"}
         else "metal_ligand_automatic" if capability_profile == "metal_active_site_quantum"
+        else "parameter_sweep_ground_state" if capability_profile == "molecular_ground_state_vqe_sweep"
+        else (
+            "explicit_ground_state"
+            if capability_profile == "molecular_ground_state_vqe"
+            and molecular_specification is not None
+            and any(
+                item.field_name == "active_space" and item.source == "scientist"
+                for item in molecular_specification.control_provenance
+            )
+            else "frontier_ground_state"
+        ) if capability_profile == "molecular_ground_state_vqe"
         else "not_requested"
     )
+    assumptions = [
+        "Semantic entity resolution must precede any atom-index materialization."
+    ]
+    if molecular_specification is not None:
+        assumptions.extend(molecular_specification.assumptions)
     return StructuredScientificObjective(
         objective_identifier=f"scientific-objective-{digest}", original_request=normalized,
         task_type=task, input_references=input_references,
         research_requirements=research_requirements,
+        molecular_ground_state_specification=molecular_specification,
         semantic_target=ScientificSemanticTarget(
             protein_reference_identifier=protein_refs[0] if len(protein_refs) == 1 else None,
             ligand_reference_identifier=ligand_refs[0] if len(ligand_refs) == 1 else None,
@@ -407,7 +462,7 @@ def compile_scientific_objective(
         scan_start_angstrom=scan_start, scan_end_angstrom=scan_end,
         active_space_policy=active_policy, quantum_execution_target=quantum,
         budget=budget or ScientificExecutionBudget(),
-        assumptions=("Semantic entity resolution must precede any atom-index materialization.",),
+        assumptions=tuple(assumptions),
         ambiguity_hypotheses=tuple(ambiguities), clarification_required=bool(ambiguities),
     )
 

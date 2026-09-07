@@ -48,6 +48,7 @@ export function completedEvidenceMatches(
 
 export function usePresetRun({
   api = pulsateApi,
+  enabled = true,
   selectedPresetId,
   displayedPresetId,
   experimentIdentifier,
@@ -59,6 +60,7 @@ export function usePresetRun({
   executionTarget = 'local_simulator',
 }: {
   api?: PulsateApi
+  enabled?: boolean
   selectedPresetId: string | null
   displayedPresetId: string | null
   experimentIdentifier?: string
@@ -101,13 +103,14 @@ export function usePresetRun({
   ), [stateIdentityMatches, structureSha256])
 
   useEffect(() => {
+    if (!enabled) return
     const controller = new AbortController()
     api.getRunCapability(controller.signal).then(setCapability).catch((cause) => {
       if (controller.signal.aborted) return
       setCapability({ available: false, execution_targets: [], reason: messageFor(cause), maximum_run_seconds: null })
     })
     return () => controller.abort()
-  }, [api])
+  }, [api, enabled])
 
   useEffect(() => {
     generationRef.current += 1

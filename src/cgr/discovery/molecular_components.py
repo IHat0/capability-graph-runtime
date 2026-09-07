@@ -146,6 +146,7 @@ class RDKitMolecularCandidateGenerator:
         store: MolecularCandidateArtifactStore,
         *,
         seed_smiles: tuple[str, ...],
+        seed_metadata: Mapping[str, dict] | None = None,
         allowed_substituents: tuple[str, ...] = ("C", "F", "Cl"),
     ) -> None:
         if not isinstance(store, MolecularCandidateArtifactStore):
@@ -159,6 +160,11 @@ class RDKitMolecularCandidateGenerator:
             raise ValueError("Unsupported molecular substituent configuration.")
         self._store = store
         self._seed_smiles = seed_smiles
+        self._seed_metadata = {
+            smiles: {key: json.dumps(value, sort_keys=True) if isinstance(value, (list, dict)) else value
+                     for key, value in metadata.items()}
+            for smiles, metadata in (seed_metadata or {}).items()
+        }
         self._substituents = allowed_substituents
 
     @property
@@ -189,7 +195,8 @@ class RDKitMolecularCandidateGenerator:
                     generated_by=self.generator_identifier,
                     representation_artifacts=(pointer,),
                     objective_identifiers=request.objective_identifiers,
-                    metadata={"canonical_smiles": smiles, "generation_kind": "seed"},
+                    metadata={**self._seed_metadata.get(smiles, {}),
+                              "canonical_smiles": smiles, "generation_kind": "seed"},
                 ))
         else:
             for parent in request.parent_candidates:

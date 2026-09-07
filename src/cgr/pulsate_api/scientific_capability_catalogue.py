@@ -132,12 +132,49 @@ _CONFORMER = ("solvated_conformer_comparison",)
 _DISCOVERY = ("protein_ligand_discovery",)
 _ANALYSIS = ("structure_analysis",)
 _PROTEIN_DESIGN = ("de_novo_protein_design",)
+_GROUND_STATE = ("molecular_ground_state_vqe",)
+_GROUND_STATE_SWEEP = ("molecular_ground_state_vqe_sweep",)
 
 
 def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
     """Return the production Phase 8 artifact contract catalogue."""
 
     definitions = (
+        ScientificCapabilityDefinition(
+            capability_name="electronic.molecular_system_resolve",
+            produced_artifact_types=("molecular_structure", "electronic_molecule"),
+            supported_task_types=_GROUND_STATE,
+            verification_required=True,
+            priority=5,
+        ),        ScientificCapabilityDefinition(
+            capability_name="electronic.molecular_parameter_sweep_resolve",
+            produced_artifact_types=("molecular_structure", "molecular_parameter_sweep"),
+            supported_task_types=_GROUND_STATE_SWEEP,
+            verification_required=True,
+            priority=5,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="scientific_computation.molecular_ground_state_sweep",
+            accepted_artifact_types=("molecular_parameter_sweep",),
+            produced_artifact_types=(
+                "ground_state_parameter_sweep_result",
+                "multi_point_execution_receipt",
+            ),
+            supported_task_types=_GROUND_STATE_SWEEP,
+            verification_required=True,
+            priority=70,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="scientific_verification.molecular_ground_state_sweep",
+            accepted_artifact_types=(
+                "ground_state_parameter_sweep_result",
+                "multi_point_execution_receipt",
+            ),
+            produced_artifact_types=("scientific_verification_report",),
+            supported_task_types=_GROUND_STATE_SWEEP,
+            verification_required=True,
+            priority=80,
+        ),
         ScientificCapabilityDefinition(
             capability_name="molecular.structure_ingestion",
             accepted_artifact_types=("scientist_input",),
@@ -207,7 +244,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             capability_name="electronic.configuration_define",
             accepted_artifact_types=("electronic_molecule",),
             produced_artifact_types=("electronic_structure_configuration",),
-            supported_task_types=(*_TS, *_METAL),
+            supported_task_types=(*_TS, *_METAL, *_GROUND_STATE),
             priority=35,
         ),
         ScientificCapabilityDefinition(
@@ -229,7 +266,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
                 "electronic_structure_configuration",
             ),
             produced_artifact_types=("electronic_hartree_fock_result",),
-            supported_task_types=(*_TS, *_METAL),
+            supported_task_types=(*_TS, *_METAL, *_GROUND_STATE),
             priority=42,
         ),
         ScientificCapabilityDefinition(
@@ -247,6 +284,19 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
         ),
         ScientificCapabilityDefinition(
             capability_name="electronic.active_space_select",
+            accepted_artifact_types=(
+                "electronic_molecule",
+                "electronic_structure_configuration",
+                "electronic_hartree_fock_result",
+            ),
+            produced_artifact_types=("electronic_active_space_selection",),
+            supported_task_types=_GROUND_STATE,
+            verification_required=True,
+            priority=45,
+        ),
+
+        ScientificCapabilityDefinition(
+            capability_name="electronic.active_space_select",
             accepted_artifact_types=("molecular_structure", "semantic_target_selection"),
             produced_artifact_types=("electronic_active_space_selection",),
             supported_task_types=_PES,
@@ -262,7 +312,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
                 "electronic_active_space_selection",
             ),
             produced_artifact_types=("electronic_active_space",),
-            supported_task_types=(*_TS, *_METAL),
+            supported_task_types=(*_TS, *_METAL, *_GROUND_STATE),
             priority=50,
         ),
         ScientificCapabilityDefinition(
@@ -369,31 +419,55 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             capability_name="quantum.hamiltonian_construct",
             accepted_artifact_types=("electronic_active_space",),
             produced_artifact_types=("second_quantized_hamiltonian",),
-            supported_task_types=_METAL,
+            supported_task_types=(*_METAL, *_GROUND_STATE),
             priority=58,
         ),
         ScientificCapabilityDefinition(
             capability_name="quantum.fermion_to_qubit_map",
             accepted_artifact_types=("second_quantized_hamiltonian",),
             produced_artifact_types=("mapped_qubit_hamiltonian",),
-            supported_task_types=_METAL,
+            supported_task_types=(*_METAL, *_GROUND_STATE),
             priority=60,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="quantum.exact_diagonalize",
+            accepted_artifact_types=("mapped_qubit_hamiltonian",),
+            produced_artifact_types=("exact_diagonalization_result",),
+            supported_task_types=_GROUND_STATE,
+            priority=62,
         ),
         ScientificCapabilityDefinition(
             capability_name="quantum.ansatz_construct",
             accepted_artifact_types=("mapped_qubit_hamiltonian",),
             produced_artifact_types=("variational_ansatz",),
-            supported_task_types=_METAL,
+            supported_task_types=(*_METAL, *_GROUND_STATE),
             priority=65,
         ),
         ScientificCapabilityDefinition(
             capability_name="quantum.vqe_execute",
             accepted_artifact_types=("mapped_qubit_hamiltonian", "variational_ansatz"),
             produced_artifact_types=("variational_ground_state_result",),
-            supported_task_types=_METAL,
+            supported_task_types=(*_METAL, *_GROUND_STATE),
             verification_required=True,
             priority=70,
         ),
+        ScientificCapabilityDefinition(
+            capability_name="scientific_verification.molecular_ground_state",
+            accepted_artifact_types=(
+                "electronic_molecule",
+                "exact_diagonalization_result",
+                "variational_ground_state_result",
+            ),
+            produced_artifact_types=(
+                "scientific_verification_report",
+                "molecular_ground_state_execution_receipt",
+            ),
+            supported_task_types=_GROUND_STATE,
+            verification_required=True,
+            priority=80,
+        ),
+
+
         ScientificCapabilityDefinition(
             capability_name="scientific_verification.metal_centre",
             accepted_artifact_types=(
@@ -410,7 +484,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             capability_name="quantum.ibm_execution_prepare",
             accepted_artifact_types=("mapped_qubit_hamiltonian",),
             produced_artifact_types=("authorization_request",),
-            supported_task_types=_METAL,
+            supported_task_types=(*_METAL, *_GROUND_STATE),
             authorization_required=True,
             # Keep this terminal handoff after the scientist-facing local result.
             # It prepares an authorization request and never submits a job.
@@ -548,7 +622,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
         ),
         ScientificCapabilityDefinition(
             capability_name="molecular.docking_receptor_prepare",
-            accepted_artifact_types=("molecular_structure",),
+            accepted_artifact_types=("prepared_molecular_structure",),
             produced_artifact_types=("docking_receptor_pdbqt",),
             supported_task_types=_DISCOVERY,
             verification_required=True,

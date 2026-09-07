@@ -126,6 +126,7 @@ class ScientificExecutionRecord(BaseModel):
     workflow_snapshot_fingerprint: str | None = None
     scene_identifier: str | None = None
     scientist_summary: str
+    pending_scientific_summaries: tuple[str, ...] = ()
     verified_scientific_summaries: tuple[str, ...] = ()
     scientist_result: ScientistFacingResult | None = None
     limitations: tuple[str, ...] = ()

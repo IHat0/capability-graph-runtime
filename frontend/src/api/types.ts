@@ -509,6 +509,13 @@ export interface ResearchSessionResponse {
   accepted_evidence: ResearchEvidenceProposal[]
   compilation: ResearchCompilationResponse | null
   execution_status: string | null
+  execution_steps?: Array<{
+    step_identifier: string
+    capability_name: string
+    status: 'pending' | 'running' | 'succeeded' | 'failed' | 'blocked'
+    error_code: string | null
+    error_message: string | null
+  }>
   scene_identifier: string | null
   scientist_result: ScientistFacingResult | null
   scientist_summary: string
@@ -571,6 +578,7 @@ export interface ResearchVisualizationOverlay {
 
 export interface ResearchVisualizationCandidate {
   candidate_identifier: string
+  display_name?: string
   generation: number
   parent_candidate_identifiers: string[]
   transformation: Record<string, unknown> | null

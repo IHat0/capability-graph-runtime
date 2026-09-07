@@ -126,6 +126,132 @@ def test_common_report_always_contains_all_seven_dimensions_in_order() -> None:
     assert report.authorization_passed is True
 
 
+def test_energy_agreement_passes_when_difference_is_within_tolerance() -> None:
+    report = default_scientific_verifier_registry().verify(
+        EnergyComparisonRequest(
+            request_identifier="verification.energy.agreement-pass",
+            subject_identifier="subject.energy",
+            calculations=(
+                _calculation("calc.a", energy=-1.0, uncertainty=None),
+                _calculation("calc.b", energy=-0.9999999995, uncertainty=None),
+            ),
+            comparison_goal="verify_agreement",
+            maximum_agreement_difference_hartree=1e-5,
+        )
+    )
+
+    assert report.overall_outcome is VerificationOutcome.PASSED
+
+
+def test_energy_agreement_fails_when_difference_exceeds_tolerance() -> None:
+    report = default_scientific_verifier_registry().verify(
+        EnergyComparisonRequest(
+            request_identifier="verification.energy.agreement-fail",
+            subject_identifier="subject.energy",
+            calculations=(
+                _calculation("calc.a", energy=-1.0, uncertainty=None),
+                _calculation("calc.b", energy=-0.998, uncertainty=None),
+            ),
+            comparison_goal="verify_agreement",
+            maximum_agreement_difference_hartree=1e-5,
+        )
+    )
+
+    assert report.overall_outcome is VerificationOutcome.FAILED
+    assert (
+        _result(report, VerificationDimension.NUMERICAL_INTEGRITY).outcome
+        is VerificationOutcome.FAILED
+    )
+
+
+def test_variational_upper_bound_accepts_a_converged_approximation() -> None:
+    report = default_scientific_verifier_registry().verify(
+        EnergyComparisonRequest(
+            request_identifier="verification.energy.variational-pass",
+            subject_identifier="subject.energy",
+            calculations=(
+                _calculation("calc.a", energy=-1.0, uncertainty=None),
+                _calculation("calc.b", energy=-0.99995, uncertainty=None),
+            ),
+            comparison_goal="verify_variational_upper_bound",
+            variational_reference_calculation_identifier="calc.a",
+            variational_candidate_calculation_identifier="calc.b",
+            variational_tolerance_hartree=1e-9,
+        )
+    )
+
+    assert report.overall_outcome is VerificationOutcome.PASSED
+
+
+def test_variational_upper_bound_rejects_energy_below_exact_reference() -> None:
+    report = default_scientific_verifier_registry().verify(
+        EnergyComparisonRequest(
+            request_identifier="verification.energy.variational-fail",
+            subject_identifier="subject.energy",
+            calculations=(
+                _calculation("calc.a", energy=-1.0, uncertainty=None),
+                _calculation("calc.b", energy=-1.001, uncertainty=None),
+            ),
+            comparison_goal="verify_variational_upper_bound",
+            variational_reference_calculation_identifier="calc.a",
+            variational_candidate_calculation_identifier="calc.b",
+            variational_tolerance_hartree=1e-9,
+        )
+    )
+
+    assert report.overall_outcome is VerificationOutcome.FAILED
+    assert (
+        _result(report, VerificationDimension.SCIENTIFIC_PLAUSIBILITY).outcome
+        is VerificationOutcome.FAILED
+    )
+
+
+def test_parameterized_curve_allows_geometry_specific_molecule_fingerprints() -> None:
+    report = default_scientific_verifier_registry().verify(
+        PotentialEnergyCurveRequest(
+            request_identifier="verification.curve.parameterized-system",
+            subject_identifier="subject.parameterized-system",
+            calculations=(
+                _calculation(
+                    "calc.a", energy=-1.0, molecule="molecule.point-a"
+                ),
+                _calculation(
+                    "calc.b",
+                    energy=-1.1,
+                    molecule="molecule.point-b",
+                    geometry_character="d",
+                ),
+                _calculation(
+                    "calc.c",
+                    energy=-0.9,
+                    molecule="molecule.point-c",
+                    geometry_character="e",
+                ),
+            ),
+            points=(
+                PotentialEnergyPoint(
+                    calculation_identifier="calc.a",
+                    reaction_coordinate=0.5,
+                    reaction_coordinate_unit="angstrom",
+                ),
+                PotentialEnergyPoint(
+                    calculation_identifier="calc.b",
+                    reaction_coordinate=1.0,
+                    reaction_coordinate_unit="angstrom",
+                ),
+                PotentialEnergyPoint(
+                    calculation_identifier="calc.c",
+                    reaction_coordinate=1.5,
+                    reaction_coordinate_unit="angstrom",
+                ),
+            ),
+            require_same_molecule=False,
+        )
+    )
+
+    assert report.overall_outcome is VerificationOutcome.PASSED
+
+
 def test_execution_can_pass_while_scientific_quality_fails() -> None:
     report = default_scientific_verifier_registry().verify(
         EnergyComparisonRequest(

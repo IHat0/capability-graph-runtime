@@ -111,14 +111,17 @@ def _qiskit_modules() -> tuple[object, object, object, object, object]:
     import numpy
     from qiskit.quantum_info import SparsePauliOp
     from qiskit_nature.second_q.hamiltonians import ElectronicEnergy
-    from qiskit_nature.second_q.mappers import JordanWignerMapper
+    from qiskit_nature.second_q.mappers import JordanWignerMapper, ParityMapper
     from qiskit_nature.second_q.operators import FermionicOp
 
     return (
         numpy,
         SparsePauliOp,
         ElectronicEnergy,
-        JordanWignerMapper,
+        {
+            "jordan_wigner": JordanWignerMapper,
+            "parity": ParityMapper,
+        },
         FermionicOp,
     )
 
@@ -131,7 +134,7 @@ def _variational_modules() -> tuple[object, ...]:
     from qiskit_algorithms.optimizers import SLSQP
     from qiskit_algorithms.utils import algorithm_globals
     from qiskit_nature.second_q.circuit.library import HartreeFock, UCCSD
-    from qiskit_nature.second_q.mappers import JordanWignerMapper
+    from qiskit_nature.second_q.mappers import JordanWignerMapper, ParityMapper
 
     return (
         numpy,
@@ -143,7 +146,10 @@ def _variational_modules() -> tuple[object, ...]:
         algorithm_globals,
         HartreeFock,
         UCCSD,
-        JordanWignerMapper,
+        {
+            "jordan_wigner": JordanWignerMapper,
+            "parity": ParityMapper,
+        },
     )
 
 
@@ -153,6 +159,12 @@ def _noisy_modules() -> tuple[object, object, object, object]:
     from qiskit_aer.primitives import EstimatorV2
 
     return EstimatorV2, NoiseModel, depolarizing_error, transpile
+
+
+def _exact_statevector_gradient() -> object:
+    from qiskit_algorithms.gradients import ReverseEstimatorGradient
+
+    return ReverseEstimatorGradient()
 
 
 def _descriptor(
@@ -209,7 +221,7 @@ def quantum_workflow_capability_envelopes() -> tuple[CapabilityExecutionEnvelope
             ("fermion_to_qubit_mapping",),
             True,
             (
-                "Version 1 supports Jordan-Wigner mapping without qubit reduction.",
+                "Version 1 supports Jordan-Wigner and parity mapping without qubit reduction.",
                 "Every mapped Hamiltonian must pass an explicit Hermiticity check.",
             ),
         ),
@@ -222,8 +234,8 @@ def quantum_workflow_capability_envelopes() -> tuple[CapabilityExecutionEnvelope
             False,
             (
                 (
-                    "Version 1 exact diagonalization supports Jordan-Wigner "
-                    "Hamiltonians only."
+                    "Version 1 exact diagonalization supports validated Jordan-Wigner "
+                    "and parity Hamiltonians."
                 ),
                 "The full mapped matrix is bounded to 12 qubits and 4096 basis states.",
                 (
@@ -245,7 +257,7 @@ def quantum_workflow_capability_envelopes() -> tuple[CapabilityExecutionEnvelope
                     "UCCSD ansatz with a Hartree-Fock initial state."
                 ),
                 "Version 1 requires an explicit all-zero initial point.",
-                "Version 1 supports Jordan-Wigner mapped active spaces only.",
+                "Version 1 supports Jordan-Wigner and parity mapped active spaces.",
             ),
         ),
         (
@@ -416,6 +428,80 @@ def _parameter_hash(values: tuple[QuantumRealParameter, ...]) -> str:
     return sha256_fingerprint([item.value_hex for item in values])
 
 
+def _qubit_mapper(mapper_name: str, mapper_types: object) -> object:
+    if not isinstance(mapper_types, dict) or mapper_name not in mapper_types:
+        raise ValueError(f"Unsupported fermion-to-qubit mapper: {mapper_name!r}.")
+    return mapper_types[mapper_name]()
+
+
+def _mapped_basis_index(
+    occupation_index: int,
+    *,
+    number_of_qubits: int,
+    mapper_name: str,
+) -> int:
+    """Translate one occupation-number basis index into the mapper basis."""
+
+    if mapper_name == "jordan_wigner":
+        return occupation_index
+    if mapper_name != "parity":
+        raise ValueError(f"Unsupported fermion-to-qubit mapper: {mapper_name!r}.")
+    mapped_index = 0
+    running_parity = 0
+    for qubit in range(number_of_qubits):
+        running_parity ^= (occupation_index >> qubit) & 1
+        mapped_index |= running_parity << qubit
+    return mapped_index
+
+
+def _occupation_basis_index(
+    mapped_index: int,
+    *,
+    number_of_qubits: int,
+    mapper_name: str,
+) -> int:
+    """Translate one mapper-basis index back to occupation-number bits."""
+
+    if mapper_name == "jordan_wigner":
+        return mapped_index
+    if mapper_name != "parity":
+        raise ValueError(f"Unsupported fermion-to-qubit mapper: {mapper_name!r}.")
+    occupation_index = 0
+    previous_parity = 0
+    for qubit in range(number_of_qubits):
+        current_parity = (mapped_index >> qubit) & 1
+        occupation_index |= (current_parity ^ previous_parity) << qubit
+        previous_parity = current_parity
+    return occupation_index
+
+
+def _particle_counts(
+    mapped_index: int,
+    mapped: MappedQubitHamiltonian,
+) -> tuple[int, int]:
+    occupation_index = _occupation_basis_index(
+        mapped_index,
+        number_of_qubits=mapped.number_of_qubits,
+        mapper_name=mapped.mapper,
+    )
+    spatial = mapped.active_spatial_orbital_count
+    alpha_mask = (1 << spatial) - 1
+    beta_mask = alpha_mask << spatial
+    return (
+        (occupation_index & alpha_mask).bit_count(),
+        ((occupation_index & beta_mask) >> spatial).bit_count(),
+    )
+
+
+def _particle_sector_indices(mapped: MappedQubitHamiltonian) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index in range(1 << mapped.number_of_qubits)
+        if _particle_counts(index, mapped)
+        == (mapped.alpha_electron_count, mapped.beta_electron_count)
+    )
+
+
 def _native_mapped_operator(
     mapped: MappedQubitHamiltonian, sparse_pauli_type: object
 ) -> object:
@@ -432,13 +518,9 @@ def _native_variational_ansatz(
     *,
     hartree_fock_type: object,
     uccsd_type: object,
-    mapper_type: object,
+    mapper_types: object,
 ) -> tuple[object, object]:
-    if mapped.mapper != "jordan_wigner":
-        raise ValueError(
-            "Version 1 variational execution requires Jordan-Wigner mapping."
-        )
-    mapper = mapper_type()
+    mapper = _qubit_mapper(mapped.mapper, mapper_types)
     particles = (mapped.alpha_electron_count, mapped.beta_electron_count)
     initial_state = hartree_fock_type(
         num_spatial_orbitals=mapped.active_spatial_orbital_count,
@@ -1013,8 +1095,8 @@ class QiskitQuantumWorkflowAdapter:
             hamiltonian_reference, SecondQuantizedHamiltonian
         )
         mapper_name = self._string_parameter(invocation, "mapper")
-        if mapper_name != "jordan_wigner":
-            raise ValueError("Version 1 supports only the Jordan-Wigner mapper.")
+        if mapper_name not in {"jordan_wigner", "parity"}:
+            raise ValueError("The requested fermion-to-qubit mapper is unsupported.")
         tolerance = self._float_parameter(
             invocation,
             "hermiticity_tolerance",
@@ -1022,12 +1104,12 @@ class QiskitQuantumWorkflowAdapter:
             maximum=1e-4,
         )
 
-        _, _, _, mapper_type, fermionic_type = _qiskit_modules()
+        _, _, _, mapper_types, fermionic_type = _qiskit_modules()
         native_fermionic = fermionic_type(
             {term.label: term.coefficient.value for term in hamiltonian.terms},
             num_spin_orbitals=hamiltonian.register_length,
         )
-        mapper = mapper_type()
+        mapper = _qubit_mapper(mapper_name, mapper_types)
         native_qubit = mapper.map(native_fermionic).simplify(atol=tolerance)
         terms = _pauli_terms(native_qubit.to_list())
         if not terms:
@@ -1052,7 +1134,7 @@ class QiskitQuantumWorkflowAdapter:
             active_space_identifier=hamiltonian.active_space_identifier,
             active_space_sha256=hamiltonian.active_space_sha256,
             molecule_identifier=hamiltonian.molecule_identifier,
-            mapper="jordan_wigner",
+            mapper=mapper_name,
             active_electron_count=hamiltonian.active_electron_count,
             alpha_electron_count=hamiltonian.alpha_electron_count,
             beta_electron_count=hamiltonian.beta_electron_count,
@@ -1119,10 +1201,6 @@ class QiskitQuantumWorkflowAdapter:
             minimum=1e-14,
             maximum=1e-4,
         )
-        if mapped.mapper != "jordan_wigner":
-            raise ValueError(
-                "Particle-sector matrix restriction requires Jordan-Wigner mapping."
-            )
         if mapped.number_of_qubits > _MAXIMUM_EXACT_QUBITS:
             raise ValueError("Mapped Hamiltonian exceeds the exact-solver qubit bound.")
         full_dimension = 1 << mapped.number_of_qubits
@@ -1145,14 +1223,7 @@ class QiskitQuantumWorkflowAdapter:
         if matrix.shape != (full_dimension, full_dimension):
             raise ValueError("Mapped Hamiltonian matrix has an invalid shape.")
         n = mapped.active_spatial_orbital_count
-        alpha_mask = (1 << n) - 1
-        beta_mask = alpha_mask << n
-        sector_indices = tuple(
-            index
-            for index in range(full_dimension)
-            if (index & alpha_mask).bit_count() == mapped.alpha_electron_count
-            and ((index & beta_mask) >> n).bit_count() == mapped.beta_electron_count
-        )
+        sector_indices = _particle_sector_indices(mapped)
         expected_sector = comb(n, mapped.alpha_electron_count) * comb(
             n, mapped.beta_electron_count
         )
@@ -1299,13 +1370,13 @@ class QiskitQuantumWorkflowAdapter:
             _,
             hartree_fock_type,
             uccsd_type,
-            mapper_type,
+            mapper_types,
         ) = _variational_modules()
         _, native_ansatz = _native_variational_ansatz(
             mapped,
             hartree_fock_type=hartree_fock_type,
             uccsd_type=uccsd_type,
-            mapper_type=mapper_type,
+            mapper_types=mapper_types,
         )
         number_of_parameters = int(native_ansatz.num_parameters)
         if number_of_parameters <= 0:
@@ -1429,14 +1500,14 @@ class QiskitQuantumWorkflowAdapter:
             algorithm_globals,
             hartree_fock_type,
             uccsd_type,
-            mapper_type,
+            mapper_types,
         ) = _variational_modules()
         native_qubit = _native_mapped_operator(mapped, sparse_pauli_type)
         _, native_ansatz = _native_variational_ansatz(
             mapped,
             hartree_fock_type=hartree_fock_type,
             uccsd_type=uccsd_type,
-            mapper_type=mapper_type,
+            mapper_types=mapper_types,
         )
         if int(native_ansatz.num_parameters) != ansatz_spec.number_of_parameters:
             raise ValueError("Reconstructed ansatz parameter count is inconsistent.")
@@ -1480,6 +1551,7 @@ class QiskitQuantumWorkflowAdapter:
             estimator=estimator_type(seed=random_seed),
             ansatz=native_ansatz,
             optimizer=optimizer,
+            gradient=_exact_statevector_gradient(),
             initial_point=initial_point,
             callback=callback,
         )
@@ -1534,6 +1606,7 @@ class QiskitQuantumWorkflowAdapter:
             active_space_sha256=mapped.active_space_sha256,
             algorithm_identifier="variational_quantum_eigensolver",
             estimator_identifier="exact_statevector_expectation",
+            gradient_identifier="reverse_mode_exact_statevector",
             optimizer_identifier="slsqp",
             optimizer_version=_installed_version("qiskit-algorithms") or "unavailable",
             optimizer_status=status_identifier,
@@ -1563,6 +1636,7 @@ class QiskitQuantumWorkflowAdapter:
             metadata={
                 "optimizer": result.optimizer_identifier,
                 "estimator": result.estimator_identifier,
+                "gradient": result.gradient_identifier,
                 "number_of_qubits": result.number_of_qubits,
                 "number_of_parameters": result.number_of_parameters,
                 "optimizer_evaluations": result.optimizer_evaluations,
@@ -1582,6 +1656,7 @@ class QiskitQuantumWorkflowAdapter:
             diagnostics={
                 "optimizer": result.optimizer_identifier,
                 "estimator": result.estimator_identifier,
+                "gradient": result.gradient_identifier,
                 "optimizer_evaluations": result.optimizer_evaluations,
                 "total_energy_hartree": result.total_energy_hartree,
                 "reference_energy_used": False,
@@ -1648,14 +1723,14 @@ class QiskitQuantumWorkflowAdapter:
             _,
             hartree_fock_type,
             uccsd_type,
-            mapper_type,
+            mapper_types,
         ) = _variational_modules()
         native_qubit = _native_mapped_operator(mapped, sparse_pauli_type)
         _, native_ansatz = _native_variational_ansatz(
             mapped,
             hartree_fock_type=hartree_fock_type,
             uccsd_type=uccsd_type,
-            mapper_type=mapper_type,
+            mapper_types=mapper_types,
         )
         if int(native_ansatz.num_parameters) != vqe.number_of_parameters:
             raise ValueError("Statevector ansatz parameter count is inconsistent.")
@@ -1688,17 +1763,13 @@ class QiskitQuantumWorkflowAdapter:
         if energy_difference > energy_consistency_tolerance:
             raise ValueError("Statevector energy differs from the VQE result.")
 
-        n = mapped.active_spatial_orbital_count
-        alpha_mask = (1 << n) - 1
-        beta_mask = alpha_mask << n
         probabilities = numpy.abs(data) ** 2
         sector_probability = 0.0
         observed_alpha = 0.0
         observed_beta = 0.0
         for index, probability_value in enumerate(probabilities):
             probability = float(probability_value)
-            alpha_count = (index & alpha_mask).bit_count()
-            beta_count = ((index & beta_mask) >> n).bit_count()
+            alpha_count, beta_count = _particle_counts(index, mapped)
             observed_alpha += probability * alpha_count
             observed_beta += probability * beta_count
             if (
@@ -1878,7 +1949,7 @@ class QiskitQuantumWorkflowAdapter:
             _,
             hartree_fock_type,
             uccsd_type,
-            mapper_type,
+            mapper_types,
         ) = _variational_modules()
         (
             estimator_type,
@@ -1891,7 +1962,7 @@ class QiskitQuantumWorkflowAdapter:
             mapped,
             hartree_fock_type=hartree_fock_type,
             uccsd_type=uccsd_type,
-            mapper_type=mapper_type,
+            mapper_types=mapper_types,
         )
         if int(native_ansatz.num_parameters) != vqe.number_of_parameters:
             raise ValueError("Noisy-simulation ansatz parameter count is inconsistent.")

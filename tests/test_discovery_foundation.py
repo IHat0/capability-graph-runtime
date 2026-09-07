@@ -763,6 +763,21 @@ def test_pareto_dominance_respects_minimize_and_maximize_objectives() -> None:
     assert not pareto_dominates(right_assessment, left_assessment, (affinity, burden))
 
 
+def test_zero_weight_descriptor_does_not_change_pareto_order() -> None:
+    affinity = _objective("affinity", direction=ObjectiveDirection.MAXIMIZE)
+    descriptor = _objective("descriptor", direction=ObjectiveDirection.MAXIMIZE, weight=0)
+    left = _root_candidate("candidate-left", "small_molecule", objectives=("affinity", "descriptor"))
+    right = _root_candidate("candidate-right", "small_molecule", artifact_character="b",
+                            objectives=("affinity", "descriptor"))
+    left_assessment = _assessment(left, (_score(left, "affinity", 10.0, 0.9),
+                                        _score(left, "descriptor", 1.0, 0.1)))
+    right_assessment = _assessment(right, (_score(right, "affinity", 9.0, 0.8),
+                                          _score(right, "descriptor", 10.0, 0.9)))
+    assert pareto_dominates(left_assessment, right_assessment, (affinity, descriptor))
+    assert not pareto_dominates(right_assessment, left_assessment, (affinity, descriptor))
+    assert left_assessment.objective_scores[1].value == 1.0
+
+
 def test_multiobjective_ranking_preserves_score_vectors_and_pareto_fronts() -> None:
     campaign = _campaign(
         _objective("affinity", direction=ObjectiveDirection.MAXIMIZE, weight=2.0),

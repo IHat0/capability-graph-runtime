@@ -105,7 +105,7 @@ def test_openmm_adapter_is_discoverable_and_executes_through_phase4() -> None:
         invocation_builder=InvocationBuilder(),
     )
 
-    assert len(bridges) == 9
+    assert len(bridges) == len(adapter.declaration.capabilities)
     assert FORCE_FIELD_SELECT in registry.identities()
     discovered = catalogue.find(
         objective_type="force_field_selection",

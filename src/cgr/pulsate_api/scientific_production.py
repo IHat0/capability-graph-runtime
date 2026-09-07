@@ -32,6 +32,8 @@ from .phase8_scientific_handlers import (
     bond_dissociation_registry,
     covalent_transition_state_registry,
     metal_active_site_registry,
+    molecular_ground_state_registry,
+    molecular_ground_state_sweep_registry,
     protein_design_registry,
     protein_ligand_discovery_registry,
     structure_analysis_registry,
@@ -141,6 +143,15 @@ def phase8_production_registry(
             store=payload_store,
             rdkit_adapter=rdkit,
             pyscf_adapter=pyscf,
+        ),
+        "molecular_ground_state_vqe": molecular_ground_state_registry(
+            store=payload_store,
+            pyscf_adapter=pyscf,
+            qiskit_adapter=qiskit,
+        ),        "molecular_ground_state_vqe_sweep": molecular_ground_state_sweep_registry(
+            store=payload_store,
+            pyscf_adapter=pyscf,
+            qiskit_adapter=qiskit,
         ),
         "metal_active_site_quantum": metal_active_site_registry(
             store=payload_store,

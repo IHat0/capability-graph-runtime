@@ -13,7 +13,7 @@ function messageFor(error: unknown): string {
   return error instanceof Error ? error.message : 'An unexpected API error occurred.'
 }
 
-export function useExperimentWorkspace(api: WorkspaceApi = pulsateApi) {
+export function useExperimentWorkspace(api: WorkspaceApi = pulsateApi, enabled = true) {
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [presets, setPresets] = useState<PresetSummaryResponse[]>([])
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null)
@@ -34,6 +34,11 @@ export function useExperimentWorkspace(api: WorkspaceApi = pulsateApi) {
   const displayedPresetIdRef = useRef<string | null>(null)
 
   useEffect(() => {
+    if (!enabled) {
+      setInitialLoading(false)
+      setErrors([])
+      return
+    }
     const controller = new AbortController()
     async function initialize() {
       const [healthResult, presetsResult] = await Promise.allSettled([
@@ -54,7 +59,7 @@ export function useExperimentWorkspace(api: WorkspaceApi = pulsateApi) {
     }
     void initialize()
     return () => controller.abort()
-  }, [api])
+  }, [api, enabled])
 
   useEffect(() => {
     if (!selectedPresetId) return

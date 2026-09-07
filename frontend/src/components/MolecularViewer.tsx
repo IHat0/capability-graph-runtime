@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { MolecularScene } from '../scene/types'
 import type { LoadedMolecularProjectScene } from '../scene/native-project'
 import { isNativeProjectScene } from '../scene/native-molstar'
@@ -56,6 +56,9 @@ function CoordinateMolecularViewer({ scene, loading }: { scene: MolecularScene; 
   const selectedAtom = scene.atoms.find((atom) => atom.id === selectedAtomId)
   const selectedMeasurements = scene.measurements.filter((measurement) => measurement.atomIds.includes(selectedAtomId ?? ''))
   const bounds = useMemo(() => structureBounds(scene.atoms, scene.coordinateUnit), [scene])
+  const selectAtom = useCallback((atom: { atomIdentifier: string } | null) => {
+    setSelectedAtomId(atom?.atomIdentifier ?? null)
+  }, [])
 
   useEffect(() => setSelectedAtomId(null), [scene.id])
 
@@ -75,7 +78,7 @@ function CoordinateMolecularViewer({ scene, loading }: { scene: MolecularScene; 
       </div>
 
       <div className="viewer-stage">
-        <MolstarViewer ref={viewerRef} scene={scene} onAtomSelected={(atom) => setSelectedAtomId(atom?.atomIdentifier ?? null)} onRenderingStateChange={setRendering} />
+        <MolstarViewer ref={viewerRef} scene={scene} onAtomSelected={selectAtom} onRenderingStateChange={setRendering} />
         {(loading || rendering.loading) && <div className="viewer-loading" role="status"><span />Updating structure…</div>}
         {rendering.error && <div className="viewer-render-error" role="alert"><strong>Rendering unavailable</strong><span>{rendering.error}</span></div>}
         <div className="viewer-toolbar" aria-label="Molecular camera controls">

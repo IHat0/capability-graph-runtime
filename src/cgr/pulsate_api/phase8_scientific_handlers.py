@@ -9,6 +9,7 @@ artifacts remain persisted in the shared artifact repository.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
@@ -58,8 +59,10 @@ from cgr.electronic_structure import (
     IMPLICIT_SOLVENT_HARTREE_FOCK,
     MOLECULE_CONSTRUCT,
     ElectronicActiveSpace,
+    ElectronicAtom,
     ElectronicFrequencyAnalysis,
     ElectronicFrequencyMode,
+    ElectronicHartreeFockResult,
     ElectronicImplicitSolventResult,
     ElectronicMolecule,
     ElectronicReactionPathPoint,
@@ -75,9 +78,12 @@ from cgr.electronic_structure import (
 )
 from cgr.quantum_workflow import (
     ANSATZ_CONSTRUCT,
+    EXACT_DIAGONALIZE,
     FERMION_TO_QUBIT_MAP,
     HAMILTONIAN_CONSTRUCT,
     VQE_EXECUTE,
+    ExactDiagonalizationResult,
+    MappedQubitHamiltonian,
     QiskitQuantumWorkflowAdapter,
     VariationalGroundStateResult,
 )
@@ -96,6 +102,7 @@ from cgr.science import (
 from cgr.workflow_graph import CapabilityInvocation as WorkflowCapabilityInvocation
 from cgr.scientific_verification import (
     CalculationEvidence,
+    EnergyComparisonRequest,
     MetalCentreRequest,
     PotentialEnergyCurveRequest,
     PotentialEnergyPoint,
@@ -213,7 +220,14 @@ class _NativeRunner:
     ) -> ArtifactReference:
         digest = hashlib.sha256(payload).hexdigest()
         reference = ArtifactReference(
-            artifact_identifier=_stable_identifier(artifact_type.replace("_", "-"), digest),
+            # Equal bytes may arise in different calculations. Keep content
+            # deduplication separate from the identity of the provenance record.
+            artifact_identifier=_stable_identifier(
+                artifact_type.replace("_", "-"), digest, producer,
+                execution_identifier, media_type,
+                json.dumps(dict(metadata or {}), sort_keys=True, separators=(",", ":")),
+                tuple(parent.pointer.model_dump_json() for parent in parents),
+            ),
             schema_version=_VERSION,
             artifact_type=artifact_type,
             media_type=media_type,
@@ -2329,6 +2343,945 @@ class MetalCentreVerificationHandler:
         )
 
 
+def _ground_state_specification(objective: StructuredScientificObjective):
+    specification = objective.molecular_ground_state_specification
+    if specification is None:
+        raise ScientificCapabilityFailure(
+            "molecular_ground_state_specification_missing",
+            "Molecular identity, geometry, and electronic controls must be resolved before execution.",
+        )
+    return specification
+
+
+def _materialize_ground_state_point(
+    runner: _NativeRunner,
+    *,
+    objective: StructuredScientificObjective,
+    point,
+    execution_identifier: str,
+    producer: str,
+) -> tuple[ArtifactReference, ArtifactReference]:
+    """Persist one geometry and its exact electronic identity without guessing."""
+
+    import json
+
+    specification = _ground_state_specification(objective)
+    geometry_identifier = _stable_identifier(
+        "ground-state-geometry",
+        objective.objective_identifier,
+        point.point_identifier,
+        *(coordinate for atom in point.atoms for coordinate in (
+            atom.element_symbol,
+            atom.x_angstrom,
+            atom.y_angstrom,
+            atom.z_angstrom,
+        )),
+    )
+    structure_payload = json.dumps(
+        {
+            "schema_version": "2.0.0",
+            "geometry_identifier": geometry_identifier,
+            "point_identifier": point.point_identifier,
+            "system_label": specification.system_label,
+            "molecular_formula": specification.molecular_formula,
+            "coordinate_unit": "angstrom",
+            "atoms": [
+                {
+                    "atom_index": atom.atom_index,
+                    "element_symbol": atom.element_symbol,
+                    "atomic_number": atom.atomic_number,
+                    "x": atom.x_angstrom,
+                    "y": atom.y_angstrom,
+                    "z": atom.z_angstrom,
+                }
+                for atom in point.atoms
+            ],
+            "parameter_name": point.parameter_name,
+            "parameter_value": point.parameter_value,
+            "identity_supporting_quote": specification.identity_supporting_quote,
+            "geometry_supporting_quote": point.supporting_quote,
+            "electronic_controls": {
+                "molecular_charge": specification.molecular_charge,
+                "spin": specification.spin,
+                "basis_set": specification.basis_set,
+                "reference_method": specification.reference_method,
+                "active_electron_count": specification.active_electron_count,
+                "active_spatial_orbital_count": specification.active_spatial_orbital_count,
+                "requested_frozen_core_orbital_count": specification.requested_frozen_core_orbital_count,
+                "mapper": specification.mapper,
+                "ansatz": specification.ansatz,
+                "execution_model": specification.execution_model,
+            },
+            "control_provenance": [
+                item.model_dump(mode="json") for item in specification.control_provenance
+            ],
+            "assumptions": list(specification.assumptions),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    structure = runner.write_json(
+        artifact_type="molecular_structure",
+        payload=structure_payload,
+        producer=producer,
+        execution_identifier=execution_identifier,
+        metadata={
+            "system_label": specification.system_label,
+            "molecular_formula": specification.molecular_formula,
+            "geometry_point_identifier": point.point_identifier,
+            "evidence_kind": "literal_question_grounding",
+        },
+    )
+    electron_count = specification.electron_count
+    alpha_electrons = (electron_count + specification.spin) // 2
+    beta_electrons = electron_count - alpha_electrons
+    molecule = ElectronicMolecule(
+        schema_version=_VERSION,
+        molecule_identifier=_stable_identifier(
+            "electronic-molecule",
+            structure.content_sha256,
+            specification.molecular_charge,
+            specification.spin,
+        ),
+        source_artifact_identifier=structure.artifact_identifier,
+        source_geometry_identifier=geometry_identifier,
+        atoms=tuple(
+            ElectronicAtom(
+                atom_index=atom.atom_index,
+                atomic_number=atom.atomic_number,
+                element_symbol=atom.element_symbol,
+                x_angstrom=atom.x_angstrom,
+                y_angstrom=atom.y_angstrom,
+                z_angstrom=atom.z_angstrom,
+                source_atom_index=atom.atom_index,
+            )
+            for atom in point.atoms
+        ),
+        molecular_charge=specification.molecular_charge,
+        source_formal_charge=specification.molecular_charge,
+        spin=specification.spin,
+        electron_count=electron_count,
+        alpha_electron_count=alpha_electrons,
+        beta_electron_count=beta_electrons,
+    )
+    electronic = runner.write_json(
+        artifact_type="electronic_molecule",
+        payload=molecule.to_canonical_json().encode("utf-8"),
+        producer=producer,
+        execution_identifier=execution_identifier,
+        parents=(structure,),
+        metadata={
+            "molecular_charge": specification.molecular_charge,
+            "spin": specification.spin,
+            "electron_count": electron_count,
+            "source_policy": specification.electronic_state_policy,
+        },
+    )
+    return structure, electronic
+
+
+class GroundStateMolecularSystemHandler:
+    """Materialize one arbitrary represented molecular geometry."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del record
+        specification = _ground_state_specification(objective)
+        if specification.is_parameter_sweep:
+            raise ScientificCapabilityFailure(
+                "single_point_geometry_required",
+                "A parameter sweep must use the parameter-sweep capability composition.",
+            )
+        structure, electronic = _materialize_ground_state_point(
+            self.runner,
+            objective=objective,
+            point=specification.geometry_points[0],
+            execution_identifier=invocation.invocation_identifier,
+            producer="electronic.molecular_system_resolve",
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(structure, electronic),
+            evidence_artifacts=(structure, electronic),
+            scientific_summary=(
+                f"Resolved {specification.molecular_formula} geometry from literal question evidence."
+            ),
+        )
+
+
+class GroundStateParameterSweepSpecificationHandler:
+    """Persist a general ordered collection of molecular geometry points."""
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del record
+        import json
+
+        specification = _ground_state_specification(objective)
+        if not specification.is_parameter_sweep:
+            raise ScientificCapabilityFailure(
+                "parameter_sweep_required",
+                "The parameter-sweep workflow requires at least two explicit geometry points.",
+            )
+        payload = json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "objective_identifier": objective.objective_identifier,
+                "specification": specification.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        structure = self.runner.write_json(
+            artifact_type="molecular_structure",
+            payload=payload,
+            producer="electronic.molecular_parameter_sweep_resolve",
+            execution_identifier=invocation.invocation_identifier,
+            metadata={
+                "molecular_formula": specification.molecular_formula,
+                "geometry_point_count": len(specification.geometry_points),
+                "representation": "ordered_cartesian_geometry_sweep",
+            },
+        )
+        sweep = self.runner.write_json(
+            artifact_type="molecular_parameter_sweep",
+            payload=payload,
+            producer="electronic.molecular_parameter_sweep_resolve",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(structure,),
+            metadata={
+                "geometry_point_count": len(specification.geometry_points),
+                "parameter_name": specification.geometry_points[0].parameter_name,
+            },
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(structure, sweep),
+            evidence_artifacts=(structure, sweep),
+            scientific_summary=(
+                f"Resolved {len(specification.geometry_points)} ordered geometries for "
+                f"{specification.molecular_formula}."
+            ),
+        )
+
+
+def _ground_state_configuration_parameters(specification) -> dict[str, object]:
+    return {
+        "basis_set": specification.basis_set,
+        "reference_method": specification.reference_method,
+        "convergence_tolerance": 1.0e-10,
+        "maximum_iterations": 200,
+        "direct_scf": True,
+        "density_fitting": False,
+        "symmetry": False,
+        "initial_guess": "minao",
+    }
+
+
+def _ground_state_active_space_parameters(specification) -> dict[str, object]:
+    return {
+        "active_electron_count": specification.active_electron_count,
+        "active_spatial_orbital_count": specification.active_spatial_orbital_count,
+        "selection_method": "frontier",
+    }
+
+
+def _ground_state_mapping_parameters(specification) -> dict[str, object]:
+    return {"mapper": specification.mapper, "hermiticity_tolerance": 1.0e-9}
+
+
+def _ground_state_ansatz_parameters(specification) -> dict[str, object]:
+    return {
+        "ansatz": specification.ansatz,
+        "initial_state": "hartree_fock",
+        "initial_point_policy": "all_zeros",
+        "repetitions": 1,
+        "generalized": False,
+        "preserve_spin": True,
+        "include_imaginary": False,
+    }
+
+
+class MolecularGroundStateSweepExecutionHandler:
+    """Execute the same validated single-point chain for every geometry point."""
+
+    def __init__(self, store, pyscf_adapter, qiskit_adapter) -> None:
+        self.runner = _NativeRunner(store)
+        self.pyscf_adapter = pyscf_adapter
+        self.qiskit_adapter = qiskit_adapter
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        del record
+        import json
+
+        specification = _ground_state_specification(objective)
+        if specification.mapper not in {"jordan_wigner", "parity"}:
+            raise ScientificCapabilityFailure(
+                "unsupported_fermion_to_qubit_mapper",
+                "The requested fermion-to-qubit mapper is not supported by the validated exact/VQE adapter.",
+            )
+        point_results: list[dict[str, object]] = []
+        evidence: list[ArtifactReference] = []
+        for position, point in enumerate(specification.geometry_points, start=1):
+            execution = f"{invocation.invocation_identifier}-point-{position:03d}"
+            structure, molecule = _materialize_ground_state_point(
+                self.runner,
+                objective=objective,
+                point=point,
+                execution_identifier=execution,
+                producer="scientific_computation.molecular_ground_state_sweep",
+            )
+            configuration, = self.runner.invoke(
+                self.pyscf_adapter, CONFIGURATION_DEFINE,
+                inputs=(molecule,), parameters=_ground_state_configuration_parameters(specification),
+                execution_identifier=execution, objective=objective,
+            )
+            hartree_fock, = self.runner.invoke(
+                self.pyscf_adapter, HARTREE_FOCK,
+                inputs=(molecule, configuration), execution_identifier=execution, objective=objective,
+            )
+            active_selection, = self.runner.invoke(
+                self.pyscf_adapter, ACTIVE_SPACE_SELECT,
+                inputs=(molecule, configuration, hartree_fock),
+                parameters=_ground_state_active_space_parameters(specification),
+                execution_identifier=execution, objective=objective,
+            )
+            active_space, = self.runner.invoke(
+                self.pyscf_adapter, ACTIVE_SPACE_CONSTRUCT,
+                inputs=(molecule, configuration, hartree_fock, active_selection),
+                execution_identifier=execution, objective=objective,
+            )
+            hamiltonian, = self.runner.invoke(
+                self.qiskit_adapter, HAMILTONIAN_CONSTRUCT,
+                inputs=(active_space,), parameters={"integral_symmetry_tolerance": 1.0e-8},
+                execution_identifier=execution, objective=objective,
+            )
+            mapped, = self.runner.invoke(
+                self.qiskit_adapter, FERMION_TO_QUBIT_MAP,
+                inputs=(hamiltonian,), parameters=_ground_state_mapping_parameters(specification),
+                execution_identifier=execution, objective=objective,
+            )
+            exact, = self.runner.invoke(
+                self.qiskit_adapter, EXACT_DIAGONALIZE,
+                inputs=(mapped,), parameters={
+                    "solver": "numpy_eigh_particle_sector",
+                    "particle_number_tolerance": 1.0e-10,
+                    "hermiticity_tolerance": 1.0e-9,
+                }, execution_identifier=execution, objective=objective,
+            )
+            ansatz, = self.runner.invoke(
+                self.qiskit_adapter, ANSATZ_CONSTRUCT,
+                inputs=(mapped,), parameters=_ground_state_ansatz_parameters(specification),
+                execution_identifier=execution, objective=objective,
+            )
+            vqe, = self.runner.invoke(
+                self.qiskit_adapter, VQE_EXECUTE,
+                inputs=(mapped, ansatz), parameters={
+                    "optimizer": "slsqp",
+                    "estimator": specification.execution_model,
+                    "maximum_iterations": 300,
+                    "convergence_threshold": 1.0e-9,
+                    "random_seed": 29,
+                }, execution_identifier=execution, objective=objective,
+            )
+            hf_result = ElectronicHartreeFockResult.model_validate_json(self.runner.store.read(hartree_fock))
+            active_result = ElectronicActiveSpace.model_validate_json(self.runner.store.read(active_space))
+            mapped_result = MappedQubitHamiltonian.model_validate_json(self.runner.store.read(mapped))
+            exact_result = ExactDiagonalizationResult.model_validate_json(self.runner.store.read(exact))
+            vqe_result = VariationalGroundStateResult.model_validate_json(self.runner.store.read(vqe))
+            difference = abs(vqe_result.total_energy_hartree - exact_result.total_energy_hartree)
+            point_results.append({
+                "point_identifier": point.point_identifier,
+                "parameter_name": point.parameter_name,
+                "parameter_value": point.parameter_value,
+                "molecule_identifier": mapped_result.molecule_identifier,
+                "structure_artifact_identifier": structure.artifact_identifier,
+                "structure_sha256": structure.content_sha256,
+                "hartree_fock_total_energy_hartree": hf_result.total_energy_hartree,
+                "hartree_fock_electronic_energy_hartree": hf_result.electronic_energy_hartree,
+                "nuclear_repulsion_energy_hartree": hf_result.nuclear_repulsion_energy_hartree,
+                "active_space_constant_energy_hartree": active_result.constant_energy_hartree,
+                "combined_inactive_electronic_contribution_hartree": (
+                    active_result.constant_energy_hartree
+                    - hf_result.nuclear_repulsion_energy_hartree
+                ),
+                "inactive_occupied_orbital_indices": list(
+                    active_result.frozen_core_orbital_indices
+                ),
+                "inactive_occupied_orbital_count": len(active_result.frozen_core_orbital_indices),
+                "geometry": [atom.model_dump(mode="json") for atom in point.atoms],
+                "exact_raw_active_space_energy_hartree": exact_result.raw_active_space_eigenvalue_hartree,
+                "exact_total_energy_hartree": exact_result.total_energy_hartree,
+                "exact_maximum_eigenpair_residual_hartree": exact_result.maximum_eigenpair_residual_hartree,
+                "vqe_raw_active_space_energy_hartree": vqe_result.raw_active_space_energy_hartree,
+                "vqe_total_energy_hartree": vqe_result.total_energy_hartree,
+                "vqe_exact_absolute_difference_hartree": difference,
+                "number_of_qubits_before_reduction": mapped_result.active_spin_orbital_count,
+                "number_of_qubits_after_reduction": mapped_result.number_of_qubits,
+                "symmetry_reduction_applied": mapped_result.two_qubit_reduction_applied,
+                "vqe_converged": vqe_result.converged,
+                "optimizer": vqe_result.optimizer_identifier,
+                "gradient": vqe_result.gradient_identifier,
+                "optimizer_status": vqe_result.optimizer_status,
+                "optimizer_evaluations": vqe_result.optimizer_evaluations,
+                "evidence_artifact_identifiers": [
+                    item.artifact_identifier for item in (
+                        structure, molecule, configuration, hartree_fock, active_selection,
+                        active_space, hamiltonian, mapped, exact, ansatz, vqe,
+                    )
+                ],
+            })
+            evidence.extend((
+                structure, molecule, configuration, hartree_fock, active_selection,
+                active_space, hamiltonian, mapped, exact, ansatz, vqe,
+            ))
+        result_payload = json.dumps({
+            "schema_version": "1.0.0",
+            "molecular_formula": specification.molecular_formula,
+            "point_count": len(point_results),
+            "points": point_results,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        result = self.runner.write_json(
+            artifact_type="ground_state_parameter_sweep_result",
+            payload=result_payload,
+            producer="scientific_computation.molecular_ground_state_sweep",
+            execution_identifier=invocation.invocation_identifier,
+            parents=tuple(evidence),
+            metadata={"point_count": len(point_results), "all_points_completed": True},
+        )
+        receipt_payload = json.dumps({
+            "schema_version": "1.0.0",
+            "objective_identifier": objective.objective_identifier,
+            "molecular_formula": specification.molecular_formula,
+            "controls": {
+                "charge": specification.molecular_charge,
+                "spin": specification.spin,
+                "basis_set": specification.basis_set,
+                "reference_method": specification.reference_method,
+                "active_electron_count": specification.active_electron_count,
+                "active_spatial_orbital_count": specification.active_spatial_orbital_count,
+                "mapper": specification.mapper,
+                "ansatz": specification.ansatz,
+                "execution_model": specification.execution_model,
+                "optimizer": "slsqp",
+                "maximum_optimizer_iterations": 300,
+                "convergence_threshold_hartree": 1.0e-9,
+            },
+            "control_provenance": [item.model_dump(mode="json") for item in specification.control_provenance],
+            "assumptions": list(specification.assumptions),
+            "requested_outputs": list(specification.requested_outputs),
+            "points": point_results,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        receipt = self.runner.write_json(
+            artifact_type="multi_point_execution_receipt",
+            payload=receipt_payload,
+            producer="scientific_computation.molecular_ground_state_sweep",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(result, *evidence),
+            metadata={"point_count": len(point_results), "auditable": True},
+        )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(result, receipt),
+            evidence_artifacts=(*evidence, result, receipt),
+            scientific_summary=f"Completed {len(point_results)} independently persisted ground-state calculations.",
+        )
+
+
+class MolecularGroundStateSweepVerificationHandler:
+    _MAXIMUM_VQE_ERROR_HARTREE = 1.0e-5
+    _VARIATIONAL_TOLERANCE_HARTREE = 1.0e-7
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        references = {item.artifact_type: item for item in record.artifact_references}
+        try:
+            result_reference = references["ground_state_parameter_sweep_result"]
+            receipt_reference = references["multi_point_execution_receipt"]
+        except KeyError as exc:
+            raise ScientificCapabilityFailure(
+                "molecular_ground_state_sweep_evidence_incomplete",
+                "Sweep verification requires result and execution-receipt artifacts.",
+            ) from exc
+        document = json.loads(self.runner.store.read(result_reference))
+        points = document.get("points")
+        specification = _ground_state_specification(objective)
+        if not isinstance(points, list) or len(points) != len(specification.geometry_points):
+            raise ScientificCapabilityFailure(
+                "molecular_ground_state_sweep_point_mismatch",
+                "The result does not cover every requested geometry exactly once.",
+            )
+        calculations = []
+        curve_points = []
+        method = "exact-active-space-diagonalization"
+        method_sha = hashlib.sha256(method.encode()).hexdigest()
+        for position, point in enumerate(points, start=1):
+            exact = float(point["exact_total_energy_hartree"])
+            vqe = float(point["vqe_total_energy_hartree"])
+            difference = abs(vqe - exact)
+            if (
+                not bool(point["vqe_converged"])
+                or difference > self._MAXIMUM_VQE_ERROR_HARTREE
+                or vqe < exact - self._VARIATIONAL_TOLERANCE_HARTREE
+            ):
+                raise ScientificCapabilityFailure(
+                    "molecular_ground_state_sweep_verification_failed",
+                    f"Geometry point {position} failed exact-reference VQE verification.",
+                )
+            calculation_identifier = f"exact-sweep-point-{position:03d}"
+            calculations.append(CalculationEvidence(
+                calculation_identifier=calculation_identifier,
+                artifact_sha256=result_reference.content_sha256,
+                molecule_identifier=str(point["molecule_identifier"]),
+                geometry_sha256=str(point["structure_sha256"]),
+                method_identifier=method,
+                method_sha256=method_sha,
+                execution_completed=True,
+                execution_successful=True,
+                identity_valid=True,
+                numerically_converged=True,
+                values_finite=math.isfinite(exact),
+                authorized=True,
+                total_energy_hartree=exact,
+            ))
+            curve_points.append(PotentialEnergyPoint(
+                calculation_identifier=calculation_identifier,
+                reaction_coordinate=float(point["parameter_value"]),
+                reaction_coordinate_unit="angstrom",
+            ))
+        request = PotentialEnergyCurveRequest(
+            request_identifier="molecular-ground-state-parameter-sweep-verification",
+            subject_identifier=_stable_identifier("molecular-sweep", specification.molecular_formula),
+            calculations=tuple(calculations),
+            points=tuple(curve_points),
+            authorization_required=False,
+            require_same_molecule=False,
+            require_same_geometry=False,
+            require_interior_minimum=False,
+        )
+        report = default_scientific_verifier_registry().verify(request)
+        report_reference = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=report.to_canonical_json().encode("utf-8"),
+            producer="scientific_verification.molecular_ground_state_sweep",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(result_reference, receipt_reference),
+            metadata={
+                "passed": report.overall_outcome is VerificationOutcome.PASSED,
+                "point_count": len(points),
+                "every_point_exact_vqe_verified": True,
+            },
+        )
+        if report.overall_outcome is not VerificationOutcome.PASSED:
+            raise ScientificCapabilityFailure(
+                "scientific_verification_failed",
+                "The molecular ground-state parameter sweep failed curve verification.",
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report_reference,),
+            evidence_artifacts=(result_reference, receipt_reference, report_reference),
+            verified=True,
+            scientific_summary=(
+                f"Verified exact and VQE agreement independently at all {len(points)} "
+                "geometry points: "
+                + "; ".join(
+                    f"{point['parameter_value']:.6g} angstrom, "
+                    f"VQE {point['vqe_total_energy_hartree']:.10f} Hartree, "
+                    f"exact {point['exact_total_energy_hartree']:.10f} Hartree"
+                    for point in points[:8]
+                )
+                + (
+                    "; additional points remain in the receipt"
+                    if len(points) > 8
+                    else "."
+                )
+            ),
+            limitations=(
+                "Each value is an active-space result in the recorded finite basis, not a complete-basis full-correlation energy.",
+            ),
+        )
+
+class MolecularGroundStateVerificationHandler:
+    """Verify one VQE result and persist a complete evidence-derived receipt."""
+
+    _MAXIMUM_VQE_ERROR_HARTREE = 1.0e-5
+    _VARIATIONAL_TOLERANCE_HARTREE = 1.0e-7
+
+    def __init__(self, store: ScientificPayloadStore) -> None:
+        self.runner = _NativeRunner(store)
+
+    def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
+        import json
+
+        references = {
+            item.artifact_type: item
+            for item in record.artifact_references
+            if item.artifact_type in {
+                "molecular_structure",
+                "electronic_molecule",
+                "electronic_hartree_fock_result",
+                "electronic_active_space",
+                "mapped_qubit_hamiltonian",
+                "exact_diagonalization_result",
+                "variational_ground_state_result",
+            }
+        }
+        required = {
+            "molecular_structure",
+            "electronic_molecule",
+            "electronic_hartree_fock_result",
+            "electronic_active_space",
+            "mapped_qubit_hamiltonian",
+            "exact_diagonalization_result",
+            "variational_ground_state_result",
+        }
+        if not required.issubset(references):
+            raise ScientificCapabilityFailure(
+                "molecular_ground_state_evidence_incomplete",
+                "Ground-state verification requires geometry, HF, active-space, mapped, exact, and VQE evidence.",
+            )
+        specification = _ground_state_specification(objective)
+        structure_reference = references["molecular_structure"]
+        molecule_reference = references["electronic_molecule"]
+        hf_reference = references["electronic_hartree_fock_result"]
+        active_reference = references["electronic_active_space"]
+        mapped_reference = references["mapped_qubit_hamiltonian"]
+        exact_reference = references["exact_diagonalization_result"]
+        vqe_reference = references["variational_ground_state_result"]
+        molecule = ElectronicMolecule.model_validate_json(self.runner.store.read(molecule_reference))
+        hartree_fock = ElectronicHartreeFockResult.model_validate_json(self.runner.store.read(hf_reference))
+        active = ElectronicActiveSpace.model_validate_json(self.runner.store.read(active_reference))
+        mapped = MappedQubitHamiltonian.model_validate_json(self.runner.store.read(mapped_reference))
+        exact = ExactDiagonalizationResult.model_validate_json(self.runner.store.read(exact_reference))
+        vqe = VariationalGroundStateResult.model_validate_json(self.runner.store.read(vqe_reference))
+        identity_valid = (
+            exact.active_space_identifier == vqe.active_space_identifier == active.active_space_identifier
+            and exact.active_space_sha256 == vqe.active_space_sha256 == active_reference.content_sha256
+            and exact.mapped_hamiltonian_identifier == vqe.mapped_hamiltonian_identifier == mapped.mapping_identifier
+            and exact.mapped_hamiltonian_sha256 == vqe.mapped_hamiltonian_sha256 == mapped_reference.content_sha256
+            and active.active_electron_count == specification.active_electron_count
+            and active.active_spatial_orbital_count == specification.active_spatial_orbital_count
+            and mapped.mapper == specification.mapper
+        )
+        resolved_inactive = len(active.frozen_core_orbital_indices)
+        requested_frozen = specification.requested_frozen_core_orbital_count
+        if requested_frozen is not None and requested_frozen > resolved_inactive:
+            raise ScientificCapabilityFailure(
+                "frozen_core_request_not_satisfied",
+                "The constructed active space contains fewer inactive occupied orbitals than the reviewed frozen-core request.",
+            )
+        difference = abs(vqe.total_energy_hartree - exact.total_energy_hartree)
+        variationally_consistent = vqe.total_energy_hartree >= exact.total_energy_hartree - self._VARIATIONAL_TOLERANCE_HARTREE
+        exact_method = "exact-active-space-diagonalization"
+        vqe_method = "vqe-uccsd-exact-statevector"
+        request = EnergyComparisonRequest(
+            request_identifier="molecular-ground-state-vqe-verification",
+            subject_identifier=molecule.molecule_identifier,
+            calculations=(
+                CalculationEvidence(
+                    calculation_identifier="exact-ground-state",
+                    artifact_sha256=exact_reference.content_sha256,
+                    molecule_identifier=molecule.molecule_identifier,
+                    geometry_sha256=structure_reference.content_sha256,
+                    method_identifier=exact_method,
+                    method_sha256=hashlib.sha256(exact_method.encode()).hexdigest(),
+                    execution_completed=True,
+                    execution_successful=True,
+                    identity_valid=identity_valid,
+                    numerically_converged=math.isfinite(exact.total_energy_hartree) and math.isfinite(exact.maximum_eigenpair_residual_hartree),
+                    values_finite=math.isfinite(exact.total_energy_hartree),
+                    authorized=True,
+                    total_energy_hartree=exact.total_energy_hartree,
+                ),
+                CalculationEvidence(
+                    calculation_identifier="vqe-ground-state",
+                    artifact_sha256=vqe_reference.content_sha256,
+                    molecule_identifier=molecule.molecule_identifier,
+                    geometry_sha256=structure_reference.content_sha256,
+                    method_identifier=vqe_method,
+                    method_sha256=hashlib.sha256(vqe_method.encode()).hexdigest(),
+                    execution_completed=True,
+                    execution_successful=vqe.converged,
+                    identity_valid=identity_valid,
+                    numerically_converged=vqe.converged and variationally_consistent,
+                    values_finite=math.isfinite(vqe.total_energy_hartree),
+                    authorized=True,
+                    total_energy_hartree=vqe.total_energy_hartree,
+                ),
+            ),
+            comparison_goal="verify_variational_upper_bound",
+            variational_reference_calculation_identifier="exact-ground-state",
+            variational_candidate_calculation_identifier="vqe-ground-state",
+            variational_tolerance_hartree=self._VARIATIONAL_TOLERANCE_HARTREE,
+            require_same_method=False,
+            require_same_geometry=True,
+            authorization_required=False,
+        )
+        report = default_scientific_verifier_registry().verify(request)
+        inactive_electronic_energy = active.constant_energy_hartree - hartree_fock.nuclear_repulsion_energy_hartree
+        additional_inactive = (
+            resolved_inactive - requested_frozen if requested_frozen is not None else resolved_inactive
+        )
+        inactive_partition = requested_frozen or 0
+        requested_frozen_indices = active.frozen_core_orbital_indices[:inactive_partition]
+        additional_inactive_indices = active.frozen_core_orbital_indices[
+            inactive_partition:
+        ]
+        receipt_payload = json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "objective_identifier": objective.objective_identifier,
+                "molecular_formula": specification.molecular_formula,
+                "geometry_artifact_identifier": structure_reference.artifact_identifier,
+                "scientific_controls": {
+                    "molecular_charge": specification.molecular_charge,
+                    "spin": specification.spin,
+                    "multiplicity": specification.multiplicity,
+                    "basis_set": specification.basis_set,
+                    "reference_method": specification.reference_method,
+                    "active_electron_count": specification.active_electron_count,
+                    "active_spatial_orbital_count": specification.active_spatial_orbital_count,
+                    "requested_frozen_core_orbital_count": requested_frozen,
+                    "mapper": specification.mapper,
+                    "ansatz": specification.ansatz,
+                    "execution_model": specification.execution_model,
+                },
+                "control_provenance": [item.model_dump(mode="json") for item in specification.control_provenance],
+                "assumptions": list(specification.assumptions),
+                "requested_outputs": list(specification.requested_outputs),
+                "hartree_fock": {
+                    "reference_method": hartree_fock.reference_method,
+                    "converged": hartree_fock.converged,
+                    "iterations": hartree_fock.iterations,
+                    "electronic_energy_hartree": hartree_fock.electronic_energy_hartree,
+                    "nuclear_repulsion_energy_hartree": hartree_fock.nuclear_repulsion_energy_hartree,
+                    "total_energy_hartree": hartree_fock.total_energy_hartree,
+                },
+                "active_space": {
+                    "active_orbital_indices": list(active.active_orbital_indices),
+                    "inactive_occupied_orbital_indices": list(active.frozen_core_orbital_indices),
+                    "requested_frozen_core_orbital_indices": list(requested_frozen_indices),
+                    "additional_inactive_occupied_orbital_indices": list(additional_inactive_indices),
+                    "resolved_inactive_occupied_orbital_count": resolved_inactive,
+                    "requested_frozen_core_orbital_count": requested_frozen,
+                    "additional_inactive_occupied_orbital_count": additional_inactive,
+                    "nuclear_energy_contribution_hartree": hartree_fock.nuclear_repulsion_energy_hartree,
+                    "combined_inactive_electronic_contribution_hartree": inactive_electronic_energy,
+                    "constant_energy_hartree": active.constant_energy_hartree,
+                },
+                "mapping": {
+                    "mapper": mapped.mapper,
+                    "number_of_qubits_before_reduction": mapped.active_spin_orbital_count,
+                    "number_of_qubits_after_reduction": mapped.number_of_qubits,
+                    "symmetry_reduction_applied": mapped.two_qubit_reduction_applied,
+                },
+                "exact": {
+                    "raw_active_space_eigenvalue_hartree": exact.raw_active_space_eigenvalue_hartree,
+                    "constant_energy_hartree": exact.constant_energy_hartree,
+                    "total_energy_hartree": exact.total_energy_hartree,
+                    "maximum_eigenpair_residual_hartree": exact.maximum_eigenpair_residual_hartree,
+                },
+                "vqe": {
+                    "raw_active_space_energy_hartree": vqe.raw_active_space_energy_hartree,
+                    "constant_energy_hartree": vqe.constant_energy_hartree,
+                    "total_energy_hartree": vqe.total_energy_hartree,
+                    "converged": vqe.converged,
+                    "gradient": vqe.gradient_identifier,
+                    "optimizer_status": vqe.optimizer_status,
+                    "optimizer_evaluations": vqe.optimizer_evaluations,
+                    "maximum_iterations": vqe.maximum_iterations,
+                    "convergence_threshold": vqe.convergence_threshold,
+                    "trace": [item.model_dump(mode="json") for item in vqe.trace],
+                },
+                "verification": {
+                    "identity_valid": identity_valid,
+                    "absolute_difference_hartree": difference,
+                    "variationally_consistent": variationally_consistent,
+                    "outcome": report.overall_outcome.value,
+                },
+                "evidence_artifacts": [
+                    {
+                        "artifact_type": reference.artifact_type,
+                        "artifact_identifier": reference.artifact_identifier,
+                        "content_sha256": reference.content_sha256,
+                    }
+                    for reference in (
+                        structure_reference, molecule_reference, hf_reference, active_reference,
+                        mapped_reference, exact_reference, vqe_reference,
+                    )
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        receipt_reference = self.runner.write_json(
+            artifact_type="molecular_ground_state_execution_receipt",
+            payload=receipt_payload,
+            producer="scientific_verification.molecular_ground_state",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(
+                structure_reference, molecule_reference, hf_reference, active_reference,
+                mapped_reference, exact_reference, vqe_reference,
+            ),
+            metadata={
+                "molecular_formula": specification.molecular_formula,
+                "verification_passed": report.overall_outcome is VerificationOutcome.PASSED,
+                "auditable": True,
+            },
+        )
+        report_reference = self.runner.write_json(
+            artifact_type="scientific_verification_report",
+            payload=report.to_canonical_json().encode("utf-8"),
+            producer="scientific_verification.molecular_ground_state",
+            execution_identifier=invocation.invocation_identifier,
+            parents=(receipt_reference, exact_reference, vqe_reference),
+            metadata={
+                "passed": report.overall_outcome is VerificationOutcome.PASSED,
+                "exact_total_energy_hartree": exact.total_energy_hartree,
+                "vqe_total_energy_hartree": vqe.total_energy_hartree,
+                "absolute_difference_hartree": difference,
+                "variationally_consistent": variationally_consistent,
+                "execution_receipt_identifier": receipt_reference.artifact_identifier,
+            },
+        )
+        if report.overall_outcome is not VerificationOutcome.PASSED:
+            raise ScientificCapabilityFailure(
+                "scientific_verification_failed",
+                "The molecular ground-state VQE result failed exact-reference verification.",
+            )
+        limitations = [
+            (
+                f"The reported values use the recorded {specification.basis_set} basis and "
+                f"CAS({specification.active_electron_count}e,{specification.active_spatial_orbital_count}o) active space."
+            ),
+            "Exact diagonalization verifies the same active-space Hamiltonian; it is not a complete-basis or full-correlation reference.",
+        ]
+        if additional_inactive:
+            limitations.append(
+                "The existing electronic adapter reports nuclear and combined inactive-electronic energy contributions; it does not assign a unique orbital-by-orbital energy to correlated inactive orbitals."
+            )
+        if difference > self._MAXIMUM_VQE_ERROR_HARTREE:
+            limitations.append(
+                f"The VQE-exact difference {difference:.3e} Hartree exceeds the audited quality target "
+                f"of {self._MAXIMUM_VQE_ERROR_HARTREE:.1e} Hartree; the result remains verified as a "
+                "converged variational upper bound, not as exact-equivalent agreement."
+            )
+        return ScientificCapabilityOutcome(
+            output_artifacts=(report_reference, receipt_reference),
+            evidence_artifacts=(exact_reference, vqe_reference, receipt_reference, report_reference),
+            verified=True,
+            scientific_summary=(
+                f"Verified local VQE total energy {vqe.total_energy_hartree:.10f} Hartree "
+                f"against exact active-space energy {exact.total_energy_hartree:.10f} Hartree "
+                f"(absolute difference {difference:.3e} Hartree); RHF total energy was "
+                f"{hartree_fock.total_energy_hartree:.10f} Hartree."
+            ),
+            limitations=tuple(limitations),
+        )
+
+
+def molecular_ground_state_registry(
+    *,
+    store: ScientificPayloadStore,
+    pyscf_adapter: PySCFElectronicStructureAdapter,
+    qiskit_adapter: QiskitQuantumWorkflowAdapter,
+) -> ScientistCapabilityRegistry:
+    """Return the generic single-point molecular ground-state execution slice."""
+
+    def configuration_parameters(objective, record):
+        del record
+        return _ground_state_configuration_parameters(_ground_state_specification(objective))
+
+    def active_space_parameters(objective, record):
+        del record
+        return _ground_state_active_space_parameters(_ground_state_specification(objective))
+
+    def mapping_parameters(objective, record):
+        del record
+        return _ground_state_mapping_parameters(_ground_state_specification(objective))
+
+    def ansatz_parameters(objective, record):
+        del record
+        return _ground_state_ansatz_parameters(_ground_state_specification(objective))
+
+    def vqe_parameters(objective, record):
+        del record
+        specification = _ground_state_specification(objective)
+        return {
+            "optimizer": "slsqp",
+            "estimator": specification.execution_model,
+            "maximum_iterations": 300,
+            "convergence_threshold": 1.0e-9,
+            "random_seed": 29,
+        }
+
+    registry = ScientistCapabilityRegistry(
+        {
+            "electronic.molecular_system_resolve": GroundStateMolecularSystemHandler(store),
+            "scientific_verification.molecular_ground_state": MolecularGroundStateVerificationHandler(store),
+            "molecular.scene_project": MinimalSceneHandler(store),
+        }
+    )
+    native = {
+        "electronic.configuration_define": ScientificEngineHandler(
+            pyscf_adapter, CONFIGURATION_DEFINE, parameters=configuration_parameters,
+        ),
+        "electronic.hartree_fock": ScientificEngineHandler(pyscf_adapter, HARTREE_FOCK),
+        "electronic.active_space_select": ScientificEngineHandler(
+            pyscf_adapter, ACTIVE_SPACE_SELECT, parameters=active_space_parameters,
+        ),
+        "electronic.active_space_construct": ScientificEngineHandler(pyscf_adapter, ACTIVE_SPACE_CONSTRUCT),
+        "quantum.hamiltonian_construct": ScientificEngineHandler(
+            qiskit_adapter, HAMILTONIAN_CONSTRUCT,
+            parameters={"integral_symmetry_tolerance": 1.0e-8},
+        ),
+        "quantum.fermion_to_qubit_map": ScientificEngineHandler(
+            qiskit_adapter, FERMION_TO_QUBIT_MAP, parameters=mapping_parameters,
+        ),
+        "quantum.exact_diagonalize": ScientificEngineHandler(
+            qiskit_adapter, EXACT_DIAGONALIZE,
+            parameters={
+                "solver": "numpy_eigh_particle_sector",
+                "particle_number_tolerance": 1.0e-10,
+                "hermiticity_tolerance": 1.0e-9,
+            },
+        ),
+        "quantum.ansatz_construct": ScientificEngineHandler(
+            qiskit_adapter, ANSATZ_CONSTRUCT, parameters=ansatz_parameters,
+        ),
+        "quantum.vqe_execute": ScientificEngineHandler(
+            qiskit_adapter, VQE_EXECUTE, parameters=vqe_parameters,
+        ),
+    }
+    for name, handler in native.items():
+        registry.register(name, handler)
+    return registry
+
+
+def molecular_ground_state_sweep_registry(
+    *,
+    store: ScientificPayloadStore,
+    pyscf_adapter: PySCFElectronicStructureAdapter,
+    qiskit_adapter: QiskitQuantumWorkflowAdapter,
+) -> ScientistCapabilityRegistry:
+    """Return the generic ordered multi-geometry execution slice."""
+
+    return ScientistCapabilityRegistry(
+        {
+            "electronic.molecular_parameter_sweep_resolve": GroundStateParameterSweepSpecificationHandler(store),
+            "scientific_computation.molecular_ground_state_sweep": MolecularGroundStateSweepExecutionHandler(
+                store, pyscf_adapter, qiskit_adapter
+            ),
+            "scientific_verification.molecular_ground_state_sweep": MolecularGroundStateSweepVerificationHandler(store),
+            "molecular.scene_project": MinimalSceneHandler(store),
+        }
+    )
+
 def metal_active_site_registry(
     *,
     store: ScientificPayloadStore,
@@ -4016,6 +4969,66 @@ class _DiscoveryArtifactBridge:
         return self.runner.store.read(reference)
 
 
+def _discovery_target(record, store):
+    """Resolve a deposited ligand-defined region and a protein-only docking receptor."""
+    protein = _objective_input(record, kinds=("protein_structure",))
+    lines = store.read(protein).decode("utf-8").splitlines()
+    if sum(line.startswith("MODEL ") for line in lines) > 1:
+        raise ScientificCapabilityFailure("receptor_model_ambiguous", "Select one deposited receptor model.")
+    groups = {}
+    for line in lines:
+        if line.startswith("HETATM") and line[17:20].strip() != "HOH":
+            groups.setdefault(line[17:27], []).append(line)
+    labels = {str(value["display_name"]).upper().removesuffix("_IDEAL").removesuffix("_MODEL")
+              for value in _discovery_ligands(record, store).values()}
+    organic = {key: values for key, values in groups.items()
+               if any(line[76:78].strip() == "C" for line in values)}
+    matches = {key: values for key, values in organic.items() if key[:3].strip() in labels}
+    if len(matches) != 1 and len(organic) == 1:
+        matches = organic
+    # A compact supplied receptor may be used in its entirety; large targets require site evidence.
+    atoms = _pdb_atoms(("\n".join(line for line in lines if line.startswith("ATOM  ")) + "\n").encode())
+    if len(matches) == 1:
+        region_atoms = _pdb_atoms(("\n".join(next(iter(matches.values()))) + "\n").encode())
+        method = "deposited_ligand_coordinates_with_6A_margin"
+    elif len(atoms) <= 100:
+        region_atoms = atoms
+        method = "complete_compact_receptor_envelope"
+    else:
+        raise ScientificCapabilityFailure(
+            "binding_region_ambiguous",
+            "Provide a receptor with one identifiable bound reference ligand or an explicitly prepared binding region."
+        )
+    choices = {}
+    for line in lines:
+        if line.startswith("ATOM  ") and line[16:17].strip():
+            choices.setdefault(line[17:27], {}).setdefault(line[16], []).append(float(line[54:60] or 0))
+    chosen = {key: sorted(values, key=lambda alt: (-sum(values[alt])/len(values[alt]), alt))[0]
+              for key, values in choices.items()}
+    receptor = [line[:16] + " " + line[17:] for line in lines if line.startswith("ATOM  ")
+                and (not line[16].strip() or line[16] == chosen[line[17:27]])]
+    if any(int(atom["atomic_number"]) in _TRANSITION_METAL_NUMBERS
+           for values in groups.values() for atom in _pdb_atoms(("\n".join(values) + "\n").encode())):
+        raise ScientificCapabilityFailure(
+            "receptor_cofactor_requires_review", "This protein-only docking method cannot discard a bound metal cofactor."
+        )
+    region_atoms = tuple(atom for atom in region_atoms if atom["element"] != "H")
+    center = [sum(float(atom[axis]) for atom in region_atoms) / len(region_atoms) for axis in ("x", "y", "z")]
+    size = [max(12.0, max(float(atom[axis]) for atom in region_atoms)
+                - min(float(atom[axis]) for atom in region_atoms) + 12.0) for axis in ("x", "y", "z")]
+    residues = sorted({f"chain-{atom['chain'].lower()}-residue-{atom['sequence']}-{atom['residue_name'].lower()}"
+                       for atom in atoms if any(sum((float(atom[axis])-float(site[axis]))**2
+                                                 for axis in ("x", "y", "z")) <= 36 for site in region_atoms)})
+    return ("\n".join(receptor) + "\nTER\nEND\n").encode(), {
+        "definition_method": method, "center_angstrom": center, "size_angstrom": size,
+        "selected_residue_identifiers": residues,
+        "source_protein_artifact_identifier": protein.artifact_identifier,
+        "reference_residue": next(iter(matches), None),
+        "alternate_conformation_policy": "highest_mean_occupancy_then_lexical_tie_break",
+        "excluded_nonpolymer_atom_count": sum(line.startswith("HETATM") for line in lines),
+    }
+
+
 class DiscoveryProteinIngestionHandler:
     def __init__(self, store: ScientificPayloadStore) -> None:
         self.runner = _NativeRunner(store)
@@ -4023,8 +5036,7 @@ class DiscoveryProteinIngestionHandler:
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
         del objective
         source = _objective_input(record, kinds=("protein_structure",))
-        payload = self.runner.store.read(source)
-        _pdb_atoms(payload)
+        payload, region = _discovery_target(record, self.runner.store)
         structure = self.runner.write_bytes(
             artifact_type="molecular_structure",
             media_type="chemical/x-pdb",
@@ -4033,7 +5045,11 @@ class DiscoveryProteinIngestionHandler:
             execution_identifier=invocation.invocation_identifier,
             parents=(source,),
         )
-        return ScientificCapabilityOutcome(output_artifacts=(structure,))
+        return ScientificCapabilityOutcome(
+            output_artifacts=(structure,),
+            limitations=("Protein-only rigid docking excludes deposited ligand, waters and nonpolymer additives; any later modeled atoms are recorded separately.",
+                         "Alternate conformations use highest mean occupancy, with a lexical tie break."),
+        )
 
 
 class DiscoveryProteinPreparationHandler:
@@ -4045,13 +5061,47 @@ class DiscoveryProteinPreparationHandler:
         structure = next(
             item for item in record.artifact_references if item.artifact_type == "molecular_structure"
         )
+        import io
+        from importlib.metadata import version
+        try:
+            from pdbfixer import PDBFixer
+            from openmm import Platform
+            from openmm.app import PDBFile
+        except ImportError as error:
+            raise ScientificCapabilityFailure(
+                "receptor_preparation_dependency_missing",
+                "Missing-atom receptor preparation requires the pinned PDBFixer dependency."
+            ) from error
+        fixer = PDBFixer(pdbfile=io.StringIO(self.runner.store.read(structure).decode()),
+                         platform=Platform.getPlatformByName("CPU"))
+        fixer.missingResidues = {}
+        fixer.findMissingAtoms()
+        additions = [
+            {"chain": residue.chain.id, "residue": residue.id, "residue_name": residue.name,
+             "atoms": [atom.name for atom in atoms]}
+            for residue, atoms in fixer.missingAtoms.items()
+        ] + [{"chain": residue.chain.id, "residue": residue.id, "residue_name": residue.name,
+              "atoms": list(names)} for residue, names in fixer.missingTerminals.items()]
+        if any(set(item["atoms"]) & {"N", "CA", "C", "O"} for item in additions):
+            raise ScientificCapabilityFailure(
+                "receptor_backbone_incomplete",
+                "The receptor has missing backbone atoms. Provide a reviewed complete receptor model."
+            )
+        fixer.addMissingAtoms(seed=1729)
+        output = io.StringIO()
+        PDBFile.writeFile(fixer.topology, fixer.positions, output, keepIds=True)
+        prepared_payload = output.getvalue().encode()
+        preparation = {
+            "method": "pdbfixer_existing_residue_heavy_atom_completion",
+            "pdbfixer_version": version("pdbfixer"), "openmm_version": version("openmm"),
+            "random_seed": 1729, "modeled_atom_additions": additions,
+            "missing_residues_built": False, "exact_pka_calculated": False,
+            "protonation_policy": "Meeko_standard_residue_templates",
+            "modeled_coordinates_are_experimental": False,
+        }
         report = self.runner.write_json(
             artifact_type="molecular_protein_protonation_preparation",
-            payload=(
-                b'{"method":"explicit_standard_residue_structure","target_ph":7.4,'
-                b'"exact_pka_calculated":false,"ambiguous_residue_states":[],'
-                b'"usage":"docking_receptor_preparation"}'
-            ),
+            payload=json.dumps(preparation, sort_keys=True).encode(),
             producer="molecular.protein_protonation_prepare",
             execution_identifier=invocation.invocation_identifier,
             parents=(structure,),
@@ -4059,44 +5109,20 @@ class DiscoveryProteinPreparationHandler:
         prepared = self.runner.write_bytes(
             artifact_type="prepared_molecular_structure",
             media_type="chemical/x-pdb",
-            payload=self.runner.store.read(structure),
+            payload=prepared_payload,
             producer="molecular.protein_protonation_prepare",
             execution_identifier=invocation.invocation_identifier,
             parents=(structure, report),
         )
         return ScientificCapabilityOutcome(
-            output_artifacts=(report, prepared), evidence_artifacts=(report, prepared)
+            output_artifacts=(report, prepared), evidence_artifacts=(report, prepared),
+            limitations=(f"PDBFixer modeled {sum(len(item['atoms']) for item in additions)} missing side-chain/terminal atoms in existing residues; these coordinates are predictions, not experimental observations.",
+                         "No missing residue loops or backbone atoms are reconstructed; Meeko standard protonation templates are used without pKa calculation."),
         )
 
 
 def _protein_pocket(record: ScientificExecutionRecord, store: ScientificPayloadStore) -> dict[str, object]:
-    protein = _objective_input(record, kinds=("protein_structure",))
-    atoms = _pdb_atoms(store.read(protein))
-    heavy = tuple(atom for atom in atoms if str(atom["element"]) != "H")
-    if len(heavy) < 3:
-        raise ScientificCapabilityFailure(
-            "binding_pocket_unresolved",
-            "The supplied receptor has too few heavy atoms for a docking pocket.",
-        )
-    center = tuple(
-        sum(float(atom[axis]) for atom in heavy) / len(heavy) for axis in ("x", "y", "z")
-    )
-    extents = tuple(
-        max(float(atom[axis]) for atom in heavy) - min(float(atom[axis]) for atom in heavy)
-        for axis in ("x", "y", "z")
-    )
-    size = tuple(max(12.0, min(24.0, extent + 8.0)) for extent in extents)
-    residues = tuple(dict.fromkeys(
-        f"chain-{str(atom['chain']).lower()}-residue-{str(atom['sequence']).lower()}-{str(atom['residue_name']).lower()}"
-        for atom in heavy
-    ))
-    return {
-        "definition_method": "protein_heavy_atom_envelope_with_4A_margin",
-        "center_angstrom": list(center),
-        "size_angstrom": list(size),
-        "selected_residue_identifiers": list(residues),
-        "source_protein_artifact_identifier": protein.artifact_identifier,
-    }
+    return _discovery_target(record, store)[1]
 
 
 class DiscoverySemanticTargetHandler:
@@ -4148,7 +5174,7 @@ class BindingPocketResolutionHandler:
         return ScientificCapabilityOutcome(
             output_artifacts=(reference,), evidence_artifacts=(reference,),
             scientific_summary=(
-                f"Resolved a {pocket['size_angstrom']} Angstrom docking box from the protein heavy-atom envelope."
+                f"Resolved a {pocket['size_angstrom']} Angstrom docking box using {pocket['definition_method']}."
             ),
         )
 
@@ -4166,7 +5192,12 @@ class DiscoveryReceptorPreparationHandler:
         import json
 
         structure = next(
-            item for item in record.artifact_references if item.artifact_type == "molecular_structure"
+            item for item in record.artifact_references if item.artifact_type == "prepared_molecular_structure"
+        )
+        structure = self.runner.write_bytes(
+            artifact_type="molecular_structure", media_type="chemical/x-pdb",
+            payload=self.runner.store.read(structure), producer="molecular.docking_receptor_input",
+            execution_identifier=invocation.invocation_identifier, parents=(structure,),
         )
         pocket_reference = next(
             (item for item in record.artifact_references if item.artifact_type == "binding_pocket"),
@@ -4197,6 +5228,47 @@ class DiscoveryReceptorPreparationHandler:
         )
 
 
+def _discovery_generates(objective: StructuredScientificObjective) -> bool:
+    requirements = objective.research_requirements
+    return requirements is None or bool(
+        set(requirements.operations) & {"generate_candidates", "design_next_generation"}
+    )
+
+
+def _discovery_ligands(record, store):
+    """Read every supplied identity, retaining exact source-record provenance."""
+    import io
+    from rdkit import Chem
+
+    identities = {}
+    supplied = {item.artifact_identifier for item in record.objective.input_references
+                if item.artifact_type in {"ligand_structure", "prepared_ligand"}}
+    for reference in record.artifact_references:
+        if reference.artifact_identifier not in supplied:
+            continue
+        payload = store.read(reference)
+        if "smiles" in reference.media_type.lower():
+            molecules = [Chem.MolFromSmiles(line.split()[0])
+                         for line in payload.decode("utf-8").splitlines() if line.strip()]
+        else:
+            molecules = list(Chem.ForwardSDMolSupplier(io.BytesIO(payload), removeHs=True))
+        if not molecules or any(molecule is None for molecule in molecules):
+            raise ScientificCapabilityFailure(
+                "discovery_candidate_invalid", "A supplied candidate file contains an invalid molecular record."
+            )
+        for index, molecule in enumerate(molecules, 1):
+            smiles = Chem.MolToSmiles(Chem.RemoveHs(molecule), canonical=True, isomericSmiles=True)
+            label = reference.metadata.get("display_name") or reference.metadata.get("filename")
+            if label and str(label).lower().endswith((".sdf", ".mol", ".smi", ".smiles")):
+                label = str(label).rsplit(".", 1)[0]
+            if not label and molecule.HasProp("_Name"):
+                label = molecule.GetProp("_Name")
+            entry = identities.setdefault(smiles, {"display_name": str(label or smiles), "sources": []})
+            entry["sources"].append({"artifact_identifier": reference.artifact_identifier,
+                                     "record_number": index, "content_sha256": reference.content_sha256})
+    return identities
+
+
 class DiscoveryCampaignInitializeHandler:
     def __init__(self, store: ScientificPayloadStore) -> None:
         self.runner = _NativeRunner(store)
@@ -4206,7 +5278,14 @@ class DiscoveryCampaignInitializeHandler:
         objective: StructuredScientificObjective,
         *,
         generator_identifier: str,
+        candidate_count: int = 0,
     ) -> DiscoveryCampaign:
+        generates = _discovery_generates(objective)
+        count = max(3, candidate_count + 1) if generates else candidate_count
+        if count < 1 or count > objective.budget.maximum_candidates:
+            raise ScientificCapabilityFailure(
+                "discovery_candidate_budget", "Supply candidate structures within the approved candidate limit."
+            )
         return DiscoveryCampaign(
             campaign_identifier=_stable_identifier("protein-ligand-campaign", objective.objective_identifier),
             description="Bounded protein-ligand discovery with RDKit preparation and native Vina pose evaluation.",
@@ -4215,26 +5294,26 @@ class DiscoveryCampaignInitializeHandler:
                     objective_identifier="drug_likeness",
                     metric_identifier="rdkit_qed",
                     direction=ObjectiveDirection.MAXIMIZE,
-                    weight=0.35,
+                    weight=0.35 if generates else 0.0,
                     required_verifier_families=("candidate_ranking",),
                 ),
                 DiscoveryObjective(
                     objective_identifier="vina_pose_score",
                     metric_identifier="autodock_vina_score_kcal_per_mol",
                     direction=ObjectiveDirection.MINIMIZE,
-                    weight=0.65,
+                    weight=0.65 if generates else 1.0,
                     required_verifier_families=("candidate_ranking",),
                 ),
             ),
             permitted_candidate_types=("small_molecule",),
             constraint_identifiers=("three_dimensional_conformer", "native_vina_pose_generated"),
             budget=DiscoveryCampaignBudget(
-                max_generations=2,
-                max_candidates_total=3,
-                max_candidates_per_generation=2,
-                max_validity_checks=6,
-                max_evaluations=6,
-                max_expensive_evaluations=3,
+                max_generations=2 if generates else 1,
+                max_candidates_total=count,
+                max_candidates_per_generation=max(2, candidate_count) if generates else count,
+                max_validity_checks=2 * count,
+                max_evaluations=2 * count,
+                max_expensive_evaluations=count,
                 maximum_wall_time_seconds=min(900.0, float(objective.budget.maximum_wall_time_seconds)),
             ),
             stopping_policy=DiscoveryStoppingPolicy(
@@ -4245,7 +5324,8 @@ class DiscoveryCampaignInitializeHandler:
             metadata={
                 "generator": generator_identifier,
                 "docking_engine": "autodock_vina",
-                "minimum_generations": 2,
+                "minimum_generations": 2 if generates else 1,
+                "candidate_mode": "generate" if generates else "evaluate_supplied",
             },
         )
 
@@ -4256,6 +5336,7 @@ class DiscoveryCampaignInitializeHandler:
         )
         campaign = self.campaign(
             objective,
+            candidate_count=len(_discovery_ligands(record, self.runner.store)),
             generator_identifier=(
                 "generator.rdkit_scaffold_transform"
                 if has_scientist_seed
@@ -4283,7 +5364,7 @@ class DiscoveryDesignLoopBindingHandler:
         self.runner = _NativeRunner(store)
 
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
-        del objective
+        generates = _discovery_generates(objective)
         import json
 
         parents = tuple(
@@ -4337,8 +5418,8 @@ class DiscoveryDesignLoopBindingHandler:
                     ],
                 },
             ],
-            "required_stages": list(DiscoveryDesignLoopTraceHandler._REQUIRED_STAGES),
-            "candidate_lineage_required": True,
+            "required_stages": list(DiscoveryDesignLoopTraceHandler.stages(generates)),
+            "candidate_lineage_required": generates,
             "candidate_verification_required": True,
             "authorizes_execution": False,
         }
@@ -4390,10 +5471,10 @@ class DiscoveryCampaignIterationHandler:
         if (
             contract.get("schema")
             != "pulsate.discovery-design-loop-contract/v1"
-            or contract.get("candidate_lineage_required") is not True
+            or contract.get("candidate_lineage_required") is not _discovery_generates(objective)
             or contract.get("candidate_verification_required") is not True
             or tuple(contract.get("required_stages", ()))
-            != DiscoveryDesignLoopTraceHandler._REQUIRED_STAGES
+            != DiscoveryDesignLoopTraceHandler.stages(_discovery_generates(objective))
         ):
             raise ScientificCapabilityFailure(
                 "discovery_design_loop_unbound",
@@ -4411,39 +5492,15 @@ class DiscoveryCampaignIterationHandler:
             None,
         )
         if ligand_reference is not None:
-            ligand_payload = self.runner.store.read(ligand_reference)
-            try:
-                ligand_block = ligand_payload.decode("utf-8").split("$$$$", 1)[0]
-            except UnicodeDecodeError as error:
-                raise ScientificCapabilityFailure(
-                    "discovery_seed_invalid",
-                    "The reviewed molecular seed is not valid UTF-8 structure data.",
-                ) from error
-            molecule = Chem.MolFromMolBlock(
-                ligand_block,
-                removeHs=True,
-                sanitize=True,
-            )
-            if molecule is None:
-                raise ScientificCapabilityFailure(
-                    "discovery_seed_invalid",
-                    "The reviewed molecular seed could not be converted into one exact molecular identity.",
-                )
-            seed_smiles = (
-                str(
-                    Chem.MolToSmiles(
-                        molecule,
-                        canonical=True,
-                        isomericSmiles=True,
-                    )
-                ),
-            )
+            supplied_identities = _discovery_ligands(record, self.runner.store)
             generator = RDKitMolecularCandidateGenerator(
                 self.bridge,
-                seed_smiles=seed_smiles,
+                seed_smiles=tuple(supplied_identities),
+                seed_metadata=supplied_identities,
                 allowed_substituents=("C", "F"),
             )
-            generation_mode = "scientist_seeded_scaffold_optimization"
+            generation_mode = ("scientist_seeded_scaffold_optimization"
+                               if _discovery_generates(objective) else "supplied_candidate_comparison")
             generation_source = ligand_reference.artifact_identifier
         else:
             generator = RDKitDeNovoMolecularCandidateGenerator(
@@ -4486,13 +5543,13 @@ class DiscoveryCampaignIterationHandler:
             selection_policy=SelectionPolicy(max_selected_candidates=1),
         )
         run = runtime.run(campaign)
-        if not run.completed or len(run.state.generations) < 2:
+        if not run.completed or len(run.state.generations) < campaign.metadata["minimum_generations"]:
             raise ScientificCapabilityFailure(
                 "discovery_campaign_incomplete",
-                "The bounded discovery campaign did not complete at least two generations.",
+                "The candidate evaluation did not complete the requested campaign.",
                 retryable=True,
             )
-        if not run.state.lineage.edges:
+        if _discovery_generates(objective) and not run.state.lineage.edges:
             raise ScientificCapabilityFailure(
                 "discovery_lineage_missing",
                 "The second molecular generation has no persisted parent transformation lineage.",
@@ -4541,10 +5598,14 @@ class DiscoveryCampaignIterationHandler:
             ),
             limitations=(
                 "Vina scores rank generated poses and are not binding free energies.",
+                "Screening uses a rigid receptor and supplied charge/stereochemical states; activity and efficacy are not established.",
+                "For supplied-candidate comparison, ranking is by Vina score; QED is reported separately, not a potency measurement.",
                 (
                     "This compact campaign samples bounded scientist-seeded scaffold "
                     "transformations rather than exhaustive chemical space."
-                    if ligand_reference is not None
+                    if ligand_reference is not None and _discovery_generates(objective)
+                    else "All distinct supplied candidates were evaluated without creating new molecular identities."
+                    if not _discovery_generates(objective)
                     else (
                         "This compact campaign samples a declared de novo fragment-assembly "
                         "policy rather than exhaustive chemical space or global novelty."
@@ -4573,10 +5634,12 @@ class DiscoveryRankingVerificationHandler:
         )
         trace = json.loads(self.runner.store.read(trace_reference))
         generations = run.state.generations
+        supplied_only = result_reference.metadata.get("generation_mode") == "supplied_candidate_comparison"
         verification_passed = (
             run.completed
-            and len(generations) >= 2
-            and bool(run.state.lineage.edges)
+            and len(generations) >= (1 if supplied_only else 2)
+            and (supplied_only or bool(run.state.lineage.edges))
+            and bool(generations[-1].selected_candidate_identifiers)
             and all(
                 record.assessment is not None and record.assessment.scientific_quality_passed
                 for generation in generations
@@ -4584,6 +5647,7 @@ class DiscoveryRankingVerificationHandler:
                 if record.candidate.candidate_identifier in generation.valid_candidate_identifiers
             )
             and all(generation.ranking is not None for generation in generations)
+            and (not supplied_only or {r.candidate.metadata["canonical_smiles"] for g in generations for r in g.candidate_records} == set(_discovery_ligands(record, self.runner.store)))
             and trace.get("loop_complete") is True
             and trace.get("run_fingerprint") == run.fingerprint
         )
@@ -4633,6 +5697,13 @@ class DiscoveryDesignLoopTraceHandler:
         "design_next_generation",
     )
 
+    @classmethod
+    def stages(cls, generates: bool) -> tuple[str, ...]:
+        if generates:
+            return cls._REQUIRED_STAGES
+        return ("load_supplied_candidates", "validate_structure", "prepare_molecule_and_target",
+                "dock_or_simulate", "verify_evidence", "rank_candidates")
+
     def __init__(self, store: ScientificPayloadStore) -> None:
         self.runner = _NativeRunner(store)
 
@@ -4659,6 +5730,7 @@ class DiscoveryDesignLoopTraceHandler:
             self.runner.store.read(result_reference)
         )
         candidates: list[dict[str, object]] = []
+        supplied_only = result_reference.metadata.get("generation_mode") == "supplied_candidate_comparison"
         selected_identifiers: list[str] = []
         for generation in run.state.generations:
             selected_identifiers.extend(generation.selected_candidate_identifiers)
@@ -4669,6 +5741,8 @@ class DiscoveryDesignLoopTraceHandler:
                 candidates.append(
                     {
                         "candidate_identifier": candidate.candidate_identifier,
+                        "display_name": candidate.metadata.get("display_name", candidate.metadata.get("canonical_smiles", candidate.candidate_identifier)),
+                        "source_inputs": json.loads(str(candidate.metadata.get("sources", "[]"))),
                         "candidate_sha256": candidate.fingerprint,
                         "generation": candidate.generation,
                         "parent_candidate_identifiers": list(
@@ -4723,20 +5797,26 @@ class DiscoveryDesignLoopTraceHandler:
             {"stage": "design_next_generation", "evidence": "parent transformations and lineage edges"},
         ]
         loop_complete = (
+            # A comparison must not claim transformations or a next generation.
+            # Those checks still apply to campaigns that actually generate candidates.
             run.completed
             and bool(candidates)
-            and bool(run.state.lineage.edges)
+            and (supplied_only or bool(run.state.lineage.edges))
             and all(generation.ranking is not None for generation in run.state.generations)
-            and tuple(item["stage"] for item in stages) == self._REQUIRED_STAGES
+            and json.loads(self.runner.store.read(contract_reference))["required_stages"] == list(self.stages(not supplied_only))
         )
         payload = {
+            "candidate_mode": "evaluate_supplied" if supplied_only else "generate",
             "schema": "pulsate.discovery-design-loop/v1",
             "run_fingerprint": run.fingerprint,
             "design_loop_contract_identifier": (
                 contract_reference.artifact_identifier
             ),
             "loop_complete": loop_complete,
-            "stages": stages,
+            "stages": ([{"stage": "load_supplied_candidates", "evidence": "exact supplied identities and source records"}]
+                       + [item for item in stages if item["stage"] not in
+                          {"generate_molecule", "refine_selected_candidates", "design_next_generation"}]
+                       if supplied_only else stages),
             "candidates": candidates,
             "lineage": [
                 item.model_dump(mode="json") for item in run.state.lineage.edges
@@ -4768,8 +5848,9 @@ class DiscoveryDesignLoopTraceHandler:
             output_artifacts=(trace,),
             evidence_artifacts=(trace,),
             scientific_summary=(
-                "Persisted the complete generate, validate, prepare, dock, refine, "
-                "verify, rank, and next-generation design trace."
+                "Persisted the supplied-candidate preparation, docking, verification and ranking trace."
+                if supplied_only else
+                "Persisted the complete generation, evaluation, verification and next-generation trace."
             ),
         )
 
@@ -4977,7 +6058,7 @@ class DiscoverySceneHandler:
         )
         run = DiscoveryCampaignRun.model_validate_json(self.runner.store.read(result_reference))
         last = run.state.generations[-1]
-        protein_reference = _objective_input(record, kinds=("protein_structure",))
+        protein_reference = next(item for item in record.artifact_references if item.artifact_type == "prepared_molecular_structure")
         reference_map = {
             item.artifact_identifier: item for item in record.artifact_references
         }

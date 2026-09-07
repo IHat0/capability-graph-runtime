@@ -1,5 +1,5 @@
 import { act, renderHook } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PulsateApi } from '../api/client'
 import type { ResearchSessionResponse } from '../api/types'
 import { useResearchSession } from './useResearchSession'
@@ -98,6 +98,79 @@ function api(): PulsateApi {
 }
 
 describe('useResearchSession', () => {
+  it('accepts an intent-only confirmation without requiring filler text', async () => {
+    const client = api()
+    vi.mocked(client.createResearchSession).mockResolvedValue({
+      ...awaiting,
+      intent_proposal: { task_type: 'structure_analysis' } as ResearchSessionResponse['intent_proposal'],
+    })
+    const hook = renderHook(() => useResearchSession(client))
+    act(() => hook.result.current.setQuestion('Analyze the structure.'))
+    await act(async () => hook.result.current.start())
+    act(() => hook.result.current.setAcceptIntentProposal(true))
+    await act(async () => hook.result.current.respond())
+    expect(client.replyResearchSession).toHaveBeenCalledWith(
+      awaiting.session_identifier, 'I confirm the reviewed proposal.',
+      true, false, false, false, [], [], expect.any(AbortSignal),
+    )
+  })
+
+  it('reopens a saved session from the page address', async () => {
+    const client = api()
+    vi.mocked(client.getResearchSession).mockResolvedValue(planned)
+    window.history.replaceState(null, '', '/?research=' + planned.session_identifier)
+    const hook = renderHook(() => useResearchSession(client))
+    await act(async () => {})
+    expect(hook.result.current.session?.session_identifier).toBe(planned.session_identifier)
+    expect(hook.result.current.session?.status).toBe('planned')
+    expect(client.createResearchSession).not.toHaveBeenCalled()
+  })
+
+  it('does not restore a discarded question when an old request finishes', async () => {
+    const client = api()
+    let complete!: (value: ResearchSessionResponse) => void
+    vi.mocked(client.createResearchSession).mockImplementation(() => new Promise((resolve) => { complete = resolve }))
+    const hook = renderHook(() => useResearchSession(client))
+    act(() => hook.result.current.setQuestion('Analyze this structure.'))
+    let pending!: Promise<void>
+    await act(async () => { pending = hook.result.current.start() })
+    act(() => hook.result.current.newSession())
+    await act(async () => { complete(awaiting); await pending })
+    expect(hook.result.current.session).toBeNull()
+    expect(hook.result.current.busy).toBe(false)
+    expect(new URL(window.location.href).searchParams.has('research')).toBe(false)
+  })
+
+  it('polls durable progress while the execution request is pending', async () => {
+    vi.useFakeTimers()
+    try {
+      const client = api()
+      vi.mocked(client.createResearchSession).mockResolvedValue(planned)
+      const running = { ...planned, status: 'running' as const, revision: 3, execution_steps: [{
+        step_identifier: 'step-1', capability_name: 'structure.analyze',
+        status: 'running' as const, error_code: null, error_message: null,
+      }] }
+      vi.mocked(client.getResearchSession).mockResolvedValue(running)
+      let finish!: (value: ResearchSessionResponse) => void
+      vi.mocked(client.executeResearchSession).mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+      const hook = renderHook(() => useResearchSession(client))
+      act(() => hook.result.current.setQuestion('Analyze this structure.'))
+      await act(async () => hook.result.current.start())
+      let pending!: Promise<void>
+      await act(async () => { pending = hook.result.current.execute() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(501) })
+      expect(hook.result.current.session?.status).toBe('running')
+      expect(hook.result.current.session?.execution_steps?.[0].status).toBe('running')
+      await act(async () => { finish({ ...running, status: 'failed', revision: 4 }); await pending })
+      expect(hook.result.current.session?.status).toBe('failed')
+      hook.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  beforeEach(() => window.history.replaceState(null, '', '/'))
+
   it('keeps a clarification and reply in one durable session', async () => {
     const client = api()
     const hook = renderHook(() => useResearchSession(client))

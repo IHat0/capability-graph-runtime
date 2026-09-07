@@ -75,6 +75,55 @@ class EnergyComparisonVerifier(BaseObjectiveScientificVerifier):
         lowest_identifier, lowest_energy = ordered[0]
         second_identifier, second_energy = ordered[1]
         gap = second_energy - lowest_energy
+        if request.comparison_goal == "verify_agreement":
+            maximum_difference = request.maximum_agreement_difference_hartree
+            assert maximum_difference is not None
+            if gap > maximum_difference:
+                findings.append(
+                    finding(
+                        "verification.numerical.energy_agreement_exceeded",
+                        VerificationDimension.NUMERICAL_INTEGRITY,
+                        "The compared energies differ by more than the declared agreement tolerance.",
+                        subject_identifier=request.subject_identifier,
+                        expected=f"difference<={maximum_difference}",
+                        observed=gap,
+                        evidence_identifiers=(lowest_identifier, second_identifier),
+                    )
+                )
+            return tuple(findings)
+        if request.comparison_goal == "verify_variational_upper_bound":
+            reference_identifier = (
+                request.variational_reference_calculation_identifier
+            )
+            candidate_identifier = (
+                request.variational_candidate_calculation_identifier
+            )
+            tolerance = request.variational_tolerance_hartree
+            assert reference_identifier is not None
+            assert candidate_identifier is not None
+            assert tolerance is not None
+            reference_energy = available.get(reference_identifier)
+            candidate_energy = available.get(candidate_identifier)
+            if (
+                reference_energy is not None
+                and candidate_energy is not None
+                and candidate_energy < reference_energy - tolerance
+            ):
+                findings.append(
+                    finding(
+                        "verification.plausibility.variational_upper_bound_violated",
+                        VerificationDimension.SCIENTIFIC_PLAUSIBILITY,
+                        "The variational energy is below the independently diagonalized reference beyond tolerance.",
+                        subject_identifier=request.subject_identifier,
+                        expected=f"candidate>={reference_energy - tolerance}",
+                        observed=candidate_energy,
+                        evidence_identifiers=(
+                            reference_identifier,
+                            candidate_identifier,
+                        ),
+                    )
+                )
+            return tuple(findings)
         if gap < request.minimum_resolvable_difference_hartree:
             findings.append(
                 finding(

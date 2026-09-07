@@ -225,7 +225,7 @@ class MappedQubitHamiltonian(CanonicalModel):
     active_space_identifier: str
     active_space_sha256: str
     molecule_identifier: str
-    mapper: Literal["jordan_wigner"]
+    mapper: Literal["jordan_wigner", "parity"]
     active_electron_count: int = Field(gt=0)
     alpha_electron_count: int = Field(ge=0)
     beta_electron_count: int = Field(ge=0)
@@ -287,7 +287,7 @@ class MappedQubitHamiltonian(CanonicalModel):
             raise ValueError("Active spin-orbital count must be twice spatial count.")
         if self.number_of_qubits != self.active_spin_orbital_count:
             raise ValueError(
-                "Jordan-Wigner mapping without reduction requires one qubit "
+                "Fermion-to-qubit mapping without reduction requires one qubit "
                 "per spin orbital."
             )
         if (
@@ -315,7 +315,7 @@ class ExactDiagonalizationResult(CanonicalModel):
     active_space_sha256: str
     solver_identifier: Literal["numpy_eigh_particle_sector"]
     solver_version: str
-    mapper: Literal["jordan_wigner"]
+    mapper: Literal["jordan_wigner", "parity"]
     number_of_qubits: int = Field(gt=0, le=_MAXIMUM_EXACT_QUBITS)
     active_spatial_orbital_count: int = Field(gt=0)
     alpha_electron_count: int = Field(ge=0)
@@ -468,7 +468,7 @@ class VariationalAnsatz(CanonicalModel):
     active_space_identifier: str
     active_space_sha256: str
     molecule_identifier: str
-    mapper: Literal["jordan_wigner"]
+    mapper: Literal["jordan_wigner", "parity"]
     number_of_qubits: int = Field(gt=0, le=64)
     active_spatial_orbital_count: int = Field(gt=0, le=32)
     active_electron_count: int = Field(gt=0)
@@ -578,6 +578,7 @@ class VariationalGroundStateResult(CanonicalModel):
     active_space_sha256: str
     algorithm_identifier: Literal["variational_quantum_eigensolver"]
     estimator_identifier: Literal["exact_statevector_expectation"]
+    gradient_identifier: Literal["reverse_mode_exact_statevector"]
     optimizer_identifier: Literal["slsqp"]
     optimizer_version: str
     optimizer_status: str

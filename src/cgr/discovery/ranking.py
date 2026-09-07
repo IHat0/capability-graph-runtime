@@ -45,6 +45,9 @@ def pareto_dominates(
 
     strictly_better = False
     for objective in objectives:
+        # Zero-weight quantities remain auditable but do not select candidates.
+        if objective.weight == 0:
+            continue
         left_value = left_scores[objective.objective_identifier].value
         right_value = right_scores[objective.objective_identifier].value
         if objective.direction is ObjectiveDirection.MAXIMIZE:

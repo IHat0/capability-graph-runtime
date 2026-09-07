@@ -1323,3 +1323,125 @@ def test_ambiguous_entity_reply_selects_exactly_one_listed_candidate() -> None:
         "Either 1ABC or 2DEF is fine.",
         candidates,
     ) is None
+
+
+def test_complete_named_diatomic_vqe_question_plans_in_one_turn(
+    tmp_path: Path,
+) -> None:
+    class Provider:
+        provider_kind = "controlled_test_provider"
+        model_name = "replaceable-model"
+
+        def complete(self, _messages: list[dict[str, str]]) -> str:
+            return json.dumps(
+                {
+                    "requirements": [
+                        {
+                            "operation": "calculate_vqe_ground_state_energy",
+                            "requested_output": "variational_ground_state_energy",
+                            "supporting_quote": "VQE energy",
+                        }
+                    ]
+                }
+            )
+
+    execution_repository = ScientificExecutionRepository(tmp_path / "executions")
+    session_repository = ResearchSessionRepository(tmp_path / "sessions")
+    execution_repository.start()
+    session_repository.start()
+    controller = ResearchSessionController(
+        repository=session_repository,
+        execution_repository=execution_repository,
+        question_writer=DeterministicScientificQuestionWriter(),
+        requirement_interpreter=ProviderNeutralScientificRequirementInterpreter(
+            Provider()  # type: ignore[arg-type]
+        ),
+    )
+
+    session = controller.create(
+        ResearchSessionCreateRequest(
+            question=(
+                "What is the VQE energy of Lithium Hydride with a bond length "
+                "of 1.6 \u00c5?"
+            )
+        ),
+        tenant_identifier_sha256=hashlib.sha256(
+            b"tenant-one-turn-ground-state"
+        ).hexdigest(),
+    )
+
+    assert session.status == "planned"
+    assert not session.next_questions
+    assert session.accepted_research_requirements is not None
+    assert (
+        session.accepted_research_requirements.capability_profile
+        == "molecular_ground_state_vqe"
+    )
+    assert session.compilation is not None
+    objective = session.compilation.compatibility_objective
+    assert objective.molecular_ground_state_specification is not None
+    assert objective.molecular_ground_state_specification.element_symbols == (
+        "Li",
+        "H",
+    )
+    assert objective.molecular_ground_state_specification.bond_length_angstrom == 1.6
+    capabilities = {
+        item.capability_name for item in session.compilation.compatibility_plan.steps
+    }
+    assert "quantum.vqe_execute" in capabilities
+    assert "scientific_verification.molecular_ground_state" in capabilities
+    assert "molecular.protein_protonation_prepare" not in capabilities
+
+
+def test_incomplete_named_diatomic_vqe_question_remains_resumable(
+    tmp_path: Path,
+) -> None:
+    class Provider:
+        provider_kind = "controlled_test_provider"
+        model_name = "replaceable-model"
+
+        def complete(self, _messages: list[dict[str, str]]) -> str:
+            return json.dumps(
+                {
+                    "requirements": [
+                        {
+                            "operation": "calculate_vqe_ground_state_energy",
+                            "requested_output": "variational_ground_state_energy",
+                            "supporting_quote": "VQE energy",
+                        }
+                    ]
+                }
+            )
+
+    execution_repository = ScientificExecutionRepository(tmp_path / "executions")
+    session_repository = ResearchSessionRepository(tmp_path / "sessions")
+    execution_repository.start()
+    session_repository.start()
+    controller = ResearchSessionController(
+        repository=session_repository,
+        execution_repository=execution_repository,
+        question_writer=DeterministicScientificQuestionWriter(),
+        requirement_interpreter=ProviderNeutralScientificRequirementInterpreter(
+            Provider()  # type: ignore[arg-type]
+        ),
+    )
+
+    session = controller.create(
+        ResearchSessionCreateRequest(
+            question="What is the VQE energy of Lithium Hydride?"
+        ),
+        tenant_identifier_sha256=hashlib.sha256(
+            b"tenant-incomplete-ground-state"
+        ).hexdigest(),
+    )
+
+    assert session.status == "awaiting_clarification"
+    assert session.compilation is not None
+    assert session.compilation.compatibility_objective.clarification_required
+    assert any(
+        "bond length" in reason.lower()
+        for reason in session.compilation.compatibility_plan.blocking_reasons
+    )
+    assert all(
+        "protein" not in item.question.lower() for item in session.next_questions
+    )

@@ -49,6 +49,30 @@ def _invoke(adapter, capability_name, *, inputs=(), parameters=None, execution="
     ))
 
 
+def test_repeated_preparation_keeps_distinct_execution_provenance():
+    store = MemoryPayloadStore()
+    adapter = MeekoDockingPreparationAdapter(store)
+    descriptor = adapter.declaration.capabilities[0].descriptor
+    references = []
+    for execution in ("execution.first", "execution.second"):
+        invocation = CapabilityInvocation(
+            capability=descriptor, experiment=EXPERIMENT,
+            input_artifacts=(),
+            context=ExecutionContext(execution_id=execution),
+        )
+        references.append(adapter._write(invocation, "docking_receptor_pdbqt", b"same bytes", ()))
+    assert references[0].artifact_identifier != references[1].artifact_identifier
+    assert references[0].content_sha256 == references[1].content_sha256
+    assert references[0].provenance.execution_identifier != references[1].provenance.execution_identifier
+
+
+def test_long_preparation_diagnostics_remain_controlled():
+    result = MeekoDockingPreparationAdapter._failure("preparation_failed", "Invalid receptor",
+                                                   details={"stderr_tail": "x" * 4000})
+    assert result.status is ExecutionStatus.FAILED
+    assert len(result.failure.details["stderr_tail"]) == 1024
+
+
 def test_meeko_declaration_is_import_safe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "meeko", None)
     adapter = MeekoDockingPreparationAdapter(MemoryPayloadStore())

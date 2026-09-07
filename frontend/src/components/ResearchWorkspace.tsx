@@ -26,10 +26,21 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
         <div>
           <p className="section-kicker">Unified research session</p>
           <h1>Ask Pulsate a scientific question.</h1>
-          <p>Describe the goal in your own words. Pulsate will ask for missing information instead of silently assuming it or stopping.</p>
+          <p>Describe your goal and any conditions you know. Pulsate will explain its assumptions and ask when a necessary detail is missing.</p>
         </div>
         {session && <button className="secondary-button" type="button" onClick={research.newSession}>New question</button>}
       </header>
+
+      <details className="research-resume">
+        <summary>Reopen a research session</summary>
+        <form onSubmit={(event) => { event.preventDefault(); void research.resume() }}>
+          <label htmlFor="saved-research-session">Saved session identifier</label>
+          <input id="saved-research-session" value={research.sessionIdentifierInput}
+            onChange={(event) => research.setSessionIdentifierInput(event.target.value)} />
+          <button className="secondary-button" type="submit" disabled={research.busy || !research.sessionIdentifierInput.trim()}>Open session</button>
+        </form>
+        <p>Bookmark this page to return to the same research later.</p>
+      </details>
 
       {!session ? (
         <form className="research-composer" onSubmit={(event) => { event.preventDefault(); void research.start() }}>
@@ -52,10 +63,13 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
             <span className={`research-status__dot research-status__dot--${session.status}`} />
             <div>
               <strong>{statusLabel(session.status)}</strong>
-              <p>{session.scientist_summary}</p>
+              <p>{session.scientist_result ? (session.scientist_result.principal_result ?? 'The calculation is complete. Review the verified result below.') : session.scientist_summary}</p>
               <small>Session {session.session_identifier} · revision {session.revision}</small>
             </div>
           </section>
+
+          {session.execution_steps && session.execution_steps.length > 0 && <ExecutionProgress steps={session.execution_steps} />}
+          {session.status === 'failed' && <p role="alert">This calculation did not complete. Review its failed step. Its evidence and conversation are preserved.</p>}
 
           <ol className="research-conversation">
             {session.conversation.map((turn) => {
@@ -175,7 +189,7 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
                 disabled={research.busy}
               />
               <AttachmentControls research={research} />
-              <button className="primary-button" type="submit" disabled={research.busy || (!research.reply.trim() && !research.acceptEvidenceProposal && !research.acceptRequirementProposal)}>
+              <button className="primary-button" type="submit" disabled={research.busy || (!research.reply.trim() && !research.acceptIntentProposal && !research.acceptEvidenceProposal && !research.acceptRequirementProposal && research.attachments.length === 0)}>
                 {research.busy ? 'Updating plan…' : 'Continue'}
               </button>
             </form>
@@ -184,8 +198,8 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
           {session.status === 'planned' && (
             <section className="research-ready">
               <div>
-                <strong>The canonical research graph is ready.</strong>
-                <p>Execution will use this exact persisted graph and the evidence attached to this session.</p>
+                <strong>Your research plan is ready.</strong>
+                <p>Run the planned calculations using the reviewed inputs and conditions.</p>
               </div>
               <button className="primary-button" type="button" disabled={research.busy} onClick={() => void research.execute()}>
                 {research.busy ? 'Running…' : 'Run research'}
@@ -195,7 +209,7 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
 
           {session.compilation && research.visualization && (
             <section className="research-plan-entities">
-              <strong>Structures used by the canonical plan</strong>
+              <strong>Structures used in this research</strong>
               <div>{research.visualization.structures.map((structure) => (
                 <button type="button" key={structure.artifact_identifier} onClick={() => void research.openScene(structure.artifact_identifier)}>
                   {structure.label}
@@ -232,6 +246,20 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
       {research.error && <p className="inline-error" role="alert">{research.error}</p>}
     </main>
   )
+}
+
+function ExecutionProgress({ steps }: { steps: NonNullable<NonNullable<ResearchSessionWorkspace['session']>['execution_steps']> }) {
+  const completed = steps.filter((step) => step.status === 'succeeded').length
+  return <section className="research-execution" aria-label="Calculation progress">
+    <h2>Calculation progress</h2>
+    <p>{completed} of {steps.length} steps completed</p>
+    <progress value={completed} max={steps.length} aria-label="Completed calculation steps" />
+    <ol>{steps.map((step) => <li key={step.step_identifier}>
+      <strong>{statusLabel(step.capability_name.split('.').slice(1).join(' ') || step.capability_name)}</strong>
+      <span> — {statusLabel(step.status)}</span>
+      {step.error_message && <p role="alert">{step.error_message}</p>}
+    </li>)}</ol>
+  </section>
 }
 
 function readableValue(value: unknown): string {
@@ -293,7 +321,7 @@ function DiscoveryWorkspace({ research }: { research: ResearchSessionWorkspace }
               <thead><tr><th>Candidate</th><th>Generation</th><th>Parents</th><th>Properties</th><th>State</th><th /></tr></thead>
               <tbody>{visualization.candidates.map((candidate) => (
                 <tr key={candidate.candidate_identifier} data-selected={candidate.selected || undefined}>
-                  <td><strong>{candidate.candidate_identifier}</strong></td>
+                  <td><strong>{candidate.display_name ?? candidate.candidate_identifier}</strong></td>
                   <td>{candidate.generation}</td>
                   <td>{candidate.parent_candidate_identifiers.join(', ') || 'seed'}</td>
                   <td>{candidate.properties_and_calculations.map((property, position) => (
@@ -403,6 +431,7 @@ function Result({ result, research }: { result: NonNullable<ResearchSessionWorks
       <p className="research-result__primary">{result.principal_result ?? result.scientific_result}</p>
       <h3>Resolved interpretation</h3>
       <p>{result.resolved_interpretation}</p>
+      {result.assumptions.length > 0 && <><h3>Assumptions used</h3><ul>{result.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></>}
       {result.structures_and_entities.length > 0 && <><h3>Structures and entities</h3><div className="research-result__entities">{result.structures_and_entities.map((item, position) => {
         const structure = research.visualization?.structures[position]
         return <button type="button" key={`${item}-${position}`} disabled={!structure} onClick={() => structure && void research.openScene(structure.artifact_identifier)}>{item}</button>

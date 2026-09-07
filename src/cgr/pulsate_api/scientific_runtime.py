@@ -368,12 +368,12 @@ class ScientistResultAssembler:
                 f"Pulsate understood the request as {objective.task_type.replace('_', ' ')}.",
             )
         for entity in entities:
-            add("entity", f"Pulsate used the persisted input {entity}.")
+            add("entity", f"Input: {entity}.")
         if methods:
             add(
                 "methods",
                 "The verified workflow completed these capabilities: "
-                + ", ".join(methods)
+                + ", ".join(method.replace("molecular.", "").replace("discovery.", "").replace("_", " ") for method in methods)
                 + ".",
                 record.evidence_artifact_identifiers,
             )
@@ -388,14 +388,20 @@ class ScientistResultAssembler:
             if all(isinstance(item, list) for item in (candidates, lineage, selected, stages)):
                 add(
                     "principal_result",
-                    "The verified discovery loop recorded "
-                    f"{len(candidates)} candidates, {len(lineage)} parent-child "
-                    f"transformations, and selected: "
-                    + (", ".join(str(item) for item in selected) if selected else "none")
+                    ("The verified candidate comparison evaluated "
+                     if document.get("candidate_mode") == "evaluate_supplied"
+                     else "The verified discovery loop recorded ")
+                    + (f"{len(candidates)} supplied candidates and selected: "
+                       if document.get("candidate_mode") == "evaluate_supplied"
+                       else f"{len(candidates)} candidates, {len(lineage)} parent-child transformations, and selected: ")
+                    + (", ".join(str(candidate.get("display_name", candidate["candidate_identifier"]))
+                                 for candidate in candidates
+                                 if candidate.get("candidate_identifier") in selected)
+                       if selected else "none")
                     + ".",
                     (trace_identifier,),
                 )
-                for candidate in candidates:
+                for candidate in sorted(candidates, key=lambda item: (item.get("selection") or {}).get("rank") or 1000000):
                     if not isinstance(candidate, dict):
                         continue
                     selection = candidate.get("selection")
@@ -403,6 +409,12 @@ class ScientistResultAssembler:
                     if not isinstance(selection, dict) or not isinstance(identifier, str):
                         continue
                     rank = selection.get("rank")
+                    label = candidate.get("display_name") or identifier
+                    scores = {item["objective_identifier"]: item["value"]
+                              for item in candidate.get("properties_and_calculations", [])}
+                    details = "; ".join(
+                        f"{name.replace('_', ' ')} = {value:.4f}" + (" kcal/mol" if name == "vina_pose_score" else "")
+                        for name, value in scores.items() if isinstance(value, (int, float)))
                     outcome = selection.get("outcome")
                     rationale = selection.get("rationale")
                     if (
@@ -412,7 +424,7 @@ class ScientistResultAssembler:
                     ):
                         add(
                             "ranking",
-                            f"Rank {rank}: {identifier} ({outcome}). {rationale}",
+                            f"Rank {rank}: {label} ({outcome}). {details}. {rationale}",
                             (trace_identifier,),
                         )
         elif record.verified_scientific_summaries:
@@ -435,12 +447,20 @@ class ScientistResultAssembler:
             add("assumption", assumption)
         for limitation in record.limitations:
             add("limitation", limitation, record.evidence_artifact_identifiers)
+        pocket = self._read_json_evidence(record, "binding_pocket")
+        if pocket is not None and isinstance(pocket[0], dict):
+            region = pocket[0]
+            add("principal_result",
+                "The docking region is centered at "
+                + str(region.get("center_angstrom")) + " Angstrom, with dimensions "
+                + str(region.get("size_angstrom")) + " Angstrom. It was resolved using "
+                + str(region.get("definition_method", "recorded structural evidence")).replace("_", " ")
+                + "; this is a structure-defined search region, not an independent pocket prediction.",
+                (pocket[1],))
         if record.evidence_artifact_identifiers:
             add(
                 "evidence",
-                "The conclusion is supported by these persisted evidence artifacts: "
-                + ", ".join(record.evidence_artifact_identifiers)
-                + ".",
+                f"The {len(record.evidence_artifact_identifiers)} supporting evidence artifacts are retained for inspection and download.",
                 record.evidence_artifact_identifiers,
             )
         add(
@@ -537,10 +557,16 @@ class ScientistResultAssembler:
         artifacts = {
             item.artifact_identifier: item for item in record.artifact_references
         }
-        entities = tuple(
+        input_entities = tuple(
             self._entity_description(item, artifacts.get(item.artifact_identifier))
             for item in objective.input_references
         )
+        generated_entities = tuple(
+            self._generated_entity_description(item)
+            for item in record.artifact_references
+            if item.artifact_type == "molecular_structure"
+        )
+        entities = tuple(dict.fromkeys((*input_entities, *generated_entities)))
         verification_status = "passed" if record.verified else "inconclusive"
         allowed = self._allowed_statements(objective, record, methods, entities)
         selected = self._select_statements(allowed)
@@ -608,6 +634,8 @@ class ScientistResultAssembler:
         if artifact_reference is None:
             return base
         metadata = artifact_reference.metadata
+        label = metadata.get("display_name") or metadata.get("filename") or metadata.get("acquisition_source_identifier")
+        base = f"{input_reference.artifact_type.replace('_', ' ')}: {label or input_reference.reference_identifier}"
         source_kind = metadata.get("acquisition_source_kind")
         source_identifier = metadata.get("acquisition_source_identifier")
         confidence = metadata.get("evidence_resolution_confidence")
@@ -615,6 +643,25 @@ class ScientistResultAssembler:
             str(value)
             for value in (source_kind, source_identifier, confidence)
             if isinstance(value, str) and value
+        )
+        return base + (" [" + "; ".join(details) + "]" if details else "")
+
+    @staticmethod
+    def _generated_entity_description(artifact_reference) -> str:
+        metadata = artifact_reference.metadata
+        details = tuple(
+            f"{name}={metadata[name]}"
+            for name in (
+                "system_label",
+                "molecular_formula",
+                "geometry_point_identifier",
+                "representation",
+            )
+            if name in metadata
+        )
+        base = (
+            f"{artifact_reference.artifact_type}:"
+            f"{artifact_reference.artifact_identifier}"
         )
         return base + (" [" + "; ".join(details) + "]" if details else "")
 
@@ -706,6 +753,12 @@ class ScientificObjectiveRuntime:
                 workflow_graph_identifier=graph.graph_identifier,
                 workflow_run_identifier=record.execution_identifier,
                 scientist_summary="Scientific capability execution is running.",
+                limitations=tuple(
+                    item
+                    for item in record.limitations
+                    if item
+                    != "This record contains a plan, not fabricated calculation results."
+                ),
             )
             adapter = CapabilityAdapterRegistry(
                 {
@@ -883,14 +936,37 @@ class ScientificObjectiveRuntime:
                 ))),
                 scene_identifier=outcome.scene_identifier or current.scene_identifier,
                 scientist_summary=outcome.scientific_summary or current.scientist_summary,
+                pending_scientific_summaries=(
+                    ()
+                    if outcome.verified is not None
+                    else tuple(
+                        dict.fromkeys(
+                            (
+                                *current.pending_scientific_summaries,
+                                *(
+                                    (outcome.scientific_summary,)
+                                    if outcome.scientific_summary is not None
+                                    and capability_name != "scientist.result_assemble"
+                                    else ()
+                                ),
+                            )
+                        )
+                    )
+                ),
                 verified_scientific_summaries=tuple(
                     dict.fromkeys(
                         (
                             *current.verified_scientific_summaries,
                             *(
-                                (outcome.scientific_summary,)
+                                (
+                                    *current.pending_scientific_summaries,
+                                    *(
+                                        (outcome.scientific_summary,)
+                                        if outcome.scientific_summary is not None
+                                        else ()
+                                    ),
+                                )
                                 if outcome.verified is True
-                                and outcome.scientific_summary is not None
                                 and capability_name != "scientist.result_assemble"
                                 else ()
                             ),

@@ -478,6 +478,13 @@ function parseResearchSession(value: unknown): ResearchSessionResponse {
       && isRecord(value.compilation.canonical_plan)
       && isRecord(value.compilation.canonical_graph)))
     || !(value.execution_status === null || typeof value.execution_status === 'string')
+    || !(value.execution_steps === undefined || (Array.isArray(value.execution_steps)
+      && value.execution_steps.every((step) => isRecord(step)
+        && hasString(step, 'step_identifier')
+        && hasString(step, 'capability_name')
+        && ['pending', 'running', 'succeeded', 'failed', 'blocked'].includes(String(step.status))
+        && (step.error_code === null || hasString(step, 'error_code'))
+        && (step.error_message === null || hasString(step, 'error_message')))))
     || !(value.scene_identifier === null || typeof value.scene_identifier === 'string')
     || !(value.scientist_result === null || (isRecord(value.scientist_result)
       && hasString(value.scientist_result, 'original_request')
@@ -975,7 +982,7 @@ export function createPulsateApi(configuration: PulsateApiConfiguration = {}): P
             content_sha256: digest,
             byte_size: bytes.byteLength,
             storage_location: null,
-            metadata: {},
+            metadata: { display_name: input.file.name.slice(0, 512) },
             provenance: {
               producer: 'pulsate-research-workspace',
               producer_version: { major: 1, minor: 0, patch: 0 },

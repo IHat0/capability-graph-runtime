@@ -18,8 +18,8 @@ import { usePresetRun } from './hooks/usePresetRun'
 import { useWorkflowRun } from './hooks/useWorkflowRun'
 
 export function App() {
-  const workspace = useExperimentWorkspace()
   const existingRun = useExistingRun()
+  const workspace = useExperimentWorkspace(undefined, existingRun.run !== null)
   const molecularProject = useMolecularProjectScene()
   const molecularPlanning = useMolecularPlanning(molecularProject.scene?.metadata.project_identifier ?? null)
   const research = useResearchSession()
@@ -29,6 +29,7 @@ export function App() {
   const hasScene = displayedScene !== null
   const readOnlyLookup = molecularProject.loading || molecularProject.scene !== null || existingRun.loading || existingRun.run !== null
   const presetRun = usePresetRun({
+    enabled: existingRun.run !== null || workspace.selectedPresetId !== null,
     selectedPresetId: workspace.selectedPresetId,
     displayedPresetId: workspace.displayedPresetId,
     experimentIdentifier: workspace.scene?.experimentId,
@@ -66,7 +67,9 @@ export function App() {
     ? { primary: 'Read-only project', secondary: 'Opening scene' }
     : molecularProject.scene
       ? { primary: 'Native molecular project', secondary: 'Read-only verified resources' }
-      : existingRunHeaderStatus
+      : research.session && !existingRun.run
+        ? { primary: 'Research session', secondary: research.session.status.replaceAll('_', ' ') }
+        : existingRunHeaderStatus
 
   const openRun = async () => {
     if (await existingRun.openRun()) molecularProject.clear()

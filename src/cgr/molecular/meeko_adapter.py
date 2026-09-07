@@ -149,7 +149,8 @@ class MeekoDockingPreparationAdapter:
             failure=FailureInformation(
                 code=code,
                 message=message,
-                details=dict(details or {}),
+                details={key: value[-1024:] if isinstance(value, str) else value
+                         for key, value in (details or {}).items()},
             ),
         )
 
@@ -174,7 +175,8 @@ class MeekoDockingPreparationAdapter:
         except _MeekoPreparationFailure as error:
             return self._failure(
                 "docking_preparation_invalid",
-                "Docking preparation failed controlled chemical validation.",
+                "Receptor preparation requires complete residues and one selected alternate conformation. "
+                + str(error.diagnostics.get("stdout_tail", ""))[-900:],
                 details=error.diagnostics,
             )
         except (ValueError, KeyError, UnicodeDecodeError, subprocess.SubprocessError) as error:
@@ -206,8 +208,13 @@ class MeekoDockingPreparationAdapter:
         parents: tuple[ArtifactReference, ...],
     ) -> ArtifactReference:
         digest = hashlib.sha256(payload).hexdigest()
+        identity = hashlib.sha256(
+            (digest + invocation.capability.capability_name
+             + invocation.context.execution_id
+             + "".join(parent.pointer.to_canonical_json() for parent in parents)).encode()
+        ).hexdigest()
         reference = ArtifactReference(
-            artifact_identifier=f"{artifact_type}-{digest[:32]}",
+            artifact_identifier=f"{artifact_type}-{identity[:32]}",
             schema_version=_VERSION,
             artifact_type=artifact_type,
             media_type="chemical/x-pdbqt",

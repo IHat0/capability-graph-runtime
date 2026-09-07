@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -20,6 +21,8 @@ ScientificResearchOperation = Literal[
     "generate_candidates",
     "dock_candidates",
     "refine_promising_candidates",
+    "calculate_vqe_ground_state_energy",
+    "scan_parameterized_ground_state_energy",
     "estimate_relevant_quantities",
     "compare_computational_methods",
     "verify_and_rank_results",
@@ -34,6 +37,8 @@ ScientificRequestedOutput = Literal[
     "generated_candidates",
     "docking_evidence",
     "refined_candidates",
+    "variational_ground_state_energy",
+    "parameter_sweep_ground_state_energies",
     "quantity_estimates",
     "method_comparison",
     "verified_candidate_ranking",
@@ -48,6 +53,8 @@ ScientificCapabilityProfile = Literal[
     "bond_dissociation_scan",
     "solvated_conformer_comparison",
     "protein_ligand_discovery",
+    "molecular_ground_state_vqe",
+    "molecular_ground_state_vqe_sweep",
 ]
 
 
@@ -59,6 +66,8 @@ _OUTPUT_BY_OPERATION: dict[ScientificResearchOperation, ScientificRequestedOutpu
     "generate_candidates": "generated_candidates",
     "dock_candidates": "docking_evidence",
     "refine_promising_candidates": "refined_candidates",
+    "calculate_vqe_ground_state_energy": "variational_ground_state_energy",
+    "scan_parameterized_ground_state_energy": "parameter_sweep_ground_state_energies",
     "estimate_relevant_quantities": "quantity_estimates",
     "compare_computational_methods": "method_comparison",
     "verify_and_rank_results": "verified_candidate_ranking",
@@ -164,6 +173,28 @@ def validate_requirement_proposal(
             "molecular_structure_analysis",
             "scientific_verification_report",
         ]
+    elif "scan_parameterized_ground_state_energy" in operation_set and operation_set <= {
+        "scan_parameterized_ground_state_energy",
+        "calculate_vqe_ground_state_energy",
+        "compare_computational_methods",
+    }:
+        profile = "molecular_ground_state_vqe_sweep"
+        required = [
+            "ground_state_parameter_sweep_result",
+            "multi_point_execution_receipt",
+            "scientific_verification_report",
+        ]
+    elif "calculate_vqe_ground_state_energy" in operation_set and operation_set <= {
+        "calculate_vqe_ground_state_energy",
+        "compare_computational_methods",
+    }:
+        profile = "molecular_ground_state_vqe"
+        required = [
+            "variational_ground_state_result",
+            "exact_diagonalization_result",
+            "molecular_ground_state_execution_receipt",
+            "scientific_verification_report",
+        ]
     elif operation_set == {"generate_protein_candidates"}:
         profile = "de_novo_protein_design"
         required = [
@@ -176,7 +207,7 @@ def validate_requirement_proposal(
     }:
         profile: ScientificCapabilityProfile = "solvated_conformer_comparison"
         required = ["scientific_verification_report"]
-    elif operation_set & _DISCOVERY_OPERATIONS:
+    elif operation_set and operation_set <= _DISCOVERY_OPERATIONS:
         profile: ScientificCapabilityProfile = "protein_ligand_discovery"
         required = [
             "discovery_design_loop_contract",
@@ -188,7 +219,9 @@ def validate_requirement_proposal(
             required.append("scientific_verification_report")
     else:
         raise ValueError(
-            "The proposed requirement combination has no registered deterministic capability composition."
+            "No registered composition produces all requested outputs for these operations: "
+            + ", ".join(sorted(operation_set))
+            + ". The request was not reduced to a smaller workflow."
         )
 
     required.append("scientist_facing_result")
@@ -237,9 +270,22 @@ class ProviderNeutralScientificRequirementInterpreter:
                             + ". requested_output must be the matching value from this map: "
                             + json.dumps(_OUTPUT_BY_OPERATION, sort_keys=True)
                             + ". supporting_quote must be a literal non-empty substring of the "
-                            "scientist request that supports that operation. Do not name software, "
-                            "choose methods, invent entities or values, authorize work, or add "
-                            "commentary. Return {} when no operation is explicit."
+                            "scientist request that supports that operation. Preserve an explicitly "
+                            "stated VQE method, but never choose a method the scientist did not state. "
+                            "Do not invent entities or values, authorize work, or add commentary. "
+                            "Classify the requested outcome, not every prerequisite substep. "
+                            "Comparing or prioritizing compounds for a protein target means "
+                            "dock_candidates and verify_and_rank_results. compare_structures "
+                            "means a structural/conformer comparison, not candidate prioritization. "
+                            "analyze_structure means an inventory or descriptor report. "
+                            "identify_binding_regions means locating a binding site. "
+                            "generate_candidates and design_next_generation require an explicit "
+                            "request to create NEW molecular identities, not evaluate supplied ones. "
+                            "generate_protein_candidates requires creating NEW protein sequences; "
+                            "the presence of a protein target never implies protein generation. "
+                            "refine_promising_candidates requires additional optimization, not "
+                            "merely choosing the most promising supplied compound. "
+                            "Return {} when no operation is explicit."
                         ),
                     },
                     {"role": "user", "content": scientist_text},
@@ -248,6 +294,15 @@ class ProviderNeutralScientificRequirementInterpreter:
             parsed = json.loads(content)
             if set(parsed) != {"requirements"}:
                 return None
+            # Recover a unique literal source span when the model changes only case.
+            # The persisted supporting quote remains scientist-authored text.
+            for item in parsed["requirements"]:
+                quote = item.get("supporting_quote")
+                if isinstance(quote, str) and quote not in scientist_text:
+                    matches = list(re.finditer(re.escape(quote), scientist_text, re.IGNORECASE))
+                    if len(matches) != 1:
+                        return None
+                    item["supporting_quote"] = matches[0].group()
             requirements = tuple(
                 ScientificRequirement.model_validate(item)
                 for item in parsed["requirements"]

@@ -677,3 +677,30 @@ a { color: inherit; }
   .workflow-run-loader input { width: 100%; min-width: 0; }
   .workflow-run-loader > div { align-items: stretch; flex-direction: column; }
 }
+
+.research-resume {
+  margin: 0.75rem 0 1.25rem;
+  font-size: 0.85rem;
+}
+.research-resume summary { cursor: pointer; }
+.research-resume form { display: grid; gap: 0.5rem; margin-top: 0.75rem; }
+.research-resume input {
+  min-width: 0;
+  width: 100%;
+  padding: 0.6rem;
+  border: 1px solid #d8d8d4;
+  border-radius: 0.35rem;
+}
+.research-resume p { color: #686861; line-height: 1.5; }
+.research-execution {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #e3e3dd;
+  border-radius: 0.5rem;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+.research-execution h2 { margin: 0; font-size: 1rem; }
+.research-execution progress { width: 100%; accent-color: #267a52; }
+.research-execution ol { margin-bottom: 0; padding-left: 1.3rem; }
+.research-execution li { margin-top: 0.3rem; }

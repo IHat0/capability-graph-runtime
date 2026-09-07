@@ -384,7 +384,8 @@ def test_missing_qiskit_dependencies_fail_without_native_output() -> None:
     assert not result.output_artifacts
 
 
-def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
+@pytest.mark.parametrize("mapper_name", ("jordan_wigner", "parity"))
+def test_real_qiskit_pipeline_matches_independent_pyscf_fci(mapper_name: str) -> None:
     pytest.importorskip("qiskit")
     pytest.importorskip("qiskit_nature")
     pytest.importorskip("qiskit_algorithms")
@@ -427,7 +428,7 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
             FERMION_TO_QUBIT_MAP,
             inputs=(hamiltonian_reference,),
             parameters={
-                "mapper": "jordan_wigner",
+                "mapper": mapper_name,
                 "hermiticity_tolerance": 1e-10,
             },
             execution_identifier="execution.phase5b-mapping",
@@ -436,7 +437,7 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
     assert mapping_result.status is ExecutionStatus.SUCCESS
     mapped_reference = mapping_result.output_artifacts[0]
     mapped = MappedQubitHamiltonian.model_validate_json(store.read(mapped_reference))
-    assert mapped.mapper == "jordan_wigner"
+    assert mapped.mapper == mapper_name
     assert mapped.number_of_qubits == 4
     assert mapped.maximum_antihermitian_coefficient <= 1e-10
     assert "qiskit" not in mapped.to_canonical_json().lower()
@@ -522,6 +523,7 @@ def test_real_qiskit_pipeline_matches_independent_pyscf_fci() -> None:
     assert vqe_result.status is ExecutionStatus.SUCCESS
     vqe_reference = vqe_result.output_artifacts[0]
     vqe = VariationalGroundStateResult.model_validate_json(store.read(vqe_reference))
+    assert vqe.gradient_identifier == "reverse_mode_exact_statevector"
     assert vqe.reference_energy_used is False
     assert vqe.converged
     assert vqe.optimizer_evaluations >= len(vqe.trace) >= 1

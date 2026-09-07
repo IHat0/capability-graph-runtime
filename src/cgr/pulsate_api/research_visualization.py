@@ -87,6 +87,7 @@ def _structure_role(reference: ArtifactReference) -> str:
         "docking_receptor_pdbqt",
         "predicted_protein_structure",
         "protein_structure",
+        "prepared_molecular_structure",
         "prepared_receptor",
     }:
         return "protein"
@@ -133,6 +134,7 @@ def _candidate_artifact_bindings(
         selection = _mapping(candidate.get("selection"))
         candidates[identifier] = {
             "candidate_identifier": identifier,
+            "display_name": _string(candidate.get("display_name")) or identifier,
             "generation": candidate.get("generation", 0),
             "parent_candidate_identifiers": _strings(
                 candidate.get("parent_candidate_identifiers")

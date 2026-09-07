@@ -5,6 +5,7 @@ import { ResearchWorkspace } from './ResearchWorkspace'
 
 function state(overrides: Partial<ResearchSessionWorkspace> = {}): ResearchSessionWorkspace {
   return {
+    sessionIdentifierInput: '', setSessionIdentifierInput: vi.fn(), resume: vi.fn(),
     question: '', setQuestion: vi.fn(), reply: '', setReply: vi.fn(), session: null,
     attachments: [], scene: null, visualization: null, busy: false, error: null,
     acceptIntentProposal: false, setAcceptIntentProposal: vi.fn(),

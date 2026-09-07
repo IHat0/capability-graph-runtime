@@ -18,6 +18,7 @@ from cgr.quantum_preflight.artifacts import write_json_atomic
 from cgr.science import ArtifactReference, CandidateResearchPlan, ScientificObjective
 from cgr.science.canonical import validate_identifier, validate_sha256
 from cgr.workflow_graph import WorkflowGraphDefinition
+from .scientific_capability_truth import ScientificCapabilityGroundingError
 
 from .scientific_conversation import (
     ClarificationPrompt,
@@ -33,6 +34,7 @@ from .scientific_conversation import (
 from .scientific_executions import (
     ScientificExecutionRecord,
     ScientificExecutionRepository,
+    ScientificNodeExecutionRecord,
     ScientificObjectiveCompileRequest,
     ScientistFacingResult,
 )
@@ -189,6 +191,7 @@ class ResearchSession(BaseModel):
     )
     compilation: ResearchCompilation | None = None
     execution_status: str | None = None
+    execution_steps: tuple[ScientificNodeExecutionRecord, ...] = ()
     scene_identifier: str | None = None
     scientist_result: ScientistFacingResult | None = None
     scientist_summary: str
@@ -559,6 +562,8 @@ class ResearchSessionController:
     ) -> ResearchSession:
         with self._lock:
             current = self._owned(session_identifier, tenant_identifier_sha256)
+            if current.status in {"running", "verifying", "replanning"}:
+                raise ValueError("Research is running. Wait for the result before changing the question.")
             now = self._next_time(current.updated_at)
             scientist_turn = self._turn(
                 session_identifier=session_identifier,
@@ -779,6 +784,7 @@ class ResearchSessionController:
                         execution.status if execution is not None else None
                     ),
                     "scene_identifier": None,
+                    "execution_steps": (),
                     "scientist_result": None,
                     "scientist_summary": summary,
                 }
@@ -793,7 +799,29 @@ class ResearchSessionController:
         *,
         tenant_identifier_sha256: str,
     ) -> ResearchSession:
-        return self._owned(session_identifier, tenant_identifier_sha256)
+        current = self._owned(session_identifier, tenant_identifier_sha256)
+        if current.compilation is None:
+            return current
+        execution = self.execution_repository.get(current.compilation.execution_identifier)
+        if current.status not in {"running", "planned", "failed", "completed"}:
+            return current
+        status = {
+            "running": "running", "succeeded": "completed", "failed": "failed",
+        }.get(execution.status, current.status)
+        # Read the durable execution snapshot without acquiring the runtime lock.
+        # A disconnected caller can recover progress and the final verified result.
+        return current.model_copy(update={
+            "status": status,
+            "execution_status": execution.status,
+            "execution_steps": execution.node_executions,
+            "scene_identifier": execution.scene_identifier,
+            "scientist_result": execution.scientist_result if status == "completed" else None,
+            "scientist_summary": (
+                execution.scientist_summary
+                if execution.status in {"running", "succeeded", "failed"}
+                else current.scientist_summary
+            ),
+        })
 
     def execute(
         self,
@@ -810,29 +838,40 @@ class ResearchSessionController:
                     "This research session needs clarification or approval "
                     "before execution."
                 )
-            execution = self.runtime.execute(
-                current.compilation.execution_identifier
-            )
-            now = self._next_time(current.updated_at)
-            status = {
-                "running": "running",
-                "succeeded": "completed",
-                "failed": "failed",
-            }.get(execution.status, current.status)
-            replacement = current.model_copy(
-                update={
-                    "updated_at": now,
+            current = self.repository.replace(
+                current.model_copy(update={
+                    "status": "running",
+                    "execution_status": "running",
                     "revision": current.revision + 1,
-                    "status": status,
-                    "execution_status": execution.status,
-                    "scene_identifier": execution.scene_identifier,
-                    "scientist_result": execution.scientist_result,
-                    "scientist_summary": execution.scientist_summary,
-                }
+                    "updated_at": self._next_time(current.updated_at),
+                    "scientist_summary": "Research is running. You can reopen this session to check progress.",
+                }),
+                expected_revision=current.revision,
             )
-            return self.repository.replace(
-                replacement, expected_revision=current.revision
-            )
+        # Never hold the conversation lock across a potentially long calculation.
+        # The running transition above rejects duplicate submissions and replies.
+        try:
+            self.runtime.execute(current.compilation.execution_identifier)
+        finally:
+            with self._lock:
+                persisted = self._owned(session_identifier, tenant_identifier_sha256)
+                snapshot = self.get(
+                    session_identifier,
+                    tenant_identifier_sha256=tenant_identifier_sha256,
+                )
+                if snapshot.execution_status == "planned":
+                    snapshot = snapshot.model_copy(update={"status": "planned"})
+                self.repository.replace(
+                    snapshot.model_copy(update={
+                        "updated_at": self._next_time(persisted.updated_at),
+                        "revision": persisted.revision + 1,
+                    }),
+                    expected_revision=persisted.revision,
+                )
+        return self.get(
+            session_identifier,
+            tenant_identifier_sha256=tenant_identifier_sha256,
+        )
 
     def capability(self) -> dict[str, object]:
         return {
@@ -1052,6 +1091,16 @@ class ResearchSessionController:
                 tenant_identifier_sha256=tenant_identifier_sha256,
                 project_identifier=session_identifier,
             )
+        except ScientificCapabilityGroundingError as error:
+            return None, None, (ClarificationPrompt(
+                requirement_identifier="requirement-execution-capability",
+                question=(
+                    "This research needs an execution capability that is not configured: "
+                    + ", ".join(error.capability_names)
+                    + ". This is a platform configuration limitation, not missing scientific information. "
+                    "An administrator must configure the executor before this request can run."
+                ),
+            ),), None, None
         except ValueError:
             execution = None
             if accepted_task_type is not None:

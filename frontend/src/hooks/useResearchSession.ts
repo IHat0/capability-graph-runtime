@@ -113,6 +113,8 @@ function applyVisualization(
 
 export function useResearchSession(api: PulsateApi = pulsateApi) {
   const [question, setQuestion] = useState('')
+  const [sessionIdentifierInput, setSessionIdentifierInput] = useState('')
+  const [executingSessionIdentifier, setExecutingSessionIdentifier] = useState<string | null>(null)
   const [reply, setReply] = useState('')
   const [session, setSession] = useState<ResearchSessionResponse | null>(null)
   const [attachments, setAttachments] = useState<ResearchAttachment[]>([])
@@ -184,6 +186,7 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
     try {
       const evidence = await upload(signal, 1)
       const created = await api.createResearchSession(trimmed, evidence.inputs, evidence.artifacts, signal)
+      if (signal.aborted) return
       setSession(created)
       setQuestion('')
       setAttachments([])
@@ -191,7 +194,7 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
     } catch (caught) {
       if (!(caught instanceof DOMException && caught.name === 'AbortError')) setError(message(caught))
     } finally {
-      setBusy(false)
+      if (!signal.aborted) setBusy(false)
     }
   }, [api, beginRequest, busy, question, upload])
 
@@ -199,6 +202,7 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
     const trimmed = reply.trim()
     const approvalOnly = Boolean(
       (session?.status === 'awaiting_approval' && acceptEvidenceProposal)
+      || Boolean(session?.intent_proposal && acceptIntentProposal)
       || Boolean(session?.requirement_proposal && acceptRequirementProposal)
       || Boolean(
         session?.evidence_proposal
@@ -206,13 +210,13 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
         && acceptEvidenceProposal,
       )
     )
-    if (!session || (!trimmed && !approvalOnly) || busy) return
+    if (!session || (!trimmed && !approvalOnly && attachments.length === 0) || busy) return
     const signal = beginRequest()
     try {
       const evidence = await upload(signal, session.input_references.length + 1)
       const updated = await api.replyResearchSession(
         session.session_identifier,
-        trimmed || 'I confirm the reviewed evidence.',
+        trimmed || (approvalOnly ? 'I confirm the reviewed proposal.' : 'Please use the attached inputs to answer the outstanding question.'),
         acceptIntentProposal,
         acceptRequirementProposal,
         acceptEvidenceProposal,
@@ -221,6 +225,7 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
         evidence.artifacts,
         signal,
       )
+      if (signal.aborted) return
       setSession(updated)
       setReply('')
       setAttachments([])
@@ -230,19 +235,89 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
     } catch (caught) {
       if (!(caught instanceof DOMException && caught.name === 'AbortError')) setError(message(caught))
     } finally {
-      setBusy(false)
+      if (!signal.aborted) setBusy(false)
     }
-  }, [acceptEvidenceProposal, acceptIntentProposal, acceptRequirementProposal, api, beginRequest, busy, reply, session, upload])
+  }, [acceptEvidenceProposal, acceptIntentProposal, acceptRequirementProposal, api, attachments.length, beginRequest, busy, reply, session, upload])
+
+  const resume = useCallback(async (identifier = sessionIdentifierInput.trim()) => {
+    setExecutingSessionIdentifier(null)
+    if (!/^research-session-[0-9a-f]{32}$/.test(identifier)) {
+      setError('Enter a valid saved research session identifier.')
+      return
+    }
+    const signal = beginRequest()
+    try {
+      const restored = await api.getResearchSession(identifier, signal)
+      if (signal.aborted) return
+      setSession(restored)
+      setScene(null)
+      setVisualization(null)
+      setReply('')
+      setAttachments([])
+      setAcceptIntentProposal(false)
+      setAcceptRequirementProposal(false)
+      setAcceptEvidenceProposal(false)
+      setSessionIdentifierInput(identifier)
+    } catch (caught) {
+      if (!signal.aborted) setError(message(caught))
+    } finally {
+      if (!signal.aborted) setBusy(false)
+    }
+  }, [api, beginRequest, sessionIdentifierInput])
+
+  const initialSession = useRef(new URL(window.location.href).searchParams.get('research'))
+  useEffect(() => {
+    if (initialSession.current) {
+      const identifier = initialSession.current
+      initialSession.current = null
+      void resume(identifier)
+    }
+  }, [resume])
+
+  useEffect(() => {
+    if (!session) return
+    const url = new URL(window.location.href)
+    url.searchParams.set('research', session.session_identifier)
+    window.history.replaceState(null, '', url)
+  }, [session])
+
+  useEffect(() => {
+    const identifier = executingSessionIdentifier
+      ?? (session?.status === 'running' ? session.session_identifier : null)
+    if (!identifier) return
+    const pollController = new AbortController()
+    let timer: ReturnType<typeof setTimeout>
+    const poll = async () => {
+      try {
+        const latest = await api.getResearchSession(identifier, pollController.signal)
+        if (!pollController.signal.aborted) setSession((current) => (
+          current?.session_identifier === identifier
+          && current.status !== 'completed'
+          && latest.revision >= current.revision ? latest : current
+        ))
+      } catch (caught) {
+        if (!pollController.signal.aborted) setError(message(caught))
+      }
+      if (!pollController.signal.aborted) timer = setTimeout(() => void poll(), 1500)
+    }
+    timer = setTimeout(() => void poll(), 500)
+    return () => { pollController.abort(); clearTimeout(timer) }
+  }, [api, executingSessionIdentifier, session?.session_identifier, session?.status])
 
   const execute = useCallback(async () => {
     if (!session || busy) return
     const signal = beginRequest()
+    setExecutingSessionIdentifier(session.session_identifier)
     try {
-      setSession(await api.executeResearchSession(session.session_identifier, signal))
+      const updated = await api.executeResearchSession(session.session_identifier, signal)
+      if (!signal.aborted) setSession(updated)
     } catch (caught) {
-      if (!(caught instanceof DOMException && caught.name === 'AbortError')) setError(message(caught))
+      if (!signal.aborted) setError(message(caught) + ' Reopen this session to check whether the server completed the calculation.')
     } finally {
-      setBusy(false)
+      if (!signal.aborted) {
+        setBusy(false)
+        setExecutingSessionIdentifier(null)
+      }
     }
   }, [api, beginRequest, busy, session])
 
@@ -372,6 +447,13 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
 
   const newSession = useCallback(() => {
     controller.current?.abort()
+    visualizationController.current?.abort()
+    setExecutingSessionIdentifier(null)
+    setSessionIdentifierInput('')
+    setLoadingSceneArtifact(null)
+    const url = new URL(window.location.href)
+    url.searchParams.delete('research')
+    window.history.replaceState(null, '', url)
     setQuestion('')
     setReply('')
     setSession(null)
@@ -392,6 +474,7 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
   ) ?? []
 
   return {
+    sessionIdentifierInput, setSessionIdentifierInput, resume,
     question, setQuestion, reply, setReply, session, attachments, scene, visualization, busy, error,
     acceptIntentProposal, setAcceptIntentProposal, loadingSceneArtifact,
     acceptRequirementProposal, setAcceptRequirementProposal,

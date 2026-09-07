@@ -375,23 +375,97 @@ class EnergyComparisonRequest(ScientificVerificationRequest):
     """Compare two or more energies on a declared comparable footing."""
 
     objective_family: Literal["energy_comparison"] = "energy_comparison"
+    comparison_goal: Literal[
+        "resolve_ordering",
+        "verify_agreement",
+        "verify_variational_upper_bound",
+    ] = (
+        "resolve_ordering"
+    )
     minimum_resolvable_difference_hartree: float = Field(default=1e-6, gt=0)
+    maximum_agreement_difference_hartree: float | None = Field(
+        default=None,
+        gt=0,
+    )
     expected_lowest_calculation_identifier: str | None = None
+    variational_reference_calculation_identifier: str | None = None
+    variational_candidate_calculation_identifier: str | None = None
+    variational_tolerance_hartree: float | None = Field(default=None, ge=0)
 
-    @field_validator("expected_lowest_calculation_identifier")
+    @field_validator(
+        "expected_lowest_calculation_identifier",
+        "variational_reference_calculation_identifier",
+        "variational_candidate_calculation_identifier",
+    )
     @classmethod
     def validate_expected_lowest(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return validate_identifier(value, label="expected lowest calculation")
+        return validate_identifier(value, label="energy-comparison calculation")
 
     @model_validator(mode="after")
     def validate_energy_comparison(self) -> Self:
         if len(self.calculations) < 2:
             raise ValueError("Energy comparison requires at least two calculations.")
-        if self.expected_lowest_calculation_identifier is not None and (
-            self.expected_lowest_calculation_identifier
-            not in {item.calculation_identifier for item in self.calculations}
+        calculation_identifiers = {
+            item.calculation_identifier for item in self.calculations
+        }
+        if self.comparison_goal == "verify_agreement":
+            if len(self.calculations) != 2:
+                raise ValueError(
+                    "Energy agreement verification requires exactly two calculations."
+                )
+            if self.maximum_agreement_difference_hartree is None:
+                raise ValueError(
+                    "Energy agreement verification requires an explicit maximum difference."
+                )
+            if self.expected_lowest_calculation_identifier is not None:
+                raise ValueError(
+                    "Energy agreement verification cannot declare an expected ordering."
+                )
+        elif self.comparison_goal == "verify_variational_upper_bound":
+            identifiers = {
+                self.variational_reference_calculation_identifier,
+                self.variational_candidate_calculation_identifier,
+            }
+            if None in identifiers or len(identifiers) != 2:
+                raise ValueError(
+                    "Variational-bound verification requires distinct reference and candidate calculations."
+                )
+            if not identifiers.issubset(calculation_identifiers):
+                raise ValueError(
+                    "Variational-bound calculation is not present in the request."
+                )
+            if self.variational_tolerance_hartree is None:
+                raise ValueError(
+                    "Variational-bound verification requires an explicit tolerance."
+                )
+            if self.maximum_agreement_difference_hartree is not None:
+                raise ValueError(
+                    "Variational-bound verification cannot declare an agreement threshold."
+                )
+        elif self.maximum_agreement_difference_hartree is not None:
+            raise ValueError(
+                "An agreement threshold requires the verify-agreement comparison goal."
+            )
+        if (
+            self.comparison_goal != "verify_variational_upper_bound"
+            and any(
+                value is not None
+                for value in (
+                    self.variational_reference_calculation_identifier,
+                    self.variational_candidate_calculation_identifier,
+                    self.variational_tolerance_hartree,
+                )
+            )
+        ):
+            raise ValueError(
+                "Variational-bound controls require the variational comparison goal."
+            )
+        if (
+            self.expected_lowest_calculation_identifier is not None
+            and self.expected_lowest_calculation_identifier
+            not in calculation_identifiers
         ):
             raise ValueError(
                 "Expected lowest calculation is not present in the request."

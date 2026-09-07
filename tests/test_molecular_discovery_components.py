@@ -52,6 +52,65 @@ def _generation_request(
     )
 
 
+def test_supplied_candidate_comparison_preserves_sources_and_budget():
+    from types import SimpleNamespace
+    from cgr.pulsate_api.phase8_scientific_handlers import (
+        _discovery_ligands, _discovery_generates, DiscoveryCampaignInitializeHandler,
+        DiscoveryDesignLoopTraceHandler,
+    )
+    pytest.importorskip("rdkit")
+    refs = tuple(SimpleNamespace(
+        artifact_identifier=f"input-{i}", artifact_type="ligand_structure",
+        media_type="chemical/x-daylight-smiles", content_sha256=hashlib.sha256(data).hexdigest(),
+        metadata={"display_name": f"candidate-{i}"}, payload=data,
+    ) for i, data in enumerate((b"CCO\nCCN", b"OCC", b"c1ccccc1")))
+    record = SimpleNamespace(artifact_references=refs, objective=SimpleNamespace(input_references=refs))
+    supplied = _discovery_ligands(record, SimpleNamespace(read=lambda ref: ref.payload))
+    assert set(supplied) == {"CCO", "CCN", "c1ccccc1"}
+    assert len(supplied["CCO"]["sources"]) == 2
+    assert supplied["CCN"]["sources"][0]["record_number"] == 2
+    generator = RDKitMolecularCandidateGenerator(
+        MemoryCandidateStore(), seed_smiles=tuple(supplied), seed_metadata=supplied,
+    )
+    result = generator.propose(_generation_request(generation=0))
+    assert len(result.candidates) == 3
+    assert all(candidate.metadata["sources"] for candidate in result.candidates)
+    assert all(candidate.transformation is None for candidate in result.candidates)
+    objective = SimpleNamespace(
+        research_requirements=SimpleNamespace(operations=("verify_and_rank_results",)),
+        objective_identifier="objective.comparison",
+        budget=SimpleNamespace(maximum_candidates=64, maximum_wall_time_seconds=600),
+    )
+    assert not _discovery_generates(objective)
+    campaign = DiscoveryCampaignInitializeHandler.campaign(
+        objective, generator_identifier=generator.generator_identifier, candidate_count=7,
+    )
+    assert campaign.budget.max_generations == 1
+    assert campaign.budget.max_candidates_total == 7
+    assert campaign.budget.max_candidates_per_generation == 7
+    assert campaign.budget.max_expensive_evaluations == 7
+    assert "design_next_generation" not in DiscoveryDesignLoopTraceHandler.stages(False)
+    objective.research_requirements.operations = ("generate_candidates",)
+    generated = DiscoveryCampaignInitializeHandler.campaign(
+        objective, generator_identifier=generator.generator_identifier, candidate_count=4,
+    )
+    assert generated.budget.max_generations == 2
+    assert generated.budget.max_candidates_total > 4
+
+
+def test_invalid_candidate_after_valid_record_is_not_dropped():
+    from types import SimpleNamespace
+    from cgr.pulsate_api.phase8_scientific_handlers import _discovery_ligands
+    from cgr.pulsate_api.scientific_runtime import ScientificCapabilityFailure
+    pytest.importorskip("rdkit")
+    ref = SimpleNamespace(artifact_identifier="input", artifact_type="ligand_structure",
+                          media_type="chemical/x-daylight-smiles")
+    record = SimpleNamespace(artifact_references=(ref,),
+                             objective=SimpleNamespace(input_references=(ref,)))
+    with pytest.raises(ScientificCapabilityFailure, match="invalid molecular record"):
+        _discovery_ligands(record, SimpleNamespace(read=lambda ref: b"CCO\nINVALID"))
+
+
 def test_molecular_generator_produces_real_seed_and_transformed_lineage() -> None:
     pytest.importorskip("rdkit")
     store = MemoryCandidateStore()
