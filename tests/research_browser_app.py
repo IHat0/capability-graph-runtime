@@ -28,8 +28,10 @@ class AnalysisIntentFixture:
     model_name = "analysis-intent-only"
 
     def complete(self, messages):
-        if "Translate the scientist request" in messages[0]["content"]:
+        if any("Translate the scientist request" in message["content"] for message in messages):
             text = messages[-1]["content"]
+            if "\n\nThe text to classify is: " in text:
+                text = json.JSONDecoder().raw_decode(text.split("\n\nThe text to classify is: ", 1)[1])[0]
             return json.dumps({"requirements": [{
                 "operation": "analyze_structure",
                 "requested_output": "structure_analysis",

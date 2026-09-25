@@ -914,6 +914,52 @@ class ProviderNeutralScientificEvidenceInterpreter:
         ):
             return None
 
+    def propose_named_entities(
+        self, turns: tuple[ScientistEvidenceTurn, ...],
+    ) -> tuple[ScientificNamedInputCandidate, ...]:
+        """Extract a bounded role-labelled collection; bind provenance in code."""
+        if self.provider is None or not turns:
+            return ()
+        try:
+            parsed = json.loads(self.provider.complete([
+                {"role": "system", "content": (
+                    'Extract entities from the research question. Return exactly '
+                    '{"protein_names": ["literal target names"], "ligand_names": ["literal compound names"]}. '
+                    'Separate the protein target from compounds evaluated against it. Include ALL named compounds. '
+                    'Use literal substrings only, no synonyms or identifiers. Use empty arrays when no name is given. '
+                    'Do not include PDB accession codes as protein names.'
+                )},
+                {"role": "user", "content": "\n".join(turn.content for turn in turns)},
+            ]))
+            if not isinstance(parsed, dict) or set(parsed) != {"protein_names", "ligand_names"}:
+                return ()
+            result = []
+            roles = {}
+            for entity_type in ("protein", "ligand"):
+                names = parsed[entity_type + "_names"]
+                if not isinstance(names, list) or len(names) > 64:
+                    return ()
+                for name in names:
+                    if not isinstance(name, str) or not name.strip():
+                        return ()
+                    key = name.casefold()
+                    if key in roles:
+                        if roles[key] != entity_type:
+                            return ()
+                        continue
+                    turn = next((turn for turn in reversed(turns) if name in turn.content), None)
+                    if turn is None:
+                        return ()
+                    roles[key] = entity_type
+                    result.append(ScientificNamedInputCandidate(
+                        name=name, entity_type=entity_type,
+                        turn_identifier=turn.turn_identifier, supporting_quote=name,
+                        provider_kind=self.provider.provider_kind, model_name=self.provider.model_name,
+                    ))
+            return tuple(result)
+        except (TypeError, ValueError, RuntimeError):
+            return ()
+
     def propose_named_ligand(
         self,
         turns: tuple[ScientistEvidenceTurn, ...],
@@ -931,22 +977,28 @@ class ProviderNeutralScientificEvidenceInterpreter:
                     {
                         "role": "system",
                         "content": (
-                            "Identify exactly one named ligand, compound, inhibitor, "
-                            "or drug only when the scientist literally names it. Return "
-                            "exactly one JSON object with name, turn_identifier, and "
-                            "supporting_quote, or return {}. The name and quote must be "
-                            "literal substrings of that scientist turn. Do not provide "
-                            "an identifier, structure, synonym, correction, inference, "
-                            "or commentary. If more than one candidate is named, return {}."
+                            'Extract explicitly named compounds from the text. Return only JSON: '
+                            '{"names": ["literal compound name", ...]}. '
+                            'Include every compound being evaluated. Do not include the protein '
+                            'or its PDB accession. No synonyms or invented names.'
                         ),
                     },
                     {
                         "role": "user",
-                        "content": json.dumps(payload, separators=(",", ":")),
+                        "content": "\n".join(item.content for item in turns),
                     },
                 ]
             )
             parsed = json.loads(content)
+            if set(parsed) == {"names"}:
+                names = parsed["names"]
+                if not isinstance(names, list) or len(names) != 1 or not isinstance(names[0], str):
+                    return None
+                matches = [turn for turn in turns if names[0] and names[0] in turn.content]
+                if len(matches) != 1:
+                    return None
+                parsed = {"name": names[0], "supporting_quote": names[0],
+                          "turn_identifier": matches[0].turn_identifier}
             if set(parsed) != {"name", "turn_identifier", "supporting_quote"}:
                 return None
             candidate = ScientificNamedInputCandidate(

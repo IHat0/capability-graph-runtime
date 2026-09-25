@@ -92,6 +92,10 @@ def _merge_identified(
     return tuple(sorted(merged.values(), key=lambda item: getattr(item, attribute)))
 
 
+class NamedInputResolutionRequired(ValueError):
+    """A named member of the requested input collection remains unresolved."""
+
+
 def _acquired_artifact_identifiers(
     artifacts: tuple[ArtifactReference, ...],
 ) -> tuple[str, ...]:
@@ -1221,6 +1225,13 @@ class ResearchSessionController:
                 accepted_partial_target=accepted_partial_target,
                 accepted_evidence=accepted_evidence,
             )
+        except NamedInputResolutionRequired as error:
+            evidence_proposal = None
+            questions = (*questions, ClarificationPrompt(
+                requirement_identifier="requirement-named-input-resolution",
+                question="The trusted-source lookup could not resolve all named inputs: "
+                + str(error)[:700] + ". Please clarify these names or retry the lookup; no named candidate will be silently omitted.",
+            ))
         except (TypeError, ValueError):
             # Model-derived or acquired evidence is non-authoritative. A malformed
             # proposal must fail closed into the existing clarification path.
@@ -1329,6 +1340,59 @@ class ResearchSessionController:
         )
         return compilation, execution, questions, None
 
+    def _named_collection_proposal(
+        self, *, scientist_turns, input_references, artifact_references,
+        tenant_identifier_sha256,
+    ):
+        """Acquire missing named inputs as a collection, never just its first member."""
+        extractor = getattr(self.evidence_interpreter, "propose_named_entities", None)
+        if extractor is None or self.evidence_resolver is None:
+            return None
+        turns = tuple(ScientistEvidenceTurn(turn_identifier=turn.turn_identifier, content=turn.content)
+                      for turn in scientist_turns)
+        candidates = extractor(turns)
+        existing = {(item.artifact_type, str(item.metadata.get("display_name", "")).casefold())
+                    for item in artifact_references}
+        has_protein = any(item.artifact_type == "protein_structure" for item in input_references)
+        acquired, ambiguous, unresolved = [], [], []
+        for candidate in candidates:
+            kind = candidate.entity_type + "_structure"
+            if (kind, candidate.name.casefold()) in existing or (candidate.entity_type == "protein" and has_protein):
+                continue
+            proposal = self.evidence_resolver.acquire_named_entity(
+                candidate=candidate, input_references=input_references,
+                tenant_identifier_sha256=tenant_identifier_sha256,
+            )
+            if proposal is None:
+                unresolved.append(candidate.name)
+                continue
+            if proposal.source_kind == "entity_resolution_candidates":
+                ambiguous.append(proposal)
+            else:
+                acquired.append(proposal)
+        if acquired:
+            identity = "\x1f".join(item.proposal_identifier for item in acquired)
+            return acquired[0].model_copy(update={
+                "proposal_identifier": "evidence-proposal-" + hashlib.sha256(identity.encode()).hexdigest()[:32],
+                "summary": "Pulsate acquired the uniquely resolved named inputs; each retains its exact public record and source name.",
+                "input_references": tuple(ref for item in acquired for ref in item.input_references),
+                "artifact_references": tuple(ref for item in acquired for ref in item.artifact_references),
+                "supporting_quotes": tuple(quote for item in acquired for quote in item.supporting_quotes),
+            })
+        if unresolved:
+            raise NamedInputResolutionRequired(", ".join(unresolved))
+        if ambiguous:
+            proposal = ambiguous[0]
+            if any(item.entity_type == "protein" for item in proposal.entity_candidates):
+                return proposal.model_copy(update={"summary": (
+                    "The target name maps to multiple public protein/structure records. "
+                    "Which organism and protein domain or residue region is intended for this study? "
+                    "The current bounded search is not a structure-suitability ranking, so Pulsate cannot responsibly "
+                    "choose a deposited structure from its ordering. You do not need to upload a file."
+                )})
+            return proposal
+        return None
+
     def _evidence_proposal(
         self,
         *,
@@ -1387,6 +1451,14 @@ class ResearchSessionController:
             return deterministic
         if self.evidence_interpreter is None:
             return None
+        if capability_profile in {"protein_ligand_discovery", "structure_analysis"}:
+            collection = self._named_collection_proposal(
+                scientist_turns=scientist_turns, input_references=input_references,
+                artifact_references=artifact_references,
+                tenant_identifier_sha256=tenant_identifier_sha256,
+            )
+            if collection is not None:
+                return collection
         accepted_turn_identifiers = {
             quote.turn_identifier
             for accepted in accepted_evidence
@@ -1583,6 +1655,9 @@ class ResearchSessionController:
                 + ". Pulsate will acquire that exact structure and ask for final "
                 "provenance confirmation."
             )
+            if any(item.entity_type == "protein" for item in proposal.entity_candidates):
+                question = proposal.summary + " Public matching records (not ranked by suitability): " + choices
+                retained = [item for item in retained if "protein" not in item.question.casefold()]
         else:
             question = (
                 proposal.summary

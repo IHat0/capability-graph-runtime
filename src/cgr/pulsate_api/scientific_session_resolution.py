@@ -324,10 +324,10 @@ class PersistedStructureEvidenceResolver:
     ) -> ScientificEvidenceProposal | None:
         """Acquire one unique trusted match or return bounded review candidates."""
 
-        if self.payload_store is None or any(
+        if self.payload_store is None or (candidate.entity_type == "protein" and any(
             item.artifact_type == f"{candidate.entity_type}_structure"
             for item in input_references
-        ):
+        )):
             return None
         try:
             matches: tuple[TrustedEntityCandidate, ...]
@@ -368,6 +368,7 @@ class PersistedStructureEvidenceResolver:
                 tenant_identifier_sha256=tenant_identifier_sha256,
                 resolution_status="trusted_named_entity_acquired",
                 resolution_confidence="high",
+                display_name=candidate.name,
             )
             semantic = ScientificInputReference(
                 reference_identifier=(
@@ -653,6 +654,7 @@ class PersistedStructureEvidenceResolver:
         tenant_identifier_sha256: str,
         resolution_status: str,
         resolution_confidence: str | None,
+        display_name: str | None = None,
     ) -> ArtifactReference:
         assert self.payload_store is not None
         digest = acquired.content_sha256
@@ -661,6 +663,8 @@ class PersistedStructureEvidenceResolver:
             "tenant_identifier_sha256": tenant_identifier_sha256,
             "evidence_resolution_status": resolution_status,
         }
+        if display_name is not None:
+            metadata["display_name"] = display_name
         if resolution_confidence is not None:
             metadata["evidence_resolution_confidence"] = resolution_confidence
         artifact_identity = json.dumps(
