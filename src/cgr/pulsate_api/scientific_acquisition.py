@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable, Literal
 from urllib.error import HTTPError, URLError
@@ -63,6 +64,7 @@ class AcquiredScientificInput:
     source_identifier: str
     source_url: str | None = None
     generation_method: str | None = None
+    selection_evidence: str | None = None
 
     @property
     def content_sha256(self) -> str:
@@ -79,6 +81,8 @@ class AcquiredScientificInput:
             values["acquisition_source_url"] = self.source_url
         if self.generation_method is not None:
             values["acquisition_generation_method"] = self.generation_method
+        if self.selection_evidence is not None:
+            values["target_selection_sha256"] = hashlib.sha256(self.selection_evidence.encode()).hexdigest()
         return values
 
 
@@ -120,7 +124,23 @@ def grounded_identifiers(question: str) -> GroundedScientificIdentifiers:
     )
 
 
-def _fetch_bytes(url: str, accept: str, maximum_bytes: int) -> bytes:
+def _open_source_request(request):
+    """Bounded retries for transient transport errors; never retry unsafe data."""
+    for attempt in range(3):
+        try:
+            return urlopen(request, timeout=30)
+        except HTTPError as error:
+            if error.code not in {429, 500, 502, 503, 504} or attempt == 2:
+                raise
+            error.close()
+        except (URLError, TimeoutError, OSError):
+            if attempt == 2:
+                raise
+        time.sleep(0.25 * 2**attempt)
+    raise AssertionError('Unreachable retry state')
+
+
+def _fetch_bytes(url: str, accept: str, maximum_bytes: int, *, allow_no_content: bool = False) -> bytes:
     request = Request(
         url,
         headers={
@@ -130,7 +150,7 @@ def _fetch_bytes(url: str, accept: str, maximum_bytes: int) -> bytes:
         method="GET",
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with _open_source_request(request) as response:
             resolved = urlsplit(response.geturl())
             requested = urlsplit(url)
             if (
@@ -144,6 +164,8 @@ def _fetch_bytes(url: str, accept: str, maximum_bytes: int) -> bytes:
             if declared is not None and int(declared) > maximum_bytes:
                 raise ValueError("Scientific input acquisition exceeds its size limit.")
             payload = response.read(maximum_bytes + 1)
+            if allow_no_content and getattr(response, 'status', None) == 204 and not payload:
+                return b''
     except (HTTPError, URLError, TimeoutError, OSError, ValueError):
         raise ValueError("The exact scientific input could not be acquired safely.") from None
     if not payload or len(payload) > maximum_bytes:

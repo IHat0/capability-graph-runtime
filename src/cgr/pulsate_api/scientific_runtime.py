@@ -484,6 +484,20 @@ class ScientistResultAssembler:
         pocket = self._read_json_evidence(record, "binding_pocket")
         if pocket is not None and isinstance(pocket[0], dict):
             region = pocket[0]
+            selection = region.get("target_selection_evidence")
+            if isinstance(selection, dict):
+                chosen = selection["selected"]
+                add("principal_result", "Selected experimental receptor PDB " + chosen["pdb_id"]
+                    + ", chain " + chosen["chain"] + ", UniProt " + selection["uniprot_accession"]
+                    + ", domain " + selection["domain"]["description"]
+                    + ", X-ray resolution " + str(chosen["resolution_angstrom"]) + " Angstrom. "
+                    + selection["policy"] + " Reviewed " + str(len(selection["reviewed"]))
+                    + " of " + str(selection["candidate_count"]) + " eligible cross-references. "
+                    + "Selected-chain deposited mutation/conflict records: " + str(chosen["mutation_records"])
+                    + "; missing residue/atom records: " + str(chosen["missing_records"])
+                    + "; flagged binding-site-neighbor missing records: " + str(chosen["binding_site_missing_records"])
+                    + "; deposited site identity match: " + str(chosen.get("site_identity_evidence", {}))
+                    + ". Full candidate exclusions and provenance are retained in the binding-pocket evidence.", (pocket[1],))
             add("principal_result",
                 "The docking region is centered at "
                 + str(region.get("center_angstrom")) + " Angstrom, with dimensions "

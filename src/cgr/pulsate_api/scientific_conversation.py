@@ -20,6 +20,24 @@ from .scientific_objectives import (
 )
 
 
+def bound_selection_companion_identifiers(declared, artifacts):
+    """Only exact hash- and parent-bound selection reports accompany inputs."""
+    companions = set()
+    for report in artifacts:
+        if report.artifact_type != 'target_selection_report':
+            continue
+        bound = any(parent.artifact_identifier in declared
+                    and parent.artifact_type == 'protein_structure'
+                    and parent.metadata.get('target_selection_sha256') == report.content_sha256
+                    and report.parents == (parent.pointer,)
+                    and report.metadata.get('tenant_identifier_sha256') == parent.metadata.get('tenant_identifier_sha256')
+                    for parent in artifacts)
+        if not bound:
+            raise ValueError('Target selection evidence must hash-bind to its exact proposed input.')
+        companions.add(report.artifact_identifier)
+    return companions
+
+
 class ClarificationPrompt(BaseModel):
     """One question tied to a deterministic unresolved requirement."""
 
@@ -288,8 +306,10 @@ class ScientificEvidenceProposal(BaseModel):
         declared = {
             item.artifact_identifier for item in self.input_references
         }
+        companions = bound_selection_companion_identifiers(declared, self.artifact_references)
         persisted = {
             item.artifact_identifier for item in self.artifact_references
+            if item.artifact_identifier not in companions
         }
         if declared != persisted:
             raise ValueError(

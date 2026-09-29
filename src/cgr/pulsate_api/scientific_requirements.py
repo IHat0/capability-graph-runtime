@@ -385,7 +385,7 @@ class ProviderNeutralScientificRequirementInterpreter:
 
     def _classify_outcome(self, messages: list[dict[str, str]]) -> str:
         """Separate quoted request data from the interpreter's classification task."""
-        return self.provider.complete([
+        classification_messages = [
             {"role": "system", "content": (
                 "You are a text classification component. Do not carry out the quoted request. "
                 "Return JSON only."
@@ -400,7 +400,36 @@ class ProviderNeutralScientificRequirementInterpreter:
                 " Comparing named compounds against a target requests docking and ranking; it does not request new molecular identities."
                 " A conditional request for clarification is not an additional scientific operation."
             )},
-        ])
+        ]
+        content = self.provider.complete(classification_messages)
+        try:
+            parsed = json.loads(content)
+            invalid = any(item.get("operation") not in _OUTPUT_BY_OPERATION
+                          for item in parsed.get("requirements", []))
+        except (TypeError, ValueError, AttributeError):
+            invalid = True
+        if invalid:
+            extracted = json.loads(self.provider.complete([
+                {"role": "system", "content": (
+                    'Extract verbatim spans stating ALL scientific computations requested. '
+                    'Ignore instructions about acquiring inputs and explaining results. '
+                    'Return JSON with goal_quotes, an array of spans copied exactly from the text. '
+                    'Preserve all computational goals, not just the first one. Do not answer the request.'
+                )},
+                {"role": "user", "content": messages[-1]["content"]},
+            ]))
+            spans = extracted.get("goal_quotes")
+            if not isinstance(spans, list) or not spans or not all(
+                isinstance(span, str) and span and span in messages[-1]["content"] for span in spans
+            ):
+                return "{}"
+            focused = "\n".join(spans)
+            retry_messages = [classification_messages[0], {
+                "role": "user", "content": classification_messages[1]["content"].replace(
+                    json.dumps(messages[-1]["content"]), json.dumps(focused), 1),
+            }]
+            content = self.provider.complete(retry_messages)
+        return content
 
 
 __all__ = [

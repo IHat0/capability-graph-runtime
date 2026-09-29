@@ -244,8 +244,10 @@ class ResearchSession(BaseModel):
             raise ValueError("Clarification attempt counts must be positive.")
         declared = {item.artifact_identifier for item in self.input_references}
         supplied = {item.artifact_identifier for item in self.artifact_references}
+        from .scientific_conversation import bound_selection_companion_identifiers
+        companions = bound_selection_companion_identifiers(declared, self.artifact_references)
         if len(supplied) != len(self.artifact_references) or (
-            supplied and supplied != declared
+            supplied and supplied - companions != declared
         ):
             raise ValueError(
                 "Every persisted session artifact must bind one semantic input."
@@ -1044,10 +1046,12 @@ class ResearchSessionController:
             inputs = self._accept_proposed_inputs(
                 inputs,
                 evidence_proposal.input_references,
+                merge=evidence_proposal.source_kind == 'named_identifier_acquisition',
             )
             artifacts = self._accept_proposed_artifacts(
                 artifacts,
                 evidence_proposal.artifact_references,
+                merge=evidence_proposal.source_kind == 'named_identifier_acquisition',
             )
             if evidence_proposal.covalent_reaction_target is not None:
                 target = evidence_proposal.covalent_reaction_target
@@ -1351,6 +1355,13 @@ class ResearchSessionController:
         turns = tuple(ScientistEvidenceTurn(turn_identifier=turn.turn_identifier, content=turn.content)
                       for turn in scientist_turns)
         candidates = extractor(turns)
+        from .scientific_target_selection import extract_target_scope
+        provider = getattr(self.evidence_interpreter, "provider", None)
+        scope = extract_target_scope(turns, provider) if any(c.entity_type == "protein" for c in candidates) else None
+        if scope is not None:
+            candidates = tuple(c.model_copy(update={"name": scope["name"]})
+                               if c.entity_type == "protein" else c for c in candidates)
+        candidates = tuple({(c.entity_type, c.name.casefold()): c for c in candidates}.values())
         existing = {(item.artifact_type, str(item.metadata.get("display_name", "")).casefold())
                     for item in artifact_references}
         has_protein = any(item.artifact_type == "protein_structure" for item in input_references)
@@ -1359,10 +1370,15 @@ class ResearchSessionController:
             kind = candidate.entity_type + "_structure"
             if (kind, candidate.name.casefold()) in existing or (candidate.entity_type == "protein" and has_protein):
                 continue
-            proposal = self.evidence_resolver.acquire_named_entity(
-                candidate=candidate, input_references=input_references,
-                tenant_identifier_sha256=tenant_identifier_sha256,
-            )
+            extra = {"target_scope": scope, "provider": provider,
+                     "ligand_names": tuple(c.name for c in candidates if c.entity_type == "ligand")} if candidate.entity_type == "protein" and scope else {}
+            try:
+                proposal = self.evidence_resolver.acquire_named_entity(
+                    candidate=candidate, input_references=input_references,
+                    tenant_identifier_sha256=tenant_identifier_sha256, **extra,
+                )
+            except ValueError as error:
+                raise NamedInputResolutionRequired(str(error)) from error
             if proposal is None:
                 unresolved.append(candidate.name)
                 continue
@@ -1935,7 +1951,10 @@ class ResearchSessionController:
     def _accept_proposed_inputs(
         current: tuple[ScientificInputReference, ...],
         proposed: tuple[ScientificInputReference, ...],
+        *, merge: bool = False,
     ) -> tuple[ScientificInputReference, ...]:
+        if merge:
+            return _merge_identified(current, proposed, attribute='reference_identifier')
         if not proposed:
             return current
         replaced_types = {item.artifact_type for item in proposed}
@@ -1949,7 +1968,10 @@ class ResearchSessionController:
     def _accept_proposed_artifacts(
         current: tuple[ArtifactReference, ...],
         proposed: tuple[ArtifactReference, ...],
+        *, merge: bool = False,
     ) -> tuple[ArtifactReference, ...]:
+        if merge:
+            return _merge_identified(current, proposed, attribute='artifact_identifier')
         if not proposed:
             return current
         replaced_types = {item.artifact_type for item in proposed}

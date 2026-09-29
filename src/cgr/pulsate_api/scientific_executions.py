@@ -209,7 +209,9 @@ class ScientificObjectiveCompileRequest(BaseModel):
         supplied = {item.artifact_identifier for item in self.artifact_references}
         if len(supplied) != len(self.artifact_references):
             raise ValueError("Scientific input artifact identities must be unique.")
-        if supplied and supplied != declared:
+        from .scientific_conversation import bound_selection_companion_identifiers
+        companions = bound_selection_companion_identifiers(declared, self.artifact_references)
+        if supplied and supplied - companions != declared:
             raise ValueError(
                 "Every semantic scientific input must bind one exact artifact reference."
             )

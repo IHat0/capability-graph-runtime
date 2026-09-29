@@ -580,12 +580,20 @@ class OpenAICompatibleModelProvider:
             return self._request_count
 
     def complete(self, messages: list[dict[str, str]]) -> str:
+        return self._complete(messages, {"type": "json_object"})
+
+    def complete_structured(self, messages: list[dict[str, str]], schema: dict) -> str:
+        return self._complete(messages, {"type": "json_schema", "json_schema": {
+            "name": "scientific_extraction", "strict": True, "schema": schema,
+        }})
+
+    def _complete(self, messages, response_format) -> str:
         request_payload = json.dumps(
             {
                 "model": self.model_name,
                 "messages": messages,
                 "temperature": 0,
-                "response_format": {"type": "json_object"},
+                "response_format": response_format,
             },
             separators=(",", ":"),
         ).encode("utf-8")

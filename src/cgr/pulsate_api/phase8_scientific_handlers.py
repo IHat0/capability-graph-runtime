@@ -4973,6 +4973,17 @@ def _discovery_target(record, store):
     """Resolve a deposited ligand-defined region and a protein-only docking receptor."""
     protein = _objective_input(record, kinds=("protein_structure",))
     lines = store.read(protein).decode("utf-8").splitlines()
+    selection = None
+    selection_hash = protein.metadata.get("target_selection_sha256")
+    if selection_hash is not None:
+        report = next((r for r in record.artifact_references if r.artifact_type == 'target_selection_report'
+                       and r.content_sha256 == selection_hash), None)
+        if report is None:
+            raise ScientificCapabilityFailure('target_selection_evidence_missing', 'The receptor selection report is missing.')
+        selection = json.loads(store.read(report))
+    if selection is not None:
+        chain = selection["selected"]["chain"]
+        lines = [line for line in lines if not line.startswith("ATOM  ") or line[21:22] == chain]
     if sum(line.startswith("MODEL ") for line in lines) > 1:
         raise ScientificCapabilityFailure("receptor_model_ambiguous", "Select one deposited receptor model.")
     groups = {}
@@ -4984,6 +4995,16 @@ def _discovery_target(record, store):
     organic = {key: values for key, values in groups.items()
                if any(line[76:78].strip() == "C" for line in values)}
     matches = {key: values for key, values in organic.items() if key[:3].strip() in labels}
+    if selection is not None:
+        selected_key = selection["selected"]["reference_residue"]
+        identity = selection["selected"].get("site_identity_evidence", {})
+        if (identity.get("chemical_component_id") != selected_key[:3].strip() or
+                identity.get("match_policy") != "full standard InChIKey equality" or
+                not identity.get("inchikey")):
+            raise ScientificCapabilityFailure("selected_site_identity_missing", "Automatic receptor selection lacks candidate-matched site evidence; reacquire the receptor under the current policy.")
+        if selected_key not in organic:
+            raise ScientificCapabilityFailure("selected_site_missing", "The acquired receptor does not contain the selected deposited reference site.")
+        matches = {selected_key: organic[selected_key]}
     if len(matches) != 1 and len(organic) == 1:
         matches = organic
     # A compact supplied receptor may be used in its entirety; large targets require site evidence.
@@ -5024,6 +5045,7 @@ def _discovery_target(record, store):
         "selected_residue_identifiers": residues,
         "source_protein_artifact_identifier": protein.artifact_identifier,
         "reference_residue": next(iter(matches), None),
+        "target_selection_evidence": selection,
         "alternate_conformation_policy": "highest_mean_occupancy_then_lexical_tie_break",
         "excluded_nonpolymer_atom_count": sum(line.startswith("HETATM") for line in lines),
     }
@@ -5048,7 +5070,8 @@ class DiscoveryProteinIngestionHandler:
         return ScientificCapabilityOutcome(
             output_artifacts=(structure,),
             limitations=("Protein-only rigid docking excludes deposited ligand, waters and nonpolymer additives; any later modeled atoms are recorded separately.",
-                         "Alternate conformations use highest mean occupancy, with a lexical tie break."),
+                         "Alternate conformations use highest mean occupancy, with a lexical tie break.",
+                         *((region.get("target_selection_evidence") or {}).get("limitations", []))),
         )
 
 

@@ -321,6 +321,9 @@ class PersistedStructureEvidenceResolver:
         candidate: ScientificNamedInputCandidate,
         input_references: tuple[ScientificInputReference, ...],
         tenant_identifier_sha256: str,
+        target_scope=None,
+        provider=None,
+        ligand_names=(),
     ) -> ScientificEvidenceProposal | None:
         """Acquire one unique trusted match or return bounded review candidates."""
 
@@ -329,9 +332,21 @@ class PersistedStructureEvidenceResolver:
             for item in input_references
         )):
             return None
+        selected_source = None
+        if candidate.entity_type == "protein" and target_scope is not None:
+            from .scientific_target_selection import select_experimental_target
+            selected_source = select_experimental_target(target_scope, provider, ligand_names=ligand_names)
         try:
             matches: tuple[TrustedEntityCandidate, ...]
-            if candidate.entity_type == "protein":
+            if selected_source is not None:
+                selection = json.loads(selected_source.selection_evidence)
+                matches = (TrustedEntityCandidate(
+                    entity_type="protein", source_kind="uniprot",
+                    source_identifier=selection["uniprot_accession"],
+                    display_label=candidate.name, structure_identifier=selected_source.source_identifier,
+                    confidence="high",
+                ),)
+            elif candidate.entity_type == "protein":
                 matches = resolve_protein_uniprot_name_candidates(candidate.name)
             else:
                 matches = resolve_ligand_pubchem_name_candidates(candidate.name)
@@ -343,7 +358,7 @@ class PersistedStructureEvidenceResolver:
                     structure_identifier = matches[0].structure_identifier
                     if structure_identifier is None:
                         return None
-                    source = acquire_protein_pdb(structure_identifier)
+                    source = selected_source or acquire_protein_pdb(structure_identifier)
                     acquired = AcquiredScientificInput(
                         artifact_type=source.artifact_type,
                         media_type=source.media_type,
@@ -355,6 +370,7 @@ class PersistedStructureEvidenceResolver:
                             + structure_identifier
                         ),
                         source_url=source.source_url,
+                        selection_evidence=source.selection_evidence,
                     )
                 else:
                     acquired = acquire_ligand_pubchem(
@@ -370,6 +386,29 @@ class PersistedStructureEvidenceResolver:
                 resolution_confidence="high",
                 display_name=candidate.name,
             )
+            references = (reference,)
+            if acquired.selection_evidence is not None:
+                payload = acquired.selection_evidence.encode('utf-8')
+                digest = hashlib.sha256(payload).hexdigest()
+                report_metadata = {'tenant_identifier_sha256': tenant_identifier_sha256,
+                                   'evidence_resolution_confidence': 'high',
+                                   'acquisition_source_kind': 'uniprot_pdb_selection_evidence'}
+                report_identity = hashlib.sha256(json.dumps({
+                    'content_sha256': digest, 'metadata': report_metadata,
+                    'parent': reference.pointer.model_dump(mode='json'),
+                }, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                report = ArtifactReference(
+                    artifact_identifier='target-selection-' + tenant_identifier_sha256[:16] + '-' + report_identity[:32],
+                    schema_version=_VERSION, artifact_type='target_selection_report',
+                    media_type='application/json', content_sha256=digest, byte_size=len(payload),
+                    metadata=report_metadata,
+                    provenance=CreationProvenance(producer='pulsate-target-selection',
+                        producer_version=_VERSION, execution_identifier='target-selection-' + digest[:32],
+                        source='uniprot_pdb_cross_reference'),
+                    parents=(reference.pointer,),
+                )
+                self.payload_store.write(report, payload)
+                references = (reference, report)
             semantic = ScientificInputReference(
                 reference_identifier=(
                     f"input-acquired-{candidate.entity_type}-"
@@ -394,7 +433,7 @@ class PersistedStructureEvidenceResolver:
                     "structure. Review the identity, provenance, and confidence."
                 ),
                 input_references=(semantic,),
-                artifact_references=(reference,),
+                artifact_references=references,
                 supporting_quotes=(
                     ScientificEvidenceQuote(
                         field_name=(
