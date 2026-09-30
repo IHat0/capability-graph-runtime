@@ -601,6 +601,19 @@ function parseResearchVisualization(value: unknown): ResearchVisualizationWorksp
     malformed('The backend returned a malformed research visualization workspace.')
   }
   if (containsCredentialField(value)) malformed('The backend returned unsafe visualization data.')
+  const construction = value.construction_summary
+  if (construction !== undefined && construction !== null && (
+    !isRecord(construction)
+    || !['name', 'formula', 'structure_artifact_identifier'].every(key => hasString(construction, key))
+    || !['atom_count', 'generated_conformers', 'converged_conformers'].every(key => isFiniteNumber(construction[key]))
+    || (construction.selected_compute === 'classical'
+      ? !['computation_reason', 'xyz_artifact_identifier'].every(key => hasString(construction, key))
+        || !Array.isArray(construction.workflow) || !construction.workflow.every(item => typeof item === 'string')
+      : !hasString(construction, 'hardware_status') || !['active_electron_count', 'active_spatial_orbital_count', 'logical_qubits'].every(key => isFiniteNumber(construction[key])))
+    || typeof construction.identity_verified !== 'boolean'
+    || !Array.isArray(construction.energies)
+    || !construction.energies.every(item => isRecord(item) && hasString(item, 'label') && hasString(item, 'unit') && isFiniteNumber(item.value))
+  )) malformed('The backend returned malformed molecular construction evidence.')
   return value as unknown as ResearchVisualizationWorkspace
 }
 

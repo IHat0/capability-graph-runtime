@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pytest
 from datetime import UTC, datetime
 
 from cgr.kernel.contracts import CapabilityVersion
@@ -250,3 +251,56 @@ def test_complex_scene_keeps_structure_and_atom_identities_separate() -> None:
         left.artifact_identifier,
         right.artifact_identifier,
     }
+
+
+@pytest.mark.parametrize('classical', [False, True])
+def test_constructed_result_keeps_unlike_energies_separate_and_links_generated_structure(classical):
+    structure_payload = (
+        '\n  independently generated\n\n  2  1  0  0  0  0            999 V2000\n'
+        '    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n'
+        '    1.4000    0.0000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0\n'
+        '  1  2  1  0  0  0  0\nM  END\n$$$$\n'
+    ).encode()
+    structure = _reference('constructed_molecule_sdf', structure_payload, media_type='chemical/x-mdl-sdfile')
+    documents = {
+        'molecular_construction_evidence': {'name': 'generated fixture', 'formula': 'CO',
+            'atom_count_including_hydrogens': 2, 'generated_conformers': 3, 'converged_conformers': 2,
+            'sdf_artifact_identifier': structure.artifact_identifier, 'selected_conformer': {'energy': 7.25}},
+        'molecular_identity_verification': {'passed': True},
+        'molecular_ground_state_execution_receipt': {'scientific_controls': {'active_electron_count': 2, 'active_spatial_orbital_count': 2},
+            'mapping': {'number_of_qubits_after_reduction': 4}, 'hartree_fock': {'total_energy_hartree': -90.0},
+            'exact': {'total_energy_hartree': -90.1}, 'vqe': {'total_energy_hartree': -90.09},
+            'verification': {'absolute_difference_hartree': .01}},
+        'quantum_hardware_proposal': {'status': 'backend_preparation_pending'},
+    }
+    if classical:
+        documents.pop('molecular_ground_state_execution_receipt')
+        documents.pop('quantum_hardware_proposal')
+        documents['molecular_construction_evidence']['xyz_artifact_identifier'] = 'generated-xyz'
+        documents['molecular_construction_execution_receipt'] = {
+            'hartree_fock': {'total_energy_hartree': -90.0},
+            'computation_selection': {'reason': 'Classical methods are sufficient for structural construction.'},
+            'workflow': ['identity', 'construction', 'conformers', 'optimization', 'RHF', 'identity verification'],
+        }
+    payloads = {structure.artifact_identifier: structure_payload}
+    references = [structure]
+    for kind, document in documents.items():
+        payload = json.dumps(document).encode()
+        reference = _reference(kind, payload)
+        references.append(reference)
+        payloads[reference.artifact_identifier] = payload
+    workspace = build_research_visualization(session=_session(structure), store=_Store(payloads), artifact_references=tuple(references))
+    result = workspace['construction_summary']
+    assert result['structure_artifact_identifier'] == structure.artifact_identifier
+    assert result['identity_verified'] is True
+    assert result['energies'][0] == {'label': 'Optimized force-field geometry', 'value': 7.25, 'unit': 'kcal/mol'}
+    assert result['energies'][1]['value'] == -90.0
+    assert result['energies'][1]['unit'] == 'Hartree'
+    if classical:
+        assert result['selected_compute'] == 'classical'
+        assert result['xyz_artifact_identifier'] == 'generated-xyz'
+        assert len(result['energies']) == 2
+        assert 'logical_qubits' not in result
+        assert 'hardware_status' not in result
+    else:
+        assert result['hardware_status'] == 'backend_preparation_pending'

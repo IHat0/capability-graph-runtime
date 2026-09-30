@@ -1218,6 +1218,10 @@ class ResearchSessionController:
             budget=budget,
             tenant_identifier_sha256=tenant_identifier_sha256,
         )
+        if (accepted_research_requirements is not None and
+                accepted_research_requirements.capability_profile == "molecular_construction"):
+            # This workflow acquires identity specifications, never public coordinates.
+            return compilation, execution, questions, no_intent, None
         try:
             evidence_proposal = self._evidence_proposal(
                 objective=execution.objective,

@@ -64,6 +64,7 @@ export function normalizeScene(raw: SceneResponse, detail?: PresetDetailResponse
     if (!a || !b || left === right) return []
     const declaredValue = finiteNumber(bond.declared_distance)
     const backendDerivedValue = finiteNumber(bond.derived_distance)
+    if (declaredValue === undefined && backendDerivedValue === undefined) return []
     const geometricValue = euclideanDistance(a.position, b.position)
     return [{
       id: `measurement.${bond.bond_identifier}`,

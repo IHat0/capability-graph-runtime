@@ -302,7 +302,7 @@ def compile_scientific_objective(
             target_kind = "molecular_ground_state"
         elif profile == "protein_ligand_discovery":
             target_kind = "binding_pocket"
-        elif profile == "structure_analysis":
+        elif profile in {"structure_analysis", "molecular_construction"}:
             target_kind = "whole_structure"
         elif profile == "de_novo_protein_design":
             target_kind = "designed_protein"

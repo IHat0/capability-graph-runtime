@@ -36,6 +36,12 @@ _JSON_VISUALIZATION_ARTIFACT_TYPES = frozenset(
         "molecular_scene_state",
         "scientific_verification_report",
         "potential_energy_curve",
+        "molecular_construction_evidence",
+        "molecular_identity_verification",
+        "molecular_ground_state_execution_receipt",
+        "molecular_construction_execution_receipt",
+        "computation_selection_decision",
+        "quantum_hardware_proposal",
     }
 )
 _REPORT_ARTIFACT_TYPES = frozenset(
@@ -630,6 +636,51 @@ def build_research_visualization(
         }
         for reference in all_references
     ]
+    construction_summary = None
+    by_kind = {reference.artifact_type: documents.get(reference.artifact_identifier)
+               for reference in all_references if reference.artifact_identifier in documents}
+    built = by_kind.get("molecular_construction_evidence")
+    checked = by_kind.get("molecular_identity_verification")
+    classical_receipt = by_kind.get("molecular_construction_execution_receipt")
+    receipt = classical_receipt or by_kind.get("molecular_ground_state_execution_receipt")
+    hardware = by_kind.get("quantum_hardware_proposal")
+    if built and checked and receipt and not classical_receipt:
+        construction_summary = {
+            "name": built["name"], "formula": built["formula"],
+            "atom_count": built["atom_count_including_hydrogens"],
+            "generated_conformers": built["generated_conformers"],
+            "converged_conformers": built["converged_conformers"],
+            "structure_artifact_identifier": built["sdf_artifact_identifier"],
+            "identity_verified": checked["passed"],
+            "active_electron_count": receipt["scientific_controls"]["active_electron_count"],
+            "active_spatial_orbital_count": receipt["scientific_controls"]["active_spatial_orbital_count"],
+            "logical_qubits": receipt["mapping"]["number_of_qubits_after_reduction"],
+            "hardware_status": hardware["status"] if hardware else "not_prepared",
+            "energies": [
+                {"label": "Optimized force-field geometry", "value": built["selected_conformer"]["energy"], "unit": "kcal/mol"},
+                {"label": "Full-molecule RHF", "value": receipt["hartree_fock"]["total_energy_hartree"], "unit": "Hartree"},
+                {"label": "Exact active-space total", "value": receipt["exact"]["total_energy_hartree"], "unit": "Hartree"},
+                {"label": "Statevector VQE total", "value": receipt["vqe"]["total_energy_hartree"], "unit": "Hartree"},
+                {"label": "VQE–exact absolute difference", "value": receipt["verification"]["absolute_difference_hartree"], "unit": "Hartree"},
+            ],
+        }
+    if built and checked and classical_receipt:
+        construction_summary = {
+            "name": built["name"], "formula": built["formula"],
+            "atom_count": built["atom_count_including_hydrogens"],
+            "generated_conformers": built["generated_conformers"],
+            "converged_conformers": built["converged_conformers"],
+            "structure_artifact_identifier": built["sdf_artifact_identifier"],
+            "xyz_artifact_identifier": built["xyz_artifact_identifier"],
+            "identity_verified": checked["passed"],
+            "computation_reason": classical_receipt["computation_selection"]["reason"],
+            "selected_compute": "classical",
+            "workflow": classical_receipt["workflow"],
+            "energies": [
+                {"label": "Optimized force-field geometry", "value": built["selected_conformer"]["energy"], "unit": "kcal/mol"},
+                {"label": "Full-molecule RHF (STO-3G)", "value": classical_receipt["hartree_fock"]["total_energy_hartree"], "unit": "Hartree"},
+            ],
+        }
     return {
         "schema_version": "pulsate.research-visualization/v1",
         "session_identifier": session.session_identifier,
@@ -644,6 +695,7 @@ def build_research_visualization(
         "comparisons": comparisons,
         "verification_artifact_identifiers": verification_artifacts,
         "export_items": export_items,
+        "construction_summary": construction_summary,
         "grounding_policy": "persisted_artifact_or_deterministic_computation_only",
     }
 

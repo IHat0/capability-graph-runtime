@@ -21,6 +21,7 @@ _VISUALIZABLE_ARTIFACT_TYPES = frozenset(
         "docking_pose_pdbqt",
         "docking_receptor_pdbqt",
         "molecular_structure",
+        "constructed_molecule_sdf",
         "molecular_candidate_docking_poses_pdbqt",
         "prepared_molecular_structure",
         "prepared_ligand",

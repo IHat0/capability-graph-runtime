@@ -130,7 +130,10 @@ def phase8_production_registry(
         if protein_adapters is None
         else protein_adapters
     )
+    from .scientific_construction import molecular_construction_registry
     task_registries: dict[str, ScientistCapabilityRegistry] = {
+        "molecular_construction": molecular_construction_registry(
+            store=payload_store, rdkit_adapter=rdkit, pyscf_adapter=pyscf, qiskit_adapter=qiskit),
         "structure_analysis": structure_analysis_registry(
             store=payload_store,
         ),

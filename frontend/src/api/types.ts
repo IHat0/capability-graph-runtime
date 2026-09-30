@@ -620,6 +620,16 @@ export interface ResearchVisualizationWorkspace {
   comparisons: ResearchVisualizationComparison[]
   verification_artifact_identifiers: string[]
   export_items: ResearchVisualizationExportItem[]
+  construction_summary?: {
+    name: string; formula: string; atom_count: number
+    generated_conformers: number; converged_conformers: number
+    structure_artifact_identifier: string; identity_verified: boolean
+    active_electron_count?: number; active_spatial_orbital_count?: number
+    logical_qubits?: number; hardware_status?: string
+    selected_compute?: 'classical'; computation_reason?: string
+    xyz_artifact_identifier?: string; workflow?: string[]
+    energies: Array<{ label: string; value: number; unit: string }>
+  } | null
   grounding_policy: 'persisted_artifact_or_deterministic_computation_only'
 }
 

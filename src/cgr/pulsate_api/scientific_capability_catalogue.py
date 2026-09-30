@@ -133,6 +133,7 @@ _DISCOVERY = ("protein_ligand_discovery",)
 _ANALYSIS = ("structure_analysis",)
 _PROTEIN_DESIGN = ("de_novo_protein_design",)
 _GROUND_STATE = ("molecular_ground_state_vqe",)
+_CONSTRUCTION = ("molecular_construction",)
 _GROUND_STATE_SWEEP = ("molecular_ground_state_vqe_sweep",)
 
 
@@ -140,6 +141,32 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
     """Return the production Phase 8 artifact contract catalogue."""
 
     definitions = (
+        ScientificCapabilityDefinition(
+            capability_name="scientific_verification.molecular_construction",
+            accepted_artifact_types=("molecular_identity_verification", "electronic_molecule",
+                "molecular_construction_evidence", "electronic_structure_configuration",
+                "electronic_hartree_fock_result", "computation_selection_decision"),
+            produced_artifact_types=("scientific_verification_report", "molecular_construction_execution_receipt"),
+            supported_task_types=("molecular_construction",), verification_required=True, priority=79,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="molecular.identity_construct",
+            produced_artifact_types=("molecular_structure", "electronic_molecule",
+                "molecular_construction_evidence"),
+            supported_task_types=("molecular_construction",), verification_required=True, priority=4,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="molecular.identity_verify",
+            accepted_artifact_types=("molecular_construction_evidence", "molecular_structure", "computation_selection_decision"),
+            produced_artifact_types=("molecular_identity_verification",),
+            supported_task_types=("molecular_construction",), verification_required=True, priority=6,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="electronic.computation_select",
+            accepted_artifact_types=("electronic_hartree_fock_result", "molecular_construction_evidence"),
+            produced_artifact_types=("computation_selection_decision",),
+            supported_task_types=_CONSTRUCTION, verification_required=True, priority=44,
+        ),
         ScientificCapabilityDefinition(
             capability_name="electronic.molecular_system_resolve",
             produced_artifact_types=("molecular_structure", "electronic_molecule"),
@@ -244,7 +271,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             capability_name="electronic.configuration_define",
             accepted_artifact_types=("electronic_molecule",),
             produced_artifact_types=("electronic_structure_configuration",),
-            supported_task_types=(*_TS, *_METAL, *_GROUND_STATE),
+            supported_task_types=(*_TS, *_METAL, *_GROUND_STATE, *_CONSTRUCTION),
             priority=35,
         ),
         ScientificCapabilityDefinition(
@@ -266,7 +293,7 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
                 "electronic_structure_configuration",
             ),
             produced_artifact_types=("electronic_hartree_fock_result",),
-            supported_task_types=(*_TS, *_METAL, *_GROUND_STATE),
+            supported_task_types=(*_TS, *_METAL, *_GROUND_STATE, *_CONSTRUCTION),
             priority=42,
         ),
         ScientificCapabilityDefinition(

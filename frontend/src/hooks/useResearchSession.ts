@@ -363,6 +363,34 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
     }
   }, [api, beginRequest, busy, session, visualization])
 
+  // Load persisted generated coordinates on both completion and saved-session reopen.
+  // Keep this separate from the request controller so polling cannot cancel rendering.
+  const autoSceneKey = useRef<string | null>(null)
+  useEffect(() => {
+    if (!session || !visualization || busy || session.status !== 'completed'
+      || visualization.session_identifier !== session.session_identifier
+      || visualization.revision !== session.revision) return
+    const built = visualization.construction_summary
+    if (!built?.identity_verified) return
+    const key = `${session.session_identifier}:${built.structure_artifact_identifier}`
+    if (autoSceneKey.current === key && scene) return
+    const sceneController = new AbortController()
+    setLoadingSceneArtifact(built.structure_artifact_identifier)
+    void api.getResearchScene(session.session_identifier, built.structure_artifact_identifier, sceneController.signal)
+      .then(response => {
+        if (sceneController.signal.aborted) return
+        const generated = normalizeScene(response)
+        generated.provenance = { ...generated.provenance, coordinate_source: 'generated_by_rdkit',
+          display_name: built.name, formula: built.formula }
+        autoSceneKey.current = key
+        setLoadingSceneArtifact(null)
+        setScene(applyVisualization(generated, visualization))
+      })
+      .catch(caught => { if (!sceneController.signal.aborted) setError(message(caught)) })
+      .finally(() => { if (!sceneController.signal.aborted) setLoadingSceneArtifact(null) })
+    return () => sceneController.abort()
+  }, [api, session, visualization, busy, scene])
+
   const focusCandidate = useCallback(async (candidateIdentifier: string) => {
     if (!visualization) return
     const candidate = visualization.candidates.find((item) => item.candidate_identifier === candidateIdentifier)
@@ -410,7 +438,8 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = artifactIdentifier
+      const suffix = ({ 'chemical/x-mdl-sdfile': '.sdf', 'chemical/x-xyz': '.xyz', 'application/json': '.json' } as Record<string, string>)[resource.mediaType] ?? ''
+      anchor.download = artifactIdentifier + suffix
       anchor.click()
       URL.revokeObjectURL(url)
     } catch (caught) {

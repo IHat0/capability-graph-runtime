@@ -27,7 +27,9 @@ export function sceneToMolstarStructure(scene: MolecularScene): MolstarStructure
   const sourceIndexByAtomId = new Map(scene.atoms.map((atom, index) => [atom.id, index]))
   const atomLines = scene.atoms.map((atom, index) => {
     const [x, y, z] = pointToAngstrom(atom.position, scene.coordinateUnit)
-    return `${index + 1} A${index + 1} ${numeric(x)} ${numeric(y)} ${numeric(z)} ${safeToken(atom.element)} 1 PUL`
+    // Mol* infers elements from names when MOL2 atom types have no subtype.
+    // A1/A2 erased every element, producing gray unknown atoms in the real viewer.
+    return `${index + 1} ${safeToken(atom.element)}${index + 1} ${numeric(x)} ${numeric(y)} ${numeric(z)} ${safeToken(atom.element)} 1 PUL`
   })
   const bondLines = scene.bonds.flatMap((bond, index) => {
     const left = sourceIndexByAtomId.get(bond.atomIds[0])

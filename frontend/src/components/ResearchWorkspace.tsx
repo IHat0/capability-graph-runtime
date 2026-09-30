@@ -18,6 +18,7 @@ interface ResearchWorkspaceProps {
 
 export function ResearchWorkspace({ research, inspector = false }: ResearchWorkspaceProps) {
   const session = research.session
+  const constructionComplete = Boolean(session?.scientist_result && research.visualization?.construction_summary)
   const responseNeeded = session?.status === 'awaiting_clarification' || session?.status === 'awaiting_approval'
   const acquiredApprovalNeeded = Boolean(session?.unapproved_input_artifact_identifiers.length)
   return (
@@ -25,8 +26,8 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
       <header className="research-heading">
         <div>
           <p className="section-kicker">Unified research session</p>
-          <h1>Ask Pulsate a scientific question.</h1>
-          <p>Describe your goal and any conditions you know. Pulsate will explain its assumptions and ask when a necessary detail is missing.</p>
+          <h1>{constructionComplete ? 'Research result' : 'Ask Pulsate a scientific question.'}</h1>
+          <p>{constructionComplete ? session?.conversation.find(turn => turn.role === 'scientist')?.content : 'Describe your goal and any conditions you know. Pulsate will explain its assumptions and ask when a necessary detail is missing.'}</p>
         </div>
         {session && <button className="secondary-button" type="button" onClick={research.newSession}>New question</button>}
       </header>
@@ -63,15 +64,18 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
             <span className={`research-status__dot research-status__dot--${session.status}`} />
             <div>
               <strong>{statusLabel(session.status)}</strong>
-              <p>{session.scientist_result ? (session.scientist_result.principal_result ?? 'The calculation is complete. Review the verified result below.') : session.scientist_summary}</p>
+              <p>{research.visualization?.construction_summary ? 'Generated geometry and electronic calculations are complete. Inspect the molecule and computed values below.' : session.scientist_result ? (session.scientist_result.principal_result ?? 'The calculation is complete. Review the verified result below.') : session.scientist_summary}</p>
               <small>Session {session.session_identifier} · revision {session.revision}</small>
             </div>
           </section>
 
-          {session.execution_steps && session.execution_steps.length > 0 && <ExecutionProgress steps={session.execution_steps} />}
+          {constructionComplete && <ConstructionResult research={research} />}
+          {session.execution_steps && session.execution_steps.length > 0 && (constructionComplete
+            ? <details><summary>Completed calculation record</summary><ExecutionProgress steps={session.execution_steps} /></details>
+            : <ExecutionProgress steps={session.execution_steps} />)}
           {session.status === 'failed' && <p role="alert">This calculation did not complete. Review its failed step. Its evidence and conversation are preserved.</p>}
 
-          <ol className="research-conversation">
+          <details open={!constructionComplete}><summary>Session conversation</summary><ol className="research-conversation">
             {session.conversation.map((turn) => {
               const evidenceArtifacts = session.accepted_evidence.flatMap((evidence) => (
                 evidence.supporting_quotes.some((quote) => quote.turn_identifier === turn.turn_identifier)
@@ -90,7 +94,7 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
               </li>
               )
             })}
-          </ol>
+          </ol></details>
 
           {session.intent_proposal && responseNeeded && (
             <label className="research-confirmation">
@@ -218,7 +222,9 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
             </section>
           )}
 
-          {session.scientist_result && <Result result={session.scientist_result} research={research} />}
+          {session.scientist_result && (research.visualization?.construction_summary ? <>
+            <details><summary>Scientific answer, assumptions, and methods</summary><Result result={session.scientist_result} research={research} /></details>
+          </> : <Result result={session.scientist_result} research={research} />)}
 
           {research.visualization && <DiscoveryWorkspace research={research} />}
 
@@ -420,6 +426,28 @@ function AttachmentControls({ research }: { research: ResearchSessionWorkspace }
       )}
     </div>
   )
+}
+
+function ConstructionResult({ research }: { research: ResearchSessionWorkspace }) {
+  const built = research.visualization?.construction_summary
+  if (!built) return null
+  return <article className="research-result">
+    <p className="section-kicker">Generated structure · identity {built.identity_verified ? 'verified' : 'unverified'}</p>
+    <h2>Constructed {built.name}</h2>
+    <p><strong>{built.name}</strong> · {built.formula} · {built.atom_count} atoms</p>
+    <p>Displayed coordinates generated by Pulsate. Drag to rotate; scroll to zoom.</p>
+    {!research.scene && <button type="button" onClick={() => void research.openScene(built.structure_artifact_identifier)}>Show generated molecule in 3D</button>}
+    {built.workflow && <p aria-label="Completed construction workflow">{built.workflow.join(' → ')}</p>}
+    <p>{built.converged_conformers} of {built.generated_conformers} generated geometries optimized.</p>
+    <table><thead><tr><th>Calculation</th><th>Computed value</th></tr></thead><tbody>
+      {built.energies.map(item => <tr key={item.label}><td>{item.label}</td><td>{Math.abs(item.value) < 1e-5 ? item.value.toExponential(3) : item.value.toFixed(9)} {item.unit}</td></tr>)}
+    </tbody></table>
+    {built.selected_compute === 'classical' ? <><p><strong>Classical computation was sufficient.</strong> The quantum path was not invoked.</p><details><summary>Why these computation methods?</summary><p>{built.computation_reason}</p></details></>
+      : <p>Reduced electronic benchmark: {built.active_electron_count} electrons, {built.active_spatial_orbital_count} spatial orbitals, {built.logical_qubits} qubits. IBM hardware: {statusLabel(built.hardware_status ?? 'not_prepared')}.</p>}
+    <p>The force-field and electronic energies are different observables. RHF/STO-3G is a minimal-basis gas-phase reference, not a high-accuracy energy prediction.</p>
+    <button type="button" onClick={() => void research.exportArtifact(built.structure_artifact_identifier)}>Download SDF evidence</button>
+    {built.xyz_artifact_identifier && <button type="button" onClick={() => void research.exportArtifact(built.xyz_artifact_identifier!)}>Download XYZ evidence</button>}
+  </article>
 }
 
 function Result({ result, research }: { result: NonNullable<ResearchSessionWorkspace['session']>['scientist_result']; research: ResearchSessionWorkspace }) {

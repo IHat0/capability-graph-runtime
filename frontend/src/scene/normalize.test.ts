@@ -4,6 +4,13 @@ import { currentFixtureDetail, currentFixtureScene } from '../test/fixtures'
 import { normalizeScene } from './normalize'
 
 describe('scene normalization', () => {
+  it('does not add a measurement label to every ordinary structural bond', () => {
+    const scene = normalizeScene({ ...currentFixtureScene,
+      bonds: [{ bond_identifier: 'structural-bond', atom_identifiers: ['atom-a', 'atom-b'], order: 1 }],
+    })
+    expect(scene.bonds).toHaveLength(1)
+    expect(scene.measurements).toEqual([])
+  })
   it('normalizes the current coordinate scene without identifier-specific branches', () => {
     const scene = normalizeScene(currentFixtureScene, currentFixtureDetail)
     expect(scene.atoms).toEqual([

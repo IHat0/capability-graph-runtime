@@ -393,6 +393,29 @@ class ScientistResultAssembler:
                 + ".",
                 record.evidence_artifact_identifiers,
             )
+        construction = self._read_json_evidence(record, "molecular_construction_evidence")
+        identity_check = self._read_json_evidence(record, "molecular_identity_verification")
+        classical_receipt = self._read_json_evidence(record, "molecular_construction_execution_receipt")
+        receipt = classical_receipt or self._read_json_evidence(record, "molecular_ground_state_execution_receipt")
+        if construction is not None and identity_check is not None and receipt is not None:
+            built, checked, electronic = construction[0], identity_check[0], receipt[0]
+            add("principal_result", f"Constructed {built['name']} ({built['formula']}) with {built['atom_count_including_hydrogens']} atoms including hydrogens. "
+                f"Generated {built['generated_conformers']} geometries; {built['converged_conformers']} converged. "
+                f"Selected force-field energy: {built['selected_conformer']['energy']:.6f} kcal/mol ({built['force_field']}). "
+                f"Fresh post-construction identity verification passed: {checked['passed']}. No public 3D coordinates were used.",
+                (construction[1], identity_check[1]))
+            if classical_receipt is not None:
+                add("principal_result", f"Full-molecule classical RHF/STO-3G total energy: {electronic['hartree_fock']['total_energy_hartree']:.9f} Hartree. "
+                    f"Converged in {electronic['hartree_fock']['iterations']} iterations. "
+                    + electronic['computation_selection']['reason'] + " The quantum path was not selected. "
+                    "The RHF total includes electronic and nuclear-repulsion contributions; force-field energy is a different observable.", (receipt[1],))
+            else:
+                add("principal_result", f"Full-molecule RHF total energy: {electronic['hartree_fock']['total_energy_hartree']:.9f} Hartree. "
+                f"Reduced active-space exact total: {electronic['exact']['total_energy_hartree']:.9f} Hartree; "
+                f"statevector VQE total: {electronic['vqe']['total_energy_hartree']:.9f} Hartree. "
+                f"VQE–exact difference on the same Hamiltonian: {electronic['verification']['absolute_difference_hartree']:.3g} Hartree. "
+                "These totals include inactive-orbital and nuclear contributions; the force-field energy is a different observable. "
+                    "The reduced quantum problem is not the entire molecule. No IBM hardware job has run.", (receipt[1],))
         trace = self._read_json_evidence(record, "discovery_design_loop_trace")
         if trace is not None and isinstance(trace[0], dict):
             document = trace[0]
@@ -461,7 +484,7 @@ class ScientistResultAssembler:
                 from .scientific_candidate_evidence import docking_confidence
                 for statement in docking_confidence(document):
                     add("confidence", statement, (trace_identifier,))
-        elif record.verified_scientific_summaries:
+        elif construction is None and record.verified_scientific_summaries:
             for summary in record.verified_scientific_summaries:
                 add(
                     "principal_result",

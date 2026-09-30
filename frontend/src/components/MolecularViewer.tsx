@@ -50,6 +50,7 @@ function NativeMolecularViewer({ scene, loading }: { scene: LoadedMolecularProje
 }
 
 function CoordinateMolecularViewer({ scene, loading }: { scene: MolecularScene; loading: boolean }) {
+  const generated = scene.provenance?.coordinate_source === 'generated_by_rdkit'
   const viewerRef = useRef<MolstarViewerHandle>(null)
   const [selectedAtomId, setSelectedAtomId] = useState<string | null>(null)
   const [rendering, setRendering] = useState({ loading: false, error: null as string | null })
@@ -66,8 +67,8 @@ function CoordinateMolecularViewer({ scene, loading }: { scene: MolecularScene; 
     <section className="viewer-shell" id="structure" aria-labelledby="viewer-title">
       <div className="viewer-titlebar">
         <div>
-          <span className="section-kicker">Structure</span>
-          <h1 id="viewer-title">Molecular workspace</h1>
+          <span className="section-kicker">{generated ? 'Pulsate-generated coordinates · interactive 3D' : 'Structure'}</span>
+          <h1 id="viewer-title">{generated ? `Constructed ${String(scene.provenance?.display_name ?? 'molecule')}` : 'Molecular workspace'}</h1>
         </div>
         <div className="viewer-meta">
           <span>{scene.atoms.length} atoms · {scene.bonds.length} bonds</span>

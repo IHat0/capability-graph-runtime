@@ -14,6 +14,7 @@ from cgr.science.canonical import validate_identifier
 from .natural_language import NaturalLanguageModelProvider
 
 ScientificResearchOperation = Literal[
+    "construct_molecule",
     "analyze_structure",
     "generate_protein_candidates",
     "identify_binding_regions",
@@ -30,6 +31,7 @@ ScientificResearchOperation = Literal[
 ]
 
 ScientificRequestedOutput = Literal[
+    "constructed_molecular_structure",
     "structure_analysis",
     "generated_protein_candidates",
     "binding_region_evidence",
@@ -46,6 +48,7 @@ ScientificRequestedOutput = Literal[
 ]
 
 ScientificCapabilityProfile = Literal[
+    "molecular_construction",
     "structure_analysis",
     "de_novo_protein_design",
     "covalent_transition_state",
@@ -59,6 +62,7 @@ ScientificCapabilityProfile = Literal[
 
 
 _OUTPUT_BY_OPERATION: dict[ScientificResearchOperation, ScientificRequestedOutput] = {
+    "construct_molecule": "constructed_molecular_structure",
     "analyze_structure": "structure_analysis",
     "generate_protein_candidates": "generated_protein_candidates",
     "identify_binding_regions": "binding_region_evidence",
@@ -186,7 +190,11 @@ def validate_requirement_proposal(
     operation_set = set(operations)
     del available_input_types
 
-    if operation_set == {"analyze_structure"}:
+    if operation_set == {"construct_molecule"}:
+        profile = "molecular_construction"
+        required = ["molecular_identity_verification", "molecular_construction_evidence",
+                    "molecular_construction_execution_receipt", "scientific_verification_report", "computation_selection_decision"]
+    elif operation_set == {"analyze_structure"}:
         profile: ScientificCapabilityProfile = "structure_analysis"
         required = [
             "molecular_structure_analysis",
@@ -304,6 +312,8 @@ class ProviderNeutralScientificRequirementInterpreter:
                             "dock_candidates and verify_and_rank_results. compare_structures "
                             "means a structural/conformer comparison, not candidate prioritization. "
                             "analyze_structure means an inventory or descriptor report. "
+                            "construct_molecule means computationally building the structure of a named known chemical entity. "
+                            "A request to create an existing named molecule is construct_molecule, not discovery of new identities. "
                             "identify_binding_regions means locating a binding site. "
                             "generate_candidates and design_next_generation require an explicit "
                             "request to create NEW molecular identities, not evaluate supplied ones. "

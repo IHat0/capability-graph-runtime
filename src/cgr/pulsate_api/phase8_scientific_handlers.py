@@ -2360,6 +2360,8 @@ def _materialize_ground_state_point(
     point,
     execution_identifier: str,
     producer: str,
+    geometry_origin: str = "literal_question_grounding",
+    parents: tuple[ArtifactReference, ...] = (),
 ) -> tuple[ArtifactReference, ArtifactReference]:
     """Persist one geometry and its exact electronic identity without guessing."""
 
@@ -2429,8 +2431,9 @@ def _materialize_ground_state_point(
             "system_label": specification.system_label,
             "molecular_formula": specification.molecular_formula,
             "geometry_point_identifier": point.point_identifier,
-            "evidence_kind": "literal_question_grounding",
+            "evidence_kind": geometry_origin,
         },
+        parents=parents,
     )
     electron_count = specification.electron_count
     alpha_electrons = (electron_count + specification.spin) // 2

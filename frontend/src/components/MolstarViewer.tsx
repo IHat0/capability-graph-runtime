@@ -61,12 +61,22 @@ async function loadMolstarScene(plugin: PluginContext, scene: MolecularScene, ad
   const data = await plugin.builders.data.rawData({ data: adapted.data, label: adapted.label })
   const trajectory = await plugin.builders.structure.parseTrajectory(data, adapted.format)
   if (!isCurrent()) return false
-  await plugin.builders.structure.hierarchy.applyPreset(trajectory, 'default')
+  const generated = scene.provenance?.coordinate_source === 'generated_by_rdkit'
+  await plugin.builders.structure.hierarchy.applyPreset(trajectory, 'default', generated ? { representationPreset: 'empty' } : {})
   if (!isCurrent()) return false
 
   const structureRef = plugin.managers.structure.hierarchy.current.structures[0]
   const structure = structureRef?.cell.obj?.data
   if (!structure || !structureRef) throw new Error('Mol* did not create a structure from the supplied coordinates.')
+
+  if (generated) {
+    const component = await plugin.builders.structure.tryCreateComponentStatic(structureRef.cell, 'all')
+    if (!component) throw new Error('Mol* could not create the generated molecular component.')
+    await plugin.builders.structure.representation.addRepresentation(component, {
+      type: 'ball-and-stick', typeParams: { sizeFactor: 0.25, aspectRatio: 1.5, ignoreHydrogens: false },
+      color: 'element-symbol', colorParams: { carbonColor: { name: 'element-symbol', params: {} } },
+    })
+  }
 
   for (const region of scene.regions) {
     if (!isCurrent()) return false
@@ -111,7 +121,7 @@ async function loadMolstarScene(plugin: PluginContext, scene: MolecularScene, ad
       visualParams: { textSize: 0.18, textColor: Color(0x4f4f4c) },
     })
   }
-  if (scene.atoms.length <= ATOM_LABEL_THRESHOLD) {
+  if (!generated && scene.atoms.length <= ATOM_LABEL_THRESHOLD) {
     for (const atom of scene.atoms) {
       if (!isCurrent()) return false
       const sourceIndex = adapted.sourceIndexByAtomId.get(atom.id)
@@ -139,7 +149,24 @@ async function loadMolstarScene(plugin: PluginContext, scene: MolecularScene, ad
     }
   }
   if (!isCurrent()) return false
+  // Representation creation can finish before its render objects reach the canvas.
+  // Commit before framing; signal readiness only after an actual rendered frame.
+  plugin.canvas3d?.commit(true)
   frameScene(plugin, scene, 0)
+  if (generated && plugin.canvas3d) {
+    const canvas = plugin.canvas3d
+    await new Promise<void>((resolve, reject) => {
+      const lastDraw = canvas.didDraw.value
+      const timer = setTimeout(() => { subscription.unsubscribe(); reject(new Error('The generated molecule did not finish rendering.')) }, 15_000)
+      const subscription = canvas.didDraw.subscribe(timestamp => {
+        if (timestamp === lastDraw) return
+        clearTimeout(timer)
+        subscription.unsubscribe()
+        resolve()
+      })
+      canvas.requestDraw()
+    })
+  }
   return true
 }
 

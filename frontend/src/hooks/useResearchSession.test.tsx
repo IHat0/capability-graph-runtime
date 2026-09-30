@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PulsateApi } from '../api/client'
 import type { ResearchSessionResponse } from '../api/types'
 import { useResearchSession } from './useResearchSession'
+import { currentFixtureScene } from '../test/fixtures'
 
 const awaiting: ResearchSessionResponse = {
   session_identifier: `research-session-${'a'.repeat(32)}`,
@@ -98,6 +99,39 @@ function api(): PulsateApi {
 }
 
 describe('useResearchSession', () => {
+  it.each(['completion', 'saved reopening'])('automatically opens persisted generated coordinates on %s', async (path) => {
+    const client = api()
+    const completed = { ...planned, status: 'completed' as const, revision: 3 }
+    const built = { name: 'generated fixture', formula: 'H2', atom_count: 2,
+      generated_conformers: 4, converged_conformers: 4, identity_verified: true,
+      structure_artifact_identifier: 'generated-sdf', selected_compute: 'classical' as const,
+      computation_reason: 'Classical construction is sufficient.', xyz_artifact_identifier: 'generated-xyz',
+      workflow: ['construction'], energies: [] }
+    vi.mocked(client.getResearchVisualization).mockResolvedValue({
+      schema_version: 'pulsate.research-visualization/v1', session_identifier: completed.session_identifier,
+      revision: 3, scene_identifier: null, structures: [], selections: [], interactions: [], overlays: [],
+      candidates: [], lineage: [], comparisons: [], verification_artifact_identifiers: [], export_items: [],
+      construction_summary: built, grounding_policy: 'persisted_artifact_or_deterministic_computation_only',
+    })
+    vi.mocked(client.getResearchScene).mockResolvedValue(currentFixtureScene)
+    vi.mocked(client.createResearchSession).mockResolvedValue(planned)
+    vi.mocked(client.executeResearchSession).mockResolvedValue(completed)
+    vi.mocked(client.getResearchSession).mockResolvedValue(completed)
+    const hook = renderHook(() => useResearchSession(client))
+    if (path === 'completion') {
+      act(() => hook.result.current.setQuestion('Construct the named structure.'))
+      await act(async () => hook.result.current.start())
+      await act(async () => hook.result.current.execute())
+    } else {
+      await act(async () => hook.result.current.resume(completed.session_identifier))
+    }
+    expect(client.getResearchScene).toHaveBeenCalledWith(completed.session_identifier, 'generated-sdf', expect.any(AbortSignal))
+    expect(hook.result.current.scene?.provenance?.coordinate_source).toBe('generated_by_rdkit')
+    expect(hook.result.current.scene?.atoms).toHaveLength(2)
+    hook.rerender()
+    expect(client.getResearchScene).toHaveBeenCalledTimes(1)
+    hook.unmount()
+  })
   it('accepts an intent-only confirmation without requiring filler text', async () => {
     const client = api()
     vi.mocked(client.createResearchSession).mockResolvedValue({
