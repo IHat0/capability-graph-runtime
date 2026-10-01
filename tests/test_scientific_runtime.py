@@ -121,6 +121,26 @@ def test_long_durable_answer_does_not_overflow_the_execution_summary():
     assert outcome.scientific_summary == 'Insufficient evidence.'
 
 
+def test_many_candidate_statements_retain_complete_answer():
+    objective = SimpleNamespace(input_references=(), assumptions=(), original_request='Assess supplied candidates.',
+        task_type='protein_ligand_discovery', semantic_target=SimpleNamespace(target_label='target'))
+    record = SimpleNamespace(node_executions=(), artifact_references=(), verified=True,
+        scientist_summary='summary', evidence_artifact_identifiers=(), replanning_event_identifiers=(),
+        scene_identifier=None, limitations=())
+    assembler = ScientistResultAssembler()
+    principal = 'Candidate evidence. ' * 600
+    follow_up = 'Independent follow-up required. ' * 200
+    assembler._allowed_statements = lambda *args: (
+        {'category': 'principal_result', 'text': principal, 'evidence_artifact_identifiers': []},
+        {'category': 'recommendation', 'text': follow_up, 'evidence_artifact_identifiers': []})
+    outcome = assembler.execute(invocation=None, objective=objective, record=record)
+    assert principal in outcome.scientist_result.scientific_result
+    assert follow_up in outcome.scientist_result.scientific_result
+    assert len(outcome.scientist_result.principal_result) <= 8192
+    assert len(outcome.scientist_result.recommended_next_step) <= 4096
+    assert 'complete answer' in outcome.scientist_result.principal_result
+
+
 def test_failure_after_verification_preserves_evidence_without_claiming_complete_verification(tmp_path):
     repository = ScientificExecutionRepository(tmp_path / 'executions')
     repository.start()

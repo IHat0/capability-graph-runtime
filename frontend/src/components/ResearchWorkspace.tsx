@@ -476,6 +476,19 @@ function ProspectiveResult({ research }: { research: ResearchSessionWorkspace })
       {candidate.hypotheses.length ? <ul>{candidate.hypotheses.map(h => <li key={h.metric}>{h.hypothesis} {statusLabel(h.metric)} = {h.computed_value.toFixed(3)} (screen threshold {h.screen_threshold}). {h.limitation}</li>)}</ul>
         : <p>No flags in the implemented descriptor screen. This does not establish safety.</p>}
       <details><summary>Unresolved risk dimensions</summary><ul>{candidate.unsupported_risk_dimensions.map(d => <li key={d}>{d}</li>)}</ul></details>
+      {candidate.alternative_targets && <details open><summary>Alternative-target investigation — hypotheses, not toxicity findings</summary>
+        {!candidate.alternative_targets.targets.length && <p>No defensible structural panel was obtained within the search bounds. This is missing evidence, not evidence of safety.</p>}
+        {candidate.alternative_targets.targets.map(t => <section key={t.target.uniprot_accession}>
+          <h4>UniProt {t.target.uniprot_accession} · PDB {t.target.pdb_id}</h4>
+          <p>Locally computed chemical similarity: {t.target.similarity.toFixed(3)}. Similarity nominates a hypothesis, not activity.</p>
+          {t.comparison && t.status === 'computed' ? <>
+            <p>Vina score {t.comparison.alternative_score_kcal_per_mol.toFixed(3)} kcal/mol; raw difference from intended target {t.comparison.raw_score_difference_kcal_per_mol.toFixed(3)} kcal/mol.</p>
+            <p>{t.comparison.limitation}</p>
+            <details><summary>Sourced functional follow-up hypotheses</summary><ul>{t.functional_hypotheses?.map(h => <li key={h.go_identifier}>{h.go_identifier}: {h.annotation}. {h.hypothesis} {h.limitation}</li>)}</ul></details>
+          </> : <p>Not computed: {t.reason}</p>}
+        </section>)}
+        <ul>{candidate.orthogonal_follow_up?.map(f => <li key={f}>{f}</li>)}</ul>
+      </details>}
     </section>)}
     <details><summary>Model selection, assumptions and limitations</summary>
       <p>{target.policy}</p><ul>{[...assessment.assumptions, ...target.limitations].map(t => <li key={t}>{t}</li>)}</ul>

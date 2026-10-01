@@ -552,6 +552,24 @@ class ScientistResultAssembler:
                         + hypothesis['limitation'], (identifier,), True)
                 for dimension in candidate['unsupported_risk_dimensions']:
                     add('limitation', 'Not established by this assessment: ' + dimension + '.', (identifier,), True)
+                alternative = candidate.get('alternative_targets')
+                if alternative is not None:
+                    if not alternative['targets']:
+                        add('limitation', 'No defensible alternative-target structural panel was obtained within the recorded search bounds. This is missing evidence, not a clean safety screen.', (identifier,), True)
+                    for item in alternative['targets']:
+                        target_name = item['target']['uniprot_accession']
+                        if item['status'] != 'computed':
+                            add('limitation', f'Alternative target {target_name} remains unsupported: ' + item['reason'], (identifier,), True)
+                            continue
+                        comparison = item['comparison']
+                        add('principal_result', f'Alternative-target hypothesis {target_name}: native Vina score '
+                            f"{comparison['alternative_score_kcal_per_mol']:.4f} kcal/mol; raw difference from intended target "
+                            f"{comparison['raw_score_difference_kcal_per_mol']:.4f} kcal/mol. " + comparison['limitation'], (identifier,), True)
+                        for hypothesis in item['functional_hypotheses']:
+                            add('limitation', f"Sourced annotation {hypothesis['go_identifier']} ({hypothesis['annotation']}): "
+                                + hypothesis['hypothesis'] + ' ' + hypothesis['limitation'], (identifier,), True)
+                    for follow_up in candidate.get('orthogonal_follow_up', []):
+                        add('recommendation', follow_up, (identifier,), True)
             for assumption in assessment['assumptions']:
                 add('assumption', assumption, (identifier,), True)
             add('confidence', assessment['verification_scope'], (identifier,), True)
@@ -681,6 +699,13 @@ class ScientistResultAssembler:
         principal = " ".join(texts("principal_result")) or record.scientist_summary
         confidence = texts("confidence") + texts("limitation")
         recommendation = " ".join(texts("recommendation")) or None
+        def bounded_summary(text, maximum):
+            if text is None or len(text) <= maximum:
+                return text
+            notice = ' [Summary shortened; the complete answer and all candidate evidence remain available below and in downloadable artifacts.]'
+            prefix = text[:maximum - len(notice)]
+            boundary = prefix.rfind('. ')
+            return (prefix[:boundary + 1] if boundary >= 0 else prefix) + notice
         selected_evidence = tuple(
             sorted(
                 {
@@ -711,10 +736,10 @@ class ScientistResultAssembler:
                 selected_evidence or record.evidence_artifact_identifiers
             ),
             scene_identifiers=((record.scene_identifier,) if record.scene_identifier else ()),
-            principal_result=principal,
+            principal_result=bounded_summary(principal, 8192),
             candidate_ranking=texts("ranking"),
             confidence_and_uncertainty=confidence,
-            recommended_next_step=recommendation,
+            recommended_next_step=bounded_summary(recommendation, 4096),
             synthesis_provider_kind=(
                 self.provider.provider_kind if self.provider is not None else None
             ),

@@ -645,6 +645,13 @@ export interface ResearchVisualizationWorkspace {
       intended_target: { best_vina_score_kcal_per_mol: number; limitation: string }
       hypotheses: Array<{ metric: string; computed_value: number; screen_threshold: number; hypothesis: string; limitation: string }>
       unsupported_risk_dimensions: string[]
+      alternative_targets?: { status: string; targets: Array<{
+        status: string; reason?: string
+        target: { uniprot_accession: string; pdb_id: string; similarity: number }
+        comparison?: { alternative_score_kcal_per_mol: number; raw_score_difference_kcal_per_mol: number; limitation: string }
+        functional_hypotheses?: Array<{ go_identifier: string; annotation: string; hypothesis: string; limitation: string }>
+      }> }
+      orthogonal_follow_up?: string[]
     }>
   } | null
   grounding_policy: 'persisted_artifact_or_deterministic_computation_only'

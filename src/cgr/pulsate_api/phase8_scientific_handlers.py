@@ -4942,9 +4942,11 @@ def covalent_transition_state_registry(
 class _DiscoveryArtifactBridge:
     """Expose scientist artifacts through the Phase 7 pointer-only store contract."""
 
-    def __init__(self, store: ScientificPayloadStore) -> None:
+    def __init__(self, store: ScientificPayloadStore, *, producer="discovery.campaign_iterate",
+                 execution_identifier="discovery-campaign-component", parents=()) -> None:
         self.runner = _NativeRunner(store)
         self.references: dict[tuple[str, str], ArtifactReference] = {}
+        self.producer, self.execution_identifier, self.parents = producer, execution_identifier, parents
 
     def register(self, reference: ArtifactReference) -> ArtifactPointer:
         self.references[(reference.artifact_identifier, reference.content_sha256)] = reference
@@ -4959,8 +4961,9 @@ class _DiscoveryArtifactBridge:
                 else f"application/vnd.pulsate.{artifact_type.replace('_', '-')}+json"
             ),
             payload=payload,
-            producer="discovery.campaign_iterate",
-            execution_identifier="discovery-campaign-component",
+            producer=self.producer,
+            execution_identifier=self.execution_identifier,
+            parents=self.parents,
         )
         return self.register(reference)
 
@@ -6230,7 +6233,11 @@ def protein_ligand_discovery_registry(
 ) -> ScientistCapabilityRegistry:
     bridge = _DiscoveryArtifactBridge(store)
     from .scientific_prospective import ProspectiveAssessmentHandler
+    from .scientific_off_targets import OffTargetHypothesisHandler, OffTargetScreeningHandler, OffTargetVerificationHandler
     registry = ScientistCapabilityRegistry({
+        "discovery.off_target_hypothesize": OffTargetHypothesisHandler(store),
+        "discovery.off_target_screen": OffTargetScreeningHandler(store, meeko_adapter),
+        "discovery.off_target_verify": OffTargetVerificationHandler(store),
         "discovery.prospective_assess": ProspectiveAssessmentHandler(store),
         "molecular.structure_ingestion": DiscoveryProteinIngestionHandler(store),
         "molecular.force_field_select": TSForceFieldSelectionHandler(store),

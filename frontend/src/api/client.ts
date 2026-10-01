@@ -511,6 +511,21 @@ function parseResearchSession(value: unknown): ResearchSessionResponse {
   return value as unknown as ResearchSessionResponse
 }
 
+function validAlternativeTargets(value: unknown): boolean {
+  if (value === undefined) return true // Older frozen sessions remain readable.
+  if (!isRecord(value) || !hasString(value, 'status') || !Array.isArray(value.targets)) return false
+  return value.targets.every(t => {
+    if (!isRecord(t) || !['computed', 'unsupported'].includes(String(t.status)) || !isRecord(t.target)
+      || !hasString(t.target, 'uniprot_accession') || !hasString(t.target, 'pdb_id')
+      || !isFiniteNumber(t.target.similarity)) return false
+    if (t.status === 'unsupported') return hasString(t, 'reason')
+    return isRecord(t.comparison) && isFiniteNumber(t.comparison.alternative_score_kcal_per_mol)
+      && isFiniteNumber(t.comparison.raw_score_difference_kcal_per_mol) && hasString(t.comparison, 'limitation')
+      && Array.isArray(t.functional_hypotheses) && t.functional_hypotheses.every(h => isRecord(h)
+        && ['go_identifier', 'annotation', 'hypothesis', 'limitation'].every(k => hasString(h, k)))
+  })
+}
+
 function parseResearchVisualization(value: unknown): ResearchVisualizationWorkspace {
   if (!isRecord(value)
     || value.schema_version !== 'pulsate.research-visualization/v1'
@@ -614,7 +629,9 @@ function parseResearchVisualization(value: unknown): ResearchVisualizationWorksp
       && hasString(c, 'recommendation') && hasString(c, 'reason') && isRecord(c.identity) && isRecord(c.properties)
       && Object.values(c.properties).every(isFiniteNumber) && isRecord(c.intended_target)
       && isFiniteNumber(c.intended_target.best_vina_score_kcal_per_mol) && hasString(c.intended_target, 'limitation')
-      && Array.isArray(c.hypotheses) && Array.isArray(c.unsupported_risk_dimensions))
+      && Array.isArray(c.hypotheses) && Array.isArray(c.unsupported_risk_dimensions)
+      && validAlternativeTargets(c.alternative_targets)
+      && (c.orthogonal_follow_up === undefined || isStringArray(c.orthogonal_follow_up)))
   )) malformed('The backend returned malformed prospective assessment evidence.')
   if (construction !== undefined && construction !== null && (
     !isRecord(construction)

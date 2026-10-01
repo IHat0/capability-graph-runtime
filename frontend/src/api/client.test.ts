@@ -8,6 +8,39 @@ function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } })
 }
 
+describe('prospective alternative-target evidence parsing', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  function workspace(targets: unknown[]) {
+    return { schema_version: 'pulsate.research-visualization/v1', session_identifier: 'session-test', revision: 1,
+      scene_identifier: null, structures: [], selections: [], interactions: [], overlays: [], candidates: [], lineage: [],
+      comparisons: [], verification_artifact_identifiers: [], export_items: [],
+      grounding_policy: 'persisted_artifact_or_deterministic_computation_only',
+      prospective_assessment: { assessment_artifact_identifier: 'assessment-test', assessment_sha256: 'a'.repeat(64),
+        verification_scope: 'integrity only', assumptions: [], blinding_limitations: [], source_audit: [],
+        computation_selection: { reason: 'classical', selected_compute: 'classical', quantum_selected: false },
+        target_selection: { selected: {} }, candidates: [{ candidate_identifier: 'candidate-A', name: 'compound-A',
+          recommendation: 'insufficient_evidence', reason: 'limited evidence', identity: {}, properties: {},
+          intended_target: { best_vina_score_kcal_per_mol: -7, limitation: 'not affinity' }, hypotheses: [], unsupported_risk_dimensions: [],
+          alternative_targets: { status: 'computed', targets } }] } }
+  }
+  it('retains computed and explicitly unsupported targets without inventing activity', async () => {
+    const targets = [
+      { status: 'computed', target: { uniprot_accession: 'Q00001', pdb_id: 'AAAA', similarity: .9 },
+        comparison: { alternative_score_kcal_per_mol: -8, raw_score_difference_kcal_per_mol: -1, limitation: 'not affinity or toxicity' }, functional_hypotheses: [] },
+      { status: 'unsupported', reason: 'missing engine', target: { uniprot_accession: 'Q00002', pdb_id: 'BBBB', similarity: .8 } },
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(workspace(targets))))
+    const result = await pulsateApi.getResearchVisualization('session-test')
+    expect(result.prospective_assessment?.candidates[0].alternative_targets?.targets).toEqual(targets)
+  })
+  it('rejects a claimed computed target without a numerical receipt comparison', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(workspace([
+      { status: 'computed', target: { uniprot_accession: 'Q00001', pdb_id: 'AAAA', similarity: .9 } },
+    ]))))
+    await expect(pulsateApi.getResearchVisualization('session-test')).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
 describe('Pulsate API client failure handling', () => {
   afterEach(() => vi.unstubAllGlobals())
 

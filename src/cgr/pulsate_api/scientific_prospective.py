@@ -58,12 +58,22 @@ class ProspectiveAssessmentHandler:
         references = {r.artifact_identifier: r for r in record.artifact_references}
         def typed(kind):
             return next(r for r in references.values() if r.artifact_type == kind)
-        trace_ref, pocket_ref, verifier_ref = (typed(k) for k in
-            ('discovery_design_loop_trace', 'binding_pocket', 'scientific_verification_report'))
+        trace_ref, pocket_ref, verifier_ref, off_target_ref = (typed(k) for k in
+            ('discovery_design_loop_trace', 'binding_pocket', 'scientific_verification_report', 'prospective_off_target_screen'))
+        off_targets = json.loads(store.read(off_target_ref))
+        off_verifier_ref = typed('prospective_off_target_verification')
+        off_verifier = json.loads(store.read(off_verifier_ref))
+        if off_verifier.get('passed') is not True or off_verifier.get('screening_report_sha256') != off_target_ref.content_sha256:
+            raise ScientificCapabilityFailure('prospective_off_target_invalid', 'Alternative-target assessment requires independent receipt verification.')
         trace, pocket = (json.loads(store.read(r)) for r in (trace_ref, pocket_ref))
         if not record.verified or not trace.get('loop_complete'):
             raise ScientificCapabilityFailure('prospective_unverified', 'Prospective assessment requires blocking screening verification.')
-        source_audit, assessment_candidates, parents = [], [], [trace_ref, pocket_ref, verifier_ref]
+        source_audit, assessment_candidates, parents = [], [], [trace_ref, pocket_ref, verifier_ref, off_target_ref, off_verifier_ref]
+        if (off_targets.get('verification', {}).get('passed') is not True or
+                sorted(c['candidate_identifier'] for c in off_targets['candidates']) !=
+                sorted(c['candidate_identifier'] for c in trace['candidates'])):
+            raise ScientificCapabilityFailure('prospective_off_target_invalid', 'Alternative-target report must account for every verified candidate.')
+        source_audit.extend(off_targets.get('source_audit', []))
         for r in references.values():
             url = r.metadata.get('acquisition_source_url')
             if url:
@@ -106,6 +116,7 @@ class ProspectiveAssessmentHandler:
                 parents.append(r)
             parents.extend((descriptor_ref, docking_ref))
             hypotheses = property_hypotheses(properties)
+            alternative = next(c for c in off_targets['candidates'] if c['candidate_identifier'] == candidate['candidate_identifier'])
             assessment_candidates.append({'candidate_identifier': candidate['candidate_identifier'],
                 'name': candidate['display_name'], 'identity': identity,
                 'properties': properties, 'property_method': 'RDKit graph descriptors', 'rdkit_version': rdBase.rdkitVersion,
@@ -117,14 +128,19 @@ class ProspectiveAssessmentHandler:
                 'hypotheses': hypotheses, 'unsupported_risk_dimensions': [
                     'Measured solubility, exposure, metabolism and pharmacokinetics',
                     'Validated toxicity or organ-level safety predictions',
-                    'Alternative-target selectivity (no nominated panel or validated safety model)',
+                    'Calibrated alternative-target selectivity and experimentally confirmed perturbation (bounded structural screening is not a safety model)',
                     'Functional intended-target inhibition and efficacy',
                     'Receptor/conformer/protonation ensembles and higher-fidelity binding free energies'],
                 'recommendation': 'insufficient_evidence',
                 'reason': 'Intended-target docking and descriptors alone cannot establish candidate-level viability. ' +
                     ('Computed property flags warrant targeted follow-up, not a clinical conclusion.' if hypotheses else
                      'Absence of descriptor flags is not evidence of safety.'),
-                'evidence_artifact_identifiers': [descriptor_ref.artifact_identifier, docking_ref.artifact_identifier]})
+                'alternative_targets': alternative,
+                'orthogonal_follow_up': [
+                    'A target-specific functional or binding assay is needed for each supported interaction hypothesis; docking does not determine inhibition.',
+                    'Receptor/protonation ensembles and an independently justified free-energy method are needed before treating raw cross-target score differences as selectivity.',
+                    'No electronic difficulty was established by docking or descriptors; neither triggers quantum computation.'],
+                'evidence_artifact_identifiers': [descriptor_ref.artifact_identifier, docking_ref.artifact_identifier, off_target_ref.artifact_identifier]})
         selection = pocket.get('target_selection_evidence') or {}
         source_audit.extend(dict(s, **{'class': 'foundational identity/sequence/structure metadata'}) for s in selection.get('sources', []))
         document = {'schema': 'pulsate.prospective-assessment/v1', 'created_at': datetime.now(UTC).isoformat(),
