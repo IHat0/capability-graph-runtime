@@ -941,16 +941,24 @@ class ProviderNeutralScientificEvidenceInterpreter:
         if self.provider is None or not turns:
             return ()
         try:
-            parsed = json.loads(self.provider.complete([
+            messages = [
                 {"role": "system", "content": (
-                    'Extract entities from the research question. Return exactly '
+                    'You are a literal role extraction parser, not a scientific answerer. Extract entities from the research question. Return exactly '
                     '{"protein_names": ["literal target names"], "ligand_names": ["literal compound names"]}. '
                     'Separate the protein target from compounds evaluated against it. Include ALL named compounds. '
                     'Use literal substrings only, no synonyms or identifiers. Use empty arrays when no name is given. '
                     'Do not include PDB accession codes as protein names.'
+                    'A drug candidate is a compound, and its intended target is the protein named in the request. '
+                    'In a request to investigate a compound as a target drug candidate, retain BOTH roles: compound in ligand_names, target in protein_names. '
+                    'Abbreviated target names are still names; do not omit them or expand them. Never classify the candidate compound as the target.'
                 )},
                 {"role": "user", "content": "\n".join(turn.content for turn in turns)},
-            ]))
+            ]
+            structured = getattr(self.provider, 'complete_structured', None)
+            schema = {'type': 'object', 'properties': {key: {'type': 'array', 'items': {'type': 'string'}}
+                for key in ('protein_names', 'ligand_names')},
+                'required': ['protein_names', 'ligand_names'], 'additionalProperties': False}
+            parsed = json.loads(structured(messages, schema) if structured else self.provider.complete(messages))
             if not isinstance(parsed, dict) or set(parsed) != {"protein_names", "ligand_names"}:
                 return ()
             result = []

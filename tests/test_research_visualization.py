@@ -304,3 +304,16 @@ def test_constructed_result_keeps_unlike_energies_separate_and_links_generated_s
         assert 'hardware_status' not in result
     else:
         assert result['hardware_status'] == 'backend_preparation_pending'
+
+
+def test_prospective_cards_are_projected_from_the_exact_persisted_assessment():
+    document = {'schema': 'pulsate.prospective-assessment/v1',
+        'candidates': [{'name': 'compound fixture', 'recommendation': 'insufficient_evidence'}],
+        'verification_scope': 'Integrity only.'}
+    payload = json.dumps(document).encode()
+    reference = _reference('prospective_candidate_assessment', payload)
+    workspace = build_research_visualization(session=_session(reference), store=_Store({reference.artifact_identifier: payload}),
+                                             artifact_references=(reference,))
+    assert workspace['prospective_assessment'] == dict(document, assessment_artifact_identifier=reference.artifact_identifier,
+                                                       assessment_sha256=reference.content_sha256)
+    assert workspace['construction_summary'] is None

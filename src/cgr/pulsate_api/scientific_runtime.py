@@ -358,6 +358,7 @@ class ScientistResultAssembler:
             category: str,
             text: str,
             evidence: tuple[str, ...] = (),
+            mandatory: bool = False,
         ) -> None:
             statements.append(
                 {
@@ -365,6 +366,7 @@ class ScientistResultAssembler:
                     "category": category,
                     "text": text,
                     "evidence_artifact_identifiers": list(evidence),
+                    "mandatory": mandatory,
                 }
             )
 
@@ -534,6 +536,29 @@ class ScientistResultAssembler:
                 f"The {len(record.evidence_artifact_identifiers)} supporting evidence artifacts are retained for inspection and download.",
                 record.evidence_artifact_identifiers,
             )
+        prospective = self._read_json_evidence(record, "prospective_candidate_assessment")
+        if prospective is not None:
+            assessment, identifier = prospective
+            for candidate in assessment['candidates']:
+                target = candidate['intended_target']
+                add('principal_result', f"Prospective assessment of {candidate['name']}: {candidate['recommendation'].replace('_', ' ')}. "
+                    + candidate['reason'] + f" Intended-target Vina score: {target['best_vina_score_kcal_per_mol']:.4f} kcal/mol. "
+                    + target['limitation'], (identifier,), True)
+                add('principal_result', 'Computed properties: ' + '; '.join(f'{k.replace("_", " ")} = {v}'
+                    for k, v in candidate['properties'].items()) + '. These are graph descriptors, not measured ADMET.', (identifier,), True)
+                for hypothesis in candidate['hypotheses']:
+                    add('limitation', f"Derived screening hypothesis: {hypothesis['hypothesis']} "
+                        f"{hypothesis['metric']} = {hypothesis['computed_value']} exceeds the generic screen threshold {hypothesis['screen_threshold']}. "
+                        + hypothesis['limitation'], (identifier,), True)
+                for dimension in candidate['unsupported_risk_dimensions']:
+                    add('limitation', 'Not established by this assessment: ' + dimension + '.', (identifier,), True)
+            for assumption in assessment['assumptions']:
+                add('assumption', assumption, (identifier,), True)
+            add('confidence', assessment['verification_scope'], (identifier,), True)
+            add('methods', assessment['computation_selection']['reason'], (identifier,), True)
+            add('recommendation', 'Do not advance or reject on docking alone. Prioritize measured solubility/exposure and functional target assays; '
+                'use an independently justified selectivity/safety panel and ensemble binding calculations before a candidate-level decision.', (identifier,), True)
+            return tuple(statements)
         add(
             "recommendation",
             (
@@ -609,7 +634,7 @@ class ScientistResultAssembler:
             if not required.issubset(categories):
                 return allowed
             mandatory = {item["statement_identifier"] for item in allowed
-                         if item["category"] in {"ranking", "limitation", "confidence"}}
+                         if item["category"] in {"ranking", "limitation", "confidence"} or item.get("mandatory")}
             if not mandatory.issubset(set(identifiers)):
                 return allowed
             return selected
@@ -672,7 +697,7 @@ class ScientistResultAssembler:
             ),
             structures_and_entities=entities,
             methods=methods,
-            assumptions=objective.assumptions,
+            assumptions=tuple(dict.fromkeys((*objective.assumptions, *texts('assumption')))),
             scientific_result=" ".join(
                 str(item["text"]) for item in selected
             ),
@@ -699,7 +724,9 @@ class ScientistResultAssembler:
         )
         return ScientificCapabilityOutcome(
             scientist_result=result,
-            scientific_summary=result.scientific_result,
+            # The durable answer retains all evidence-backed statements; the
+            # short execution summary is a separate bounded UI/status field.
+            scientific_summary=(result.principal_result or result.scientific_result)[:8192],
             verified=record.verified,
         )
 
@@ -874,6 +901,11 @@ class ScientificObjectiveRuntime:
                     self._replace_record(
                         current,
                         status="failed",
+                        verified=False,
+                        verified_scientific_summaries=(),
+                        pending_scientific_summaries=tuple(dict.fromkeys((*current.pending_scientific_summaries,
+                            *current.verified_scientific_summaries))),
+                        scientist_result=None,
                         scientist_summary="Scientific workflow execution failed safely.",
                         limitations=(*current.limitations, str(error)[:1024]),
                     )
@@ -894,6 +926,11 @@ class ScientificObjectiveRuntime:
             return self._replace_record(
                 current,
                 status="failed",
+                verified=False,
+                verified_scientific_summaries=(),
+                pending_scientific_summaries=tuple(dict.fromkeys((*current.pending_scientific_summaries,
+                    *current.verified_scientific_summaries))),
+                scientist_result=None,
                 workflow_snapshot_fingerprint=snapshot.snapshot_fingerprint,
                 scientist_summary="Scientific workflow did not reach a successful terminal state.",
             )

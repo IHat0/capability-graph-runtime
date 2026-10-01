@@ -19,6 +19,8 @@ interface ResearchWorkspaceProps {
 export function ResearchWorkspace({ research, inspector = false }: ResearchWorkspaceProps) {
   const session = research.session
   const constructionComplete = Boolean(session?.scientist_result && research.visualization?.construction_summary)
+  const assessmentComplete = Boolean(session?.scientist_result && research.visualization?.prospective_assessment)
+  const compactResult = constructionComplete || assessmentComplete
   const responseNeeded = session?.status === 'awaiting_clarification' || session?.status === 'awaiting_approval'
   const acquiredApprovalNeeded = Boolean(session?.unapproved_input_artifact_identifiers.length)
   return (
@@ -26,8 +28,8 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
       <header className="research-heading">
         <div>
           <p className="section-kicker">Unified research session</p>
-          <h1>{constructionComplete ? 'Research result' : 'Ask Pulsate a scientific question.'}</h1>
-          <p>{constructionComplete ? session?.conversation.find(turn => turn.role === 'scientist')?.content : 'Describe your goal and any conditions you know. Pulsate will explain its assumptions and ask when a necessary detail is missing.'}</p>
+          <h1>{compactResult ? 'Research result' : 'Ask Pulsate a scientific question.'}</h1>
+          <p>{compactResult ? session?.conversation.find(turn => turn.role === 'scientist')?.content : 'Describe your goal and any conditions you know. Pulsate will explain its assumptions and ask when a necessary detail is missing.'}</p>
         </div>
         {session && <button className="secondary-button" type="button" onClick={research.newSession}>New question</button>}
       </header>
@@ -64,18 +66,19 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
             <span className={`research-status__dot research-status__dot--${session.status}`} />
             <div>
               <strong>{statusLabel(session.status)}</strong>
-              <p>{research.visualization?.construction_summary ? 'Generated geometry and electronic calculations are complete. Inspect the molecule and computed values below.' : session.scientist_result ? (session.scientist_result.principal_result ?? 'The calculation is complete. Review the verified result below.') : session.scientist_summary}</p>
+              <p>{assessmentComplete ? 'Prospective computational assessment complete. Screening evidence is not proof of efficacy or safety.' : research.visualization?.construction_summary ? 'Generated geometry and electronic calculations are complete. Inspect the molecule and computed values below.' : session.scientist_result ? (session.scientist_result.principal_result ?? 'The calculation is complete. Review the verified result below.') : session.scientist_summary}</p>
               <small>Session {session.session_identifier} · revision {session.revision}</small>
             </div>
           </section>
 
           {constructionComplete && <ConstructionResult research={research} />}
-          {session.execution_steps && session.execution_steps.length > 0 && (constructionComplete
+          {assessmentComplete && <ProspectiveResult research={research} />}
+          {session.execution_steps && session.execution_steps.length > 0 && (compactResult
             ? <details><summary>Completed calculation record</summary><ExecutionProgress steps={session.execution_steps} /></details>
             : <ExecutionProgress steps={session.execution_steps} />)}
           {session.status === 'failed' && <p role="alert">This calculation did not complete. Review its failed step. Its evidence and conversation are preserved.</p>}
 
-          <details open={!constructionComplete}><summary>Session conversation</summary><ol className="research-conversation">
+          <details open={!compactResult}><summary>Session conversation</summary><ol className="research-conversation">
             {session.conversation.map((turn) => {
               const evidenceArtifacts = session.accepted_evidence.flatMap((evidence) => (
                 evidence.supporting_quotes.some((quote) => quote.turn_identifier === turn.turn_identifier)
@@ -222,7 +225,7 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
             </section>
           )}
 
-          {session.scientist_result && (research.visualization?.construction_summary ? <>
+          {session.scientist_result && (compactResult ? <>
             <details><summary>Scientific answer, assumptions, and methods</summary><Result result={session.scientist_result} research={research} /></details>
           </> : <Result result={session.scientist_result} research={research} />)}
 
@@ -447,6 +450,46 @@ function ConstructionResult({ research }: { research: ResearchSessionWorkspace }
     <p>The force-field and electronic energies are different observables. RHF/STO-3G is a minimal-basis gas-phase reference, not a high-accuracy energy prediction.</p>
     <button type="button" onClick={() => void research.exportArtifact(built.structure_artifact_identifier)}>Download SDF evidence</button>
     {built.xyz_artifact_identifier && <button type="button" onClick={() => void research.exportArtifact(built.xyz_artifact_identifier!)}>Download XYZ evidence</button>}
+  </article>
+}
+
+function ProspectiveResult({ research }: { research: ResearchSessionWorkspace }) {
+  const assessment = research.visualization?.prospective_assessment
+  if (!assessment) return null
+  const target = assessment.target_selection
+  return <article className="research-result prospective-result">
+    <p className="section-kicker">Prospective assessment · computed evidence only</p>
+    <h2>Candidate investigation</h2>
+    <p>Intended target: {target.domain.description} · UniProt {target.uniprot_accession}</p>
+    <p>Experimental model: PDB {target.selected.pdb_id}, chain {target.selected.chain}, {target.selected.resolution_angstrom} Å.</p>
+    {assessment.candidates.map(candidate => <section key={candidate.candidate_identifier}>
+      <h3>{candidate.name}</h3>
+      <p><strong>Overall: {statusLabel(candidate.recommendation)}</strong></p><p>{candidate.reason}</p>
+      <p><strong>Intended-target screening:</strong> Vina {candidate.intended_target.best_vina_score_kcal_per_mol.toFixed(3)} kcal/mol.</p>
+      <p>{candidate.intended_target.limitation}</p>
+      <button type="button" onClick={() => void research.focusCandidate(candidate.candidate_identifier)}>Inspect candidate and target in 3D</button>
+      <details><summary>Computed molecular properties and identity</summary>
+        <p>PubChem {candidate.identity.pubchem_cid ?? 'not independently checked'} · {candidate.identity.standard_inchikey}</p>
+        <table><thead><tr><th>Graph descriptor</th><th>Computed value</th></tr></thead><tbody>{Object.entries(candidate.properties).map(([key, value]) => <tr key={key}><td>{statusLabel(key)}</td><td>{value.toFixed(3)}</td></tr>)}</tbody></table>
+      </details>
+      <h4>Liabilities to investigate — hypotheses, not findings</h4>
+      {candidate.hypotheses.length ? <ul>{candidate.hypotheses.map(h => <li key={h.metric}>{h.hypothesis} {statusLabel(h.metric)} = {h.computed_value.toFixed(3)} (screen threshold {h.screen_threshold}). {h.limitation}</li>)}</ul>
+        : <p>No flags in the implemented descriptor screen. This does not establish safety.</p>}
+      <details><summary>Unresolved risk dimensions</summary><ul>{candidate.unsupported_risk_dimensions.map(d => <li key={d}>{d}</li>)}</ul></details>
+    </section>)}
+    <details><summary>Model selection, assumptions and limitations</summary>
+      <p>{target.policy}</p><ul>{[...assessment.assumptions, ...target.limitations].map(t => <li key={t}>{t}</li>)}</ul>
+      <p>Deposited mutation records: {target.selected.mutation_records.join('; ') || 'none declared'}.</p>
+      <p>Deposited missing residue/atom records: {target.selected.missing_records.join('; ') || 'none declared'}.</p>
+    </details>
+    <p><strong>Classical computation selected; quantum not invoked.</strong> {assessment.computation_selection.reason}</p>
+    <p>{assessment.verification_scope}</p>
+    <details><summary>Foundational source audit and blinding limits</summary>
+      <ul>{assessment.source_audit.map((s, i) => <li key={i}>{s.class}: <a href={s.url} target="_blank" rel="noreferrer">source record</a> · SHA-256 {s.sha256}</li>)}</ul>
+      {assessment.blinding_limitations.map(t => <p key={t}>{t}</p>)}
+    </details>
+    <p>Assessment SHA-256: {assessment.assessment_sha256}</p>
+    <button type="button" onClick={() => void research.exportArtifact(assessment.assessment_artifact_identifier)}>Download prospective assessment evidence</button>
   </article>
 }
 

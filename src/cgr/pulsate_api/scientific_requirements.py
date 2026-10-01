@@ -14,6 +14,7 @@ from cgr.science.canonical import validate_identifier
 from .natural_language import NaturalLanguageModelProvider
 
 ScientificResearchOperation = Literal[
+    "assess_drug_candidate",
     "construct_molecule",
     "analyze_structure",
     "generate_protein_candidates",
@@ -31,6 +32,7 @@ ScientificResearchOperation = Literal[
 ]
 
 ScientificRequestedOutput = Literal[
+    "prospective_candidate_assessment",
     "constructed_molecular_structure",
     "structure_analysis",
     "generated_protein_candidates",
@@ -62,6 +64,7 @@ ScientificCapabilityProfile = Literal[
 
 
 _OUTPUT_BY_OPERATION: dict[ScientificResearchOperation, ScientificRequestedOutput] = {
+    "assess_drug_candidate": "prospective_candidate_assessment",
     "construct_molecule": "constructed_molecular_structure",
     "analyze_structure": "structure_analysis",
     "generate_protein_candidates": "generated_protein_candidates",
@@ -80,6 +83,7 @@ _OUTPUT_BY_OPERATION: dict[ScientificResearchOperation, ScientificRequestedOutpu
 
 _DISCOVERY_OPERATIONS = frozenset(
     {
+        "assess_drug_candidate",
         "identify_binding_regions",
         "generate_candidates",
         "dock_candidates",
@@ -244,6 +248,8 @@ def validate_requirement_proposal(
             required.append("binding_pocket")
         if "verify_and_rank_results" in operation_set:
             required.append("scientific_verification_report")
+        if "assess_drug_candidate" in operation_set:
+            required.append("prospective_candidate_assessment")
     else:
         raise ValueError(
             "No registered composition produces all requested outputs for these operations: "
@@ -312,6 +318,9 @@ class ProviderNeutralScientificRequirementInterpreter:
                             "dock_candidates and verify_and_rank_results. compare_structures "
                             "means a structural/conformer comparison, not candidate prioritization. "
                             "analyze_structure means an inventory or descriptor report. "
+                            "assess_drug_candidate means investigating an existing compound as a drug candidate for an intended target. "
+                            "It requests an evidence-grounded prospective assessment, not molecular construction alone. "
+                            "The capability system supplies screening and properties as prerequisites; do not invent safety or efficacy. "
                             "construct_molecule means computationally building the structure of a named known chemical entity. "
                             "A request to create an existing named molecule is construct_molecule, not discovery of new identities. "
                             "identify_binding_regions means locating a binding site. "
@@ -408,6 +417,7 @@ class ProviderNeutralScientificRequirementInterpreter:
                 "Return the requirements object. Do not list setup steps."
                 " Choosing an existing public experimental structure is input selection, NOT creating candidates and NOT comparing conformers."
                 " Comparing named compounds against a target requests docking and ranking; it does not request new molecular identities."
+                " Investigating or assessing an existing compound as a drug candidate requests assess_drug_candidate, not construct_molecule."
                 " A conditional request for clarification is not an additional scientific operation."
             )},
         ]

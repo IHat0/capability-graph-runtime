@@ -371,16 +371,24 @@ export function useResearchSession(api: PulsateApi = pulsateApi) {
       || visualization.session_identifier !== session.session_identifier
       || visualization.revision !== session.revision) return
     const built = visualization.construction_summary
-    if (!built?.identity_verified) return
-    const key = `${session.session_identifier}:${built.structure_artifact_identifier}`
+    const assessment = visualization.prospective_assessment
+    const candidateIdentifier = assessment?.candidates[0]?.candidate_identifier
+    const pose = candidateIdentifier ? visualization.structures.find(s => s.candidate_identifier === candidateIdentifier && s.artifact_type.includes('docking_poses')) : undefined
+    const protein = pose ? visualization.structures.find(s => s.role === 'protein') : undefined
+    const artifactIdentifier = built?.identity_verified ? built.structure_artifact_identifier : protein?.artifact_identifier
+    if (!artifactIdentifier) return
+    const key = `${session.session_identifier}:${artifactIdentifier}`
     if (autoSceneKey.current === key && scene) return
     const sceneController = new AbortController()
-    setLoadingSceneArtifact(built.structure_artifact_identifier)
-    void api.getResearchScene(session.session_identifier, built.structure_artifact_identifier, sceneController.signal)
+    setLoadingSceneArtifact(artifactIdentifier)
+    const response = built?.identity_verified
+      ? api.getResearchScene(session.session_identifier, artifactIdentifier, sceneController.signal)
+      : api.getResearchComplexScene(session.session_identifier, artifactIdentifier, pose?.artifact_identifier, sceneController.signal)
+    void response
       .then(response => {
         if (sceneController.signal.aborted) return
         const generated = normalizeScene(response)
-        generated.provenance = { ...generated.provenance, coordinate_source: 'generated_by_rdkit',
+        if (built?.identity_verified) generated.provenance = { ...generated.provenance, coordinate_source: 'generated_by_rdkit',
           display_name: built.name, formula: built.formula }
         autoSceneKey.current = key
         setLoadingSceneArtifact(null)

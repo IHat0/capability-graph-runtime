@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 
 from cgr.kernel.contracts import CapabilityVersion
 from cgr.pulsate_api.scientific_executions import (
@@ -103,6 +104,52 @@ class ComputationThenVerificationSummaryHandler(EvidenceHandler):
         return outcome.model_copy(
             update={"scientific_summary": "The persisted computation produced result R."}
         )
+
+
+def test_long_durable_answer_does_not_overflow_the_execution_summary():
+    objective = SimpleNamespace(input_references=(), assumptions=(), original_request='Assess a supplied candidate.',
+        task_type='protein_ligand_discovery', semantic_target=SimpleNamespace(target_label='target'))
+    record = SimpleNamespace(artifact_references=(), node_executions=(), verified=True,
+        replanning_event_identifiers=(), evidence_artifact_identifiers=(), scene_identifier=None,
+        scientist_summary='Complete.', limitations=())
+    assembler = ScientistResultAssembler()
+    assembler._allowed_statements = lambda *args: (
+        {'statement_identifier': 'short', 'category': 'principal_result', 'text': 'Insufficient evidence.', 'evidence_artifact_identifiers': []},
+        {'statement_identifier': 'detail', 'category': 'limitation', 'text': 'Evidence limitation. ' * 500, 'evidence_artifact_identifiers': []},)
+    outcome = assembler.execute(invocation=None, objective=objective, record=record)
+    assert len(outcome.scientist_result.scientific_result) > 8192
+    assert outcome.scientific_summary == 'Insufficient evidence.'
+
+
+def test_failure_after_verification_preserves_evidence_without_claiming_complete_verification(tmp_path):
+    repository = ScientificExecutionRepository(tmp_path / 'executions')
+    repository.start()
+    version = CapabilityVersion(major=1, minor=0, patch=0)
+    artifact = ArtifactReference(artifact_identifier='molecule-artifact', schema_version=version,
+        artifact_type='molecular_structure', media_type='chemical/x-mdl-molfile', content_sha256='a' * 64,
+        provenance=CreationProvenance(producer='test.fixture', producer_version=version))
+    record = repository.create(ScientificObjectiveCompileRequest(
+        question='Which conformer is preferred in water: the axial or equatorial form?',
+        input_references=(ScientificInputReference(reference_identifier='molecule-input',
+            artifact_type='molecular_structure', artifact_identifier=artifact.artifact_identifier),), artifact_references=(artifact,)))
+    handler = EvidenceHandler()
+    registry = ScientistCapabilityRegistry({s.capability_name: handler for s in record.plan.steps
+                                           if s.capability_name not in {'scientist.result_assemble', 'molecular.scene_project'}})
+    class FailedScene:
+        def execute(self, **kwargs):
+            raise ScientificCapabilityFailure('scene_failed', 'Post-verification scene failed.')
+    registry.register('molecular.scene_project', FailedScene())
+    runtime = ScientificObjectiveRuntime(root=tmp_path / 'workflow', execution_repository=repository, capability_registry=registry)
+    runtime.start()
+    try:
+        failed = runtime.execute(record.execution_identifier)
+        assert failed.status == 'failed' and not failed.verified
+        assert failed.evidence_artifact_identifiers
+        assert failed.scientist_result is None
+        assert next(n for n in failed.node_executions if n.capability_name == 'molecular.scene_project').error_code == 'scene_failed'
+    finally:
+        runtime.close()
+        repository.close()
 
 
 def test_native_adapter_declarations_build_exact_scientist_registry() -> None:

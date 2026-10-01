@@ -602,6 +602,20 @@ function parseResearchVisualization(value: unknown): ResearchVisualizationWorksp
   }
   if (containsCredentialField(value)) malformed('The backend returned unsafe visualization data.')
   const construction = value.construction_summary
+  const prospective = value.prospective_assessment
+  if (prospective !== undefined && prospective !== null && (
+    !isRecord(prospective) || !hasString(prospective, 'assessment_artifact_identifier')
+    || !hasString(prospective, 'assessment_sha256') || !hasString(prospective, 'verification_scope')
+    || !isRecord(prospective.computation_selection) || !hasString(prospective.computation_selection, 'reason')
+    || !isRecord(prospective.target_selection) || !isRecord(prospective.target_selection.selected)
+    || !Array.isArray(prospective.assumptions) || !Array.isArray(prospective.blinding_limitations)
+    || !Array.isArray(prospective.source_audit) || !Array.isArray(prospective.candidates)
+    || !prospective.candidates.every(c => isRecord(c) && hasString(c, 'candidate_identifier') && hasString(c, 'name')
+      && hasString(c, 'recommendation') && hasString(c, 'reason') && isRecord(c.identity) && isRecord(c.properties)
+      && Object.values(c.properties).every(isFiniteNumber) && isRecord(c.intended_target)
+      && isFiniteNumber(c.intended_target.best_vina_score_kcal_per_mol) && hasString(c.intended_target, 'limitation')
+      && Array.isArray(c.hypotheses) && Array.isArray(c.unsupported_risk_dimensions))
+  )) malformed('The backend returned malformed prospective assessment evidence.')
   if (construction !== undefined && construction !== null && (
     !isRecord(construction)
     || !['name', 'formula', 'structure_artifact_identifier'].every(key => hasString(construction, key))

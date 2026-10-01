@@ -38,6 +38,36 @@ def test_site_contacts_use_reference_domain_not_author_numbering():
         inspect_receptor(_source(reference_start=300), candidate)
 
 
+@pytest.mark.parametrize('case,eligible', [('remote', True), ('site', False),
+    ('terminal_proxy', True), ('internal_missing', False), ('conflict', False)])
+def test_prospective_engineered_construct_policy_retains_scientific_boundaries(case, eligible):
+    candidate = {'chains': ['A'], 'domain_start': 100, 'domain_end': 119, 'uniprot_accession': 'QTEST',
+                 'site_components': {'LIG': {'match_policy': 'synthetic exact identity'}},
+                 'mutation_policy': 'remote_engineered_annotation_only'}
+    lines = _source().payload.decode().splitlines()
+    seq = 0 if case == 'terminal_proxy' else 19
+    if case in ('remote', 'terminal_proxy'):
+        moved = 1 if case == 'terminal_proxy' else seq
+        lines = [l[:30] + '30.000  ' + l[38:] if l.startswith('ATOM  ') and int(l[22:26]) == moved else l for l in lines]
+    if case == 'internal_missing':
+        lines = [l for l in lines if not (l.startswith('ATOM  ') and int(l[22:26]) == seq)]
+    if case in ('terminal_proxy', 'internal_missing'):
+        lines.append(_line([(0, 10, 'REMARK 465'), (15, 18, 'ALA'), (19, 20, 'A'), (21, 26, seq)]))
+    lines.append(_line([(0, 6, 'SEQADV'), (16, 17, 'A'), (18, 22, seq),
+                        (49, 80, 'CONFLICT' if case == 'conflict' else 'ENGINEERED MUTATION')]))
+    source = SimpleNamespace(payload='\n'.join(lines).encode())
+    if eligible:
+        result = inspect_receptor(source, candidate)
+        assert result['mutation_records'] and result['mutation_site_review'][0]['eligible']
+        assert result['mutation_site_review'][0]['terminal_boundary_proxy'] == (case == 'terminal_proxy')
+        assert result['mutation_site_review'][0]['limitation']
+        with pytest.raises(ValueError, match='mutation/conflict'):
+            inspect_receptor(source, dict(candidate, mutation_policy='strict_unmutated'))
+    else:
+        with pytest.raises(ValueError, match='no unique ligand-defined site'):
+            inspect_receptor(source, candidate)
+
+
 def _artifact(identifier, kind, metadata=None, parents=()):
     version = CapabilityVersion(major=1, minor=0, patch=0)
     return ArtifactReference(artifact_identifier=identifier, schema_version=version,

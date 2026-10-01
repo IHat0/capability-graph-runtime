@@ -1350,7 +1350,7 @@ class ResearchSessionController:
 
     def _named_collection_proposal(
         self, *, scientist_turns, input_references, artifact_references,
-        tenant_identifier_sha256,
+        tenant_identifier_sha256, prospective=False,
     ):
         """Acquire missing named inputs as a collection, never just its first member."""
         extractor = getattr(self.evidence_interpreter, "propose_named_entities", None)
@@ -1361,7 +1361,9 @@ class ResearchSessionController:
         candidates = extractor(turns)
         from .scientific_target_selection import extract_target_scope
         provider = getattr(self.evidence_interpreter, "provider", None)
-        scope = extract_target_scope(turns, provider) if any(c.entity_type == "protein" for c in candidates) else None
+        scope_options = {'allow_drug_defaults': True,
+            'target_names': tuple(c.name for c in candidates if c.entity_type == 'protein')} if prospective else {}
+        scope = extract_target_scope(turns, provider, **scope_options) if any(c.entity_type == "protein" for c in candidates) else None
         if scope is not None:
             candidates = tuple(c.model_copy(update={"name": scope["name"]})
                                if c.entity_type == "protein" else c for c in candidates)
@@ -1476,6 +1478,8 @@ class ResearchSessionController:
                 scientist_turns=scientist_turns, input_references=input_references,
                 artifact_references=artifact_references,
                 tenant_identifier_sha256=tenant_identifier_sha256,
+                prospective=bool(objective.research_requirements and
+                    "assess_drug_candidate" in objective.research_requirements.operations),
             )
             if collection is not None:
                 return collection

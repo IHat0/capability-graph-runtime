@@ -6229,7 +6229,9 @@ def protein_ligand_discovery_registry(
     meeko_adapter: MeekoDockingPreparationAdapter,
 ) -> ScientistCapabilityRegistry:
     bridge = _DiscoveryArtifactBridge(store)
+    from .scientific_prospective import ProspectiveAssessmentHandler
     registry = ScientistCapabilityRegistry({
+        "discovery.prospective_assess": ProspectiveAssessmentHandler(store),
         "molecular.structure_ingestion": DiscoveryProteinIngestionHandler(store),
         "molecular.force_field_select": TSForceFieldSelectionHandler(store),
         "molecular.protein_protonation_prepare": DiscoveryProteinPreparationHandler(store),

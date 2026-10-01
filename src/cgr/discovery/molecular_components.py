@@ -547,11 +547,12 @@ class RDKitMolecularDescriptorEvaluator:
         embedded = int(AllChem.EmbedMolecule(molecule, parameters)) == 0
         force_field = "none"
         conformer_energy: float | None = None
+        optimization_converged = False
         if embedded and AllChem.MMFFHasAllMoleculeParams(molecule):
             properties = AllChem.MMFFGetMoleculeProperties(molecule, mmffVariant="MMFF94s")
             field = AllChem.MMFFGetMoleculeForceField(molecule, properties)
             if field is not None:
-                field.Minimize(maxIts=500)
+                optimization_converged = int(field.Minimize(maxIts=500)) == 0
                 conformer_energy = float(field.CalcEnergy())
                 force_field = "mmff94s"
         descriptors = {
@@ -568,6 +569,8 @@ class RDKitMolecularDescriptorEvaluator:
             "canonical_smiles": _read_smiles(self._store, candidate),
             "conformer_generated": embedded,
             "force_field": force_field,
+            "optimization_converged": optimization_converged,
+            "random_seed": self._seed,
             "conformer_energy_kcal_per_mol": conformer_energy,
             "descriptors": descriptors,
             "score_semantics": "rdkit_descriptor_not_binding_free_energy",
@@ -709,7 +712,7 @@ class VinaMolecularDockingEvaluator:
         field = AllChem.MMFFGetMoleculeForceField(molecule, properties)
         if field is None:
             raise ValueError("Candidate MMFF94s force-field construction failed.")
-        field.Minimize(maxIts=500)
+        optimization_converged = int(field.Minimize(maxIts=500)) == 0
         preparation = MoleculePreparation(charge_model="gasteiger", add_index_map=True)
         setups = preparation.prepare(molecule, conformer_id=0)
         if len(setups) != 1:
@@ -746,6 +749,9 @@ class VinaMolecularDockingEvaluator:
             "box_center_angstrom": self._center,
             "box_size_angstrom": self._size,
             "exhaustiveness": self._exhaustiveness,
+            "random_seed": self._seed,
+            "preparation_optimization_converged": optimization_converged,
+            "preparation_mmff94s_energy_kcal_per_mol": float(field.CalcEnergy()),
             "requested_pose_count": self._pose_count,
             "returned_pose_count": len(energies),
             "vina_scores_kcal_per_mol": [float(row[0]) for row in energies],

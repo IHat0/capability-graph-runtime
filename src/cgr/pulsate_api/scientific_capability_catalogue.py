@@ -105,6 +105,20 @@ class ScientificCapabilityCatalogue:
         for required in required_artifact_types:
             provide(required)
 
+        # An answer must wait for every requested scientific deliverable, not
+        # only the default scene/verification pair. Independent computations
+        # otherwise race synthesis and silently disappear from the answer.
+        authorization_artifacts = {kind for definition in selected.values() if definition.authorization_required
+                                   for kind in definition.produced_artifact_types}
+        for name, definition in tuple(selected.items()):
+            if 'scientist_facing_result' in definition.produced_artifact_types:
+                definition = definition.model_copy(update={'accepted_artifact_types': tuple(dict.fromkeys((
+                    *definition.accepted_artifact_types,
+                    *(kind for kind in required_artifact_types if kind not in definition.produced_artifact_types
+                      and kind not in authorization_artifacts),
+                )))})
+                selected[name] = definition
+
         ordered: list[ScientificCapabilityDefinition] = []
         remaining = dict(selected)
         produced = set(available_artifact_types)
@@ -768,6 +782,14 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
                 "molecular_scene_state",
             ),
             priority=90,
+        ),
+        ScientificCapabilityDefinition(
+            capability_name="discovery.prospective_assess",
+            accepted_artifact_types=("discovery_design_loop_trace", "binding_pocket", "scientific_verification_report"),
+            produced_artifact_types=("prospective_candidate_assessment",),
+            supported_task_types=_DISCOVERY,
+            verification_required=True,
+            priority=85,
         ),
         ScientificCapabilityDefinition(
             capability_name="scientist.result_assemble",

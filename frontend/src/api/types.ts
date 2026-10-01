@@ -630,6 +630,23 @@ export interface ResearchVisualizationWorkspace {
     xyz_artifact_identifier?: string; workflow?: string[]
     energies: Array<{ label: string; value: number; unit: string }>
   } | null
+  prospective_assessment?: {
+    assessment_artifact_identifier: string; assessment_sha256: string
+    verification_scope: string; assumptions: string[]; blinding_limitations: string[]
+    computation_selection: { selected_compute: string; quantum_selected: boolean; reason: string }
+    target_selection: { uniprot_accession: string; domain: { description: string }; selected: {
+      pdb_id: string; chain: string; resolution_angstrom: number; mutation_records: string[]; missing_records: string[]
+    }; policy: string; limitations: string[] }
+    source_audit: Array<{ url: string; class: string; sha256: string }>
+    candidates: Array<{
+      candidate_identifier: string; name: string; recommendation: string; reason: string
+      identity: { standard_inchikey: string; public_identity_checked: boolean; pubchem_cid?: number }
+      properties: Record<string, number>
+      intended_target: { best_vina_score_kcal_per_mol: number; limitation: string }
+      hypotheses: Array<{ metric: string; computed_value: number; screen_threshold: number; hypothesis: string; limitation: string }>
+      unsupported_risk_dimensions: string[]
+    }>
+  } | null
   grounding_policy: 'persisted_artifact_or_deterministic_computation_only'
 }
 

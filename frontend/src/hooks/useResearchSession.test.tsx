@@ -1,7 +1,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PulsateApi } from '../api/client'
-import type { ResearchSessionResponse } from '../api/types'
+import type { ResearchSessionResponse, ResearchVisualizationWorkspace } from '../api/types'
 import { useResearchSession } from './useResearchSession'
 import { currentFixtureScene } from '../test/fixtures'
 
@@ -147,6 +147,37 @@ describe('useResearchSession', () => {
       awaiting.session_identifier, 'I confirm the reviewed proposal.',
       true, false, false, false, [], [], expect.any(AbortSignal),
     )
+  })
+
+  it.each(['completion', 'reopen'])('automatically restores the evidence-bound prospective complex on %s', async path => {
+    const client = api()
+    const completed = { ...planned, status: 'completed' as const, revision: 3 }
+    const visualization = {
+      schema_version: 'pulsate.research-visualization/v1', session_identifier: completed.session_identifier,
+      revision: 3, scene_identifier: null, selections: [], interactions: [], overlays: [], candidates: [],
+      lineage: [], comparisons: [], verification_artifact_identifiers: [], export_items: [],
+      grounding_policy: 'persisted_artifact_or_deterministic_computation_only',
+      structures: [{ artifact_identifier: 'receptor', role: 'protein', candidate_identifier: null, artifact_type: 'docking_receptor_pdbqt' },
+        { artifact_identifier: 'pose', role: 'ligand_or_candidate', candidate_identifier: 'candidate-A', artifact_type: 'molecular_candidate_docking_poses_pdbqt' }],
+      prospective_assessment: { candidates: [{ candidate_identifier: 'candidate-A' }] },
+    } as unknown as ResearchVisualizationWorkspace
+    vi.mocked(client.getResearchVisualization).mockResolvedValue(visualization)
+    vi.mocked(client.getResearchComplexScene).mockResolvedValue(currentFixtureScene)
+    vi.mocked(client.createResearchSession).mockResolvedValue(planned)
+    vi.mocked(client.executeResearchSession).mockResolvedValue(completed)
+    vi.mocked(client.getResearchSession).mockResolvedValue(completed)
+    const hook = renderHook(() => useResearchSession(client))
+    if (path === 'completion') {
+      act(() => hook.result.current.setQuestion('Assess a candidate.'))
+      await act(async () => hook.result.current.start())
+      await act(async () => hook.result.current.execute())
+    } else await act(async () => hook.result.current.resume(completed.session_identifier))
+    expect(client.getResearchComplexScene).toHaveBeenCalledWith(completed.session_identifier, 'receptor', 'pose', expect.any(AbortSignal))
+    expect(hook.result.current.scene?.atoms).toHaveLength(2)
+    expect(hook.result.current.scene?.provenance?.coordinate_source).not.toBe('generated_by_rdkit')
+    hook.rerender()
+    expect(client.getResearchComplexScene).toHaveBeenCalledTimes(1)
+    hook.unmount()
   })
 
   it('reopens a saved session from the page address', async () => {
