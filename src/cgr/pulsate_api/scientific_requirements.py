@@ -15,6 +15,7 @@ from .natural_language import NaturalLanguageModelProvider
 from .virtual_organism import PBPKRequest, interpret_pbpk_request
 
 ScientificResearchOperation = Literal[
+    "predict_adme",
     "simulate_organism_exposure",
     "assess_drug_candidate",
     "construct_molecule",
@@ -34,6 +35,7 @@ ScientificResearchOperation = Literal[
 ]
 
 ScientificRequestedOutput = Literal[
+    "adme_parameterization",
     "virtual_organism_exposure",
     "prospective_candidate_assessment",
     "constructed_molecular_structure",
@@ -68,6 +70,7 @@ ScientificCapabilityProfile = Literal[
 
 
 _OUTPUT_BY_OPERATION: dict[ScientificResearchOperation, ScientificRequestedOutput] = {
+    "predict_adme": "adme_parameterization",
     "simulate_organism_exposure": "virtual_organism_exposure",
     "assess_drug_candidate": "prospective_candidate_assessment",
     "construct_molecule": "constructed_molecular_structure",
@@ -201,9 +204,11 @@ def validate_requirement_proposal(
     operation_set = set(operations)
     del available_input_types
 
-    if operation_set == {"simulate_organism_exposure"}:
+    if 'simulate_organism_exposure' in operation_set and operation_set <= {'simulate_organism_exposure', 'predict_adme'}:
         profile = "virtual_organism"
         required = ["virtual_organism_assessment", "scientific_verification_report", "computation_selection_decision"]
+        if 'predict_adme' in operation_set:
+            required.append('adme_verified_dossiers')
     elif operation_set == {"construct_molecule"}:
         profile = "molecular_construction"
         required = ["molecular_identity_verification", "molecular_construction_evidence",
@@ -332,6 +337,9 @@ class ProviderNeutralScientificRequirementInterpreter:
                             "assess_drug_candidate means investigating an existing compound as a drug candidate for an intended target. "
                             "It requests an evidence-grounded prospective assessment, not molecular construction alone. "
                             "The capability system supplies screening and properties as prerequisites; do not invent safety or efficacy. "
+                            "predict_adme means numerical absorption/distribution/metabolism/excretion property prediction for a molecular graph. "
+                            "When ADME prediction and PBPK suitability/exposure are requested together, use predict_adme and simulate_organism_exposure. "
+                            "Assessing PBPK parameter sufficiency is not assess_drug_candidate: it does not request intended-target screening or pharmacological conclusions. "
                             "construct_molecule means computationally building the structure of a named known chemical entity. "
                             "simulate_organism_exposure means PBPK, organism/tissue/plasma exposure over time, pharmacokinetics or virtual human/rat simulation. "
                             "Population or cross-species exposure is one simulate_organism_exposure outcome; do not classify it as docking or molecular construction. "

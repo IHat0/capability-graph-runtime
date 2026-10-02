@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import type { ResearchSessionWorkspace } from '../hooks/useResearchSession'
 import type { ResearchVisualizationWorkspace } from '../api/types'
@@ -55,5 +55,37 @@ describe('VirtualOrganismResult', () => {
   it('leaves old sessions without a PBPK assessment unchanged', () => {
     const { container } = render(<VirtualOrganismResult research={{ visualization: null } as ResearchSessionWorkspace} />)
     expect(container.childElementCount).toBe(0)
+  })
+
+  it('prominently distinguishes missing and predicted evidence, model domain and marginal uncertainty', () => {
+    const research = state(true)
+    research.visualization!.virtual_organism!.adme_parameterization = {
+      verification: { passed: true, scope: 'Synthetic UI replay fixture' },
+      prediction: { status: 'predicted', request_sha256: 'b'.repeat(64), timestamp: '2026-10-02T00:00:00Z', descriptors: { MolWt: 123 },
+        native_translation_audit: [{ species:'Human',scope:'Synthetic readiness audit',
+          ionization:{status:'missing',source:'No calibrated site model',reason:'No invented pKa'},
+          solubility:{status:'unresolved',reference_ph:null,method:'No unqualified HH equation',reason:'Mixed-pH endpoint is not intrinsic solubility'},
+          blood_plasma:{status:'native_mechanism_not_yet_instantiated',method:'Native RBC composition',required_inputs:['Hematocrit'],reason:'No B/P=1'},
+          hepatic:{status:'unresolved',equations:['Synthetic conditional equation'],required_inputs:['Incubation binding'],reason:'No CLint to plasma shortcut',value:null,unit:'ml/min/kg'},
+          renal:{status:'unresolved',component_equation:'Synthetic filtration component',unresolved_mechanisms:['secretion','reabsorption'],reason:'Filtration is not total clearance',total_clearance_established:false},
+          reference_weight:{status:'conditional_not_subject_input',value_kg:null,method:'Native subject physiology',reason:'No arbitrary weight request'} }],
+        dossiers: [{ species: 'Human', ionization_status: 'missing', ionization_source: 'No reviewed pKa', parameter_conflicts: [],
+          parameters: { renal_clearance: { value: null, unit: 'ml/min/kg', classification: 'missing', source: 'Unavailable', method: 'No renal model', uncertainty: null } },
+          adme_parameters: { fraction_unbound: { value: .1, unit: 'fraction', classification: 'predicted', source: 'Synthetic', method: 'Fixture',
+            interval: [.01, .5], uncertainty: 'Marginal interval; not joint PK confidence', prediction: { model: 'Fixture RF', model_version: 'v1', model_sha256: 'a'.repeat(64), endpoint_definition: 'Synthetic binding endpoint',
+              applicability: { status: 'out_of_domain', nearest_training_tanimoto: .1, training_graph_seen: false }, translation: null } } } }],
+      },
+    }
+    render(<VirtualOrganismResult research={research} />)
+    const section = within(screen.getByRole('region', { name: 'ADME Parameterization' }))
+    expect(section.getByText('predicted', { exact: true })).toBeTruthy()
+    expect(section.getByText('out of domain')).toBeTruthy()
+    expect(section.getByText(/Marginal interval/)).toBeTruthy()
+    expect(section.getByText(/No renal model/)).toBeTruthy()
+    expect(section.getByRole('region', { name:'Human PBPK translation trace' })).toBeTruthy()
+    expect(section.getByText(/Mixed-pH endpoint is not intrinsic solubility/)).toBeTruthy()
+    expect(section.getByText(/Filtration is not total clearance/)).toBeTruthy()
+    expect(section.getByText(/No arbitrary weight request/)).toBeTruthy()
+    expect(screen.queryByRole('img')).toBeNull()
   })
 })

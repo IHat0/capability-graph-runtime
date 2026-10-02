@@ -704,3 +704,9 @@ a { color: inherit; }
 .research-execution progress { width: 100%; accent-color: #267a52; }
 .research-execution ol { margin-bottom: 0; padding-left: 1.3rem; }
 .research-execution li { margin-top: 0.3rem; }
+.adme-evidence { display: inline-block; border-radius: .3rem; padding: .2rem .35rem; font-size: .85em; }
+.adme-evidence[data-evidence-class="measured"], .adme-evidence[data-evidence-class="sourced"] { color: #175c37; background: #e4f3e8; }
+.adme-evidence[data-evidence-class="predicted"] { color: #184f8c; background: #e6effb; }
+.adme-evidence[data-evidence-class="calculated"] { color: #145e66; background: #e3f2f3; }
+.adme-evidence[data-evidence-class="assumed"], .adme-evidence[data-evidence-class="estimated"] { color: #704705; background: #fff0ce; }
+.adme-evidence[data-evidence-class="missing"] { color: #912928; background: #fbe8e8; }

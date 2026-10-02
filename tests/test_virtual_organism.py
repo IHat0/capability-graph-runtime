@@ -32,7 +32,7 @@ def test_composes_real_pbpk_capabilities_without_molecule_routes():
     assert not objective.clarification_required
     assert objective.quantum_execution_target == 'none'
     names = [s.capability_name for s in plan.steps]
-    assert names == ['pharmacokinetics.parameterize', 'physiology.organism_construct', 'pharmacokinetics.pbpk_simulate',
+    assert names == ['pharmacokinetics.adme_predict', 'pharmacokinetics.adme_verify', 'pharmacokinetics.parameterize', 'physiology.organism_construct', 'pharmacokinetics.pbpk_simulate',
         'pharmacokinetics.population_simulate', 'pharmacokinetics.cross_species_compare', 'pharmacokinetics.exposure_verify',
         'discovery.exposure_relevance_assess', 'scientist.result_assemble']
 
@@ -218,7 +218,7 @@ def test_activity_evidence_is_identity_and_hash_checked_before_assessment():
     payload = activity.model_dump_json().encode()
     ref = SimpleNamespace(artifact_identifier='activity-A', content_sha256=digest(payload))
     exposure = {'runs': [], 'missing': [{'species': 'Human', 'reason': 'No dossier'}]}
-    documents = {'pbpk_parameterization': {'identity': {'smiles': smiles, 'inchikey': key}},
+    documents = {'pbpk_parameterization': {'identity': {'smiles': smiles, 'inchikey': key}, 'models': []},
         'pbpk_model_set': {'identity': {'smiles': smiles, 'inchikey': key}, 'models': []},
         'pbpk_exposure_result': exposure, 'pbpk_population_result': population_summary([]),
         'pbpk_cross_species_result': cross_species_summary([])}

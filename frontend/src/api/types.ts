@@ -647,6 +647,19 @@ export interface ResearchVisualizationWorkspace {
     activity_comparisons?: Array<{ status: string; reason: string; activity?: { target: string; species: string; kind: string; value: number; unit: string; source: string; assay_context: string; compatibility_limitations: string }; peak_exposure_to_activity_ratios?: number[] }>
     verification: { passed: boolean; verification_scope: string }
     parameters: Array<{ name: string; species: string; value: number | null; unit: string; classification: string; source: string; method: string; uncertainty: string | null }>
+    adme_parameterization?: {
+      verification: { passed: boolean; scope: string }
+      prediction: {
+        status: string; request_sha256: string; timestamp: string
+        descriptors: Record<string, number>
+        native_translation_audit?: NativeADMETranslationAudit[]
+        dossiers: Array<{ species: string; ionization_status: string; ionization_source: string; parameter_conflicts: Array<{ parameter: string; reason: string }>
+          parameters: Record<string, ADMEParameter>; adme_parameters: Record<string, ADMEParameter> }>
+      }
+    } | null
+    drug_parameter_uncertainty?: { scope: string; dose_analysis?: Array<{ species: string; dose_normalized_cmax_max_min_ratio: number; dose_normalized_auc_max_min_ratio: number; tissue_order_changes: boolean }>; scenarios: Array<{ species: string; scenario_identifier: string; scenario_kind: string;
+      scenario_policy: Record<string, unknown>; file_artifacts: Record<string, string>;
+      series: Array<{ path: string; organ: string; compartment: string; subject_identifier: string; times_h: number[]; values_umol_l: number[] }> }> }
     assumptions: string[]; limitations: string[]
     computation_selection: { selected_compute: string; quantum_selected: boolean; reason: string }
   } | null
@@ -675,6 +688,24 @@ export interface ResearchVisualizationWorkspace {
     }>
   } | null
   grounding_policy: 'persisted_artifact_or_deterministic_computation_only'
+}
+
+export interface ADMEParameter {
+  value: number | null; unit: string; classification: string; source: string; method: string
+  uncertainty: string | null; interval?: [number, number] | null
+  prediction?: { model: string; model_version: string; model_sha256: string; endpoint_definition: string;
+    validation?: { overall?: { n: number; mae: number; rmse: number; spearman: number | null; interval_coverage: number }; unit?: string; scope?: string; report_sha256?: string; status?: string };
+    applicability: { status: string; nearest_training_tanimoto: number; training_graph_seen: boolean }; translation: { formula: string } | null } | null
+}
+
+export interface NativeADMETranslationAudit {
+  species: string; scope: string
+  ionization: { status: string; source: string; reason: string }
+  solubility: { status: string; reference_ph: number | null; method: string; reason: string }
+  blood_plasma: { status: string; method: string; required_inputs: string[]; reason: string }
+  hepatic: { status: string; equations: string[]; required_inputs: string[]; reason: string; value: number | null; unit: string }
+  renal: { status: string; component_equation: string; unresolved_mechanisms: string[]; reason: string; total_clearance_established: boolean }
+  reference_weight: { status: string; method: string; reason: string; value_kg: number | null }
 }
 
 export interface ResearchInputUpload {

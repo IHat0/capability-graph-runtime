@@ -33,10 +33,64 @@ def canonical(document) -> bytes:
 
 
 def literal_numbers(quote: str) -> list[float]:
-    numbers = [float(n) for n in re.findall(r"(?<![\w.])\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", quote)]
+    numbers = [float(n) for n in re.findall(r"(?<![\w.])[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?", quote)]
     words = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty")
     numbers.extend(float(i) for i, word in enumerate(words) if re.search(r"(?<!\w)" + word + r"(?!\w)", quote, re.I))
     return numbers
+
+
+def literal_dose_sweep(text: str):
+    """Extract explicit numeric dosing lists, not scientific ADME estimates.
+
+    This closes lossy optional-field extraction: a model cannot silently discard
+    requested dose points. Ambiguous lists are refused instead of selecting one.
+    """
+    number = r'[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?'
+    sequence = number + r'(?:\s*(?:,\s*(?:and\s+)?|and\s+)' + number + r')+'
+    pattern = r'\b(?:dose[ -]*(?:sweep|scenarios)|doses)\s*(?:of|at|:)?\s*(' + sequence + r')\s*(mg/kg|mg)\b'
+    matches = list(re.finditer(pattern, text, re.I))
+    if len(matches) > 1:
+        raise ValueError('Multiple explicit dose sweeps require scientist clarification.')
+    if not matches:
+        return None
+    match = matches[0]
+    return tuple(literal_numbers(match.group(1))), match.group(2).lower(), match.group()
+
+
+def explicit_pbpk_controls(text):
+    """Recover unambiguous literal controls only; no missing value is chosen.
+
+    LLM intent remains separate. Labelled observation horizons cannot be replaced
+    by infusion time, and explicit human-population scope is not silently lost.
+    """
+    number = r'[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?'
+    changes, quotes = {}, {}
+    sweep = literal_dose_sweep(text)
+    if sweep:
+        doses, unit, quote = sweep
+        changes.update(dose_sweep=doses, dose=doses[0], dose_unit=unit)
+        quotes.update(dose=quote,dose_unit=quote,dose_sweep=quote)
+    else:
+        doses = list(re.finditer(r'(?<![\w.])(' + number + r')\s*(mg/kg|mg)\b',text,re.I))
+        if len(doses) == 1:
+            changes.update(dose=float(doses[0].group(1)),dose_unit=doses[0].group(2).lower())
+            quotes.update(dose=doses[0].group(),dose_unit=doses[0].group())
+    unit = r'(hours?|hrs?|h|minutes?|mins?|min)'
+    horizons = list(re.finditer(r'(?<![\w.])(' + number + r')\s*' + unit + r'\s+(?:observation|simulation)\s+(?:period|horizon|duration)\b',text,re.I))
+    if len(horizons) == 1:
+        horizon = horizons[0]
+        changes['duration_h'] = float(horizon.group(1)) / (60 if horizon.group(2).lower().startswith('min') else 1)
+        quotes['duration_h'] = horizon.group()
+    infusions = list(re.finditer(r'\binfusion\s+(?:over|for|lasting)\s+(' + number + r')\s*' + unit + r'\b',text,re.I))
+    if len(infusions) == 1:
+        infusion = infusions[0]
+        changes['infusion_minutes'] = float(infusion.group(1)) * (1 if infusion.group(2).lower().startswith('min') else 60)
+        quotes['infusion_minutes'] = infusion.group()
+    populations = list(re.finditer(r'\bpopulation\s+(?:of\s+)?(\d+)\s+human\s+(?:adults|subjects|individuals|participants)\b',text,re.I))
+    if len(populations) == 1:
+        changes['population_size'] = int(populations[0].group(1))
+        quotes['population_size'] = populations[0].group()
+    return changes, quotes
 
 
 class PBPKRequest(BaseModel):
@@ -50,6 +104,7 @@ class PBPKRequest(BaseModel):
     duration_h: float | None = Field(default=None, gt=0, le=720, allow_inf_nan=False)
     infusion_minutes: float = Field(default=0, ge=0, le=1440, allow_inf_nan=False)
     administration_times_h: tuple[float, ...] = (0.0,)
+    dose_sweep: tuple[float, ...] = ()
     formulation: Literal["Solution"] | None = None
     population_size: int = Field(default=1, ge=1, le=32)
     age_min_years: float = Field(default=20, ge=18, le=80)
@@ -73,6 +128,10 @@ class PBPKRequest(BaseModel):
             raise ValueError("Administration must precede the simulation endpoint.")
         if self.route == "Oral" and self.infusion_minutes:
             raise ValueError("Infusion duration is not an oral administration control.")
+        if len(self.dose_sweep) > 4 or any(not math.isfinite(d) or not 0 < d <= 1e6 for d in self.dose_sweep) or len(set(self.dose_sweep)) != len(self.dose_sweep):
+            raise ValueError("Dose sweeps require at most four unique positive explicit doses.")
+        if self.dose_sweep and (self.dose is None or self.dose_sweep[0] != self.dose):
+            raise ValueError("The nominal dose must be the first dose-sweep point.")
         return self
 
     def missing(self) -> tuple[str, ...]:
@@ -126,6 +185,11 @@ class PBPKRequest(BaseModel):
             numbers = [float(n) for n in re.findall(r"(?<![\w.])\d+(?:\.\d+)?", self.quotes["administration_times_h"])]
             if not all(any(math.isclose(t, n) for n in numbers) for t in self.administration_times_h):
                 raise ValueError("Each repeated dose time must be literal, in hours.")
+        if self.dose_sweep:
+            quote = self.quotes.get('dose_sweep', '')
+            numbers = literal_numbers(quote)
+            if not quote or not all(any(math.isclose(d, n) for n in numbers) for d in self.dose_sweep):
+                raise ValueError("Every exploratory sweep dose requires an exact scientist quote.")
         return self
 
 
@@ -141,6 +205,7 @@ def interpret_pbpk_request(text, provider) -> PBPKRequest | None:
                 "Simulation duration is distinct from infusion duration. An intravenous bolus has infusion_minutes=0. "
                 "Do not convert the observation horizon into an infusion. Solution formulation is only extracted when explicitly requested. "
                 "Optional infusion_minutes, administration_times_h (explicit list of dose times in hours), formulation (Solution only), "
+                "dose_sweep (at most four explicit exploratory doses, same dose_unit; dose is the first point), "
                 "population_size, age_min_years, age_max_years, proportion_female, seed may be supplied ONLY if explicit. "
                 "Population sampling is qualified for humans only; population_size is the requested human count. "
                 "Do not silently replace a requested rat population by one rat. Quote the species scope with a population count when both species are requested. "
@@ -153,7 +218,7 @@ def interpret_pbpk_request(text, provider) -> PBPKRequest | None:
             {"role": "user", "content": text},
         ]
         schema = PBPKRequest.model_json_schema()
-        schema['required'] = ['entity_name', 'species', 'dose', 'dose_unit', 'route', 'duration_h', 'quotes']
+        schema['required'] = ['entity_name', 'species', 'dose', 'dose_unit', 'route', 'duration_h', 'dose_sweep', 'quotes']
         schema['properties']['quotes'] = {'type': 'object', 'properties': {key: {'type': 'string'} for key in PBPKRequest.model_fields if key != 'quotes'},
             'required': ['entity_name', 'dose', 'dose_unit', 'route', 'duration_h'], 'additionalProperties': False,
             'description': 'Exact original-input substrings for each extracted value. Empty only when the corresponding optional control is absent/null.'}
@@ -191,6 +256,9 @@ def interpret_pbpk_request(text, provider) -> PBPKRequest | None:
                     if all(len(matches) == 1 for matches in spans):
                         quotes['species'] = text[min(m[0].start() for m in spans):max(m[0].end() for m in spans)]
                 updates = {"quotes": quotes}
+                literal_updates, literal_quotes = explicit_pbpk_controls(text)
+                updates.update(literal_updates)
+                quotes.update(literal_quotes)
                 if result.route == 'Intravenous' and result.formulation is not None and (not quotes.get('formulation') or quotes['formulation'] not in text):
                     # The oral formulation contract is not an IV control. Do not
                     # retain a model-invented formulation as a scientific fact.
@@ -202,7 +270,7 @@ def interpret_pbpk_request(text, provider) -> PBPKRequest | None:
                     # conflation of observation horizon and infusion duration.
                     updates['infusion_minutes'] = 0.0
                     quotes['infusion_minutes'] = bolus[0].group()
-                result = result.model_copy(update=updates)
+                result = PBPKRequest.model_validate(result.model_copy(update=updates).model_dump())
                 return result.check_grounding(text)
             except (ValueError, TypeError, KeyError) as error:
                 if attempt:
@@ -218,15 +286,22 @@ class PBPKParameter(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     value: float | None = Field(default=None, allow_inf_nan=False)
     unit: str
-    classification: Literal["measured", "sourced", "calculated", "estimated", "assumed", "missing"]
+    classification: Literal["measured", "sourced", "calculated", "predicted", "estimated", "assumed", "missing"]
     source: str = Field(min_length=1)
     method: str = Field(min_length=1)
     uncertainty: str | None = None
+    interval: tuple[float, float] | None = None
+    prediction: dict | None = None
 
     @model_validator(mode="after")
     def missing_is_explicit(self):
         if (self.value is None) != (self.classification == "missing"):
             raise ValueError("Missing parameter values require missing classification.")
+        if self.interval is not None and (self.value is None or not all(math.isfinite(v) for v in self.interval)
+                or not self.interval[0] <= self.value <= self.interval[1]):
+            raise ValueError("Parameter interval must be finite and contain its point estimate.")
+        if self.classification == "predicted" and (not self.prediction or self.interval is None):
+            raise ValueError("Predicted parameters require explicit model provenance and an interval.")
         return self
 
 
@@ -242,6 +317,9 @@ class CompoundDossier(BaseModel):
     ionization: tuple[dict, ...]  # Type/Pka/ValueOrigin; empty means explicitly neutral
     ionization_source: str = Field(min_length=1)
     limitations: tuple[str, ...] = ()
+    adme_parameters: dict[str, PBPKParameter] = Field(default_factory=dict)
+    parameter_conflicts: tuple[dict, ...] = ()
+    ionization_status: Literal["reviewed", "missing"] = "reviewed"
 
 
 class QuantitativeActivity(BaseModel):
@@ -270,12 +348,31 @@ def dossier_requirements(dossier: CompoundDossier, route: str) -> list[str]:
     required = set(_PARAM_UNITS) - {"intestinal_permeability"}
     if route == "Oral":
         required.add("intestinal_permeability")
+    # Experimental ml/min/kg endpoints require an experimental normalization
+    # weight. A graph with no such clearance evidence must not ask for an arbitrary
+    # virtual-human weight as though that would complete drug parameterization.
+    normalized_clearance = any(dossier.parameters.get(key) and dossier.parameters[key].value is not None
+        for key in ('hepatic_clearance', 'renal_clearance'))
+    if not normalized_clearance:
+        required.discard('reference_weight')
     missing = [key for key in sorted(required) if key not in dossier.parameters or dossier.parameters[key].value is None]
+    if dossier.ionization_status == "missing":
+        missing.append("reviewed ionization/pKa evidence (formal charge is not a pKa prediction)")
     for key, parameter in dossier.parameters.items():
         if key not in _PARAM_UNITS or parameter.unit != _PARAM_UNITS[key]:
             raise ValueError("Unsupported PBPK parameter or unit: " + key)
         if parameter.value is not None and key != "logp" and parameter.value < 0:
             raise ValueError("Negative PBPK parameter: " + key)
+        if parameter.classification == "predicted" and parameter.prediction.get("applicability", {}).get("status") != "in_domain":
+            missing.append(key + " prediction is not in-domain")
+        if parameter.classification == 'predicted':
+            native_endpoints = {'fraction_unbound': 'fraction_unbound', 'solubility': 'apparent_solubility_at_reference_ph',
+                'hepatic_clearance': 'hepatic_plasma_clearance', 'renal_clearance': 'total_renal_plasma_clearance'}
+            expected = native_endpoints.get(key)
+            if expected and parameter.prediction.get('endpoint') != expected:
+                missing.append(key + ' prediction endpoint does not establish the required native quantity')
+            if (parameter.prediction.get('translation') or {}).get('pbpk_native_eligible') is False:
+                missing.append(key + ' translation is not PBPK-native eligible')
     fu = dossier.parameters.get("fraction_unbound")
     if fu and fu.value is not None and not 0 < fu.value <= 1:
         raise ValueError("Unbound fraction must be in (0, 1].")
@@ -283,7 +380,9 @@ def dossier_requirements(dossier: CompoundDossier, route: str) -> list[str]:
     if ph and ph.value is not None and not 0 <= ph.value <= 14:
         raise ValueError("Reference pH is outside the supported aqueous range.")
     for item in dossier.ionization:
-        if set(item) - {"Type", "Pka", "ValueOrigin"} or item.get("Type") not in {"Acid", "Base"} or not math.isfinite(item.get("Pka", math.nan)):
+        pka = item.get('Pka')
+        if (set(item) - {"Type", "Pka", "ValueOrigin"} or item.get("Type") not in {"Acid", "Base"}
+            or isinstance(pka, bool) or not isinstance(pka, (float, int)) or not math.isfinite(pka) or not -10 <= pka <= 25):
             raise ValueError("Unsupported ionization evidence.")
     return missing
 
@@ -333,7 +432,8 @@ def dossier_snapshot(dossier: CompoundDossier, request: PBPKRequest) -> dict:
         compound["IntestinalPermeability"] = alternative("intestinal_permeability", "Specific intestinal permeability (transcellular)")
     origin = ({"Species": "Human", "Population": "European_ICRP_2002", "Gender": "MALE", "Age": {"Value": 30, "Unit": "year(s)"}}
               if dossier.species == "Human" else {"Species": "Rat", "Population": "Rat", "Gender": "UNKNOWN"})
-    origin["Weight"] = {"Value": dossier.parameters["reference_weight"].value, "Unit": "kg"}
+    # The clearance-assay reference weight belongs to the compound process, not
+    # the virtual person/animal. Native physiology supplies subject weight.
     snapshot = {"Version": 120, "Name": "Exposure project", "Individuals": [{"Name": "Individual", "Seed": request.seed, "OriginData": origin}],
         "Compounds": [compound], "Simulations": [{"Name": "Exposure", "Model": "4Comp", "Individual": "Individual",
             "Compounds": [{"Name": dossier.name, "Processes": processes, "Protocol": {"Name": "Administration"}}]}]}

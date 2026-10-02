@@ -544,6 +544,16 @@ class ScientistResultAssembler:
             request = assessment['request']
             add("understanding", f"Organism exposure experiment: {request['dose']} {request['dose_unit']}, {request['route']}, dose times {request['administration_times_h']} h, simulated through {request['duration_h']} h.", (identifier,), True)
             add("principal_result", "Virtual Organism state: " + assessment['status'].replace('_', ' ') + ".", (identifier,), True)
+            adme = assessment.get('adme_parameterization')
+            if adme:
+                add('methods', 'Automatic ADME parameterization uses verified numerical models, not language-model guesses. Additional endpoint predictions are not automatically simulation inputs: measured/reviewed native inputs take precedence, and actual simulation parameters are retained in the native provenance audit. ' + adme['verification']['scope'], (identifier,), True)
+                for dossier in adme['prediction']['dossiers']:
+                    for name, parameter in dossier['adme_parameters'].items():
+                        if parameter.get('prediction'):
+                            domain = parameter['prediction']['applicability']['status']
+                            low, high = parameter['interval']
+                            add('principal_result', f"Exploratory {dossier['species']} {name}: {parameter['value']:.5g} {parameter['unit']}; marginal interval [{low:.3g}, {high:.3g}]; {domain.replace('_', ' ')}. Not a measured value.", (identifier,), True)
+                add('limitation', 'Predicted endpoint intervals do not establish clinical PK accuracy, safety or efficacy. Intrinsic clearance and Caco-2 are not automatically native organ clearance or intestinal permeability.', (identifier,), True)
             for item in assessment['comparison']['subjects']:
                 pk = item['plasma_metrics']
                 add("principal_result", f"{item['species']} subject {item['subject_identifier']}: sampled plasma Cmax {pk['cmax_umol_l']:.6g} umol/l at {pk['tmax_h']:.6g} h; finite-window AUC {pk['auc_0_t_umol_h_l']:.6g} umol*h/l. No terminal extrapolation.", (identifier,), True)
