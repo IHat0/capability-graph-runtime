@@ -31,6 +31,8 @@ _INPUT_TYPES = {
     "protein_structure",
     "ligand_structure",
     "molecular_structure",
+    "pbpk_compound_dossier",
+    "quantitative_activity_evidence",
     "prepared_receptor",
     "prepared_ligand",
 }

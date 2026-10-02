@@ -648,6 +648,22 @@ class ResearchSessionController:
                 else current.accepted_task_type
             )
             requirement_validation_error: str | None = None
+            if (accepted_requirements is not None
+                    and accepted_requirements.capability_profile == 'virtual_organism'
+                    and self.requirement_interpreter is not None):
+                # Accepted intent is stable; experiment controls are resumable.
+                # Re-extract from scientist turns, not generated follow-up prose,
+                # so supplying a missing dose updates the same session contract.
+                context = ' Scientist follow-up: '.join(turn.content for turn in scientist_turns)
+                refreshed = self.requirement_interpreter.propose(context)
+                if refreshed is not None:
+                    try:
+                        validated = validate_requirement_proposal(refreshed, available_input_types=tuple(i.artifact_type for i in inputs))
+                    except ValueError:
+                        pass
+                    else:
+                        if validated.capability_profile == 'virtual_organism' and validated.pbpk_request is not None:
+                            accepted_requirements = validated
             if requirement_proposal is not None and accepted_requirements is None:
                 try:
                     accepted_requirements = validate_requirement_proposal(
@@ -1219,7 +1235,7 @@ class ResearchSessionController:
             tenant_identifier_sha256=tenant_identifier_sha256,
         )
         if (accepted_research_requirements is not None and
-                accepted_research_requirements.capability_profile == "molecular_construction"):
+                accepted_research_requirements.capability_profile in {"molecular_construction", "virtual_organism"}):
             # This workflow acquires identity specifications, never public coordinates.
             return compilation, execution, questions, no_intent, None
         try:

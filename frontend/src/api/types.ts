@@ -351,6 +351,8 @@ export type ResearchInputArtifactType =
   | 'protein_structure'
   | 'ligand_structure'
   | 'molecular_structure'
+  | 'pbpk_compound_dossier'
+  | 'quantitative_activity_evidence'
   | 'prepared_receptor'
   | 'prepared_ligand'
 
@@ -629,6 +631,24 @@ export interface ResearchVisualizationWorkspace {
     selected_compute?: 'classical'; computation_reason?: string
     xyz_artifact_identifier?: string; workflow?: string[]
     energies: Array<{ label: string; value: number; unit: string }>
+  } | null
+  virtual_organism?: {
+    assessment_artifact_identifier: string; assessment_sha256: string
+    schema_version: 'pulsate.virtual-organism/v1'
+    candidate: { name: string; inchikey: string; pubchem_cid: number | null; source_url: string | null }
+    status: 'exposure_supported' | 'insufficient_parameterization'
+    request: { dose: number; dose_unit: string; route: string; duration_h: number; seed: number; population_size: number; administration_times_h: number[] }
+    runs: Array<{ species: string; file_artifacts: Record<string, string>; result: { subject_count: number } }>
+    population: { interval_scope: string; series: Array<{ species: string; path: string; organ: string; compartment: string; subject_count: number; times_h: number[]; median_umol_l: number[]; p05_umol_l: number[]; p95_umol_l: number[] }> }
+    comparison: { comparison_scope: string; subjects: Array<{ species: string; subject_identifier: string; plasma_metrics: { cmax_umol_l: number; tmax_h: number; auc_0_t_umol_h_l: number }; tissue_to_plasma_auc_ratios: Record<string, number> }> }
+    evidence_quality: Record<string, number>
+    missing: Array<{ species: string; reason: string }>
+    exposure_relevance: { status: string; reason: string }
+    activity_comparisons?: Array<{ status: string; reason: string; activity?: { target: string; species: string; kind: string; value: number; unit: string; source: string; assay_context: string; compatibility_limitations: string }; peak_exposure_to_activity_ratios?: number[] }>
+    verification: { passed: boolean; verification_scope: string }
+    parameters: Array<{ name: string; species: string; value: number | null; unit: string; classification: string; source: string; method: string; uncertainty: string | null }>
+    assumptions: string[]; limitations: string[]
+    computation_selection: { selected_compute: string; quantum_selected: boolean; reason: string }
   } | null
   prospective_assessment?: {
     assessment_artifact_identifier: string; assessment_sha256: string

@@ -822,6 +822,14 @@ def phase8_scientific_capability_catalogue() -> ScientificCapabilityCatalogue:
             priority=100,
         ),
     )
+    from .virtual_organism_handlers import CAPABILITIES as pbpk_capabilities
+    definitions = (*definitions, *(ScientificCapabilityDefinition(
+        capability_name=name, accepted_artifact_types=accepted, produced_artifact_types=produced,
+        supported_task_types=("virtual_organism",), verification_required=True, priority=10 + index,
+    ) for index, (name, accepted, produced) in enumerate(pbpk_capabilities)),
+        ScientificCapabilityDefinition(capability_name="scientist.result_assemble",
+            accepted_artifact_types=("virtual_organism_assessment", "scientific_verification_report"),
+            produced_artifact_types=("scientist_facing_result",), supported_task_types=("virtual_organism",), priority=90))
     # One capability identity may have different task-specific artifact contracts.
     # Collapse only exact duplicate identities by assigning stable internal aliases.
     expanded: list[ScientificCapabilityDefinition] = []

@@ -12,8 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from cgr.science.canonical import validate_identifier
 
 from .natural_language import NaturalLanguageModelProvider
+from .virtual_organism import PBPKRequest, interpret_pbpk_request
 
 ScientificResearchOperation = Literal[
+    "simulate_organism_exposure",
     "assess_drug_candidate",
     "construct_molecule",
     "analyze_structure",
@@ -32,6 +34,7 @@ ScientificResearchOperation = Literal[
 ]
 
 ScientificRequestedOutput = Literal[
+    "virtual_organism_exposure",
     "prospective_candidate_assessment",
     "constructed_molecular_structure",
     "structure_analysis",
@@ -50,6 +53,7 @@ ScientificRequestedOutput = Literal[
 ]
 
 ScientificCapabilityProfile = Literal[
+    "virtual_organism",
     "molecular_construction",
     "structure_analysis",
     "de_novo_protein_design",
@@ -64,6 +68,7 @@ ScientificCapabilityProfile = Literal[
 
 
 _OUTPUT_BY_OPERATION: dict[ScientificResearchOperation, ScientificRequestedOutput] = {
+    "simulate_organism_exposure": "virtual_organism_exposure",
     "assess_drug_candidate": "prospective_candidate_assessment",
     "construct_molecule": "constructed_molecular_structure",
     "analyze_structure": "structure_analysis",
@@ -145,6 +150,7 @@ class ScientificRequirementProposal(BaseModel):
     provider_kind: str
     model_name: str = Field(min_length=1, max_length=512)
     candidate_selection: CandidateSelectionConstraint | None = None
+    pbpk_request: PBPKRequest | None = None
 
     @field_validator("proposal_identifier", "provider_kind")
     @classmethod
@@ -175,6 +181,7 @@ class ValidatedResearchRequirements(BaseModel):
     capability_profile: ScientificCapabilityProfile
     source_proposal_identifier: str
     candidate_selection: CandidateSelectionConstraint | None = None
+    pbpk_request: PBPKRequest | None = None
 
     @field_validator("source_proposal_identifier")
     @classmethod
@@ -194,7 +201,10 @@ def validate_requirement_proposal(
     operation_set = set(operations)
     del available_input_types
 
-    if operation_set == {"construct_molecule"}:
+    if operation_set == {"simulate_organism_exposure"}:
+        profile = "virtual_organism"
+        required = ["virtual_organism_assessment", "scientific_verification_report", "computation_selection_decision"]
+    elif operation_set == {"construct_molecule"}:
         profile = "molecular_construction"
         required = ["molecular_identity_verification", "molecular_construction_evidence",
                     "molecular_construction_execution_receipt", "scientific_verification_report", "computation_selection_decision"]
@@ -267,6 +277,7 @@ def validate_requirement_proposal(
         capability_profile=profile,
         source_proposal_identifier=proposal.proposal_identifier,
         candidate_selection=proposal.candidate_selection,
+        pbpk_request=proposal.pbpk_request if profile == "virtual_organism" else None,
     )
 
 
@@ -322,6 +333,8 @@ class ProviderNeutralScientificRequirementInterpreter:
                             "It requests an evidence-grounded prospective assessment, not molecular construction alone. "
                             "The capability system supplies screening and properties as prerequisites; do not invent safety or efficacy. "
                             "construct_molecule means computationally building the structure of a named known chemical entity. "
+                            "simulate_organism_exposure means PBPK, organism/tissue/plasma exposure over time, pharmacokinetics or virtual human/rat simulation. "
+                            "Population or cross-species exposure is one simulate_organism_exposure outcome; do not classify it as docking or molecular construction. "
                             "A request to create an existing named molecule is construct_molecule, not discovery of new identities. "
                             "identify_binding_regions means locating a binding site. "
                             "generate_candidates and design_next_generation require an explicit "
@@ -378,9 +391,12 @@ class ProviderNeutralScientificRequirementInterpreter:
                 item.supporting_quote not in scientist_text for item in requirements
             ):
                 return None
+            pbpk = (interpret_pbpk_request(scientist_text, self.provider)
+                    if any(item.operation == "simulate_organism_exposure" for item in requirements) else None)
             canonical = json.dumps(
                 {"requirements": [item.model_dump(mode="json") for item in requirements],
-                 "candidate_selection": selection.model_dump(mode="json") if selection else None},
+                 "candidate_selection": selection.model_dump(mode="json") if selection else None,
+                 "pbpk_request": pbpk.model_dump(mode="json") if pbpk else None},
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -391,6 +407,7 @@ class ProviderNeutralScientificRequirementInterpreter:
                 ),
                 requirements=requirements,
                 candidate_selection=selection,
+                pbpk_request=pbpk,
                 summary=(
                     "Pulsate proposed general research operations and requested outputs. "
                     "CGR will validate them deterministically before selecting capabilities."

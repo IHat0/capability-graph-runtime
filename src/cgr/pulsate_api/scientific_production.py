@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+import os
 
 from cgr.electronic_structure import PySCFElectronicStructureAdapter
 from cgr.kernel.contracts import HealthStatus
@@ -131,7 +132,9 @@ def phase8_production_registry(
         else protein_adapters
     )
     from .scientific_construction import molecular_construction_registry
+    from .virtual_organism_handlers import virtual_organism_registry
     task_registries: dict[str, ScientistCapabilityRegistry] = {
+        "virtual_organism": virtual_organism_registry(payload_store),
         "molecular_construction": molecular_construction_registry(
             store=payload_store, rdkit_adapter=rdkit, pyscf_adapter=pyscf, qiskit_adapter=qiskit),
         "structure_analysis": structure_analysis_registry(
@@ -251,18 +254,23 @@ def create_scientific_production_composition(
         catalogue=phase8_scientific_capability_catalogue(),
         registered_capability_names=registry.identities(),
         implementation_overrides={
+            "pharmacokinetics.pbpk_simulate": ScientificCapabilityImplementation.EXTERNAL_EXECUTOR,
+            **{
             envelope.descriptor.capability_name: (
                 ScientificCapabilityImplementation.EXTERNAL_EXECUTOR
             )
             for adapter in protein_adapters
             for envelope in adapter.declaration.capabilities
+            },
         },
         configured_external_capability_names=tuple(
             envelope.descriptor.capability_name
             for adapter in protein_adapters
             if adapter.health().status is HealthStatus.HEALTHY
             for envelope in adapter.declaration.capabilities
-        ),
+        ) + (("pharmacokinetics.pbpk_simulate",) if os.environ.get("PULSATE_PBPK_EXECUTABLE")
+            and Path(os.environ["PULSATE_PBPK_EXECUTABLE"]).is_file()
+            and (Path(os.environ["PULSATE_PBPK_EXECUTABLE"]).parent / "PKSimDB.sqlite").is_file() else ()),
     )
     healthy_protein_adapters = tuple(
         adapter

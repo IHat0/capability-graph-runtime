@@ -782,6 +782,7 @@ function researchInputMediaType(fileName: string): string {
     '.pdbqt': 'chemical/x-pdbqt',
     '.smi': 'chemical/x-daylight-smiles',
     '.smiles': 'chemical/x-daylight-smiles',
+      '.json': 'application/json',
   }[extension] ?? 'application/octet-stream'
 }
 

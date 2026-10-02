@@ -45,6 +45,7 @@ class ScientificInputReference(BaseModel):
     artifact_type: Literal[
         "protein_structure", "ligand_structure", "molecular_structure",
         "prepared_receptor", "prepared_ligand",
+        "pbpk_compound_dossier", "quantitative_activity_evidence",
     ]
     artifact_identifier: str
 
@@ -302,7 +303,7 @@ def compile_scientific_objective(
             target_kind = "molecular_ground_state"
         elif profile == "protein_ligand_discovery":
             target_kind = "binding_pocket"
-        elif profile in {"structure_analysis", "molecular_construction"}:
+        elif profile in {"structure_analysis", "molecular_construction", "virtual_organism"}:
             target_kind = "whole_structure"
         elif profile == "de_novo_protein_design":
             target_kind = "designed_protein"
@@ -354,6 +355,15 @@ def compile_scientific_objective(
         else task
     )
     needs_protein = capability_profile in {"covalent_transition_state", "metal_active_site_quantum", "protein_ligand_discovery"}
+    if capability_profile == "virtual_organism":
+        pbpk = research_requirements.pbpk_request
+        if pbpk is None:
+            ambiguities.append("Please specify one exact candidate identity, research dose and units, administration route and simulation duration for the organism exposure experiment.")
+        else:
+            pbpk.check_grounding(normalized)
+            target_label = pbpk.entity_name + " organism exposure"
+            if pbpk.missing():
+                ambiguities.append("The exposure experiment needs " + ", ".join(pbpk.missing()) + ". No therapeutic dose is inferred.")
     if capability_profile in {"molecular_ground_state_vqe", "molecular_ground_state_vqe_sweep"}:
         molecular_specification, molecular_reasons = (
             resolve_molecular_ground_state_specification(normalized)

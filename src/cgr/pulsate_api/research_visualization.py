@@ -24,6 +24,7 @@ _JSON_VISUALIZATION_ARTIFACT_TYPES = frozenset(
     {
         "binding_pocket",
         "prospective_candidate_assessment",
+        "virtual_organism_assessment",
         "discovery_design_loop_trace",
         "electronic_conformer_comparison",
         "electronic_qm_region_preparation",
@@ -697,6 +698,9 @@ def build_research_visualization(
         "verification_artifact_identifiers": verification_artifacts,
         "export_items": export_items,
         "construction_summary": construction_summary,
+        "virtual_organism": next((dict(documents[r.artifact_identifier],
+            assessment_artifact_identifier=r.artifact_identifier, assessment_sha256=r.content_sha256)
+            for r in all_references if r.artifact_type == 'virtual_organism_assessment' and r.artifact_identifier in documents), None),
         "prospective_assessment": next((dict(documents[r.artifact_identifier],
             assessment_artifact_identifier=r.artifact_identifier, assessment_sha256=r.content_sha256)
             for r in all_references if r.artifact_type == 'prospective_candidate_assessment'), None),

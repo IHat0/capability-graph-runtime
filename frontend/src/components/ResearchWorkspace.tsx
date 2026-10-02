@@ -1,8 +1,11 @@
 import type { ResearchInputArtifactType } from '../api/types'
 import type { ResearchSessionWorkspace } from '../hooks/useResearchSession'
+import { VirtualOrganismResult } from './VirtualOrganismResult'
 
 const attachmentKinds: Array<{ value: ResearchInputArtifactType; label: string; accept: string }> = [
   { value: 'molecular_structure', label: 'Molecule structure', accept: '.pdb,.sdf,.mol,.mol2,.pdbqt,.smi,.smiles' },
+  { value: 'pbpk_compound_dossier', label: 'Species ADME dossier', accept: '.json' },
+  { value: 'quantitative_activity_evidence', label: 'Quantitative activity evidence', accept: '.json' },
   { value: 'protein_structure', label: 'Protein structure', accept: '.pdb,.pdbqt' },
   { value: 'ligand_structure', label: 'Ligand structure', accept: '.sdf,.mol,.mol2,.pdb,.pdbqt,.smi,.smiles' },
 ]
@@ -20,7 +23,8 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
   const session = research.session
   const constructionComplete = Boolean(session?.scientist_result && research.visualization?.construction_summary)
   const assessmentComplete = Boolean(session?.scientist_result && research.visualization?.prospective_assessment)
-  const compactResult = constructionComplete || assessmentComplete
+  const organismComplete = Boolean(session?.scientist_result && research.visualization?.virtual_organism)
+  const compactResult = constructionComplete || assessmentComplete || organismComplete
   const responseNeeded = session?.status === 'awaiting_clarification' || session?.status === 'awaiting_approval'
   const acquiredApprovalNeeded = Boolean(session?.unapproved_input_artifact_identifiers.length)
   return (
@@ -73,6 +77,7 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
 
           {constructionComplete && <ConstructionResult research={research} />}
           {assessmentComplete && <ProspectiveResult research={research} />}
+          {organismComplete && <VirtualOrganismResult research={research} />}
           {session.execution_steps && session.execution_steps.length > 0 && (compactResult
             ? <details><summary>Completed calculation record</summary><ExecutionProgress steps={session.execution_steps} /></details>
             : <ExecutionProgress steps={session.execution_steps} />)}
@@ -192,12 +197,12 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
                 id="research-reply"
                 value={research.reply}
                 onChange={(event) => research.setReply(event.target.value)}
-                placeholder={session.status === 'completed' ? "Ask about the recorded candidates, ranking, or limitations." : "Answer Pulsate’s question. You can also attach exact input files here."}
+                placeholder={research.visualization?.virtual_organism?.status === 'insufficient_parameterization' ? 'Provide the missing species ADME evidence or attach a reviewed dossier to continue this exposure experiment.' : session.status === 'completed' ? "Ask about the recorded candidates, ranking, or limitations." : "Answer Pulsate’s question. You can also attach exact input files here."}
                 disabled={research.busy}
               />
-              {session.status !== 'completed' && <AttachmentControls research={research} />}
+              {(session.status !== 'completed' || research.visualization?.virtual_organism?.status === 'insufficient_parameterization') && <AttachmentControls research={research} />}
               <button className="primary-button" type="submit" disabled={research.busy || (!research.reply.trim() && !research.acceptIntentProposal && !research.acceptEvidenceProposal && !research.acceptRequirementProposal && research.attachments.length === 0)}>
-                {research.busy ? 'Processing…' : session.status === 'completed' ? 'Ask about evidence' : 'Continue'}
+                {research.busy ? 'Processing…' : session.status === 'completed' && research.visualization?.virtual_organism?.status !== 'insufficient_parameterization' ? 'Ask about evidence' : 'Continue'}
               </button>
             </form>
           )}

@@ -536,6 +536,37 @@ class ScientistResultAssembler:
                 f"The {len(record.evidence_artifact_identifiers)} supporting evidence artifacts are retained for inspection and download.",
                 record.evidence_artifact_identifiers,
             )
+        organism = self._read_json_evidence(record, "virtual_organism_assessment")
+        if organism is not None:
+            assessment, identifier = organism
+            source = f"public record CID {assessment['candidate']['pubchem_cid']}" if assessment['candidate']['pubchem_cid'] is not None else "scientist-supplied/generated graph, independently identity-checked"
+            add("entity", f"Candidate {assessment['candidate']['name']}; identity {assessment['candidate']['inchikey']}; {source}.", (identifier,), True)
+            request = assessment['request']
+            add("understanding", f"Organism exposure experiment: {request['dose']} {request['dose_unit']}, {request['route']}, dose times {request['administration_times_h']} h, simulated through {request['duration_h']} h.", (identifier,), True)
+            add("principal_result", "Virtual Organism state: " + assessment['status'].replace('_', ' ') + ".", (identifier,), True)
+            for item in assessment['comparison']['subjects']:
+                pk = item['plasma_metrics']
+                add("principal_result", f"{item['species']} subject {item['subject_identifier']}: sampled plasma Cmax {pk['cmax_umol_l']:.6g} umol/l at {pk['tmax_h']:.6g} h; finite-window AUC {pk['auc_0_t_umol_h_l']:.6g} umol*h/l. No terminal extrapolation.", (identifier,), True)
+            for missing in assessment['missing']:
+                add('principal_result', 'No accepted ' + missing['species'] + ' exposure prediction is available: ' + missing['reason'], (identifier,), True)
+                add("limitation", missing['species'] + ": " + missing['reason'], (identifier,), True)
+            add("confidence", assessment['verification']['verification_scope'], (identifier,), True)
+            add("confidence", "Parameter evidence classifications: " + str(assessment['evidence_quality']) + ". Solver convergence is not a high-confidence biological conclusion.", (identifier,), True)
+            add("methods", assessment['computation_selection']['reason'], (identifier,), True)
+            for assumption in assessment['assumptions']:
+                add("assumption", assumption, (identifier,), True)
+            for limitation in assessment['limitations']:
+                add("limitation", limitation, (identifier,), True)
+            add("limitation", assessment['exposure_relevance']['reason'], (identifier,), True)
+            for comparison in assessment.get('activity_comparisons', []):
+                if comparison['status'] == 'prioritization_hypothesis':
+                    activity = comparison['activity']
+                    add('principal_result', f"Exposure prioritization hypothesis for {activity['target']} ({activity['species']}): peak matching unbound exposure / sourced {activity['kind']} ratios {comparison['peak_exposure_to_activity_ratios']}. Assay context: {activity['assay_context']}. " + comparison['reason'], (identifier,), True)
+                    add('limitation', activity['compatibility_limitations'], (identifier,), True)
+                else:
+                    add('limitation', comparison['reason'], (identifier,), True)
+            add("recommendation", "Review the species-specific ADME measurements and modeled tissue exposures. Resolve missing binding/clearance/absorption evidence and obtain compatible quantitative activity measurements before exposure-to-mechanism conclusions. PBPK does not certify safety.", (identifier,), True)
+            return tuple(statements)
         prospective = self._read_json_evidence(record, "prospective_candidate_assessment")
         if prospective is not None:
             assessment, identifier = prospective

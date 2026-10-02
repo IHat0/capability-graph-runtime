@@ -76,6 +76,42 @@ class _NoExecution:
         raise AssertionError("Unified research-session tests cannot use preset runs.")
 
 
+def test_pbpk_missing_dose_reply_refreshes_controls_in_the_same_session(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from cgr.pulsate_api.virtual_organism import PBPKRequest
+    from cgr.pulsate_api.scientific_requirements import ScientificRequirement, ScientificRequirementProposal
+
+    question = 'Simulate candidate-A in a human after an intravenous bolus over 8 hours.'
+    reply = 'Use a research dose of 3 mg/kg.'
+    seen = []
+
+    def propose(text):
+        seen.append(text)
+        controls = PBPKRequest(entity_name='candidate-A', route='Intravenous', duration_h=8,
+            dose=3 if reply in text else None, dose_unit='mg/kg' if reply in text else None,
+            quotes={'route': 'intravenous', 'duration_h': '8 hours',
+                    **({'dose': '3 mg/kg', 'dose_unit': '3 mg/kg'} if reply in text else {})})
+        controls.check_grounding(text)
+        return ScientificRequirementProposal(proposal_identifier='proposal-pbpk-resume', summary='Exposure',
+            provider_kind='test', model_name='test', requirements=(ScientificRequirement(
+                operation='simulate_organism_exposure', requested_output='virtual_organism_exposure',
+                supporting_quote=question),), pbpk_request=controls)
+
+    controller = _controller(tmp_path)
+    controller.requirement_interpreter = SimpleNamespace(propose=propose)
+    tenant = hashlib.sha256(b'pbpk-resume-test').hexdigest()
+    first = controller.create(ResearchSessionCreateRequest(question=question), tenant_identifier_sha256=tenant)
+    assert first.status == 'awaiting_clarification'
+    assert first.accepted_research_requirements.pbpk_request.dose is None
+    resumed = controller.reply(first.session_identifier, ResearchSessionReplyRequest(message=reply),
+        tenant_identifier_sha256=tenant)
+    assert resumed.session_identifier == first.session_identifier and resumed.revision == 2
+    assert resumed.status == 'planned' and not resumed.next_questions
+    assert resumed.accepted_research_requirements.pbpk_request.dose == 3
+    assert resumed.accepted_research_requirements.pbpk_request.dose_unit == 'mg/kg'
+    assert all('What' not in text for text in seen)  # Generated prompts are never scientific evidence.
+
+
 def test_missing_value_is_asked_then_same_session_resumes(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     tenant = hashlib.sha256(b"tenant-alpha").hexdigest()
