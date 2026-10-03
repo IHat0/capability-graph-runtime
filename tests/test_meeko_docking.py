@@ -73,6 +73,35 @@ def test_long_preparation_diagnostics_remain_controlled():
     assert len(result.failure.details["stderr_tail"]) == 1024
 
 
+@pytest.mark.parametrize(
+    "stderr,stdout,expected",
+    [
+        ("RuntimeError: unsupported inter-residue bond", "none", "unsupported inter-residue bond"),
+        ("none", "incomplete residue template", "incomplete residue template"),
+        ("none", "none", "No valid prepared receptor"),
+    ],
+)
+def test_native_receptor_refusal_exposes_the_real_diagnostic(monkeypatch, stderr, stdout, expected):
+    from cgr.molecular.meeko_adapter import _MeekoPreparationFailure
+    from cgr.science import ScientificEngineHealthReport
+
+    adapter = MeekoDockingPreparationAdapter(MemoryPayloadStore())
+    monkeypatch.setattr(adapter, "health", lambda: ScientificEngineHealthReport(status=HealthStatus.HEALTHY))
+
+    def refuse(invocation):
+        raise _MeekoPreparationFailure(
+            "No valid prepared receptor", diagnostics={"return_code": 1, "stderr_tail": stderr, "stdout_tail": stdout}
+        )
+
+    monkeypatch.setattr(adapter, "_prepare_receptor", refuse)
+    result = _invoke(adapter, DOCKING_RECEPTOR_PREPARE)
+    assert result.status is ExecutionStatus.FAILED
+    assert result.output_artifacts == ()
+    assert result.failure.code == "docking_preparation_invalid"
+    assert expected in result.failure.message
+    assert result.failure.details["return_code"] == 1
+
+
 def test_meeko_declaration_is_import_safe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "meeko", None)
     adapter = MeekoDockingPreparationAdapter(MemoryPayloadStore())

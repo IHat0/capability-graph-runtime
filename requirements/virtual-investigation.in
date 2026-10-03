@@ -1,0 +1,7 @@
+# Optional original-PDF replay and native SBML calculation dependencies.
+# Missing/mismatched numerical engines must retain explicit scientific refusals.
+# PK-Sim is an external native runtime, not supplied by this Python requirement.
+pypdf==6.10.0
+pdfplumber==0.11.9
+python-libsbml==5.21.1
+libroadrunner==2.9.2

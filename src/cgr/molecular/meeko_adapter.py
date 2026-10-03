@@ -173,10 +173,18 @@ class MeekoDockingPreparationAdapter:
                 return self._prepare_receptor(invocation)
             return self._prepare_ligand(invocation)
         except _MeekoPreparationFailure as error:
+            # Native validation failures are normally written to stderr. An
+            # empty stdout stream is not a chemical diagnosis, and must not
+            # hide the reason that preparation refused the receptor.
+            diagnostic = str(error.diagnostics.get("stderr_tail", "")).strip()
+            if diagnostic in {"", "none"}:
+                diagnostic = str(error.diagnostics.get("stdout_tail", "")).strip()
+            if diagnostic in {"", "none"}:
+                diagnostic = str(error)
             return self._failure(
                 "docking_preparation_invalid",
-                "Receptor preparation requires complete residues and one selected alternate conformation. "
-                + str(error.diagnostics.get("stdout_tail", ""))[-900:],
+                "Receptor preparation failed controlled chemical validation. "
+                + diagnostic[-900:],
                 details=error.diagnostics,
             )
         except (ValueError, KeyError, UnicodeDecodeError, subprocess.SubprocessError) as error:

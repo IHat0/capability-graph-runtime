@@ -256,6 +256,36 @@ def test_confirmed_requirements_are_part_of_objective_identity() -> None:
     assert first.objective_identifier != second.objective_identifier
 
 
+def test_discovery_can_include_existing_structure_analysis_without_dropping_outputs() -> None:
+    question = "Investigate this candidate and analyze the structure."
+    proposal = ProviderNeutralScientificRequirementInterpreter(
+        _RequirementProvider([
+            {"operation":"assess_drug_candidate", "requested_output":"prospective_candidate_assessment",
+             "supporting_quote":"Investigate this candidate"},
+            {"operation":"analyze_structure", "requested_output":"structure_analysis",
+             "supporting_quote":"analyze the structure"},
+        ])
+    ).propose(question)
+    requirements = validate_requirement_proposal(proposal,available_input_types=("protein_structure","ligand_structure"))
+    references = tuple(ScientificInputReference(reference_identifier='input-'+kind,artifact_type=kind,
+        artifact_identifier='artifact-'+kind) for kind in ('protein_structure','ligand_structure'))
+    objective = compile_scientific_objective(question,input_references=references,research_requirements=requirements)
+    plan = plan_scientific_objective(objective)
+    assert plan.executable
+    assert 'molecular_structure_analysis' in requirements.required_artifact_types
+    assert 'molecular_structure_analysis_verification' in requirements.required_artifact_types
+    names = tuple(step.capability_name for step in plan.steps)
+    assert 'molecular.structure_analyze' in names
+    assert 'scientific_verification.structure_analysis' in names
+    assert 'discovery.virtual_investigate' in names
+    from cgr.pulsate_api.phase8_scientific_handlers import protein_ligand_discovery_registry
+    from types import SimpleNamespace
+    registry = protein_ligand_discovery_registry(
+        store=SimpleNamespace(read=lambda ref:b'',write=lambda ref,payload:None),meeko_adapter=SimpleNamespace())
+    assert 'molecular.structure_analyze' in registry.identities()
+    assert 'scientific_verification.structure_analysis' in registry.identities()
+
+
 def test_general_structure_analysis_composes_a_real_verified_executor_path() -> None:
     question = "Analyze this structure."
     proposal = ProviderNeutralScientificRequirementInterpreter(

@@ -158,5 +158,12 @@ def test_mixed_operations_are_never_silently_dropped(extra_operation, extra_outp
         summary="Two requested operations.",
         provider_kind="test", model_name="test",
     )
-    with pytest.raises(ValueError, match="all requested outputs"):
-        validate_requirement_proposal(proposal, available_input_types=())
+    if extra_operation == 'analyze_structure':
+        requirements = validate_requirement_proposal(proposal, available_input_types=())
+        assert requirements.operations == ('dock_candidates', 'analyze_structure')
+        assert set(requirements.requested_outputs) == {'docking_evidence', 'structure_analysis'}
+        assert 'molecular_structure_analysis' in requirements.required_artifact_types
+        assert 'molecular_structure_analysis_verification' in requirements.required_artifact_types
+    else:
+        with pytest.raises(ValueError, match="all requested outputs"):
+            validate_requirement_proposal(proposal, available_input_types=())

@@ -622,7 +622,8 @@ function parseResearchVisualization(value: unknown): ResearchVisualizationWorksp
     !isRecord(prospective) || !hasString(prospective, 'assessment_artifact_identifier')
     || !hasString(prospective, 'assessment_sha256') || !hasString(prospective, 'verification_scope')
     || !isRecord(prospective.computation_selection) || !hasString(prospective.computation_selection, 'reason')
-    || !isRecord(prospective.target_selection) || !isRecord(prospective.target_selection.selected)
+    || !isRecord(prospective.target_selection)
+    || (prospective.target_selection.selected !== undefined && !isRecord(prospective.target_selection.selected))
     || !Array.isArray(prospective.assumptions) || !Array.isArray(prospective.blinding_limitations)
     || !Array.isArray(prospective.source_audit) || !Array.isArray(prospective.candidates)
     || !prospective.candidates.every(c => isRecord(c) && hasString(c, 'candidate_identifier') && hasString(c, 'name')
@@ -632,6 +633,8 @@ function parseResearchVisualization(value: unknown): ResearchVisualizationWorksp
       && Array.isArray(c.hypotheses) && Array.isArray(c.unsupported_risk_dimensions)
       && validAlternativeTargets(c.alternative_targets)
       && (c.orthogonal_follow_up === undefined || isStringArray(c.orthogonal_follow_up)))
+    || (prospective.virtual_investigation !== undefined && prospective.virtual_investigation !== null
+      && !validVirtualInvestigation(prospective.virtual_investigation))
   )) malformed('The backend returned malformed prospective assessment evidence.')
   if (construction !== undefined && construction !== null && (
     !isRecord(construction)
@@ -646,6 +649,70 @@ function parseResearchVisualization(value: unknown): ResearchVisualizationWorksp
     || !construction.energies.every(item => isRecord(item) && hasString(item, 'label') && hasString(item, 'unit') && isFiniteNumber(item.value))
   )) malformed('The backend returned malformed molecular construction evidence.')
   return value as unknown as ResearchVisualizationWorkspace
+}
+
+function validVirtualInvestigation(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.prospective_policy) || !hasString(value, 'verification_scope')
+    || !Array.isArray(value.candidates)
+    || (value.bioactivity_structural !== undefined && !validBioactivityStructural(value.bioactivity_structural))) return false
+  return value.candidates.every(c => isRecord(c) && hasString(c, 'candidate_identifier')
+    && isRecord(c.identity) && hasString(c.identity, 'name') && hasString(c.identity, 'inchikey')
+    && hasString(c, 'candidate_status') && hasString(c, 'assessment_reason')
+    && isRecord(c.inference_levels) && Object.values(c.inference_levels).every(v => typeof v === 'boolean')
+    && c.inference_levels.clinical === false
+    && isRecord(c.dossier_acquisition) && isStringArray(c.dossier_acquisition.missing)
+    && Array.isArray(c.dossier_acquisition.conflicts) && c.dossier_acquisition.conflicts.every(v => isRecord(v) && hasString(v, 'parameter') && hasString(v, 'reason'))
+    && isRecord(c.dossier_acquisition.eligibility) && Array.isArray(c.dossier_acquisition.eligibility.decisions)
+    && c.dossier_acquisition.eligibility.decisions.every(v => isRecord(v) && hasString(v, 'identifier') && hasString(v, 'status') && hasString(v, 'reason'))
+    && isRecord(c.regimen) && hasString(c.regimen, 'status')
+    && (c.native_sensitivity === undefined || c.native_sensitivity === null || validNativeSensitivity(c.native_sensitivity))
+    && isRecord(c.bioactivity_hypotheses) && Array.isArray(c.bioactivity_hypotheses.targets)
+    && c.bioactivity_hypotheses.targets.every(t => isRecord(t) && hasString(t, 'target_accession')
+      && Array.isArray(t.evidence) && t.evidence.every(e => isRecord(e) && hasString(e, 'neighbour_chembl_id')
+        && isFiniteNumber(e.local_similarity) && isRecord(e.quantitative_neighbour_evidence)
+        && hasString(e.quantitative_neighbour_evidence, 'kind') && isFiniteNumber(e.quantitative_neighbour_evidence.value_umol_l)
+        && hasString(e.quantitative_neighbour_evidence, 'uncertainty')) && isRecord(t.tissue_relevance))
+    && Array.isArray(c.exposure_activity) && c.exposure_activity.every(e => isRecord(e) && hasString(e, 'status') && hasString(e, 'target_accession'))
+    && Array.isArray(c.functional_models) && c.functional_models.every(f => isRecord(f)
+      && (f.exposure_case_identifier === undefined || f.exposure_case_identifier === null || hasString(f, 'exposure_case_identifier')) && (
+      f.status === 'refused' ? hasString(f, 'model_identifier') && hasString(f, 'reason') :
+      f.status === 'computed' && isRecord(f.result) && isRecord(f.result.model) && hasString(f.result.model, 'name')
+        && hasString(f.result.model, 'species') && hasString(f.result.model, 'sha256') && hasString(f.result, 'inference_level')
+        && isRecord(f.result.verification) && f.result.verification.passed === true && isRecord(f.result.response)
+        && Object.values(f.result.response).every(r => isRecord(r) && hasString(r, 'unit')
+          && ['baseline_final', 'perturbed_final', 'final_difference', 'maximum_absolute_difference'].every(k => isFiniteNumber(r[k])))))
+  )
+}
+
+function validNativeSensitivity(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  if (value.status === 'refused') return hasString(value, 'reason') && value.nominal_withheld === true
+  if (value.status !== 'planned' || !isRecord(value.design) || !Array.isArray(value.design.cases)
+    || value.design.cases.length > 256 || !value.design.cases.every(c=>isRecord(c)&&hasString(c,'case_identifier'))
+    || !isFiniteNumber(value.design.total_combinations) || typeof value.design.exhaustive !== 'boolean'
+    || !hasString(value.design,'limitation') || !isRecord(value.summary)
+    || value.summary.nominal_withheld !== true || typeof value.summary.complete_discrete_space !== 'boolean'
+    || !hasString(value.summary,'qualitative_conclusion') || !isRecord(value.summary.endpoint_ranges)
+    || !Array.isArray(value.executions) || value.executions.length !== value.design.cases.length) return false
+  return Object.values(value.summary.endpoint_ranges).every(r=>isRecord(r)
+    && ['peak_range_umol_l','auc_range_umol_h_l'].every(k=>Array.isArray(r[k])&&r[k].length===2&&r[k].every(isFiniteNumber)))
+    && value.executions.every(e=>isRecord(e)&&hasString(e,'case_identifier')&&(
+      e.status==='computed' ? isRecord(e.virtual_organism) : e.status==='unsupported'&&hasString(e,'reason')))
+}
+
+function validBioactivityStructural(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  if (value.status==='not_configured') return hasString(value,'reason')
+  if (value.status!=='evaluated' || !isRecord(value.verification) || value.verification.passed!==true
+    || !isRecord(value.panel) || !Array.isArray(value.panel.candidates)
+    || !isRecord(value.screening) || !Array.isArray(value.screening.candidates)) return false
+  return value.panel.candidates.every(c=>isRecord(c)&&hasString(c,'candidate_identifier')&&Array.isArray(c.excluded)
+    && c.excluded.every(e=>isRecord(e)&&hasString(e,'reason')))
+    && value.screening.candidates.every(c=>isRecord(c)&&hasString(c,'candidate_identifier')&&Array.isArray(c.targets)
+      && c.targets.every(t=>isRecord(t)&&isRecord(t.target)&&hasString(t.target,'uniprot_accession')&&hasString(t.target,'pdb_id')&&hasString(t.target,'chain')
+        && (t.status==='computed' ? isRecord(t.docking)&&Array.isArray(t.docking.vina_scores_kcal_per_mol)
+          &&t.docking.vina_scores_kcal_per_mol.length>0&&t.docking.vina_scores_kcal_per_mol.every(isFiniteNumber)
+          :t.status==='unsupported'&&hasString(t,'reason'))))
 }
 
 function parseExperimentPlan(value: unknown): ExperimentPlanResponse {

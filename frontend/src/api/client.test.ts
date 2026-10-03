@@ -39,6 +39,20 @@ describe('prospective alternative-target evidence parsing', () => {
     ]))))
     await expect(pulsateApi.getResearchVisualization('session-test')).rejects.toBeInstanceOf(ApiError)
   })
+  it('retains explicit-structure sessions without pretending comparative receptor selection ran', async () => {
+    const value = workspace([])
+    value.prospective_assessment.target_selection = {} as { selected: object }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(value)))
+    const result = await pulsateApi.getResearchVisualization('session-test')
+    expect(result.prospective_assessment?.target_selection).toEqual({})
+  })
+  it('rejects malformed virtual-investigation claims instead of breaking or inventing the result view', async () => {
+    const value = workspace([])
+    const invalid = { prospective_policy: {}, verification_scope: 'Synthetic', candidates: [{ inference_levels: { clinical: true } }] }
+    Object.assign(value.prospective_assessment, { virtual_investigation: invalid })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(value)))
+    await expect(pulsateApi.getResearchVisualization('session-test')).rejects.toBeInstanceOf(ApiError)
+  })
 })
 
 describe('Pulsate API client failure handling', () => {

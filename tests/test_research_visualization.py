@@ -317,3 +317,25 @@ def test_prospective_cards_are_projected_from_the_exact_persisted_assessment():
     assert workspace['prospective_assessment'] == dict(document, assessment_artifact_identifier=reference.artifact_identifier,
                                                        assessment_sha256=reference.content_sha256)
     assert workspace['construction_summary'] is None
+
+
+def test_nested_native_download_matches_its_own_persisted_assessment_not_another_candidate():
+    native={'schema_version':'pulsate.virtual-organism/v1','candidate':{'name':'Synthetic'},'runs':[]}
+    native_payload=json.dumps(native).encode()
+    native_ref=_reference('virtual_organism_assessment',native_payload)
+    document={'virtual_investigation':{'candidates':[{'candidate_identifier':'fixture',
+        'native_artifact_identifiers':[native_ref.artifact_identifier],'virtual_organism':native}]}}
+    payload=json.dumps(document).encode()
+    ref=_reference('prospective_candidate_assessment',payload)
+    store=_Store({ref.artifact_identifier:payload,native_ref.artifact_identifier:native_payload})
+    workspace=build_research_visualization(session=_session(ref),store=store,artifact_references=(ref,native_ref))
+    shown=workspace['prospective_assessment']['virtual_investigation']['candidates'][0]['virtual_organism']
+    assert shown['assessment_artifact_identifier']==native_ref.artifact_identifier
+    assert shown['assessment_sha256']==native_ref.content_sha256
+    assert 'assessment_sha256' not in json.loads(store.read(ref))['virtual_investigation']['candidates'][0]['virtual_organism']
+    document['virtual_investigation']['candidates'][0]['virtual_organism']['runs']=[{'invented':True}]
+    corrupt=json.dumps(document).encode()
+    ref=_reference('prospective_candidate_assessment',corrupt)
+    store.payloads[ref.artifact_identifier]=corrupt
+    with pytest.raises(ValueError,match='exact verified assessment'):
+        build_research_visualization(session=_session(ref),store=store,artifact_references=(ref,native_ref))

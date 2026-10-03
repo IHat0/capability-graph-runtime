@@ -34,6 +34,32 @@ class PayloadStore:
         self.payloads[reference.artifact_identifier] = bytes(payload)
 
 
+def test_answer_preserves_new_nominated_docking_refusals_and_independent_reference_scope():
+    """Synthetic assembly fixture; not a biological or numerical benchmark."""
+    candidate={'candidate_identifier':'synthetic-candidate','identity':{'name':'Synthetic candidate'},
+        'candidate_status':'INSUFFICIENT EVIDENCE','assessment_reason':'No qualified transfer',
+        'dossier_acquisition':{'missing':[]},'regimen':{'status':'requires_regimen','reason':'No measured exposure'},
+        'bioactivity_hypotheses':{'targets':[]},'virtual_organism':None,'functional_models':[]}
+    assessment={'candidates':[], 'assumptions':[], 'verification_scope':'Synthetic integrity only',
+        'computation_selection':{'reason':'Synthetic classical fixture'}, 'virtual_investigation':{'candidates':[candidate],
+        'verification_scope':'Synthetic integrity only','bioactivity_structural':{'screening':{'candidates':[
+            {'candidate_identifier':'synthetic-candidate','targets':[
+                {'status':'computed','target':{'uniprot_accession':'P00002','pdb_id':'TEST','chain':'A',
+                    'independent_pocket_reference':{'reference_chembl_id':'CHEMBL100',
+                        'activity_record':{'assay_chembl_id':'CHEMBL300'}}},'docking':{'vina_scores_kcal_per_mol':[-1]}},
+                {'status':'unsupported','target':{'uniprot_accession':'P00003','pdb_id':'TST2','chain':'B'},
+                    'reason':'Alternate conformation unresolved'}]}]}}}}
+    assembler=ScientistResultAssembler()
+    assembler._read_json_evidence=lambda record,kind: (assessment,'synthetic-verified-assessment') if kind=='prospective_candidate_assessment' else None
+    objective=SimpleNamespace(research_requirements=None,task_type='prospective_candidate_assessment',assumptions=())
+    statements=assembler._allowed_statements(objective,SimpleNamespace(evidence_artifact_identifiers=(),verified_scientific_summaries=(),verified=True,limitations=()),(),())
+    result=' '.join(s['text'] for s in statements)
+    assert 'P00002, PDB TEST chain A: computed Vina scores [-1]' in result
+    assert 'P00003, PDB TST2 chain B: not computed. Alternate conformation unresolved' in result
+    assert "Its measured activity is not the candidate's activity" in result
+    assert all(s['evidence_artifact_identifiers']==['synthetic-verified-assessment'] for s in statements if 'Bioactivity-nominated' in s['text'])
+
+
 class EvidenceHandler:
     def execute(self, *, invocation, objective, record):
         del objective, record

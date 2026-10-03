@@ -28,6 +28,9 @@ def test_assessment_composes_existing_screening_plus_separate_assessment(compoun
         available_artifact_types=('scientist_input', 'protein_structure', 'ligand_structure'))
     names = [s.capability_name for s in composition]
     assert 'discovery.prospective_assess' in names
+    assert 'discovery.virtual_investigate' in names
+    assert 'discovery.virtual_investigation_verify' in names
+    assert names.index('discovery.virtual_investigate') < names.index('discovery.virtual_investigation_verify') < names.index('discovery.prospective_assess')
     assert 'discovery.campaign_iterate' in names
     assert any(n.startswith('scientific_verification.candidate_ranking') for n in names)
     answer = next(s for s in composition if 'scientist_facing_result' in s.produced_artifact_types)

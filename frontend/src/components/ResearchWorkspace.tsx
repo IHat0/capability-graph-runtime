@@ -1,6 +1,7 @@
 import type { ResearchInputArtifactType } from '../api/types'
 import type { ResearchSessionWorkspace } from '../hooks/useResearchSession'
 import { VirtualOrganismResult } from './VirtualOrganismResult'
+import { VirtualInvestigationResult } from './VirtualInvestigationResult'
 
 const attachmentKinds: Array<{ value: ResearchInputArtifactType; label: string; accept: string }> = [
   { value: 'molecular_structure', label: 'Molecule structure', accept: '.pdb,.sdf,.mol,.mol2,.pdbqt,.smi,.smiles' },
@@ -77,7 +78,8 @@ export function ResearchWorkspace({ research, inspector = false }: ResearchWorks
 
           {constructionComplete && <ConstructionResult research={research} />}
           {assessmentComplete && <ProspectiveResult research={research} />}
-          {organismComplete && <VirtualOrganismResult research={research} />}
+          {assessmentComplete && <VirtualInvestigationResult research={research} />}
+          {organismComplete && !assessmentComplete && <VirtualOrganismResult research={research} />}
           {session.execution_steps && session.execution_steps.length > 0 && (compactResult
             ? <details><summary>Completed calculation record</summary><ExecutionProgress steps={session.execution_steps} /></details>
             : <ExecutionProgress steps={session.execution_steps} />)}
@@ -465,8 +467,9 @@ function ProspectiveResult({ research }: { research: ResearchSessionWorkspace })
   return <article className="research-result prospective-result">
     <p className="section-kicker">Prospective assessment · computed evidence only</p>
     <h2>Candidate investigation</h2>
-    <p>Intended target: {target.domain.description} · UniProt {target.uniprot_accession}</p>
-    <p>Experimental model: PDB {target.selected.pdb_id}, chain {target.selected.chain}, {target.selected.resolution_angstrom} Å.</p>
+    <p>Intended target: {target.domain?.description ?? 'Scientist-specified target structure'}{target.uniprot_accession ? ` · UniProt ${target.uniprot_accession}` : ''}</p>
+    {target.selected ? <p>Experimental model: PDB {target.selected.pdb_id}, chain {target.selected.chain}, {target.selected.resolution_angstrom} Å.</p>
+      : <p>No automatic comparative receptor-selection report was produced for the explicit structure choice. Inspect the actual acquired structures and provenance in this session.</p>}
     {assessment.candidates.map(candidate => <section key={candidate.candidate_identifier}>
       <h3>{candidate.name}</h3>
       <p><strong>Overall: {statusLabel(candidate.recommendation)}</strong></p><p>{candidate.reason}</p>
@@ -496,9 +499,11 @@ function ProspectiveResult({ research }: { research: ResearchSessionWorkspace })
       </details>}
     </section>)}
     <details><summary>Model selection, assumptions and limitations</summary>
-      <p>{target.policy}</p><ul>{[...assessment.assumptions, ...target.limitations].map(t => <li key={t}>{t}</li>)}</ul>
-      <p>Deposited mutation records: {target.selected.mutation_records.join('; ') || 'none declared'}.</p>
-      <p>Deposited missing residue/atom records: {target.selected.missing_records.join('; ') || 'none declared'}.</p>
+      <p>{target.policy}</p><ul>{[...assessment.assumptions, ...(target.limitations ?? [])].map(t => <li key={t}>{t}</li>)}</ul>
+      {target.selected && <>
+        <p>Deposited mutation records: {target.selected.mutation_records.join('; ') || 'none declared'}.</p>
+        <p>Deposited missing residue/atom records: {target.selected.missing_records.join('; ') || 'none declared'}.</p>
+      </>}
     </details>
     <p><strong>Classical computation selected; quantum not invoked.</strong> {assessment.computation_selection.reason}</p>
     <p>{assessment.verification_scope}</p>

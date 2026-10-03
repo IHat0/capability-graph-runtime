@@ -69,6 +69,24 @@ class ProspectiveAssessmentHandler:
         if not record.verified or not trace.get('loop_complete'):
             raise ScientificCapabilityFailure('prospective_unverified', 'Prospective assessment requires blocking screening verification.')
         source_audit, assessment_candidates, parents = [], [], [trace_ref, pocket_ref, verifier_ref, off_target_ref, off_verifier_ref]
+        investigation_refs = [r for r in references.values() if r.artifact_type == 'virtual_investigation']
+        investigation = None
+        if investigation_refs:
+            if len(investigation_refs) != 1:
+                raise ScientificCapabilityFailure('virtual_investigation_ambiguous', 'Multiple virtual investigations cannot be mixed.')
+            investigation_ref = investigation_refs[0]
+            check_ref = typed('virtual_investigation_verification')
+            check = json.loads(store.read(check_ref))
+            if check.get('passed') is not True or check.get('report_sha256') != investigation_ref.content_sha256:
+                raise ScientificCapabilityFailure('virtual_investigation_unverified', 'Virtual investigation requires independent verification.')
+            investigation = json.loads(store.read(investigation_ref))
+            for identifier,sha in investigation['artifact_sha256'].items():
+                r = references[identifier]
+                if r.content_sha256 != sha or hashlib.sha256(store.read(r)).hexdigest() != sha:
+                    raise ScientificCapabilityFailure('virtual_investigation_corrupt', 'Virtual investigation evidence hash mismatch.')
+            if [c['candidate_identifier'] for c in investigation['candidates']] != [c['candidate_identifier'] for c in trace['candidates']]:
+                raise ScientificCapabilityFailure('virtual_investigation_coverage', 'Virtual investigation must retain all candidates.')
+            parents.extend((investigation_ref, check_ref))
         if (off_targets.get('verification', {}).get('passed') is not True or
                 sorted(c['candidate_identifier'] for c in off_targets['candidates']) !=
                 sorted(c['candidate_identifier'] for c in trace['candidates'])):
@@ -141,14 +159,21 @@ class ProspectiveAssessmentHandler:
                     'Receptor/protonation ensembles and an independently justified free-energy method are needed before treating raw cross-target score differences as selectivity.',
                     'No electronic difficulty was established by docking or descriptors; neither triggers quantum computation.'],
                 'evidence_artifact_identifiers': [descriptor_ref.artifact_identifier, docking_ref.artifact_identifier, off_target_ref.artifact_identifier]})
+            if investigation:
+                expanded = next(c for c in investigation['candidates'] if c['candidate_identifier'] == candidate['candidate_identifier'])
+                assessment_candidates[-1].update(recommendation=expanded['candidate_status'].lower().replace(' ', '_'),
+                    reason=expanded['assessment_reason'], computational_decision_scope=expanded['candidate_assessment']['scope'])
         selection = pocket.get('target_selection_evidence') or {}
         source_audit.extend(dict(s, **{'class': 'foundational identity/sequence/structure metadata'}) for s in selection.get('sources', []))
         document = {'schema': 'pulsate.prospective-assessment/v1', 'created_at': datetime.now(UTC).isoformat(),
             'execution_identifier': record.execution_identifier, 'original_request': objective.original_request,
             'candidates': assessment_candidates, 'target_selection': selection,
+            'virtual_investigation': investigation,
             'assumptions': selection.get('assumptions', []), 'source_audit': source_audit,
             'source_policy': selection.get('source_policy', {}),
-            'blinding_limitations': ['Foundational retrieval only. Pretrained model weights are not provably outcome-blind; model-generated scientific claims are disallowed.'],
+            'blinding_limitations': [('Projected foundational and general bioactivity/annotation records plus policy-qualified reviewed numerical inputs only. '
+                if investigation else 'Foundational retrieval only. ') +
+                'Pretrained model weights are not provably outcome-blind; model-generated scientific claims are disallowed.'],
             'verification_scope': 'Computational integrity and lineage only; not biological or clinical correctness.',
             'computation_selection': {'selected_compute': 'classical', 'quantum_selected': False, 'ibm_job_submitted': False,
                 'reason': 'Identity, force-field preparation, graph descriptors and rigid-receptor docking are supported classical tasks. No difficult electronic subproblem was specified or established; quantum availability alone is not a reason to invoke it.'},

@@ -537,7 +537,7 @@ class ScientistResultAssembler:
                 record.evidence_artifact_identifiers,
             )
         organism = self._read_json_evidence(record, "virtual_organism_assessment")
-        if organism is not None:
+        if organism is not None and not self._read_json_evidence(record, "prospective_candidate_assessment"):
             assessment, identifier = organism
             source = f"public record CID {assessment['candidate']['pubchem_cid']}" if assessment['candidate']['pubchem_cid'] is not None else "scientist-supplied/generated graph, independently identity-checked"
             add("entity", f"Candidate {assessment['candidate']['name']}; identity {assessment['candidate']['inchikey']}; {source}.", (identifier,), True)
@@ -580,6 +580,46 @@ class ScientistResultAssembler:
         prospective = self._read_json_evidence(record, "prospective_candidate_assessment")
         if prospective is not None:
             assessment, identifier = prospective
+            investigation = assessment.get('virtual_investigation')
+            if investigation:
+                add('methods', 'Virtual investigation uses a reviewed prospective-source policy and independently checked bioactivity, PBPK and mechanistic evidence chains. ' + investigation['verification_scope'], (identifier,), True)
+                for candidate in investigation['candidates']:
+                    add('principal_result', f"Virtual investigation of {candidate['identity']['name']}: {candidate['candidate_status']}. " + candidate['assessment_reason'], (identifier,), True)
+                    for missing in candidate['dossier_acquisition']['missing']:
+                        add('limitation', 'Human parameterization unresolved: ' + missing, (identifier,), True)
+                    if candidate['regimen']['status'] != 'scenario_ready':
+                        add('limitation', 'Human exposure was not manufactured: ' + candidate['regimen'].get('reason', ', '.join(candidate['regimen'].get('missing', []))), (identifier,), True)
+                    for target in candidate['bioactivity_hypotheses'].get('targets', []):
+                        add('principal_result', f"Bioactivity-space target hypothesis {target['target_accession']}: {len(target['evidence'])} unrelated-ligand assay records. Neighbour activities are not this candidate's potency.", (identifier,), True)
+                    structural = investigation.get('bioactivity_structural') or {}
+                    panel_candidate = next((c for c in (structural.get('screening') or {}).get('candidates', [])
+                        if c['candidate_identifier'] == candidate['candidate_identifier']), None)
+                    if panel_candidate:
+                        for screened in panel_candidate['targets']:
+                            target = screened['target']
+                            context = f"Bioactivity-nominated alternative {target['uniprot_accession']}, PDB {target['pdb_id']} chain {target['chain']}"
+                            if screened['status'] == 'computed':
+                                scores = screened['docking']['vina_scores_kcal_per_mol']
+                                add('principal_result', context + f": computed Vina scores {scores} kcal/mol. "
+                                    + 'These are uncalibrated docking hypotheses, not potency, selectivity or physiological effects.', (identifier,), True)
+                                reference = target.get('independent_pocket_reference')
+                                if reference:
+                                    add('methods', context + f" uses independently measured reference {reference['reference_chembl_id']} "
+                                        + f"and assay {reference['activity_record']['assay_chembl_id']} to define the observed pocket. "
+                                        + 'Its measured activity is not the candidate\'s activity.', (identifier,), True)
+                            else:
+                                add('limitation', context + ': not computed. ' + screened['reason'], (identifier,), True)
+                    organism_result = candidate['virtual_organism']
+                    if organism_result:
+                        for subject in organism_result['comparison']['subjects']:
+                            pk = subject['plasma_metrics']
+                            add('principal_result', f"Native {subject['species']} PBPK: sampled plasma Cmax {pk['cmax_umol_l']:.6g} umol/l; finite-window AUC {pk['auc_0_t_umol_h_l']:.6g} umol*h/l. Input and model uncertainty remain.", (identifier,), True)
+                    for functional in candidate['functional_models']:
+                        if functional['status'] == 'computed':
+                            for output,response in functional['result']['response'].items():
+                                add('principal_result', f"Mechanistic model {functional['result']['model']['identifier']} output {output}: final modeled difference {response['final_difference']:.6g} {response['unit']}. " + functional['result']['limitation'], (identifier,), True)
+                        else:
+                            add('limitation', 'Functional computation refused for ' + functional['model_identifier'] + ': ' + functional['reason'], (identifier,), True)
             for candidate in assessment['candidates']:
                 target = candidate['intended_target']
                 add('principal_result', f"Prospective assessment of {candidate['name']}: {candidate['recommendation'].replace('_', ' ')}. "

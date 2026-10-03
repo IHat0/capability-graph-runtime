@@ -92,6 +92,7 @@ _OUTPUT_BY_OPERATION: dict[ScientificResearchOperation, ScientificRequestedOutpu
 _DISCOVERY_OPERATIONS = frozenset(
     {
         "assess_drug_candidate",
+        "analyze_structure",
         "identify_binding_regions",
         "generate_candidates",
         "dock_candidates",
@@ -265,6 +266,8 @@ def validate_requirement_proposal(
             required.append("scientific_verification_report")
         if "assess_drug_candidate" in operation_set:
             required.append("prospective_candidate_assessment")
+        if "analyze_structure" in operation_set:
+            required.extend(("molecular_structure_analysis", "molecular_structure_analysis_verification"))
     else:
         raise ValueError(
             "No registered composition produces all requested outputs for these operations: "

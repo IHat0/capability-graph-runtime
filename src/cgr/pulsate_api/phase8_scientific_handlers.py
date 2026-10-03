@@ -683,7 +683,6 @@ class StructureAnalysisVerificationHandler:
         self.runner = _NativeRunner(store)
 
     def execute(self, *, invocation, objective, record) -> ScientificCapabilityOutcome:
-        del objective
         import json
 
         reference = next(
@@ -719,7 +718,9 @@ class StructureAnalysisVerificationHandler:
                 and math.isfinite(float(analysis["molecular_weight_da"]))
             )
         report = self.runner.write_json(
-            artifact_type="scientific_verification_report",
+            artifact_type=("molecular_structure_analysis_verification"
+                if objective.research_requirements and objective.research_requirements.capability_profile == "protein_ligand_discovery"
+                else "scientific_verification_report"),
             payload=json.dumps(
                 {
                     "verification_family": "structure_analysis",
@@ -4987,8 +4988,26 @@ def _discovery_target(record, store):
         if report is None:
             raise ScientificCapabilityFailure('target_selection_evidence_missing', 'The receptor selection report is missing.')
         selection = json.loads(store.read(report))
-    if selection is not None:
-        chain = selection["selected"]["chain"]
+    # Literal deposited chain labels are scientific controls, not target-name
+    # routing. Never infer a chain from its order or a repeated crystal copy.
+    import re
+    request = getattr(record.objective, 'original_request', '')
+    scopes = list(re.finditer(r'''(?<!\w)(?i:chain)\s*(?:[:=]\s*)?["']?([A-Za-z0-9])["']?(?=$|[\s,.;)])''', request))
+    if any(re.match(r'\s*(?:and|or|/|,)\s*[A-Za-z0-9](?!\w)', request[m.end():]) for m in scopes):
+        raise ScientificCapabilityFailure('receptor_chain_ambiguous', 'Select one exact deposited receptor chain.')
+    explicit = {m.group(1) for m in scopes}
+    if len(explicit) > 1:
+        raise ScientificCapabilityFailure('receptor_chain_ambiguous', 'Conflicting deposited receptor chains require clarification.')
+    requested_chain = next(iter(explicit), None)
+    chain = selection["selected"]["chain"] if selection is not None else requested_chain
+    if requested_chain is not None and chain != requested_chain:
+        raise ScientificCapabilityFailure('receptor_chain_conflict', 'The reviewed receptor selection conflicts with the scientist\'s exact chain label.')
+    if chain is not None:
+        if not any(line.startswith('ATOM  ') and line[21:22] == chain for line in lines):
+            raise ScientificCapabilityFailure('receptor_chain_missing', 'The exact requested receptor chain is absent from the deposited coordinates.')
+        # Nonpolymer author-chain labels can differ from the contacted protein
+        # chain. Preserve them for the geometric site review; do not discard a
+        # genuine bound ligand merely because its author label differs.
         lines = [line for line in lines if not line.startswith("ATOM  ") or line[21:22] == chain]
     if sum(line.startswith("MODEL ") for line in lines) > 1:
         raise ScientificCapabilityFailure("receptor_model_ambiguous", "Select one deposited receptor model.")
@@ -5013,8 +5032,27 @@ def _discovery_target(record, store):
         matches = {selected_key: organic[selected_key]}
     if len(matches) != 1 and len(organic) == 1:
         matches = organic
-    # A compact supplied receptor may be used in its entirety; large targets require site evidence.
+    site_review = None
     atoms = _pdb_atoms(("\n".join(line for line in lines if line.startswith("ATOM  ")) + "\n").encode())
+    if selection is None and len(matches) != 1 and len(organic) > 1:
+        # Apply the same bounded geometric eligibility used by experimental
+        # receptor review. Carbon-containing solvent/additive records alone do
+        # not make several meaningful reference pockets. Multiple eligible
+        # references remain ambiguous; no component name is special-cased.
+        eligible, reviewed = {}, []
+        for key, values in organic.items():
+            heavy = tuple(a for a in _pdb_atoms(("\n".join(values) + "\n").encode()) if a['element'] not in {'H','D'})
+            contacts = sum(any(sum((float(a[axis])-float(p[axis]))**2 for axis in ('x','y','z'))<=4.5**2
+                               for p in atoms) for a in heavy)
+            qualifies = len(heavy)>=12 and contacts>=5
+            reviewed.append({'reference_residue':key,'heavy_atom_count':len(heavy),
+                'contacting_heavy_atom_count':contacts,'eligible':qualifies})
+            if qualifies: eligible[key]=values
+        site_review={'policy':'Unique deposited organic reference with >=12 heavy atoms and >=5 observed protein contacts within 4.5A',
+            'components':reviewed,'candidate_identity_inferred':False,
+            'limitation':'Geometric pocket definition from the explicitly supplied receptor, not a claim that its deposited ligand matches or predicts the candidate.'}
+        if len(eligible)==1: matches=eligible
+    # A compact supplied receptor may be used in its entirety; large targets require site evidence.
     if len(matches) == 1:
         region_atoms = _pdb_atoms(("\n".join(next(iter(matches.values()))) + "\n").encode())
         method = "deposited_ligand_coordinates_with_6A_margin"
@@ -5052,6 +5090,9 @@ def _discovery_target(record, store):
         "source_protein_artifact_identifier": protein.artifact_identifier,
         "reference_residue": next(iter(matches), None),
         "target_selection_evidence": selection,
+        "reference_site_selection_review": site_review,
+        "scientist_chain_scope": ({"chain":requested_chain,"supporting_quote":scopes[0].group(),
+            "basis":"Literal scientist label checked against deposited protein coordinates; no sequence or chain inferred"} if requested_chain is not None else None),
         "alternate_conformation_policy": "highest_mean_occupancy_then_lexical_tie_break",
         "excluded_nonpolymer_atom_count": sum(line.startswith("HETATM") for line in lines),
     }
@@ -6234,7 +6275,12 @@ def protein_ligand_discovery_registry(
     bridge = _DiscoveryArtifactBridge(store)
     from .scientific_prospective import ProspectiveAssessmentHandler
     from .scientific_off_targets import OffTargetHypothesisHandler, OffTargetScreeningHandler, OffTargetVerificationHandler
+    from .virtual_investigation import VirtualInvestigationHandler, VirtualInvestigationVerificationHandler
     registry = ScientistCapabilityRegistry({
+        "molecular.structure_analyze": StructureAnalysisHandler(store),
+        "scientific_verification.structure_analysis": StructureAnalysisVerificationHandler(store),
+        "discovery.virtual_investigate": VirtualInvestigationHandler(store, meeko_adapter),
+        "discovery.virtual_investigation_verify": VirtualInvestigationVerificationHandler(store),
         "discovery.off_target_hypothesize": OffTargetHypothesisHandler(store),
         "discovery.off_target_screen": OffTargetScreeningHandler(store, meeko_adapter),
         "discovery.off_target_verify": OffTargetVerificationHandler(store),

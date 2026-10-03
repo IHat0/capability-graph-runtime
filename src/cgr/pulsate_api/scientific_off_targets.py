@@ -96,18 +96,23 @@ class _FoundationalSources:
         if url in self.cache:
             return self.cache[url]
         parsed = urlsplit(url)
-        allowed = {'search.rcsb.org': '/rcsbsearch/v2/query', 'data.rcsb.org': '/graphql',
-                   'files.rcsb.org': '/download/', 'rest.uniprot.org': '/uniprotkb/search'}
+        allowed = {'search.rcsb.org': ('/rcsbsearch/v2/query',),
+                   'data.rcsb.org': ('/graphql', '/rest/v1/core/chemcomp/'),
+                   'files.rcsb.org': ('/download/',), 'rest.uniprot.org': ('/uniprotkb/search',)}
         if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port
-                or parsed.hostname not in allowed or not parsed.path.startswith(allowed[parsed.hostname])):
+                or parsed.hostname not in allowed or not any(parsed.path.startswith(p) for p in allowed[parsed.hostname])):
             raise ValueError('Off-target source is outside the foundational retrieval allowlist.')
         payload = self.fetch(url, 'application/json' if json_result else 'chemical/x-pdb',
             8 * 1024 * 1024, **({'allow_no_content': True} if 'search.rcsb.org' in url else {}))
         value = json.loads(payload) if payload and json_result else ({} if json_result else payload)
+        # Encoded scientific queries can exceed the artifact metadata-string
+        # bound. Keep their FULL URL in the replay audit, never truncate it.
+        metadata={'source_class':source_class}
+        metadata.update({'source_url':url} if len(url)<=1024 else {'source_url_sha256':hashlib.sha256(url.encode()).hexdigest()})
         ref = self.runner.write_bytes(artifact_type='prospective_foundational_source',
             media_type='application/json' if json_result else 'chemical/x-pdb', payload=payload,
             producer='discovery.off_target_hypothesize', execution_identifier=self.invocation.invocation_identifier,
-            metadata={'source_url': url, 'source_class': source_class})
+            metadata=metadata)
         self.references.append(ref)
         self.audit.append({'url': url, 'class': source_class, 'sha256': ref.content_sha256, 'artifact_identifier': ref.artifact_identifier})
         self.cache[url] = value
@@ -137,6 +142,29 @@ def _descriptors(record, store):
     return trace_ref, rows
 
 
+def _intended_accession(record, store):
+    """Resolve deposited identity, not a molecule/target-name routing rule.
+
+    An explicit PDB choice need not have an automatic selection report. Only a
+    unique declared UniProt mapping for the prepared receptor chains is usable.
+    Ambiguous/unsupported mappings remain unresolved rather than guessed.
+    """
+    refs = {r.artifact_identifier: r for r in record.artifact_references}
+    pocket_ref = next(r for r in refs.values() if r.artifact_type == 'binding_pocket')
+    pocket = json.loads(store.read(pocket_ref))
+    selection = pocket.get('target_selection_evidence') or {}
+    if selection.get('uniprot_accession'):
+        return selection['uniprot_accession']
+    source = refs.get(pocket.get('source_protein_artifact_identifier'))
+    if source is None or source.media_type != 'chemical/x-pdb': return None
+    prepared = [r for r in refs.values() if r.artifact_type == 'prepared_molecular_structure' and r.media_type == 'chemical/x-pdb']
+    chains = {line[21:22] for r in prepared for line in store.read(r).decode().splitlines() if line.startswith('ATOM  ')}
+    accessions = {line[33:41].strip() for line in store.read(source).decode().splitlines()
+        if line.startswith('DBREF ') and line[26:32].strip() == 'UNP'
+        and (not chains or line[12:13] in chains) and re.fullmatch(r'[A-Z0-9]{6,10}', line[33:41].strip())}
+    return next(iter(accessions)) if len(accessions) == 1 else None
+
+
 class OffTargetHypothesisHandler:
     def __init__(self, store, *, fetch=_fetch_bytes):
         self.runner, self.fetch = _NativeRunner(store), fetch
@@ -147,9 +175,18 @@ class OffTargetHypothesisHandler:
         trace_ref, rows = _descriptors(record, store)
         pocket_ref = next(r for r in record.artifact_references if r.artifact_type == 'binding_pocket')
         selection = json.loads(store.read(pocket_ref)).get('target_selection_evidence') or {}
-        intended = selection.get('uniprot_accession')
+        intended = _intended_accession(record, store)
         organism = selection.get('organism', {}).get('taxonId')
         sources = _FoundationalSources(self.runner, invocation, self.fetch)
+        if intended and not organism:
+            try:
+                url = 'https://rest.uniprot.org/uniprotkb/search?query=' + quote('accession:' + intended, safe='') + '&format=json&size=2&fields=accession,organism_name'
+                annotation = sources.read(url, 'deposited intended-target identity/organism only')
+                matches = annotation.get('results', [])
+                if len(matches) == 1 and matches[0].get('primaryAccession') == intended:
+                    organism = matches[0].get('organism', {}).get('taxonId')
+            except (ValueError, KeyError, OSError, RuntimeError):
+                pass  # Explicit unsupported panel below retains the missing qualification.
         candidates, failures = [], []
         start = time.monotonic()
         # Uniform per-candidate budget. Never select a panel for only the first candidate.
@@ -273,15 +310,16 @@ class OffTargetHypothesisHandler:
 
 
 class OffTargetScreeningHandler:
-    def __init__(self, store, adapter):
+    def __init__(self, store, adapter, *, panel_type='prospective_target_panel', report_type='prospective_off_target_screen'):
         self.runner, self.adapter = _NativeRunner(store), adapter
+        self.panel_type, self.report_type = panel_type, report_type
 
     def execute(self, *, invocation, objective, record):
         from cgr.discovery import DiscoveryCandidate, VinaMolecularDockingEvaluator
         store = self.runner.store
         trace_ref, descriptors = _descriptors(record, store)
         refs = {r.artifact_identifier: r for r in record.artifact_references}
-        panel_ref = next(r for r in refs.values() if r.artifact_type == 'prospective_target_panel')
+        panel_ref = next(r for r in refs.values() if r.artifact_type == self.panel_type)
         panel = json.loads(store.read(panel_ref))
         if sorted(r['candidate_identifier'] for r in panel['candidates']) != sorted(c['candidate_identifier'] for c, _, _ in descriptors):
             raise ScientificCapabilityFailure('off_target_coverage_invalid', 'Target panel must account for every candidate.')
@@ -362,7 +400,7 @@ class OffTargetScreeningHandler:
                 'No validated toxicity model, ADME measurements, tissue expression inference, MD or quantum calculation was invoked.'],
             'verification': {'passed': True, 'scope': 'Successful native outputs have candidate/receptor hash identity, finite scores and converged ligand preparation; unsuccessful targets remain explicitly unsupported.'}}
         parents = tuple({r.artifact_identifier: r for r in (panel_ref, trace_ref, *evidence)}.values())
-        report = self.runner.write_json(artifact_type='prospective_off_target_screen', payload=json.dumps(document, sort_keys=True, allow_nan=False).encode(),
+        report = self.runner.write_json(artifact_type=self.report_type, payload=json.dumps(document, sort_keys=True, allow_nan=False).encode(),
             producer='discovery.off_target_screen', execution_identifier=invocation.invocation_identifier, parents=parents)
         return ScientificCapabilityOutcome(output_artifacts=(report,), evidence_artifacts=(*parents, report),
             scientific_summary='Completed available alternative-target docking with explicit candidate/target coverage and uncalibrated comparison limits.')
@@ -370,16 +408,17 @@ class OffTargetScreeningHandler:
 
 class OffTargetVerificationHandler:
     """Independent re-read of persisted native receipts; no scientific safety certification."""
-    def __init__(self, store):
+    def __init__(self, store, *, panel_type='prospective_target_panel', report_type='prospective_off_target_screen', verification_type='prospective_off_target_verification'):
         self.runner = _NativeRunner(store)
+        self.panel_type, self.report_type, self.verification_type = panel_type, report_type, verification_type
 
     def execute(self, *, invocation, objective, record):
         del objective
         store = self.runner.store
         refs = {r.artifact_identifier: r for r in record.artifact_references}
-        report_ref = next(r for r in refs.values() if r.artifact_type == 'prospective_off_target_screen')
+        report_ref = next(r for r in refs.values() if r.artifact_type == self.report_type)
         report = json.loads(store.read(report_ref))
-        panel_ref = next(r for r in refs.values() if r.artifact_type == 'prospective_target_panel')
+        panel_ref = next(r for r in refs.values() if r.artifact_type == self.panel_type)
         panel = json.loads(store.read(panel_ref))
         _, descriptor_rows = _descriptors(record, store)
         intended_scores = {c['candidate_identifier']: next(s['value'] for s in c['properties_and_calculations']
@@ -419,7 +458,7 @@ class OffTargetVerificationHandler:
         verification = {'schema': 'pulsate.prospective-off-target-verification/v1', 'passed': True,
             'verified_pairs': checked, 'screening_report_sha256': report_ref.content_sha256,
             'scope': 'Independent persisted receipt identity, hash, coverage and comparison checks only. Not physiological activity, selectivity or safety verification.'}
-        ref = self.runner.write_json(artifact_type='prospective_off_target_verification', payload=json.dumps(verification, sort_keys=True).encode(),
+        ref = self.runner.write_json(artifact_type=self.verification_type, payload=json.dumps(verification, sort_keys=True).encode(),
             producer='discovery.off_target_verify', execution_identifier=invocation.invocation_identifier, parents=(report_ref, panel_ref))
         return ScientificCapabilityOutcome(output_artifacts=(ref,), evidence_artifacts=(ref,), verified=True,
             scientific_summary='Independently checked persisted alternative-target numerical receipts and complete coverage.', limitations=(verification['scope'],))

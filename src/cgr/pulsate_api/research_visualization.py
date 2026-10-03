@@ -683,6 +683,24 @@ def build_research_visualization(
                 {"label": "Full-molecule RHF (STO-3G)", "value": classical_receipt["hartree_fock"]["total_energy_hartree"], "unit": "Hartree"},
             ],
         }
+    prospective_workspace = next((dict(documents[r.artifact_identifier],
+        assessment_artifact_identifier=r.artifact_identifier, assessment_sha256=r.content_sha256)
+        for r in all_references if r.artifact_type == 'prospective_candidate_assessment'), None)
+    if prospective_workspace and prospective_workspace.get('virtual_investigation'):
+        # Enrich the display projection, never the persisted scientific result.
+        # Each candidate's download must point to its own verified native result.
+        import copy
+        prospective_workspace = copy.deepcopy(prospective_workspace)
+        for candidate in prospective_workspace['virtual_investigation']['candidates']:
+            native_results=[candidate,*((candidate.get('native_sensitivity') or {}).get('executions',[]))]
+            for result in native_results:
+                if not result.get('virtual_organism'): continue
+                matches = [r for r in all_references if r.artifact_type == 'virtual_organism_assessment'
+                    and r.artifact_identifier in result['native_artifact_identifiers']]
+                if len(matches) != 1 or documents[matches[0].artifact_identifier] != result['virtual_organism']:
+                    raise ValueError('Nested native visualization lacks its exact verified assessment artifact.')
+                result['virtual_organism'].update(assessment_artifact_identifier=matches[0].artifact_identifier,
+                    assessment_sha256=matches[0].content_sha256)
     return {
         "schema_version": "pulsate.research-visualization/v1",
         "session_identifier": session.session_identifier,
@@ -701,9 +719,7 @@ def build_research_visualization(
         "virtual_organism": next((dict(documents[r.artifact_identifier],
             assessment_artifact_identifier=r.artifact_identifier, assessment_sha256=r.content_sha256)
             for r in all_references if r.artifact_type == 'virtual_organism_assessment' and r.artifact_identifier in documents), None),
-        "prospective_assessment": next((dict(documents[r.artifact_identifier],
-            assessment_artifact_identifier=r.artifact_identifier, assessment_sha256=r.content_sha256)
-            for r in all_references if r.artifact_type == 'prospective_candidate_assessment'), None),
+        "prospective_assessment": prospective_workspace,
         "grounding_policy": "persisted_artifact_or_deterministic_computation_only",
     }
 

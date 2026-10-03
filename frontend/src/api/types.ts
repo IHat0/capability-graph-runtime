@@ -664,12 +664,13 @@ export interface ResearchVisualizationWorkspace {
     computation_selection: { selected_compute: string; quantum_selected: boolean; reason: string }
   } | null
   prospective_assessment?: {
+    virtual_investigation?: VirtualInvestigation | null
     assessment_artifact_identifier: string; assessment_sha256: string
     verification_scope: string; assumptions: string[]; blinding_limitations: string[]
     computation_selection: { selected_compute: string; quantum_selected: boolean; reason: string }
-    target_selection: { uniprot_accession: string; domain: { description: string }; selected: {
+    target_selection: { uniprot_accession?: string; domain?: { description: string }; selected?: {
       pdb_id: string; chain: string; resolution_angstrom: number; mutation_records: string[]; missing_records: string[]
-    }; policy: string; limitations: string[] }
+    }; policy?: string; limitations?: string[] }
     source_audit: Array<{ url: string; class: string; sha256: string }>
     candidates: Array<{
       candidate_identifier: string; name: string; recommendation: string; reason: string
@@ -696,6 +697,45 @@ export interface ADMEParameter {
   prediction?: { model: string; model_version: string; model_sha256: string; endpoint_definition: string;
     validation?: { overall?: { n: number; mae: number; rmse: number; spearman: number | null; interval_coverage: number }; unit?: string; scope?: string; report_sha256?: string; status?: string };
     applicability: { status: string; nearest_training_tanimoto: number; training_graph_seen: boolean }; translation: { formula: string } | null } | null
+}
+
+export interface VirtualInvestigation {
+  policy_sha256: string | null
+  prospective_policy: { cutoff: string | null; cutoff_instant?: string | null; cutoff_source: string | null; allow_modern_general_knowledge: boolean }
+  verification_scope: string
+  bioactivity_structural?: { status: string; reason?: string;
+    panel?: { candidates: Array<{ candidate_identifier: string; excluded: Array<{ target_accession?: string; reason: string }> }> };
+    screening?: { candidates: Array<{ candidate_identifier: string; targets: Array<{ status: string; reason?: string;
+      target: { uniprot_accession: string; pdb_id: string; chain: string }; docking?: { vina_scores_kcal_per_mol: number[] } }> }> };
+    verification?: { passed: boolean } }
+  candidates: Array<{
+    candidate_identifier: string; identity: { name: string; inchikey: string }
+    candidate_status: string; assessment_reason: string
+    inference_levels: Record<string, boolean>
+    bioactivity_hypotheses: { status?: string; reason?: string; targets: Array<{
+      target_accession: string; status: string
+        evidence: Array<{ neighbour_chembl_id: string; local_similarity: number; classification: string; organism?: string; intended_target?: boolean | null;
+        quantitative_neighbour_evidence: { kind: string; value_umol_l: number; uncertainty: string } }>
+      tissue_relevance: { classification?: string; limitation?: string; status?: string; reason?: string; missing?: string[];
+        go?: Array<{ identifier: string; term: string; evidence: string }>;
+        expression?: Array<{ source_url: string; source_sha256: string; historical_qualification: string }> }
+    }> }
+    dossier_acquisition: { status: string; missing: string[]; conflicts: Array<{ parameter: string; reason: string }>;
+      eligibility: { decisions: Array<{ identifier: string; eligible: boolean; status: string; historically_qualified: boolean; reason: string }> } }
+    regimen: { status: string; source?: string; classification?: string; reason?: string; missing?: string[] }
+    virtual_organism: ResearchVisualizationWorkspace['virtual_organism']
+    native_sensitivity?: { status: string; reason?: string; nominal_withheld?: boolean;
+      design?: { total_combinations: number; exhaustive: boolean; limitation: string; cases: Array<{ case_identifier: string }> };
+      executions?: Array<{ case_identifier: string; status: string; reason?: string;
+        virtual_organism?: ResearchVisualizationWorkspace['virtual_organism'] }>;
+      summary?: { nominal_withheld: boolean; complete_discrete_space: boolean; qualitative_conclusion: string;
+        endpoint_ranges: Record<string, { peak_range_umol_l: number[]; auc_range_umol_h_l: number[] }> } }
+    exposure_activity: Array<{ status: string; target_accession: string; reason?: string; limitation?: string; peak_activity_ratios?: number[]; uncertainty?: string }>
+    functional_models: Array<{ status: string; model_identifier?: string; reason?: string; exposure_case_identifier?: string | null;
+      result?: { model: { identifier: string; name: string; sha256: string; species: string }; inference_level: string;
+        response: Record<string, { unit: string; baseline_final: number; perturbed_final: number; final_difference: number; maximum_absolute_difference: number }>;
+        limitation: string; verification: { passed: boolean } } }>
+  }>
 }
 
 export interface NativeADMETranslationAudit {
