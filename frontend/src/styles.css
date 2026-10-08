@@ -155,6 +155,13 @@ a { color: inherit; }
 .discovery-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
 .discovery-section-heading label { display: flex; align-items: center; gap: 6px; color: var(--secondary); font-size: 10px; white-space: nowrap; }
 .candidate-table-wrap { overflow-x: auto; }
+.virtual-investigation .candidate-table-wrap { max-width: 100%; outline-offset: 2px; }
+.virtual-investigation small { display: block; overflow-wrap: anywhere; }
+.virtual-investigation .binding-evidence-table { min-width: 34rem; font-size: 12px; }
+.virtual-investigation .binding-evidence-table th { font-size: 11px; }
+.virtual-investigation .binding-evidence-table th:not(:first-child) { min-width: 12rem; }
+.virtual-investigation .exploratory-physiology-warning { border-left: 4px solid #9b6200; background: #fff5df; padding: 12px 16px; margin: 12px 0; }
+.virtual-investigation .exploratory-physiology-warning h5 { color: #704600; font-size: 14px; margin-top: 0; }
 .candidate-table { width: 100%; border-collapse: collapse; font-size: 10px; }
 .candidate-table th { padding: 8px 7px; color: var(--muted); font-size: 9px; font-weight: 550; text-align: left; border-bottom: 1px solid var(--border); }
 .candidate-table td { padding: 9px 7px; vertical-align: top; border-bottom: 1px solid #eeeeeb; }

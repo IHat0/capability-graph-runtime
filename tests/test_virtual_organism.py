@@ -17,6 +17,39 @@ def request(**kwargs):
     return PBPKRequest(**dict(values, **kwargs))
 
 
+@pytest.mark.parametrize('phrase,minutes', [('a 12 minute infusion for 8 hours', 12.),
+    ('a 12-minute infusion for 8 hours', 12.), ('an infusion over 2 hours', 120.)])
+def test_infusion_duration_is_not_the_following_observation_window(phrase, minutes):
+    from cgr.pulsate_api.virtual_organism import explicit_pbpk_controls
+    changes, quotes = explicit_pbpk_controls('candidate-A 1 mg intravenous over ' + phrase)
+    assert changes['infusion_minutes'] == minutes
+    evidence = {'dose':'1 mg','dose_unit':'1 mg','route':'intravenous','duration_h':'8 hours', **quotes}
+    text = 'candidate-A 1 mg intravenous over ' + phrase + '. Observation duration is 8 hours.'
+    request(dose=1.,dose_unit='mg',duration_h=8.,infusion_minutes=minutes,quotes=evidence).check_grounding(text)
+
+
+def test_multiple_independent_infusion_durations_request_clarification():
+    from cgr.pulsate_api.virtual_organism import explicit_pbpk_controls
+    with pytest.raises(ValueError,match='Multiple explicit infusion'):
+        explicit_pbpk_controls('Use a 12 minute infusion or an infusion over 20 minutes.')
+
+
+def test_same_session_repeated_confirmation_is_not_a_second_infusion():
+    from cgr.pulsate_api.virtual_organism import explicit_pbpk_controls
+    text = 'Use a 12 minute infusion for 8 hours. Scientist follow-up: Use a 12 minute infusion for 8 hours.'
+    changes, quotes = explicit_pbpk_controls(text)
+    assert changes['infusion_minutes'] == 12.
+    assert quotes['infusion_minutes'] == '12 minute infusion'
+
+
+def test_structured_extraction_cannot_propose_an_unspecified_dose_sweep():
+    class Provider:
+        def complete_structured(self, messages, schema):
+            assert schema['properties']['dose_sweep']['maxItems'] == 0
+            return request().model_dump_json()
+    assert interpret_pbpk_request('candidate-A 1 mg/kg intravenous over 2 h', Provider()).dose_sweep == ()
+
+
 def csv_fixture(values=(0, 1, .5), candidate='candidate-A'):
     return (f'IndividualId,Time [min],Organism|PeripheralVenousBlood|{candidate}|Plasma (Peripheral Venous Blood) [µmol/l]\n'
             + '\n'.join(f'0,{t},{v}' for t,v in zip((0,60,120), values))).encode()

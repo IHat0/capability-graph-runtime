@@ -29,6 +29,17 @@ CAPABILITIES = (
 )
 
 
+def exposure_summary(status, runs):
+    """Count native species separately from conditional parameter experiments."""
+    species = sorted({run['species'] for run in runs})
+    conditional = sum(run.get('scenario_kind', 'nominal') != 'nominal' for run in runs)
+    reference = len(runs) - conditional
+    return (f"Virtual Organism: {status.replace('_', ' ')}; "
+        f"{len(species)} species ({', '.join(species) or 'none'}), "
+        f"{reference} reference computation(s) and {conditional} conditional input scenario(s). "
+        "This is exposure evidence, not a safety assessment.")
+
+
 def load_catalogue():
     configured = os.environ.get("PULSATE_PBPK_CATALOG_FILE")
     if not configured:
@@ -167,7 +178,8 @@ def parameter_sensitivity_summary(runs, request=None):
         if kind == 'nominal':
             continue
         items.append({'species': run['species'], 'scenario_identifier': run['scenario_identifier'], 'scenario_kind': kind,
-            'scenario_policy': run['scenario_policy'], 'series': run['result']['series'], 'file_artifacts': run['file_artifacts']})
+            'scenario_policy': run['scenario_policy'], 'series': run['result']['series'], 'file_artifacts': run['file_artifacts'],
+            'population': population_summary([dict(run, scenario_kind='nominal')])})
     dose_analysis = []
     if request:
         for species in request.species:
@@ -192,6 +204,26 @@ def parameter_sensitivity_summary(runs, request=None):
 
 
 def native_scenarios(source, request):
+    if source['entry']['kind'] == 'sponsor_dossier':
+        from .native_sensitivity import design, conditional_acquisition
+        from .sponsor_dossier import sponsor_compound_dossier
+        acquired = source['document']
+        plan = design(acquired, source['sensitivity_policy']) if acquired['conflicts'] else None
+        scenarios = []
+        for case in plan['cases'] if plan else [None]:
+            conditional = conditional_acquisition(acquired, case) if case else acquired
+            dossier = sponsor_compound_dossier(conditional)
+            local = request.model_copy(update={'population_size': request.population_size if source['species'] == 'Human' else 1})
+            missing = dossier_requirements(dossier, local.route)
+            if missing: raise ValueError('Conditional sponsor inputs remain incomplete: ' + ', '.join(missing))
+            scenarios.append({'scenario_identifier': case['case_identifier'] if case else 'nominal',
+                'scenario_kind': 'sponsor_input_sensitivity' if case else 'nominal',
+                'scenario_policy': {'experiment_class': 'sponsor_side_prospective',
+                    'historical_private_data_claim': False, 'nominal_withheld': bool(plan),
+                    'design': plan, 'case': case, 'input_provenance': acquired['experiment_provenance']},
+                'snapshot': dossier_snapshot(dossier, local), 'request': local.model_dump(mode='json'),
+                'parameters': [dict(p.model_dump(mode='json'), name=k) for k,p in dossier.parameters.items()]})
+        return scenarios
     from .adme_prediction import dossier_scenarios
     entry, species = source['entry'], source['species']
     local = request.model_copy(update={'population_size': request.population_size if species == 'Human' else 1})
@@ -202,6 +234,20 @@ def native_scenarios(source, request):
         result.append({'scenario_identifier': identifier, 'scenario_kind': kind, 'scenario_policy': receipt,
             'snapshot': snapshot, 'request': scenario_request.model_dump(mode='json')})
     return result
+
+
+def configured_sponsor(identity, species):
+    """Reuse the investigation's pinned sponsor contract in the existing PBPK path."""
+    from .virtual_investigation import load_policy
+    from .sponsor_dossier import load_sponsor_dossier, acquire_sponsor_dossier
+    from .prospective_evidence import ProspectivePolicy
+    config, root, policy_sha = load_policy()
+    if not config or not config.get('sponsor_side_dossier'): return None
+    doc, sources, sha = load_sponsor_dossier(root / config['sponsor_side_dossier']['path'])
+    if not any(c['inchikey'] == identity['inchikey'] and c['species'] == species for c in doc['candidates']): return None
+    acquired = acquire_sponsor_dossier(identity, species, doc, sources,
+        ProspectivePolicy.model_validate(config['prospective_evidence']), file_sha256=sha)
+    return acquired, sources, config.get('native_sensitivity'), policy_sha
 
 
 class VirtualOrganismHandler:
@@ -315,6 +361,28 @@ class VirtualOrganismHandler:
             entries, root = load_catalogue()
             models, missing, model_refs = [], [], []
             for species in request.species:
+                sponsor = configured_sponsor(identity, species)
+                if sponsor is not None:
+                    acquired, sources, sensitivity_policy, policy_sha = sponsor
+                    if any(m.startswith('Sponsor control missing:') for m in acquired['missing']):
+                        missing.append({'species': species, 'reason': 'Sponsor evidence missing: ' + ', '.join(acquired['missing'])})
+                        continue
+                    source_payload = canonical(acquired)
+                    entry = {'inchikey': identity['inchikey'], 'species': species, 'kind': 'sponsor_dossier',
+                        'source': 'Frozen sponsor-side prospective dossier; no private historical claim',
+                        'sha256': digest(source_payload), 'limitations': ['Conditional exploratory scenarios, not measured clinical PK or a nominal prediction.']}
+                    evidence_refs = [self.runner.write_bytes(artifact_type='sponsor_dossier_source', payload=raw,
+                        media_type='application/octet-stream', producer=name, execution_identifier=invocation.invocation_identifier,
+                        metadata={'source_sha256': sha}) for sha,raw in sources.items()]
+                    model_ref = self.runner.write_json(artifact_type='pbpk_source_model', payload=source_payload,
+                        producer=name, execution_identifier=invocation.invocation_identifier, parents=(*identity_refs, *evidence_refs))
+                    from .sponsor_dossier import sponsor_parameter_audit
+                    source = {'entry': entry, 'document': acquired, 'source_artifact_identifier': model_ref.artifact_identifier,
+                        'parameters': sponsor_parameter_audit(acquired), 'species': species, 'sensitivity_policy': sensitivity_policy, 'sponsor_policy_sha256': policy_sha}
+                    native_scenarios(source, request)
+                    model_refs.extend((*evidence_refs, model_ref))
+                    models.append(source)
+                    continue
                 supplied_matches = [(d,r) for d,r in supplied if d.species == species]
                 selected = [e for e in entries if e["inchikey"] == identity["inchikey"] and e["species"] == species]
                 if species not in supplied_species and len(selected) == 1 and selected[0]['kind'] == 'snapshot':
@@ -384,10 +452,11 @@ class VirtualOrganismHandler:
                 for scenario in scenarios:
                     models.append({**scenario, "species": species,
                         "candidate_native_name": scenario['snapshot']["Simulations"][0]["Compounds"][0]["Name"],
-                        "parameters": item["parameters"], "reference_policy": policy,
+                        "parameters": scenario.get('parameters', item["parameters"]), "reference_policy": policy,
                         "source": entry["source"], "limitations": entry.get("limitations", [])})
             decision = {"selected_compute": "classical", "quantum_selected": False, "reason": "PBPK uses classical mechanistic differential equations; no electronic subproblem is requested."}
-            ref = self.write({"identity": parameterization["identity"], "models": models, "missing": parameterization["missing"], "status": parameterization["status"], "adme": parameterization.get('adme')}, "pbpk_model_set", invocation, (parent,))
+            ref = self.write({"identity": parameterization["identity"], "models": models, "missing": parameterization["missing"], "status": parameterization["status"], "adme": parameterization.get('adme'),
+                'sponsor_dossiers': [m['document'] for m in parameterization['models'] if m['entry']['kind'] == 'sponsor_dossier']}, "pbpk_model_set", invocation, (parent,))
             selected = self.write(decision, "computation_selection_decision", invocation, (parent,))
             return ScientificCapabilityOutcome(output_artifacts=(ref, selected))
         if name == "pharmacokinetics.pbpk_simulate":
@@ -444,6 +513,16 @@ class VirtualOrganismHandler:
                 raise ValueError('Native scenario construction omitted/duplicated a required dose or parameter-uncertainty point.')
             for model in model_set['models']:
                 source = next(m for m in parameterization['models'] if m['species'] == model['species'])
+                if source['entry']['kind'] == 'sponsor_dossier':
+                    replay = configured_sponsor(parameterization['identity'], source['species'])
+                    if (replay is None or canonical(replay[0]) != canonical(source['document'])
+                            or replay[3] != source['sponsor_policy_sha256']
+                            or canonical(replay[2]) != canonical(source['sensitivity_policy'])):
+                        raise ValueError('Configured sponsor source/design failed independent replay.')
+                    for sha,raw in replay[1].items():
+                        refs = [r for r in by_id.values() if r.artifact_type == 'sponsor_dossier_source' and r.content_sha256 == sha]
+                        if not refs or any(self.runner.store.read(r) != raw for r in refs):
+                            raise ValueError('Original sponsor source bytes were omitted/changed.')
                 source_bytes = self.runner.store.read(by_id[source['source_artifact_identifier']])
                 if digest(source_bytes) != source['entry']['sha256']:
                     raise ValueError("Reviewed source model evidence hash mismatch.")
@@ -526,11 +605,17 @@ class VirtualOrganismHandler:
             assumptions = ["Healthy adult European ICRP physiology is the initial human model; not a specific patient.",
                 "Species are built separately. Rat database physiology does not distinguish sex or age-dependent maturation.",
                 "Rat population sampling is not qualified in this adapter; each rat computation represents one independently built reference individual.",
-                "Population age/sex sampling and organ/body variation use PK-Sim's database and a fixed seed. Drug-parameter interval sensitivity is separate, bounded and one-at-a-time; no joint probability, custom disease or genotype is claimed.",
+                "Population age/sex sampling and organ/body variation use PK-Sim's database and a fixed seed. Drug-parameter sensitivity is separate and bounded: prediction intervals use one-at-a-time experiments, while sponsor dossiers use the disclosed finite level-covering design. Neither design establishes joint probabilities, custom disease or genotype.",
                 "Total tissue concentrations are not intracellular free concentrations or proof of engagement.",
                 "Ordinary PBPK remains classical. Quantum infrastructure is unchanged and no IBM job was submitted."]
             assumptions.extend(m['species'] + ': ' + policy['method'] for m in models['models'] if m['scenario_kind'] == 'nominal' for policy in m.get('reference_policy', []))
             parameters = [dict(p, species=m["species"]) for m in models["models"] if m['scenario_kind'] == 'nominal' for p in m["parameters"]]
+            from .sponsor_dossier import sponsor_parameter_audit
+            # Count each parent evidence field once, not once per simulated
+            # level or subject. A conditional range is not a nominal input.
+            parameters.extend(dict(p, species=dossier['species'])
+                for dossier in models.get('sponsor_dossiers', [])
+                for p in sponsor_parameter_audit(dossier))
             quality = {label: sum(p["classification"] == label for p in parameters) for label in ("measured", "sourced", "calculated", "predicted", "estimated", "assumed", "missing")}
             quality["missing_species_dossiers"] = len(exposure["missing"])
             activity_results = verification.get('activity_comparisons', [])
@@ -540,6 +625,7 @@ class VirtualOrganismHandler:
                 "drug_parameter_uncertainty": parameter_sensitivity_summary(exposure['runs'], request),
                 "evidence_quality": quality, "activity_comparisons": activity_results,
                 "adme_parameterization": models.get('adme'),
+                'sponsor_dossiers': models.get('sponsor_dossiers', []),
                 "exposure_relevance": {"status": "prioritization_hypothesis" if any(a["status"] == "prioritization_hypothesis" for a in activity_results) else "insufficient_evidence", "reason": "Sourced quantitative assays require matching unbound species-compartment exposure. Computed ratios, when available, prioritize follow-up; they do not establish occupancy, function or safety."} if activity_results else exposure_relevance([], None),
                 "assumptions": assumptions, "verification": verification,
                 "scenario_policy": [{"species": m['species'], 'scenario_identifier': m['scenario_identifier'], "records": m.get('scenario_policy')} for m in models['models']],
@@ -549,7 +635,7 @@ class VirtualOrganismHandler:
                     *[limitation for m in models["models"] for limitation in m["limitations"]]],
                 "computation_selection": {"selected_compute": "classical", "quantum_selected": False, "reason": "PBPK is classical mechanistic ODE simulation, not an electronic structure problem."}}
             ref = self.write(assessment, "virtual_organism_assessment", invocation, (exposure_ref, model_ref, pop_ref, comparison_ref, check_ref))
-            summary = f"Virtual Organism: {assessment['status'].replace('_', ' ')}; {len(exposure['runs'])} species computation(s). This is exposure evidence, not a safety assessment."
+            summary = exposure_summary(assessment['status'], exposure['runs'])
             return ScientificCapabilityOutcome(output_artifacts=(ref,), scientific_summary=summary, limitations=tuple(assessment["limitations"]))
         raise ValueError("Unknown virtual organism capability.")
 

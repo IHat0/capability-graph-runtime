@@ -23,7 +23,8 @@ POLICY = {'version': 'pulsate.bioactivity-neighbours/v1', 'remote_similarity_per
     'activities_per_neighbour': 32, 'targets': 8,
     'scope': 'Bounded chemical-neighbour hypotheses; no calibrated candidate potency or proteome completeness'}
 CHEMBL = 'https://www.ebi.ac.uk/chembl/api/data/'
-ACTIVITY_UNITS = {'M': 1e6, 'mM': 1e3, 'uM': 1., 'µM': 1., 'nM': 1e-3, 'pM': 1e-6}
+ACTIVITY_UNITS = {'M': 1e6, 'mM': 1e3, 'uM': 1., 'µM': 1., 'umol/l': 1.,
+    'nM': 1e-3, 'nmol/l': 1e-3, 'pM': 1e-6}
 
 
 class ScientificSources:

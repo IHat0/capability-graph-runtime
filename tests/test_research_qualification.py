@@ -25,6 +25,33 @@ def test_research_label_cannot_replace_observed_benchmark():
         research_review(doc,sources,model_sha256='a'*64)
 
 
+def test_replay_cache_is_local_and_invalidated_by_package_or_actual_bytes(monkeypatch):
+    import cgr.pulsate_api.research_qualification as qualification
+    doc, sources = package()
+    doc['research_qualification']['benchmarks'] = [{'identifier': 'Synthetic cache contract'}]
+    def pin():
+        doc['research_qualification_sha256'] = digest(canonical(doc['research_qualification']))
+    pin()
+    calls = []
+    monkeypatch.setattr(qualification, 'replay_benchmark', lambda *args: calls.append(args) or {'mock': True})
+    cache = {}
+    first = research_review(doc, sources, model_sha256='a'*64, replay_cache=cache)
+    assert research_review(doc, sources, model_sha256='a'*64, replay_cache=cache) == first
+    assert len(calls) == 1
+    # Blocking verification owns a new cache and must replay independently.
+    research_review(doc, sources, model_sha256='a'*64, replay_cache={})
+    assert len(calls) == 2
+    doc['research_qualification']['uncertainty'] = 'Changed contract requires replay'
+    pin()
+    research_review(doc, sources, model_sha256='a'*64, replay_cache=cache)
+    assert len(calls) == 3
+    changed = dict(sources)
+    changed[next(iter(changed))] = b'Tampered source, same submitted hash key'
+    with pytest.raises(ValueError, match='absent or altered'):
+        research_review(doc, changed, model_sha256='a'*64, replay_cache=cache)
+    assert len(calls) == 3
+
+
 @pytest.mark.parametrize('gate',GATES)
 def test_any_missing_research_gate_refuses_transfer(gate):
     doc,sources=package();doc['research_qualification']['gates'][gate]['status']='missing'
@@ -177,3 +204,95 @@ def test_original_units_cannot_manufacture_a_scale_or_swap_time_and_amount():
             ('unknown_native_substance', 'mole/litre')]:
         with pytest.raises(ValueError):
             normalize_value(1., original, native)
+
+
+def endpoint_fixture(monkeypatch):
+    """Synthetic software contract only; no real physiological validation claim."""
+    import cgr.pulsate_api.mechanistic_models as mechanistic
+    monkeypatch.setattr(mechanistic, 'verify_simulation', lambda *_: {'passed': True, 'scope': 'Synthetic replay'})
+    model = b'Synthetic endpoint model bytes'
+    model_sha = digest(model)
+    protocol = {'kind': 'synthetic-test-only'}
+    context = {'species': 'Human', 'tissue': 'Synthetic test tissue', 'time_unit': 'ms',
+        'unit': 'ms', 'endpoint': 'V.APD90', 'experimental_conditions': 'Synthetic endpoint fixture',
+        'native_protocol_sha256': digest(canonical(protocol))}
+    raw = canonical(dict(context, identity='Synthetic compound', observations=[1., 2.]))
+    sources = {model_sha: model, digest(raw): raw}
+    trace = {'kind': 'original_primary_record', 'url': 'https://pmc.ncbi.nlm.nih.gov/articles/synthetic/',
+        'sha256': digest(raw), 'record_identifier': 'Synthetic only', 'semantic_context': context,
+        'semantic_review_basis': 'Synthetic contract test only', 'context_pointers': {
+            key: {'pointer': [field], 'expected': json_value}
+            for key, field, json_value in [('identity', 'identity', 'Synthetic compound'),
+                ('species', 'species', context['species']), ('endpoint', 'endpoint', context['endpoint']),
+                ('experimental_context', 'experimental_conditions', context['experimental_conditions']),
+                ('units', 'unit', context['unit'])]}}
+    points = []
+    for i in range(2):
+        report = {'model': dict(context, sha256=model_sha), 'receipt': {'protocol': protocol},
+            'perturbation': {'synthetic_condition': i},
+            'response': {'V.APD90': {'unit': 'ms', 'final_difference': 10. + i}}}
+        report_raw = canonical(report); sources[digest(report_raw)] = report_raw
+        points.append({'result_sha256': digest(report_raw), 'perturbation_sha256': digest(canonical(report['perturbation'])),
+            'value': float(i + 1), 'value_pointer': ['observations', i], 'subject_identifier': 'Synthetic compound',
+            'original_source': trace})
+    benchmark = {'kind': 'observed_biological', 'identifier': 'Synthetic endpoint contract',
+        'comparison_method': 'native_response_endpoint', 'observed_definition': 'change_from_control',
+        'error_budget_basis': 'Frozen test criterion, not biological accuracy', 'maximum_absolute_error': 1.,
+        'limitations': ['Synthetic data and mocked solver'], 'context': context, 'output': 'V.APD90',
+        'unit': 'ms', 'points': points}
+    return benchmark, sources, model_sha
+
+
+def exploratory_package(monkeypatch):
+    benchmark, sources, model_sha = endpoint_fixture(monkeypatch)
+    doc, gate_sources = package(); sources.update(gate_sources)
+    protocol = canonical({'criterion': 'Frozen synthetic test only'})
+    sources[digest(protocol)] = protocol
+    data = doc['research_qualification']
+    data.update(model_sha256=model_sha, qualification_state='exploratory_only', candidate_decision_authority=False,
+        predeclared_protocol_sha256=digest(protocol), benchmark_discrepancy='Synthetic observed-endpoint criterion failed',
+        benchmarks=[benchmark])
+    data['gates']['observed_benchmark']['status'] = 'failed'
+    doc.update(review_status='exploratory_reviewed', research_qualification_sha256=digest(canonical(data)))
+    return doc, sources, model_sha
+
+
+def test_exploratory_review_retains_discrepancy_without_promoting_qualification(monkeypatch):
+    doc, sources, model_sha = exploratory_package(monkeypatch)
+    receipt = research_review(doc, sources, model_sha256=model_sha)
+    assert receipt['qualification_state'] == 'exploratory_only'
+    assert receipt['candidate_decision_authority'] is False
+    assert receipt['benchmarks'][0]['biological_error_budget_passed'] is False
+    assert receipt['benchmarks'][0]['maximum_absolute_error'] == 9.
+    doc['review_status'] = 'research_validated'
+    with pytest.raises(ValueError, match='Critical research gate'):
+        research_review(doc, sources, model_sha256=model_sha)
+
+
+@pytest.mark.parametrize('gate', [g for g in GATES if g not in {'observed_benchmark', 'bounded_uncertainty'}])
+def test_exploratory_state_cannot_bypass_critical_source_mapping_or_domain_gates(monkeypatch, gate):
+    doc, sources, sha = exploratory_package(monkeypatch)
+    doc['research_qualification']['gates'][gate]['status'] = 'failed'
+    doc['research_qualification_sha256'] = digest(canonical(doc['research_qualification']))
+    with pytest.raises(ValueError, match='Critical research gate'):
+        research_review(doc, sources, model_sha256=sha)
+
+
+def test_exploratory_state_still_requires_fresh_passing_numerical_replay(monkeypatch):
+    doc, sources, sha = exploratory_package(monkeypatch)
+    import cgr.pulsate_api.mechanistic_models as mechanistic
+    monkeypatch.setattr(mechanistic, 'verify_simulation', lambda *_: {'passed': False})
+    with pytest.raises(ValueError, match='numerical replay failed'):
+        research_review(doc, sources, model_sha256=sha)
+
+
+def test_exploratory_state_cannot_hide_altered_native_result_or_frozen_protocol(monkeypatch):
+    doc, sources, sha = exploratory_package(monkeypatch)
+    result_sha = doc['research_qualification']['benchmarks'][0]['points'][0]['result_sha256']
+    sources[result_sha] = b'Tampered native result'
+    with pytest.raises(ValueError, match='absent or altered'):
+        research_review(doc, sources, model_sha256=sha)
+    doc, sources, sha = exploratory_package(monkeypatch)
+    sources.pop(doc['research_qualification']['predeclared_protocol_sha256'])
+    with pytest.raises(ValueError, match='protocol is absent or altered'):
+        research_review(doc, sources, model_sha256=sha)

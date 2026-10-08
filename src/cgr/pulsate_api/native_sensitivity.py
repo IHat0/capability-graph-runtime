@@ -16,6 +16,69 @@ from .virtual_organism import CompoundDossier, canonical, digest
 SCHEMA = 'pulsate.native-input-sensitivity/v1'
 
 
+def concentration_metrics(series):
+    """Sampled peaks and windowed trapezoidal AUC, not extrapolated PK values."""
+    values, times = series['values_umol_l'], series['times_h']
+    if (len(times) != len(values) or len(times) < 2
+            or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values + times)
+            or any(b <= a for a, b in zip(times, times[1:]))):
+        raise ValueError('Invalid native sensitivity concentration series.')
+    peak = max(values)
+    return {'peak_umol_l': peak, 'sampled_tmax_h': [t for t, v in zip(times, values) if v == peak] if peak > 0 else [],
+        'auc_umol_h_l': sum((b-a)*(x+y)/2 for a, b, x, y in zip(times, times[1:], values, values[1:])),
+        'window_h': [times[0], times[-1]], 'series_sha256': digest(canonical(series)),
+        'limitation': 'Sample-grid Cmax/Tmax and trapezoidal AUC over the recorded window; no AUC infinity or continuous peak inference.'}
+
+
+def native_exposure_endpoints(organism):
+    """Retain species, virtual person, native zone and concentration basis.
+
+    Ratios pair the same subject and sample grid, and use like total/total or
+    free/free quantities. They are conditional distribution ratios, not Kp or
+    partition coefficients inferred from an incomplete time course.
+    """
+    rows, ratios, refused = [], [], []
+    for run in organism['runs']:
+        series = run['result']['series']
+        for item in series:
+            row = dict(concentration_metrics(item), species=run['species'], organ=item['organ'],
+                compartment=item['compartment'], native_path=item.get('path'),
+                subject_identifier=item.get('subject_identifier'))
+            rows.append(row)
+        plasma = [s for s in series if s['organ'] == 'PeripheralVenousBlood' and s['compartment'] in {
+            'Plasma (Peripheral Venous Blood)', 'Plasma Unbound (Peripheral Venous Blood)'}]
+        for item in series:
+            if item['organ'] == 'PeripheralVenousBlood':
+                continue
+            free = item['compartment'] in {'Interstitial Unbound', 'Intracellular Unbound'}
+            # Other native observables may describe blood cells, intracellular or
+            # interstitial totals. Do not call those total tissue/plasma ratios.
+            if item['compartment'] not in {'Tissue', 'Interstitial Unbound', 'Intracellular Unbound'}:
+                continue
+            reference_name = 'Plasma Unbound (Peripheral Venous Blood)' if free else 'Plasma (Peripheral Venous Blood)'
+            references = [s for s in plasma if s.get('subject_identifier') == item.get('subject_identifier')
+                and s['compartment'] == reference_name and s['times_h'] == item['times_h']]
+            identity = {'species': run['species'], 'organ': item['organ'], 'compartment': item['compartment'],
+                'native_path': item.get('path'), 'subject_identifier': item.get('subject_identifier')}
+            if len(references) != 1:
+                refused.append(dict(identity, reason='No unique, same-subject/grid plasma reference with compatible concentration basis.'))
+                continue
+            reference = references[0]
+            tissue_metrics, plasma_metrics = concentration_metrics(item), concentration_metrics(reference)
+            if plasma_metrics['auc_umol_h_l'] <= 0:
+                refused.append(dict(identity, reason='Plasma AUC is zero; no finite tissue/plasma AUC ratio.'))
+                continue
+            ratios.append(dict(identity, concentration_basis='unbound' if free else 'total',
+                auc_tissue_plasma_ratio=tissue_metrics['auc_umol_h_l']/plasma_metrics['auc_umol_h_l'],
+                time_ratios=[{'time_h': t, 'ratio': x/y if y > 0 else None,
+                    'reason': None if y > 0 else 'Zero plasma concentration; ratio undefined'}
+                    for t, x, y in zip(item['times_h'], item['values_umol_l'], reference['values_umol_l'])],
+                tissue_series_sha256=tissue_metrics['series_sha256'], plasma_series_sha256=plasma_metrics['series_sha256'],
+                window_h=tissue_metrics['window_h']))
+    return {'endpoints': rows, 'tissue_plasma_ratios': ratios, 'refused_ratios': refused,
+        'interpretation': 'Native conditional concentration ratios; not equilibrium partition coefficients, occupancy or clinical effects.'}
+
+
 def design(acquisition, policy):
     conflicts = acquisition['conflicts']
     if not conflicts: return None
@@ -90,7 +153,12 @@ def conditional_acquisition(acquisition, case):
         ionization=tuple(controls['ionization']),ionization_status='reviewed',
         ionization_source='; '.join(acquisition['parameter_provenance']['ionization']),
         limitations=('Conditional sensitivity variant, not a nominal result. All parent conflicts remain preserved.',))
-    return dict(acquisition,dossier=dossier.model_dump(mode='json'),conflicts=[],missing=[],
+    if acquisition.get('schema') == 'pulsate.sponsor-side-prospective/v1':
+        from .sponsor_dossier import sponsor_compound_dossier
+        dossier = sponsor_compound_dossier(dict(acquisition, resolved_parameters=parameters, resolved_controls=controls))
+    return dict(acquisition,dossier=dossier.model_dump(mode='json'),conflicts=[],
+        resolved_parameters=parameters,resolved_controls=controls,
+        missing=list(acquisition['missing']) if acquisition.get('schema') == 'pulsate.sponsor-side-prospective/v1' else [],
         prospective_dosing=controls.get('dosing'),sensitivity_condition=case)
 
 
@@ -120,13 +188,8 @@ def summarize(plan, executions):
                 'case_identifier':execution['case_identifier'],
                 'population_sha256':digest(canonical(physiology)) if physiology is not None else None})
             for series in run['result']['series']:
-                values=series['values_umol_l']
+                metrics=concentration_metrics(series)
                 times=series['times_h']
-                if (len(times)!=len(values) or len(times)<2
-                        or any(not math.isfinite(v) or v<0 for v in values+times)
-                        or any(b<=a for a,b in zip(times,times[1:]))):
-                    raise ValueError('Invalid native sensitivity concentration series.')
-                auc=sum((b-a)*(x+y)/2 for a,b,x,y in zip(times,times[1:],values,values[1:]))
                 # Full native paths distinguish, for example, periportal and
                 # pericentral liver. Their concentrations cannot be pooled.
                 subject=series.get('subject_identifier')
@@ -137,9 +200,11 @@ def summarize(plan, executions):
                 if any(o['case_identifier']==execution['case_identifier'] for o in endpoints.get(key,[])):
                     raise ValueError('Duplicate native sensitivity observable identity; no compartments merged.')
                 endpoints.setdefault(key,[]).append({'case_identifier':execution['case_identifier'],
-                    'peak_umol_l':max(values),'auc_umol_h_l':auc,'series_sha256':digest(canonical(series))})
+                    **metrics})
     ranges={k:{'observations':v,'peak_range_umol_l':[min(x['peak_umol_l'] for x in v),max(x['peak_umol_l'] for x in v)],
-        'auc_range_umol_h_l':[min(x['auc_umol_h_l'] for x in v),max(x['auc_umol_h_l'] for x in v)]} for k,v in endpoints.items()}
+        'auc_range_umol_h_l':[min(x['auc_umol_h_l'] for x in v),max(x['auc_umol_h_l'] for x in v)],
+        'sampled_tmax_range_h':[min(t for x in v for t in x['sampled_tmax_h']), max(t for x in v for t in x['sampled_tmax_h'])]
+            if any(x['sampled_tmax_h'] for x in v) else None} for k,v in endpoints.items()}
     complete_endpoints=bool(ranges) and all(len(r['observations'])==len(plan['cases']) for r in ranges.values())
     return {'endpoint_ranges':ranges,'failed_cases':failures,'nominal_withheld':True,
         'population_alignment':{species:{'cases':rows,'paired_population_verified':

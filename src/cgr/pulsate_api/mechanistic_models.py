@@ -10,7 +10,7 @@ import json
 import math
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, model_serializer
 
 from .virtual_organism import canonical, digest
 
@@ -20,8 +20,11 @@ SBML_VERSION = '5.21.1'
 POLICY_VERSION = 'pulsate.sbml-mechanistic/v1'
 
 
-def runtime_status():
+def runtime_status(contract=None):
     """Missing optional numerical engines are explicit refusals, never results."""
+    if contract is not None and contract.format == 'cellml_compiled':
+        from .cellml_physiology import runtime_status as cellml_runtime
+        return cellml_runtime()
     import importlib
     status = {'engine':'libRoadRunner', 'required_version':ENGINE_VERSION,
         'sbml_required_version':SBML_VERSION, 'sbml_runtime_version':None,
@@ -61,11 +64,29 @@ class ModelContract(BaseModel):
     relative_tolerance: float = Field(default=1e-9, ge=1e-12, le=1e-6, allow_inf_nan=False)
     absolute_tolerance: float = Field(default=1e-11, ge=1e-24, le=1e-6, allow_inf_nan=False)
     numerical_justification: str | None = None
+    format: str = 'sbml'
+    native_compilation: dict | None = None
+    simulation_protocol: dict | None = None
+
+    @model_serializer(mode='wrap')
+    def preserve_sbml_document(self, handler):
+        document = handler(self)
+        if self.format == 'sbml':
+            for key in ('format', 'native_compilation', 'simulation_protocol'):
+                document.pop(key, None)
+        return document
 
     @model_validator(mode='after')
     def qualified_scope(self):
-        if self.level not in {'cellular_functional', 'organ_physiology'} or self.time_unit not in {'s', 'min', 'h'}:
+        if self.format not in {'sbml', 'cellml_compiled'}:
+            raise ValueError('Unsupported native model format.')
+        if self.level not in {'cellular_functional', 'organ_physiology'} or self.time_unit not in (
+                {'s', 'min', 'h'} if self.format == 'sbml' else {'ms'}):
             raise ValueError('Unsupported mechanistic model scope/time unit.')
+        if self.format == 'cellml_compiled' and (not self.native_compilation or not self.simulation_protocol):
+            raise ValueError('Native CellML needs pinned compiler evidence and an explicit simulation protocol.')
+        if self.format == 'sbml' and (self.native_compilation is not None or self.simulation_protocol is not None):
+            raise ValueError('CellML compilation controls cannot alter an SBML contract.')
         if not 1 <= len(self.outputs) <= 32 or len(self.perturbable_parameters) > 32:
             raise ValueError('Model interface exceeds its bound.')
         if (self.relative_tolerance != 1e-9 or self.absolute_tolerance != 1e-11) and not self.numerical_justification:
@@ -120,6 +141,9 @@ def load_models(path):
             raise ValueError('Model path exceeds trusted directory/size boundary.')
         sbml = model_path.read_bytes()
         if digest(sbml) != contract.sha256: raise ValueError('Mechanistic model hash mismatch.')
+        if contract.format == 'cellml_compiled':
+            from .cellml_physiology import load_compilation
+            sbml = load_compilation(contract, sbml, catalogue.parent)
         models.append((contract, sbml))
     if len({m.identifier for m,_ in models}) != len(models): raise ValueError('Duplicate model identity.')
     return models, digest(payload)
@@ -410,6 +434,9 @@ def native_equation_scales(model):
 
 def simulate(contract, payload, perturbation):
     """Piecewise constant, explicitly sampled perturbation; no hidden exposure interpolation."""
+    if contract.format == 'cellml_compiled':
+        from .cellml_physiology import simulate as simulate_cellml
+        return simulate_cellml(contract, payload, perturbation)
     model, executable = inspect_sbml(contract, payload)
     if perturbation.model_identifier != contract.identifier or contract.perturbable_parameters.get(perturbation.parameter) != perturbation.parameter_unit:
         raise ValueError('Model/parameter/unit perturbation mapping mismatch.')
@@ -471,15 +498,20 @@ def verify_simulation(report, payload):
     expected = simulate(contract, payload, perturbation)
     if canonical(expected) != canonical(report): raise ValueError('Mechanistic output/receipt failed independent replay.')
     return {'passed': True, 'report_sha256': digest(canonical(report)),
-        'scope': 'Model hash, declared SBML identifiers/units and fresh numerical replay; not biological validation.'}
+        'scope': 'Native model hash, declared identifiers/units and fresh numerical replay; not biological validation.'}
 
 
-def exposure_perturbation(model, transfer, series, activity, *, evidence_eligible, evidence_sources=None):
+def exposure_perturbation(model, transfer, series, activity, *, evidence_eligible, evidence_sources=None, qualification_cache=None):
     """Only reviewed fractional-activity transfer models; no Vina -> potency."""
     if not evidence_eligible: raise ValueError('Quantitative transfer evidence is not prospectively eligible.')
+    if 'functional_assay_sha256' in activity and (
+            activity.get('functional_transfer_supported') is not True
+            or activity.get('assay_type') != 'functional'
+            or activity.get('functional_direction') not in {'inhibitor', 'blocker'}
+            or activity.get('kind') != 'IC50'):
+        raise ValueError('The functional assay does not support a qualified inhibitory transfer; nominal/binding/other endpoint evidence remains separate.')
     if transfer.get('schema') != 'pulsate.reviewed-inhibition-transfer/v2' or not transfer.get('reviewer') or not transfer.get('source'):
         raise ValueError('No reviewed quantitative activity-to-model transfer contract.')
-    receipt = qualify_transfer(model, transfer, series, activity, evidence_sources=evidence_sources)
     if transfer.get('parameter_unit') == 'not_declared':
         raise ValueError('Undeclared model parameter units cannot support candidate physiological coupling.')
     if transfer.get('law') != 'reversible_fractional_activity' or activity.get('kind') not in transfer.get('compatible_activity_kinds', []):
@@ -495,6 +527,8 @@ def exposure_perturbation(model, transfer, series, activity, *, evidence_eligibl
             or series.get('compartment') != transfer.get('compartment')
             or activity.get('assay_context') != transfer.get('qualified_assay_context')):
         raise ValueError('Species, target, tissue, free-concentration basis or assay context is incompatible.')
+    receipt = qualify_transfer(model, transfer, series, activity, evidence_sources=evidence_sources,
+        qualification_cache=qualification_cache)
     potency, hill = activity.get('value'), transfer.get('hill_coefficient')
     if not all(type(v) in (float,int) and math.isfinite(v) and v > 0 for v in (potency, hill)):
         raise ValueError('Missing positive quantitative potency or qualified Hill coefficient.')
@@ -503,7 +537,29 @@ def exposure_perturbation(model, transfer, series, activity, *, evidence_eligibl
     concentrations = series['values_umol_l']
     if any(not math.isfinite(c) or c < 0 for c in concentrations): raise ValueError('Invalid exposure concentrations.')
     fractions = tuple(1 / (1 + (c / potency) ** hill) for c in concentrations)
-    time_factors = {'s': 3600., 'min': 60., 'h': 1.}
+    if model.format == 'cellml_compiled':
+        if (transfer.get('temporal_policy') != 'sampled_unbound_peak_snapshot'
+                or activity.get('functional_direction') not in {'inhibitor', 'blocker'}
+                or activity.get('assay_type') != 'functional'
+                or activity.get('hill_coefficient') != hill):
+            raise ValueError('Native current block requires sourced functional direction/Hill slope and a reviewed exposure-snapshot policy.')
+        period = model.simulation_protocol.get('observation_period_ms')
+        if type(period) not in (float, int) or not math.isfinite(period) or not 0 < period <= 10000:
+            raise ValueError('Missing bounded native observation period for exposure snapshot.')
+        peak = max(concentrations)
+        fraction = min(fractions)
+        receipt = dict(receipt, temporal_policy={'kind': 'sampled_unbound_peak_snapshot',
+            'peak_umol_l': peak, 'sampled_peak_times_h': [t for t,c in zip(series['times_h'], concentrations, strict=True) if c == peak],
+            'exposure_evidence_kind': series.get('evidence_kind', 'native_pbpk_timecourse'),
+            'timecourse_available': series.get('timecourse_available', True),
+            'exposure_clock_unit': 'h', 'model_clock_unit': 'ms', 'whole_exposure_sha256': digest(canonical(series)),
+            'scope': 'Paced cellular response at sampled peak exposure; not hours-long dynamic physiology or a measured response.'})
+        return Perturbation(model_identifier=model.identifier, parameter=transfer['parameter'],
+            parameter_unit=transfer['parameter_unit'], times=(0., float(period)), fractions_remaining=(fraction, fraction),
+            source=transfer['source'], classification='reviewed_exposure_activity_transfer',
+            exposure_sha256=digest(canonical(series)), activity_sha256=digest(canonical(activity)),
+            transfer_contract_sha256=digest(canonical(transfer)), transfer_receipt=receipt)
+    time_factors = {'s': 3600., 'min': 60., 'h': 1., 'ms': 3600000.}
     return Perturbation(model_identifier=model.identifier, parameter=transfer['parameter'],
         parameter_unit=transfer['parameter_unit'], times=tuple(t * time_factors[model.time_unit] for t in series['times_h']),
         fractions_remaining=fractions, source=transfer['source'], classification='reviewed_exposure_activity_transfer',
@@ -511,7 +567,7 @@ def exposure_perturbation(model, transfer, series, activity, *, evidence_eligibl
         transfer_contract_sha256=digest(canonical(transfer)), transfer_receipt=receipt)
 
 
-def qualify_transfer(model, transfer, series, activity, *, evidence_sources=None):
+def qualify_transfer(model, transfer, series, activity, *, evidence_sources=None, qualification_cache=None):
     """An accession/string match is necessary but never biological qualification.
 
     This narrow law supports calibrated reversible inhibition of a declared
@@ -521,12 +577,12 @@ def qualify_transfer(model, transfer, series, activity, *, evidence_sources=None
     required = ('version','reviewer_qualification','review_status','molecular_species',
         'parameter_meaning','direction','equation','assumptions','calibration_evidence',
         'applicability_domain','uncertainty','model_sha256','calibration_sha256')
-    if not all(transfer.get(k) for k in required) or transfer['review_status'] not in {'qualified','research_validated'}:
+    if not all(transfer.get(k) for k in required) or transfer['review_status'] not in {'qualified','research_validated','exploratory_reviewed'}:
         raise ValueError('Transfer scientific qualification is missing, pending or rejected.')
     research = None
-    if transfer['review_status'] == 'research_validated':
+    if transfer['review_status'] in {'research_validated','exploratory_reviewed'}:
         from .research_qualification import research_review
-        research = research_review(transfer,evidence_sources,model_sha256=model.sha256)
+        research = research_review(transfer,evidence_sources,model_sha256=model.sha256, replay_cache=qualification_cache)
     if transfer['model_sha256'] != model.sha256:
         raise ValueError('Biological transfer was qualified for a different model revision.')
     calibration=transfer['calibration_evidence']
@@ -559,7 +615,8 @@ def qualify_transfer(model, transfer, series, activity, *, evidence_sources=None
     expected={'model_sha256':model.sha256,'parameter':transfer.get('parameter'),
         'target_accession':transfer.get('target_accession'),'species':model.species,'tissue':model.tissue,
         'molecular_species':transfer['molecular_species'],'parameter_meaning':transfer['parameter_meaning'],
-        'parameter_unit':transfer.get('parameter_unit'),'transfer_law':'calibrated_fractional_activity'}
+        'parameter_unit':transfer.get('parameter_unit'),'transfer_law':
+            'reviewed_fractional_activity' if transfer['review_status']=='exploratory_reviewed' else 'calibrated_fractional_activity'}
     if not annotation or any(annotation.get(k)!=v or mapping.get(k)!=v for k,v in expected.items()):
         raise ValueError('No reviewed biological parameter/target/molecular-species mapping in the model contract.')
     domain=transfer['applicability_domain']
@@ -577,7 +634,10 @@ def qualify_transfer(model, transfer, series, activity, *, evidence_sources=None
         raise ValueError('Exposure lies outside the independently calibrated transfer domain.')
     if domain.get('activity_unit')!='umol/l' or domain.get('native_parameter_unit')!=transfer.get('parameter_unit'):
         raise ValueError('Transfer native/exposure/activity dimensions are not qualified.')
-    return {'schema':'pulsate.mechanistic-transfer-qualification/v1', 'qualified':True,
+    exploratory = transfer['review_status'] == 'exploratory_reviewed'
+    return {'schema':'pulsate.mechanistic-transfer-qualification/v1', 'qualified':not exploratory,
+        'qualification_state':'exploratory_only' if exploratory else 'qualified_for_research_signal',
+        'candidate_decision_authority':not exploratory,
         'qualification_scope':research or {'scope':'deployment_reviewed_model_hypothesis',
             'independent_scientific_review':False,'clinical_qualification':False},
         'model_parameter_mapping':expected,'equation':expected_equation,'direction':'inhibition',

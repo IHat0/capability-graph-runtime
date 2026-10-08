@@ -948,6 +948,7 @@ class ProviderNeutralScientificEvidenceInterpreter:
                     'Separate the protein target from compounds evaluated against it. Include ALL named compounds. '
                     'Use literal substrings only, no synonyms or identifiers. Use empty arrays when no name is given. '
                     'Do not include PDB accession codes as protein names.'
+                    'Explicitly labelled SMILES, InChI and PubChem CID values are structure sources, not compound names; exact-source acquisition handles them separately. '
                     'A drug candidate is a compound, and its intended target is the protein named in the request. '
                     'In a request to investigate a compound as a target drug candidate, retain BOTH roles: compound in ligand_names, target in protein_names. '
                     'Abbreviated target names are still names; do not omit them or expand them. Never classify the candidate compound as the target.'
@@ -978,6 +979,21 @@ class ProviderNeutralScientificEvidenceInterpreter:
                     turn = next((turn for turn in reversed(turns) if name in turn.content), None)
                     if turn is None:
                         return ()
+                    # The model may return an exact structure-source value in
+                    # the names array. Do not search that graph/identifier as a
+                    # name or reacquire a ligand already constructed from it.
+                    # Match only labelled literals in this supporting turn;
+                    # an unlabelled acronym in another turn remains a name.
+                    from .scientific_acquisition import grounded_identifiers
+                    grounded = grounded_identifiers(turn.content)
+                    typed_values = {value for value in (
+                        grounded.ligand_smiles, grounded.ligand_inchi,
+                        str(grounded.ligand_pubchem_cid) if grounded.ligand_pubchem_cid is not None else None,
+                    ) if value is not None}
+                    if name in typed_values or (
+                        grounded.protein_pdb_id is not None and name.upper() == grounded.protein_pdb_id
+                    ):
+                        continue
                     roles[key] = entity_type
                     result.append(ScientificNamedInputCandidate(
                         name=name, entity_type=entity_type,

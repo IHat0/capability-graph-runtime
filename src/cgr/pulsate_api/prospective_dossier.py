@@ -24,6 +24,7 @@ PARAMETER_CATEGORIES = {
     'reference_weight': {'preclinical_adme', 'early_pk'}, 'intestinal_permeability': {'preclinical_adme'},
     'ionization': {'ionization'}, 'binding_partner': {'binding'}, 'dosing': {'development_dose'},
     'quantitative_activity': {'quantitative_activity'},
+    'exposure_snapshot': {'early_pk'},
 }
 
 
@@ -74,8 +75,8 @@ def acquire_dossier(identity, species, policy, library, sources):
         if role == 'solubility' and (datum.context.get('reference_ph') is None
                 or datum.context.get('quantity_kind') != 'apparent_solubility_at_reference_ph'):
             raise ValueError('Unqualified/unknown-pH solubility cannot supply native reference-pH solubility.')
-        if role == 'quantitative_activity':
-            continue  # Molecular activity is not a PK-Sim native ADME parameter.
+        if role in {'quantitative_activity', 'exposure_snapshot'}:
+            continue  # Assay/exposure observations are not native ADME inputs.
         evidence_class = datum.evidence_type
         if evidence_class not in PRECEDENCE:
             unsupported.append({'datum': datum.identifier, 'reason': 'Unsupported numerical evidence class'})
@@ -131,6 +132,9 @@ def acquire_dossier(identity, species, policy, library, sources):
 
 def select_regimen(identity, acquisition, exploratory_policy):
     """No therapeutic dose is guessed; exploratory controls are frozen deployment policy."""
+    if acquisition.get('schema') == 'pulsate.sponsor-side-prospective/v1':
+        from .sponsor_dossier import select_sponsor_regimen
+        return select_sponsor_regimen(identity, acquisition, exploratory_policy)
     evidence = acquisition.get('prospective_dosing')
     if evidence:
         source = 'Date-qualified prospective development regimen'

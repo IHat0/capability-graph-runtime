@@ -17,10 +17,11 @@ from .mechanistic_models import load_models, exposure_perturbation, simulate, ve
 from .phase8_scientific_handlers import _NativeRunner
 from .prospective_dossier import acquire_dossier, load_library, select_regimen
 from .prospective_evidence import ProspectivePolicy, EvidenceDatum, eligibility, verify_source
-from .native_sensitivity import design as sensitivity_design, conditional_acquisition, summarize as summarize_sensitivity
+from .native_sensitivity import design as sensitivity_design, conditional_acquisition, summarize as summarize_sensitivity, native_exposure_endpoints
 from .scientific_runtime import ScientificCapabilityFailure, ScientificCapabilityOutcome
 from .virtual_organism import PBPKRequest, canonical, digest
 from .virtual_organism_handlers import VirtualOrganismHandler
+from .safety_pharmacology import load_panel as load_safety_panel, evaluate_panel as evaluate_safety_panel
 
 
 def same_json_document(expected, payload):
@@ -38,12 +39,24 @@ def load_policy():
     if doc.get('schema') != 'pulsate.virtual-investigation-policy/v1' or not doc.get('reviewer'):
         raise ValueError('Virtual investigation policy is not versioned/reviewed.')
     ProspectivePolicy.model_validate(doc['prospective_evidence'])
-    for field in ('source_library', 'mechanistic_catalogue'):
+    for field in ('source_library', 'mechanistic_catalogue', 'sponsor_side_dossier', 'general_safety_panel', 'target_activity_models', 'functional_activity_library'):
         if doc.get(field):
             resolved = (path.parent / doc[field]['path']).resolve(strict=True)
             if not resolved.is_relative_to(path.parent) or digest(resolved.read_bytes()) != doc[field]['sha256']:
                 raise ValueError('Virtual investigation configuration path/hash mismatch: ' + field)
+    if doc.get('target_activity_models') and not doc.get('general_safety_panel'):
+        raise ValueError('Target activity models require their exact frozen general safety panel.')
     return doc, path.parent, digest(payload)
+
+
+def acquire_investigation_dossier(identity, policy, library, sources, config, root):
+    """Opt-in sponsor data, without weakening public-history admission."""
+    if config and config.get('sponsor_side_dossier'):
+        from .sponsor_dossier import load_sponsor_dossier, acquire_sponsor_dossier
+        doc, sponsor_sources, sponsor_sha = load_sponsor_dossier(root / config['sponsor_side_dossier']['path'])
+        sources.update(sponsor_sources)
+        return acquire_sponsor_dossier(identity, 'Human', doc, sponsor_sources, policy, file_sha256=sponsor_sha)
+    return acquire_dossier(identity, 'Human', policy, library, sources)
 
 
 def compatible_activity(identity, library, sources, policy):
@@ -73,6 +86,67 @@ def compatible_activity(identity, library, sources, policy):
     return activities, excluded
 
 
+def compatible_exposure_snapshots(identity, library, sources, policy):
+    """Exact-source observed/qualified unbound endpoints, never invented curves.
+
+    A published estimated free Cmax stays sourced/estimated, not measured tissue
+    exposure. Unknown post-dose time stays null. Tissue equivalence, if admitted,
+    is an explicit source-bound assumption and still requires model qualification.
+    """
+    from .functional_pharmacology import _anchor
+    snapshots, excluded = [], []
+    for item in library.get('records', []):
+        if item.get('inchikey') != identity['inchikey'] or item.get('native_parameter') != 'exposure_snapshot':
+            continue
+        datum = EvidenceDatum.model_validate(item['datum'])
+        verify_source(datum, sources[datum.source_sha256], sources)
+        decision = eligibility(datum, policy, identity['inchikey'])
+        if not decision['eligible']:
+            excluded.append(decision)
+            continue
+        context = datum.context
+        if (datum.category != 'early_pk' or datum.evidence_type not in {'measured', 'sourced'}
+                or datum.original_source is None or datum.subject_inchikey != identity['inchikey']
+                or context.get('species') != item.get('species')
+                or context.get('endpoint') != 'unbound_Cmax' or context.get('concentration_basis') != 'unbound'
+                or datum.unit not in ACTIVITY_UNITS or type(datum.value) not in (float, int)
+                or not math.isfinite(datum.value) or datum.value <= 0
+                or not all(context.get(k) for k in ('organ', 'compartment', 'regimen'))
+                or not all(item.get(k) for k in ('uncertainty', 'applicability'))):
+            raise ValueError('Exposure snapshot needs exact identity/species, primary unbound Cmax, regimen, uncertainty and applicability.')
+        organ, compartment = context['organ'], context['compartment']
+        translation = item.get('compartment_translation')
+        if translation is not None:
+            if (translation.get('kind') != 'passive_unbound_equivalence_assumption'
+                    or translation.get('source_organ') != organ or translation.get('source_compartment') != compartment
+                    or not all(translation.get(k) for k in ('organ', 'compartment', 'rationale', 'limitations', 'source_anchors'))):
+                raise ValueError('Unqualified exposure compartment translation.')
+            for anchor in translation['source_anchors']: _anchor(anchor, sources)
+            organ, compartment = translation['organ'], translation['compartment']
+        time = context.get('peak_time_h')
+        if time is not None and (type(time) not in (float, int) or not math.isfinite(time) or time < 0):
+            raise ValueError('Invalid observed peak timestamp.')
+        snapshots.append({'species': item['species'], 'organ': organ, 'compartment': compartment,
+            'concentration_basis': 'unbound', 'unit': 'umol/l', 'values_umol_l': [float(datum.value)*ACTIVITY_UNITS[datum.unit]],
+            'times_h': [time], 'evidence_kind': 'qualified_exposure_snapshot', 'endpoint': 'Cmax',
+            'timecourse_available': False, 'classification': datum.evidence_type,
+            'exposure_case_identifier': 'observed-endpoint-' + datum.identifier,
+            'path': datum.original_source.source_url, 'datum': datum.model_dump(mode='json'),
+            'eligibility': decision, 'regimen': context['regimen'], 'uncertainty': item['uncertainty'],
+            'applicability': item['applicability'], 'compartment_translation': translation,
+            'limitation': 'Exact published exposure endpoint, not a generated concentration-time curve. Estimated free concentrations and compartment equivalence are not measured tissue concentrations.'})
+    return snapshots, excluded
+
+
+def predict_activity(identity, config, root, panel, panel_sha, *, timestamp=None):
+    if not config or not config.get('target_activity_models'):
+        return None, [], {}
+    from .activity_prediction import predict_panel, quantitative_hypotheses
+    prediction, sources = predict_panel(identity, panel, panel_sha,
+        root / config['target_activity_models']['path'], timestamp=timestamp)
+    return prediction, quantitative_hypotheses(prediction, identity), sources
+
+
 def activity_overlap(series, activity):
     compatible = [s for s in series if s.get('species') == activity['species']
         and s.get('organ') == activity.get('organ') and s.get('compartment') == activity.get('compartment')]
@@ -80,15 +154,45 @@ def activity_overlap(series, activity):
             or activity['unit'] != 'umol/l' or not activity.get('assay_context')
             or any(s.get('concentration_basis') != 'unbound' or s.get('unit') != 'umol/l' for s in compatible)):
         return {'status': 'insufficient_compatible_evidence', 'target_accession': activity['target_accession'],
-            'reason': 'Exact species, tissue/compartment, concentration units, unbound basis and assay context are required; total tissue exposure cannot be substituted.'}
+            'reason': 'Exact species, tissue/compartment, concentration units, unbound basis and assay context are required; total tissue exposure and nominal binding-assay concentration cannot be substituted.'}
     peaks = [max(s['values_umol_l']) for s in compatible]
     if any(not math.isfinite(v) or v < 0 for v in peaks): raise ValueError('Invalid exposure peak.')
+    if 'interval_umol_l' in activity:
+        interval = activity['interval_umol_l']
+        if (not isinstance(interval, (list, tuple)) or len(interval) != 2
+                or any(type(v) not in (float, int) or not math.isfinite(v) or v <= 0 for v in interval)
+                or interval[0] > interval[1] or not interval[0] <= activity['value'] <= interval[1]
+                or not activity.get('interval_definition')):
+            raise ValueError('Quantitative activity interval requires finite positive, ordered bounds and declared semantics.')
+        comparisons = []
+        for exposure, peak in zip(compatible, peaks, strict=True):
+            comparisons.append({'exposure_case_identifier': exposure.get('exposure_case_identifier'),
+                'subject_identifier': exposure.get('subject_identifier'), 'native_path': exposure.get('path'),
+                'native_population_sha256': exposure.get('native_population_sha256'),
+                'series_sha256': digest(canonical(exposure)), 'peak_umol_l': peak,
+                'peak_activity_ratio_interval': [peak/interval[1], peak/interval[0]],
+                'status': 'modeled_peak_below_activity_range' if peak < interval[0]
+                    else 'modeled_peak_exceeds_activity_range' if peak > interval[1] else 'modeled_peak_overlaps_activity_range'})
+        statuses = {r['status'] for r in comparisons}
+        return {'status': next(iter(statuses)) if len(statuses) == 1 else 'scenario_dependent_exposure_activity',
+            'target_accession': activity['target_accession'], 'kind': activity['kind'],
+            'activity_interval_umol_l': list(interval), 'interval_definition': activity['interval_definition'],
+            'comparisons': comparisons, 'activity_sha256': digest(canonical(activity)), 'uncertainty': activity['uncertainty'],
+            'limitation': 'Conditional sampled-peak/activity-range comparison; no nominal case, occupancy, effect direction, physiological consequence or clinical risk inferred. Not a joint probabilistic confidence interval.'}
     return {'status': 'exposure_relevant_molecular_hypothesis' if max(peaks) >= activity['value'] else 'modeled_peak_below_activity_point',
         'target_accession': activity['target_accession'], 'kind': activity['kind'], 'activity_umol_l': activity['value'],
         'unbound_peaks_umol_l': peaks, 'peak_activity_ratios': [p/activity['value'] for p in peaks],
         'uncertainty': activity['uncertainty'], 'series_sha256': [digest(canonical(s)) for s in compatible],
         'activity_sha256': digest(canonical(activity)),
         'limitation': 'Point assay comparison with modeled exposure; not occupancy, proven engagement, effect direction, physiological consequence or clinical risk. Subthreshold modeled peaks do not establish absence of effect.'}
+
+
+def decision_eligible_response(response):
+    """Numerical execution alone never promotes an exploratory hypothesis."""
+    receipt = response.get('perturbation', {}).get('transfer_receipt') or {}
+    return (receipt.get('qualified') is not False
+        and receipt.get('qualification_state') != 'exploratory_only'
+        and receipt.get('candidate_decision_authority') is not False)
 
 
 def assess_candidate(candidate, policy, sources=None):
@@ -126,14 +230,16 @@ def assess_candidate(candidate, policy, sources=None):
                 or type(rule.get('threshold')) not in (float,int) or not math.isfinite(rule['threshold'])):
             raise ValueError('Invalid reviewed functional response criterion.')
         responses = [f['result'] for f in candidate['functional_models'] if f['status']=='computed'
-            and f['result']['model']['identifier']==rule['model_identifier']]
+            and f['result']['model']['identifier']==rule['model_identifier']
+            and decision_eligible_response(f['result'])]
         if any(f['status']=='refused' and f.get('model_identifier')==rule['model_identifier']
                for f in candidate['functional_models']):
             missing.append('Required functional execution refused: ' + rule['model_identifier'])
         if sensitivity and sensitivity.get('status')=='planned':
             required_cases={case['case_identifier'] for case in sensitivity['design']['cases']}
             covered_cases={f.get('exposure_case_identifier') for f in candidate['functional_models']
-                if f['status']=='computed' and f['result']['model']['identifier']==rule['model_identifier']}
+                if f['status']=='computed' and f['result']['model']['identifier']==rule['model_identifier']
+                and decision_eligible_response(f['result'])}
             if not required_cases <= covered_cases:
                 missing.append('Functional criterion has not evaluated every qualified native input case: ' + rule['model_identifier'])
         observed = False
@@ -171,7 +277,7 @@ def native_experiment(store, identity, acquisition, regimen, invocation):
     source = runner.write_json(artifact_type='pbpk_source_model', payload=source_payload,
         producer='discovery.virtual_investigate', execution_identifier=invocation.invocation_identifier)
     entry = {'inchikey': identity['inchikey'], 'species': acquisition['species'], 'kind': 'dossier',
-        'source': 'Verified date-qualified prospective library', 'sha256': digest(source_payload),
+        'source': 'Frozen sponsor-side prospective dossier' if acquisition.get('experiment_provenance') else 'Verified date-qualified prospective library', 'sha256': digest(source_payload),
         'limitations': dossier['limitations']}
     model = {'entry':entry, 'document':dossier, 'source_artifact_identifier':source.artifact_identifier,
         'parameters':[dict(p,name=k) for k,p in dossier['parameters'].items()], 'species':acquisition['species']}
@@ -199,13 +305,14 @@ def native_experiment(store, identity, acquisition, regimen, invocation):
 
 def compatible_experiments(contract, transfers, activities, series, sources=None, refusals=None):
     """Every distinct qualified perturbation once; never choose a convenient one."""
-    experiments = {}
+    experiments, qualification_cache = {}, {}
     for transfer in transfers:
         for activity in activities:
             for exposure in series:
                 try:
                     perturbation = exposure_perturbation(contract, transfer, exposure, activity,
-                        evidence_eligible=activity['eligibility']['eligible'], evidence_sources=sources)
+                        evidence_eligible=activity['eligibility']['eligible'], evidence_sources=sources,
+                        qualification_cache=qualification_cache)
                 except ValueError as error:
                     if refusals is not None:
                         refusals.append({'model_identifier':contract.identifier,
@@ -308,10 +415,19 @@ class VirtualInvestigationHandler:
         library, sources, library_sha = ({'records':[]}, {}, None)
         if config and config.get('source_library'):
             library, sources, library_sha = load_library(root / config['source_library']['path'])
+        functional_library, functional_sha = None, None
+        if config and config.get('functional_activity_library'):
+            from .functional_pharmacology import load_library as load_functional_library
+            functional_library, functional_sources, functional_sha = load_functional_library(root / config['functional_activity_library']['path'])
+            sources.update(functional_sources)
         models = load_models(root / config['mechanistic_catalogue']['path'])[0] if config and config.get('mechanistic_catalogue') else []
+        safety_panel, safety_sha = None, None
+        if config and config.get('general_safety_panel'):
+            safety_panel, safety_sources, safety_sha = load_safety_panel(root / config['general_safety_panel']['path'])
+            sources.update(safety_sources)
         for contract,payload in models:
-            refs.append(self.runner.write_bytes(artifact_type='mechanistic_sbml_source',payload=payload,
-                media_type='application/sbml+xml',producer='discovery.virtual_investigate',execution_identifier=invocation.invocation_identifier,
+            refs.append(self.runner.write_bytes(artifact_type='mechanistic_cellml_compilation' if contract.format == 'cellml_compiled' else 'mechanistic_sbml_source',payload=payload,
+                media_type='application/json' if contract.format == 'cellml_compiled' else 'application/sbml+xml',producer='discovery.virtual_investigate',execution_identifier=invocation.invocation_identifier,
                 metadata={'model_identifier':contract.identifier,'source_url':contract.source_url,'model_sha256':contract.sha256}))
         for candidate, descriptor, descriptor_ref in rows:
             identity = {'name':candidate['display_name'], 'smiles':descriptor['canonical_smiles'],
@@ -325,7 +441,7 @@ class VirtualInvestigationHandler:
                         producer='discovery.virtual_investigate', execution_identifier=invocation.invocation_identifier,
                         metadata={'source_sha256':sha}))
                 bioactivity['verification'] = verify_hypotheses(bioactivity, identity['smiles'], intended, policy, source_set.payloads)
-            acquisition = acquire_dossier(identity, 'Human', policy, library, sources)
+            acquisition = acquire_investigation_dossier(identity, policy, library, sources, config, root)
             regimen = select_regimen(identity, acquisition, config.get('exploratory_regimen') if config else None)
             organism, child_workflow = None, []
             if regimen['status'] == 'scenario_ready':
@@ -352,8 +468,22 @@ class VirtualInvestigationHandler:
                         'regimen':conditional_regimen,'virtual_organism':result,'native_workflow':conditional_workflow,
                         'native_artifact_identifiers':[r.artifact_identifier for r in conditional_refs]})
                 sensitivity.update(executions=executions,summary=summarize_sensitivity(sensitivity['design'],executions))
+            native_metrics = {'reference': native_exposure_endpoints(organism) if organism else None,
+                'conditional': [{'case_identifier': e['case_identifier'], 'metrics': native_exposure_endpoints(e['virtual_organism'])}
+                    for e in sensitivity.get('executions', []) if e['status'] == 'computed'] if sensitivity else []}
             activities, excluded_activity = compatible_activity(identity, library, sources, policy)
+            if functional_library is not None:
+                from .functional_pharmacology import candidate_assays
+                functional_activities, functional_excluded = candidate_assays(identity, functional_library, sources, policy)
+                activities.extend(functional_activities)
+                excluded_activity.extend(functional_excluded)
+            prediction, predicted_activities, prediction_sources = predict_activity(identity, config, root, safety_panel, safety_sha)
+            sources.update(prediction_sources)
+            activities.extend(predicted_activities)
+            safety_coverage = evaluate_safety_panel(safety_panel, safety_sha, bioactivity, activities, intended) if safety_panel else None
             series = exposure_evidence(organism, sensitivity)
+            snapshots, excluded_exposure = compatible_exposure_snapshots(identity, library, sources, policy)
+            series.extend(snapshots)
             relevance = [activity_overlap(series, a) for a in activities]
             functional = []
             transfer_refusals = []
@@ -362,7 +492,7 @@ class VirtualInvestigationHandler:
                 if not experiments:
                     functional.append(model_refusal(contract))
                     continue
-                availability = runtime_status()
+                availability = runtime_status(contract)
                 for perturbation, activity, s in experiments.values():
                     if not availability['available']:
                         functional.append(runtime_refusal(contract, perturbation, availability))
@@ -377,12 +507,16 @@ class VirtualInvestigationHandler:
                 'bioactivity_hypotheses':bioactivity, 'dossier_acquisition':acquisition, 'regimen':regimen,
                 'virtual_organism':organism, 'native_workflow':child_workflow, 'quantitative_activity':activities,
                 'native_sensitivity':sensitivity,
+                'native_exposure_endpoints': native_metrics,
+                'general_safety_panel': safety_coverage,
+                'target_activity_prediction': prediction,
                 'native_artifact_identifiers':[r.artifact_identifier for r in child_refs] if organism else [],
                 'excluded_activity':excluded_activity, 'exposure_activity':relevance, 'functional_models':functional,
                 'functional_transfer_refusals':transfer_refusals,
-                'inference_levels':{'exposure':bool(series), 'molecular_hypotheses':bool(bioactivity.get('targets')),
-                    'cellular_functional':any(f['status']=='computed' and f['result']['inference_level']=='cellular_functional' for f in functional),
-                    'organ_physiology':any(f['status']=='computed' and f['result']['inference_level']=='organ_physiology' for f in functional), 'clinical':False},
+                'reviewed_exposure_snapshots':snapshots, 'excluded_exposure':excluded_exposure,
+                'inference_levels':{'exposure':bool(series), 'molecular_hypotheses':bool(bioactivity.get('targets') or activities),
+                    'cellular_functional':any(f['status']=='computed' and f['result']['inference_level']=='cellular_functional' and decision_eligible_response(f['result']) for f in functional),
+                    'organ_physiology':any(f['status']=='computed' and f['result']['inference_level']=='organ_physiology' and decision_eligible_response(f['result']) for f in functional), 'clinical':False},
                 })
             assessment = assess_candidate(results[-1], config.get('candidate_assessment') if config else None, sources)
             results[-1].update(candidate_assessment=assessment, candidate_status=assessment['status'], assessment_reason=assessment['reason'])
@@ -420,6 +554,7 @@ class VirtualInvestigationHandler:
                 'verification':json.loads(self.runner.store.read(checked.output_artifacts[0]))}
         document = {'schema':'pulsate.virtual-investigation/v1', 'policy_sha256':config_sha,
             'prospective_policy':policy.model_dump(mode='json'), 'source_library_sha256':library_sha, 'candidates':results,
+            'functional_activity_library_sha256': functional_sha,
             'bioactivity_structural':structural,
             'computation_selection':{'selected_compute':'classical','quantum_selected':False,
                 'reason':'PBPK and mechanistic ODEs are classical; no independently justified electronic subproblem was identified.'},
@@ -463,7 +598,21 @@ class VirtualInvestigationVerificationHandler:
         if config and config.get('source_library'):
             library, library_sources, library_sha = load_library(root / config['source_library']['path'])
         if library_sha != report['source_library_sha256']: raise ValueError('Reviewed evidence library changed before verification.')
+        functional_library, functional_sha = None, None
+        if config and config.get('functional_activity_library'):
+            from .functional_pharmacology import load_library as load_functional_library
+            functional_library, functional_sources, functional_sha = load_functional_library(root / config['functional_activity_library']['path'])
+            if any(sources.get(sha) != raw for sha,raw in functional_sources.items()):
+                raise ValueError('Original functional assay sources were omitted or changed.')
+            library_sources.update(functional_sources)
+        if functional_sha != report.get('functional_activity_library_sha256'):
+            raise ValueError('Functional assay library changed before verification.')
         models = load_models(root / config['mechanistic_catalogue']['path'])[0] if config and config.get('mechanistic_catalogue') else []
+        safety_panel, safety_sha = None, None
+        if config and config.get('general_safety_panel'):
+            safety_panel, safety_sources, safety_sha = load_safety_panel(root / config['general_safety_panel']['path'])
+            if any(sources.get(sha) != payload for sha, payload in safety_sources.items()):
+                raise ValueError('General safety panel source bytes were omitted or changed.')
         _, rows = _descriptors(record, self.runner.store)
         if [c['candidate_identifier'] for c,_,_ in rows] != [c['candidate_identifier'] for c in report['candidates']]:
             raise ValueError('Investigation omitted/reordered a candidate.')
@@ -498,11 +647,28 @@ class VirtualInvestigationVerificationHandler:
                 if bioactivity['verification'] != expected_check: raise ValueError('Bioactivity verification receipt mismatch.')
             elif bioactivity != {'status':'not_configured','targets':[], 'reason':'No reviewed virtual-investigation source policy configured'}:
                 raise ValueError('Unconfigured hypotheses were manufactured.')
-            acquisition = acquire_dossier(identity, 'Human', policy, library, library_sources)
+            acquisition = acquire_investigation_dossier(identity, policy, library, library_sources, config, root)
             regimen = select_regimen(identity, acquisition, config.get('exploratory_regimen') if config else None)
             if canonical(acquisition) != canonical(candidate['dossier_acquisition']) or canonical(regimen) != canonical(candidate['regimen']):
                 raise ValueError('Dossier/source eligibility or dosing failed replay.')
             activities, excluded = compatible_activity(identity, library, library_sources, policy)
+            if functional_library is not None:
+                from .functional_pharmacology import candidate_assays
+                functional_activities, functional_excluded = candidate_assays(identity, functional_library, library_sources, policy)
+                activities.extend(functional_activities)
+                excluded.extend(functional_excluded)
+            prediction = candidate.get('target_activity_prediction')
+            expected_prediction, predicted_activities, prediction_sources = predict_activity(identity, config, root,
+                safety_panel, safety_sha, timestamp=prediction.get('timestamp') if prediction else None)
+            if canonical(expected_prediction) != canonical(prediction):
+                raise ValueError('Candidate binding prediction/domain/refusal failed independent numerical replay.')
+            if any(sources.get(sha) != payload for sha, payload in prediction_sources.items()):
+                raise ValueError('Target activity model, validation, gate or manifest source bytes were omitted or changed.')
+            library_sources.update(prediction_sources)
+            activities.extend(predicted_activities)
+            expected_coverage = evaluate_safety_panel(safety_panel, safety_sha, bioactivity, activities, intended) if safety_panel else None
+            if canonical(expected_coverage) != canonical(candidate.get('general_safety_panel')):
+                raise ValueError('General safety panel coverage failed independent replay.')
             if canonical(activities) != canonical(candidate['quantitative_activity']) or canonical(excluded) != canonical(candidate['excluded_activity']):
                 raise ValueError('Quantitative activity extraction failed replay.')
             organism = candidate['virtual_organism']
@@ -533,6 +699,15 @@ class VirtualInvestigationVerificationHandler:
                 verify_native_result(self.runner.store,by_id,invocation,acquisition,regimen,organism,candidate['native_artifact_identifiers'])
             elif regimen['status']=='scenario_ready': raise ValueError('A required native scenario was silently omitted.')
             series = exposure_evidence(organism, sensitivity)
+            snapshots, excluded_exposure = compatible_exposure_snapshots(identity, library, library_sources, policy)
+            if canonical(snapshots) != canonical(candidate.get('reviewed_exposure_snapshots', [])) or canonical(excluded_exposure) != canonical(candidate.get('excluded_exposure', [])):
+                raise ValueError('Exact-source exposure snapshot failed independent replay.')
+            series.extend(snapshots)
+            expected_metrics = {'reference': native_exposure_endpoints(organism) if organism else None,
+                'conditional': [{'case_identifier': e['case_identifier'], 'metrics': native_exposure_endpoints(e['virtual_organism'])}
+                    for e in sensitivity.get('executions', []) if e['status'] == 'computed'] if sensitivity else []}
+            if canonical(expected_metrics) != canonical(candidate.get('native_exposure_endpoints')):
+                raise ValueError('Native peak, Tmax, AUC or tissue/plasma endpoints failed independent replay.')
             if canonical([activity_overlap(series,a) for a in activities]) != canonical(candidate['exposure_activity']):
                 raise ValueError('Exposure/activity comparison failed replay.')
             expected_combinations = {}
@@ -567,7 +742,7 @@ class VirtualInvestigationVerificationHandler:
                     if expected_combinations[model_id]:
                         key = digest(canonical(result.get('perturbation')))
                         if key not in expected_combinations[model_id]: raise ValueError('Unqualified numerical-runtime refusal.')
-                        status = runtime_status()
+                        status = runtime_status(contract)
                         expected = runtime_refusal(contract, expected_combinations[model_id][key][0], status)
                         if status['available'] or canonical(expected) != canonical(result): raise ValueError('Numerical-runtime refusal failed independent replay.')
                         actual = actual_combinations.setdefault(model_id,set())
@@ -581,9 +756,9 @@ class VirtualInvestigationVerificationHandler:
             if any(actual_combinations.get(model_id,set()) != set(experiments) or (not experiments and model_id not in refusals)
                     for model_id,experiments in expected_combinations.items()):
                 raise ValueError('Required compatible functional experiment/refusal was omitted.')
-            expected_levels = {'exposure':bool(series), 'molecular_hypotheses':bool(bioactivity.get('targets')),
-                'cellular_functional':any(f['status']=='computed' and f['result']['inference_level']=='cellular_functional' for f in candidate['functional_models']),
-                'organ_physiology':any(f['status']=='computed' and f['result']['inference_level']=='organ_physiology' for f in candidate['functional_models']), 'clinical':False}
+            expected_levels = {'exposure':bool(series), 'molecular_hypotheses':bool(bioactivity.get('targets') or activities),
+                'cellular_functional':any(f['status']=='computed' and f['result']['inference_level']=='cellular_functional' and decision_eligible_response(f['result']) for f in candidate['functional_models']),
+                'organ_physiology':any(f['status']=='computed' and f['result']['inference_level']=='organ_physiology' and decision_eligible_response(f['result']) for f in candidate['functional_models']), 'clinical':False}
             assessment = assess_candidate(dict(candidate, inference_levels=expected_levels), config.get('candidate_assessment') if config else None, library_sources)
             if (candidate['inference_levels'] != expected_levels or candidate['candidate_status'] != assessment['status']
                     or candidate['assessment_reason'] != assessment['reason'] or canonical(candidate['candidate_assessment']) != canonical(assessment)):

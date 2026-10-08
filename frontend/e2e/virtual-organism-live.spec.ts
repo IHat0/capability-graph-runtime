@@ -13,10 +13,21 @@ test('native virtual organism with evidence and saved session', async ({ page },
   await page.goto('/')
   const suppliedInputs: Array<{ label: string; path: string }> = JSON.parse(process.env.PULSATE_PBPK_INPUTS ?? '[]')
   for (const input of suppliedInputs) await page.getByLabel(input.label, { exact: true }).setInputFiles(input.path)
-  await page.getByLabel('Scientific question', { exact: true }).fill(question)
-  const started = page.waitForResponse(r => r.url().endsWith('/research/sessions') && r.request().method() === 'POST', { timeout: 200_000 })
-  await page.getByRole('button', { name: 'Start research session', exact: true }).click()
-  let session = await (await started).json()
+  let session
+  const resumeIdentifier = process.env.PULSATE_PBPK_RESUME_SESSION
+  if (resumeIdentifier) {
+    await page.getByText('Reopen a research session', { exact: true }).click()
+    await page.getByLabel('Saved session identifier', { exact: true }).fill(resumeIdentifier)
+    const opened = page.waitForResponse(r => r.url().endsWith(`/research/sessions/${resumeIdentifier}`)
+      && r.request().method() === 'GET', { timeout: 30_000 })
+    await page.getByRole('button', { name: 'Open session', exact: true }).click()
+    session = await (await opened).json()
+  } else {
+    await page.getByLabel('Scientific question', { exact: true }).fill(question)
+    const started = page.waitForResponse(r => r.url().endsWith('/research/sessions') && r.request().method() === 'POST', { timeout: 200_000 })
+    await page.getByRole('button', { name: 'Start research session', exact: true }).click()
+    session = await (await started).json()
+  }
   await writeFile(info.outputPath('initial-session.json'), JSON.stringify(session, null, 2))
   if (session.status === 'awaiting_clarification' && process.env.PULSATE_PBPK_REPLY) {
     const previousIdentifier = session.session_identifier
@@ -44,6 +55,45 @@ test('native virtual organism with evidence and saved session', async ({ page },
   await writeFile(info.outputPath('visualization.json'), JSON.stringify(visualization, null, 2))
   expect(visualization.virtual_organism).toBeTruthy()
   expect(visualization.virtual_organism.computation_selection.quantum_selected).toBe(false)
+  if (process.env.PULSATE_SPONSOR_ACCEPTANCE) {
+    const organism = visualization.virtual_organism
+    expect(organism.sponsor_dossiers).toHaveLength(1)
+    expect(organism.sponsor_dossiers[0].experiment_provenance.historical_private_data_claim).toBe(false)
+    expect(organism.runs).toHaveLength(0) // no nominal input set chosen
+    expect(organism.parameters.length).toBeGreaterThan(0)
+    expect(organism.evidence_quality.assumed).toBeGreaterThan(0)
+    const ranges = organism.parameters.filter((p: { interval?: number[] | null }) => p.interval)
+    expect(ranges.length).toBeGreaterThan(0)
+    expect(ranges.every((p: { value: number | null }) => p.value === null)).toBe(true)
+    const scenarios = organism.drug_parameter_uncertainty.scenarios
+    expect(scenarios.length).toBeGreaterThan(1)
+    for (const scenario of scenarios) {
+      expect(scenario.scenario_kind).toBe('sponsor_input_sensitivity')
+      expect(scenario.population.series.length).toBeGreaterThan(0)
+      expect(scenario.population.series.every((c: { subject_count: number }) => c.subject_count === 2)).toBe(true)
+      for (const organ of ['Heart', 'Liver', 'Kidney', 'Brain']) {
+        expect(scenario.population.series.some((c: { organ: string }) => c.organ === organ)).toBe(true)
+      }
+      expect(scenario.population.series.some((c: { compartment: string }) => c.compartment === 'Plasma Unbound (Peripheral Venous Blood)')).toBe(true)
+    }
+    await expect(page.getByRole('region', { name: 'Sponsor-side input provenance', exact: true })).toBeVisible()
+    await page.getByText('Parameter provenance, assumptions and limitations', { exact: true }).click()
+    await expect(page.getByText(/no nominal selected/).first()).toBeVisible()
+    const curves = scenarios[0].population.series
+    for (const match of [(c: { compartment: string }) => c.compartment === 'Plasma Unbound (Peripheral Venous Blood)',
+      (c: { compartment: string }) => /blood/i.test(c.compartment) && !/plasma/i.test(c.compartment),
+      (c: { organ: string; compartment: string }) => c.organ === 'Heart' && c.compartment === 'Interstitial Unbound',
+      (c: { organ: string; compartment: string }) => c.organ === 'Liver' && c.compartment === 'Tissue']) {
+      const curve = curves.find(match)
+      expect(curve, 'Required native curve present').toBeTruthy()
+      await page.getByLabel('Inspect scenario compartment', { exact: true }).selectOption(curve.path)
+      await expect(page.getByRole('img', { name: `Human ${curve.organ} ${curve.compartment} concentration time course`, exact: true })).toBeVisible()
+      await page.screenshot({path: info.outputPath(`sponsor-${curve.organ}-${curve.compartment.replaceAll(/[^a-zA-Z]/g, '-')}.png`), fullPage: true})
+    }
+    await page.getByLabel('Inspect independently simulated scenario').selectOption('1')
+    await expect(page.getByText(`Conditional scenario ${scenarios[1].scenario_identifier} — not a nominal prediction.`, {exact:true})).toBeVisible()
+    await page.screenshot({path:info.outputPath('sponsor-second-conditional-case.png'),fullPage:true})
+  }
   if (process.env.PULSATE_ADME_ACCEPTANCE) {
     await expect(page.getByRole('region', { name: 'ADME Parameterization' })).toBeVisible()
     const adme = visualization.virtual_organism.adme_parameterization
@@ -94,6 +144,10 @@ test('native virtual organism with evidence and saved session', async ({ page },
   await page.screenshot({ path: info.outputPath('virtual-organism.png'), fullPage: true })
   await page.reload()
   await expect(page.getByRole('article', { name: 'Virtual Organism result' })).toBeVisible({ timeout: 30_000 })
+  if (process.env.PULSATE_SPONSOR_ACCEPTANCE) {
+    await expect(page.getByRole('region', {name:'Sponsor-side input provenance',exact:true})).toBeVisible()
+    await expect(page.getByRole('img', {name:/concentration time course/}).first()).toBeVisible()
+  }
   await page.screenshot({ path: info.outputPath('reopened.png'), fullPage: true })
 })
 

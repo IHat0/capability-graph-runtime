@@ -557,6 +557,14 @@ class ScientistResultAssembler:
             for item in assessment['comparison']['subjects']:
                 pk = item['plasma_metrics']
                 add("principal_result", f"{item['species']} subject {item['subject_identifier']}: sampled plasma Cmax {pk['cmax_umol_l']:.6g} umol/l at {pk['tmax_h']:.6g} h; finite-window AUC {pk['auc_0_t_umol_h_l']:.6g} umol*h/l. No terminal extrapolation.", (identifier,), True)
+            sponsor_cases = [s for s in assessment.get('drug_parameter_uncertainty', {}).get('scenarios', [])
+                if s['scenario_kind'] == 'sponsor_input_sensitivity']
+            if sponsor_cases:
+                add('methods', f"Real PK-Sim Human computation evaluated {len(sponsor_cases)} conditional sponsor-input scenarios. No nominal input set was selected. These are scenario outputs, not measured PK.", (identifier,), True)
+                for scenario in sponsor_cases:
+                    for curve in scenario.get('population', {}).get('series', []):
+                        if curve['compartment'] != 'Plasma (Peripheral Venous Blood)': continue
+                        add('principal_result', f"Conditional {scenario['scenario_identifier']}: {curve['subject_count']} virtual Human subjects; peak of the empirical 95th-percentile plasma curve {max(curve['p95_umol_l']):.6g} umol/l (not the population maximum or a clinical confidence interval). Native unbound plasma, blood and organ curves are preserved.", (identifier,), True)
             for missing in assessment['missing']:
                 add('principal_result', 'No accepted ' + missing['species'] + ' exposure prediction is available: ' + missing['reason'], (identifier,), True)
                 add("limitation", missing['species'] + ": " + missing['reason'], (identifier,), True)
@@ -587,10 +595,23 @@ class ScientistResultAssembler:
                     add('principal_result', f"Virtual investigation of {candidate['identity']['name']}: {candidate['candidate_status']}. " + candidate['assessment_reason'], (identifier,), True)
                     for missing in candidate['dossier_acquisition']['missing']:
                         add('limitation', 'Human parameterization unresolved: ' + missing, (identifier,), True)
-                    if candidate['regimen']['status'] != 'scenario_ready':
+                    sensitivity = candidate.get('native_sensitivity') or {}
+                    conditional_native = [e for e in sensitivity.get('executions', []) if e['status']=='computed']
+                    if candidate['regimen']['status'] != 'scenario_ready' and not conditional_native:
                         add('limitation', 'Human exposure was not manufactured: ' + candidate['regimen'].get('reason', ', '.join(candidate['regimen'].get('missing', []))), (identifier,), True)
                     for target in candidate['bioactivity_hypotheses'].get('targets', []):
                         add('principal_result', f"Bioactivity-space target hypothesis {target['target_accession']}: {len(target['evidence'])} unrelated-ligand assay records. Neighbour activities are not this candidate's potency.", (identifier,), True)
+                    prediction = candidate.get('target_activity_prediction')
+                    if prediction:
+                        add('methods', 'Endpoint-specific classical binding models were replayed against frozen scaffold-held-out assay data. ' + prediction['scope'], (identifier,), True)
+                        for activity in prediction['targets']:
+                            if activity['status'] == 'predicted':
+                                low, high = activity['interval_umol_l']
+                                add('principal_result', f"Predicted candidate {activity['kind']} for Human {activity['gene']} ({activity['target_accession']}): {activity['value_umol_l']:.5g} umol/l, marginal interval [{low:.5g}, {high:.5g}]. "
+                                    + activity['interval_definition'] + ' ' + activity['limitation'], (identifier,), True)
+                            else:
+                                add('limitation', f"No accepted candidate binding estimate for {activity['gene']} ({activity['target_accession']}): " + activity['reason'], (identifier,), True)
+                        add('limitation', 'Nominal binding assay predictions were not relabeled as functional IC50 or unbound tissue potency. No exposure-to-physiology transfer is established by these models.', (identifier,), True)
                     structural = investigation.get('bioactivity_structural') or {}
                     panel_candidate = next((c for c in (structural.get('screening') or {}).get('candidates', [])
                         if c['candidate_identifier'] == candidate['candidate_identifier']), None)
@@ -614,8 +635,22 @@ class ScientistResultAssembler:
                         for subject in organism_result['comparison']['subjects']:
                             pk = subject['plasma_metrics']
                             add('principal_result', f"Native {subject['species']} PBPK: sampled plasma Cmax {pk['cmax_umol_l']:.6g} umol/l; finite-window AUC {pk['auc_0_t_umol_h_l']:.6g} umol*h/l. Input and model uncertainty remain.", (identifier,), True)
+                    if conditional_native:
+                        add('methods', f"Native Human exposure was computed for {len(conditional_native)} declared conditional input cases. No nominal case was selected. " + sensitivity['design']['limitation'], (identifier,), True)
+                        for execution in conditional_native:
+                            for subject in execution['virtual_organism']['comparison']['subjects']:
+                                pk=subject['plasma_metrics']
+                                add('principal_result', f"Conditional {execution['case_identifier']}, {subject['species']} subject {subject['subject_identifier']}: native sampled plasma Cmax {pk['cmax_umol_l']:.6g} umol/l, sampled Tmax {pk['tmax_h']:.6g} h, finite-window AUC {pk['auc_0_t_umol_h_l']:.6g} umol*h/l. These are scenario outputs, not measured PK or a nominal prediction.", (identifier,), True)
+                        add('limitation', sensitivity['summary']['qualitative_conclusion'] + ' Scenario ranges do not establish a clinical confidence interval.', (identifier,), True)
                     for functional in candidate['functional_models']:
                         if functional['status'] == 'computed':
+                            qualification = functional['result'].get('perturbation', {}).get('transfer_receipt') or {}
+                            if qualification.get('qualification_state') == 'exploratory_only':
+                                scope = qualification.get('qualification_scope') or {}
+                                add('limitation', 'Exploratory physiology only: this native calculation is not a qualified prediction and cannot independently change candidate status. '
+                                    + scope.get('benchmark_discrepancy', 'Observed-benchmark qualification was not established.'), (identifier,), True)
+                                for limitation in scope.get('limitations', []):
+                                    add('limitation', limitation, (identifier,), True)
                             for output,response in functional['result']['response'].items():
                                 add('principal_result', f"Mechanistic model {functional['result']['model']['identifier']} output {output}: final modeled difference {response['final_difference']:.6g} {response['unit']}. " + functional['result']['limitation'], (identifier,), True)
                         else:

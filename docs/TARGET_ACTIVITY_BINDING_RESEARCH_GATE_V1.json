@@ -1,0 +1,24 @@
+{
+  "schema": "pulsate.target-activity-research-gate/v1",
+  "version": "exploratory-binding-v1",
+  "reviewer": "Internal research engineering gate, not independent scientific qualification",
+  "kind": "Ki",
+  "species": "Human",
+  "unit": "pKi",
+  "domain": "in_domain",
+  "limits": {
+    "minimum_n": 30,
+    "minimum_interval_coverage": 0.8,
+    "maximum_mae": 0.7,
+    "maximum_rmse": 1.0,
+    "minimum_spearman": 0.5
+  },
+  "rationale": "Predeclared before fitting this panel. First-tier molecular binding research only: at least 30 in-domain scaffold-held-out molecules, positive rank information and disclosed log-molar prediction error. Broad intervals are retained; satisfying these thresholds does not justify a physiological or safety conclusion.",
+  "limitations": [
+    "Internal scaffold-held-out validation is not an independent prospective biological validation study.",
+    "A one-log RMSE ceiling permits approximately an order-of-magnitude concentration error; it is not precise potency qualification.",
+    "The 0.8 observed marginal coverage floor does not establish 0.9 coverage under distribution shift or joint coverage across targets.",
+    "Nominal binding assays do not establish functional modulation or unbound-tissue potency.",
+    "Models failing any gate remain visible but cannot issue accepted numerical candidate predictions."
+  ]
+}

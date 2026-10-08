@@ -634,6 +634,9 @@ export interface ResearchVisualizationWorkspace {
   } | null
   virtual_organism?: {
     assessment_artifact_identifier: string; assessment_sha256: string
+    sponsor_dossiers?: Array<{ experiment_provenance: { experiment_class: string; historical_private_data_claim: false;
+      input_receipts: Array<{ identifier: string; role: string; provenance_class: string; values: unknown[];
+        unit: string | null; rationale: string; uncertainty: string; source_sha256: string }> } }>
     schema_version: 'pulsate.virtual-organism/v1'
     candidate: { name: string; inchikey: string; pubchem_cid: number | null; source_url: string | null }
     status: 'exposure_supported' | 'insufficient_parameterization'
@@ -646,7 +649,7 @@ export interface ResearchVisualizationWorkspace {
     exposure_relevance: { status: string; reason: string }
     activity_comparisons?: Array<{ status: string; reason: string; activity?: { target: string; species: string; kind: string; value: number; unit: string; source: string; assay_context: string; compatibility_limitations: string }; peak_exposure_to_activity_ratios?: number[] }>
     verification: { passed: boolean; verification_scope: string }
-    parameters: Array<{ name: string; species: string; value: number | null; unit: string; classification: string; source: string; method: string; uncertainty: string | null }>
+    parameters: Array<{ name: string; species: string; value: number | null; interval?: [number, number] | null; unit: string; classification: string; source: string; method: string; uncertainty: string | null }>
     adme_parameterization?: {
       verification: { passed: boolean; scope: string }
       prediction: {
@@ -658,6 +661,7 @@ export interface ResearchVisualizationWorkspace {
       }
     } | null
     drug_parameter_uncertainty?: { scope: string; dose_analysis?: Array<{ species: string; dose_normalized_cmax_max_min_ratio: number; dose_normalized_auc_max_min_ratio: number; tissue_order_changes: boolean }>; scenarios: Array<{ species: string; scenario_identifier: string; scenario_kind: string;
+      population?: { interval_scope: string; series: Array<{ species: string; path: string; organ: string; compartment: string; subject_count: number; times_h: number[]; median_umol_l: number[]; p05_umol_l: number[]; p95_umol_l: number[] }> };
       scenario_policy: Record<string, unknown>; file_artifacts: Record<string, string>;
       series: Array<{ path: string; organ: string; compartment: string; subject_identifier: string; times_h: number[]; values_umol_l: number[] }> }> }
     assumptions: string[]; limitations: string[]
@@ -699,6 +703,15 @@ export interface ADMEParameter {
     applicability: { status: string; nearest_training_tanimoto: number; training_graph_seen: boolean }; translation: { formula: string } | null } | null
 }
 
+export interface NativeExposureEndpoints {
+  endpoints: Array<{ species: string; organ: string; compartment: string; native_path?: string | null;
+    subject_identifier?: string | null; peak_umol_l: number; sampled_tmax_h: number[];
+    auc_umol_h_l: number; window_h: number[]; limitation: string }>
+  tissue_plasma_ratios: Array<{ species: string; organ: string; compartment: string; subject_identifier?: string | null;
+    concentration_basis: string; auc_tissue_plasma_ratio: number; window_h: number[] }>
+  interpretation: string
+}
+
 export interface VirtualInvestigation {
   policy_sha256: string | null
   prospective_policy: { cutoff: string | null; cutoff_instant?: string | null; cutoff_source: string | null; allow_modern_general_knowledge: boolean }
@@ -712,6 +725,17 @@ export interface VirtualInvestigation {
     candidate_identifier: string; identity: { name: string; inchikey: string }
     candidate_status: string; assessment_reason: string
     inference_levels: Record<string, boolean>
+    reviewed_exposure_snapshots?: Array<{ species: string; organ: string; compartment: string;
+      values_umol_l: number[]; times_h: Array<number | null>; classification: string;
+      timecourse_available: false; path: string; uncertainty: string; applicability: string; limitation: string;
+      compartment_translation?: { rationale: string; limitations: string } | null;
+      datum: { identifier: string; original_source?: { source_sha256: string } } }>
+    quantitative_activity?: Array<{ functional_assay_sha256?: string; target_accession: string; species: string;
+      kind: string; value: number; unit: string; assay_type?: string; assay_host?: string; functional_direction?: string;
+      concentration_basis: string; concentration_basis_classification?: string; measured_unbound_concentration?: boolean;
+      assay_context: string; hill_coefficient?: number; functional_transfer_supported?: boolean;
+      uncertainty: string; applicability?: string; source: string; source_sha256: string;
+      datum?: { original_source?: { source_sha256: string } } }>
     bioactivity_hypotheses: { status?: string; reason?: string; targets: Array<{
       target_accession: string; status: string
         evidence: Array<{ neighbour_chembl_id: string; local_similarity: number; classification: string; organism?: string; intended_target?: boolean | null;
@@ -721,7 +745,11 @@ export interface VirtualInvestigation {
         expression?: Array<{ source_url: string; source_sha256: string; historical_qualification: string }> }
     }> }
     dossier_acquisition: { status: string; missing: string[]; conflicts: Array<{ parameter: string; reason: string }>;
-      eligibility: { decisions: Array<{ identifier: string; eligible: boolean; status: string; historically_qualified: boolean; reason: string }> } }
+      experiment_provenance?: { experiment_class: 'sponsor_side_prospective'; historical_private_data_claim: false;
+        dossier_file_sha256?: string | null; canonical_document_sha256: string;
+        input_receipts: Array<{ identifier: string; role: string; provenance_class: string; values: unknown[];
+          unit: string | null; rationale: string; uncertainty: string; source_sha256: string }> };
+      eligibility: { decisions: Array<{ identifier: string; eligible?: boolean; status: string; historically_qualified?: boolean; reason: string }> } }
     regimen: { status: string; source?: string; classification?: string; reason?: string; missing?: string[] }
     virtual_organism: ResearchVisualizationWorkspace['virtual_organism']
     native_sensitivity?: { status: string; reason?: string; nominal_withheld?: boolean;
@@ -729,10 +757,31 @@ export interface VirtualInvestigation {
       executions?: Array<{ case_identifier: string; status: string; reason?: string;
         virtual_organism?: ResearchVisualizationWorkspace['virtual_organism'] }>;
       summary?: { nominal_withheld: boolean; complete_discrete_space: boolean; qualitative_conclusion: string;
-        endpoint_ranges: Record<string, { peak_range_umol_l: number[]; auc_range_umol_h_l: number[] }> } }
-    exposure_activity: Array<{ status: string; target_accession: string; reason?: string; limitation?: string; peak_activity_ratios?: number[]; uncertainty?: string }>
+        endpoint_ranges: Record<string, { peak_range_umol_l: number[]; auc_range_umol_h_l: number[]; sampled_tmax_range_h?: number[] | null }> } }
+    native_exposure_endpoints?: { reference: NativeExposureEndpoints | null;
+      conditional: Array<{ case_identifier: string; metrics: NativeExposureEndpoints }> }
+    general_safety_panel?: { panel_sha256: string; version: string; scope: string; coverage_statement: string;
+      source_count_discrepancies: Array<{ source_label: string; stated_count: number; enumerated_count: number }>;
+      targets: Array<{ gene: string; target_accession: string; name: string; source_domains: string[]; status: string;
+        intended_target: boolean | null; limitation: string }> } | null
+    target_activity_prediction?: { scope: string; manifest_sha256: string; panel_sha256: string;
+      targets: Array<{ gene: string; target_accession: string; status: string; reason?: string; kind?: string;
+        unit?: string; value_umol_l?: number; interval_umol_l?: number[]; interval_definition?: string;
+        concentration_basis?: string; functional_direction?: string | null; limitation?: string; uncertainty?: string;
+        applicability?: { status: string; training_graph_seen: boolean; nearest_training_tanimoto: number };
+        research_gate?: { accepted: boolean; failed_metrics: string[]; scope: string;
+          metrics: { n: number; mae?: number; rmse?: number; interval_coverage?: number; spearman?: number | null } };
+        model_sha256?: string }> } | null
+    exposure_activity: Array<{ status: string; target_accession: string; reason?: string; limitation?: string; peak_activity_ratios?: number[]; uncertainty?: string;
+      activity_interval_umol_l?: number[]; interval_definition?: string;
+      comparisons?: Array<{ exposure_case_identifier?: string | null; subject_identifier?: string | null; native_path?: string | null;
+        peak_umol_l: number; peak_activity_ratio_interval: number[]; status: string }> }>
     functional_models: Array<{ status: string; model_identifier?: string; reason?: string; exposure_case_identifier?: string | null;
       result?: { model: { identifier: string; name: string; sha256: string; species: string }; inference_level: string;
+        perturbation?: { transfer_receipt?: { qualified?: boolean; qualification_state?: string;
+          candidate_decision_authority?: boolean; qualification_scope?: { benchmark_discrepancy?: string;
+            limitations?: string[]; benchmarks?: Array<{ identifier: string; maximum_absolute_error: number;
+              unit: string; error_budget: number; biological_error_budget_passed: boolean }> } } };
         response: Record<string, { unit: string; baseline_final: number; perturbed_final: number; final_difference: number; maximum_absolute_difference: number }>;
         limitation: string; verification: { passed: boolean } } }>
   }>

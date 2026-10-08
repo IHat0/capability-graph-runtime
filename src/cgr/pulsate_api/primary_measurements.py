@@ -207,7 +207,8 @@ _UNITS = {
     'M': ('molar_concentration', 1e6), 'mM': ('molar_concentration', 1000),
     'mole/litre': ('molar_concentration', 1e6), 'mole/liter': ('molar_concentration', 1e6),
     'uM': ('molar_concentration', 1), 'umol/l': ('molar_concentration', 1),
-    'nM': ('molar_concentration', .001), 'pM': ('molar_concentration', .000001),
+    'nM': ('molar_concentration', .001), 'nmol/l': ('molar_concentration', .001),
+    'pM': ('molar_concentration', .000001),
     'kg': ('mass', 1), 'g': ('mass', .001),
     'mg': ('dose_mass', 1), 'ug': ('dose_mass', .001),
 }

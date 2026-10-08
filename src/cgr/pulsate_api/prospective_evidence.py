@@ -26,13 +26,14 @@ PROHIBITED = {"clinical_outcome", "clinical_safety", "clinical_efficacy",
     "post_outcome_mechanism", "clinical_narrative"}
 SOURCE_PATHS = {
     "pubchem.ncbi.nlm.nih.gov": ("/rest/pug/compound/", "/rest/pug/assay/"),
-    "www.ebi.ac.uk": ("/chembl/api/data/", "/biomodels/"),
+    "www.ebi.ac.uk": ("/chembl/api/data/", "/biomodels/", "/europepmc/webservices/rest/"),
     "rest.uniprot.org": ("/uniprotkb/",),
     "www.proteinatlas.org": ("/api/search_download.php",),
     "files.rcsb.org": ("/download/",),
     "data.rcsb.org": ("/rest/v1/", "/graphql"),
     "docs.open-systems-pharmacology.org": ("/",),
-    "raw.githubusercontent.com": ("/Open-Systems-Pharmacology/", "/biomodels/"),
+    "raw.githubusercontent.com": ("/Open-Systems-Pharmacology/", "/biomodels/", "/CardiacModelling/"),
+    "journals.plos.org": ("/ploscompbiol/article",),
     # Original publication bytes, never wholesale database ADME annotations.
     "pk-db.com": ("/media/data/",),
     "pmc.ncbi.nlm.nih.gov": ("/articles/",),

@@ -81,7 +81,25 @@ def explicit_pbpk_controls(text):
         horizon = horizons[0]
         changes['duration_h'] = float(horizon.group(1)) / (60 if horizon.group(2).lower().startswith('min') else 1)
         quotes['duration_h'] = horizon.group()
-    infusions = list(re.finditer(r'\binfusion\s+(?:over|for|lasting)\s+(' + number + r')\s*' + unit + r'\b',text,re.I))
+    # A duration attached to the noun is the infusion control. A following
+    # "for ..." can instead be the observation window; do not overwrite an
+    # explicit "30 minute infusion" with that window. Separate contradictory
+    # noun-duration declarations still require clarification.
+    infusions = list(re.finditer(r'(?<![\w.])(' + number + r')\s*[- ]?\s*' + unit + r'\s+infusion\b',text,re.I))
+    following = list(re.finditer(r'\binfusion\s+(?:over|for|lasting)\s+(' + number + r')\s*' + unit + r'\b',text,re.I))
+    if not infusions:
+        infusions = following
+    else:
+        infusions.extend(m for m in following if not any(
+            prefix.end() == m.start() + len('infusion') for prefix in infusions))
+    # Repeated confirmation in a resumable session is not a second regimen.
+    distinct_infusions = {}
+    for infusion in infusions:
+        minutes = float(infusion.group(1)) * (1 if infusion.group(2).lower().startswith('min') else 60)
+        distinct_infusions.setdefault(minutes, infusion)
+    infusions = list(distinct_infusions.values())
+    if len(infusions) > 1:
+        raise ValueError('Multiple explicit infusion durations require scientist clarification.')
     if len(infusions) == 1:
         infusion = infusions[0]
         changes['infusion_minutes'] = float(infusion.group(1)) * (1 if infusion.group(2).lower().startswith('min') else 60)
@@ -168,7 +186,10 @@ class PBPKRequest(BaseModel):
                     numbers.append(0.0)  # The scientific definition of a bolus, not a guessed duration.
                 value = getattr(self, key)
                 # Duration may be a literal number of minutes, converted to hours.
-                if not any(math.isclose(value, n) or (key == "duration_h" and "min" in self.quotes[key].lower() and math.isclose(value * 60, n)) for n in numbers):
+                if not any(math.isclose(value, n)
+                    or (key == "duration_h" and "min" in self.quotes[key].lower() and math.isclose(value * 60, n))
+                    or (key == "infusion_minutes" and re.search(r'\b(?:hours?|hrs?|h)\b', self.quotes[key], re.I)
+                        and math.isclose(value, n * 60)) for n in numbers):
                     raise ValueError(f"Unquoted numeric control {key}.")
         if self.infusion_minutes and "infusion_minutes" not in self.quotes:
             raise ValueError("Infusion duration must be explicit.")
@@ -219,6 +240,13 @@ def interpret_pbpk_request(text, provider) -> PBPKRequest | None:
         ]
         schema = PBPKRequest.model_json_schema()
         schema['required'] = ['entity_name', 'species', 'dose', 'dose_unit', 'route', 'duration_h', 'dose_sweep', 'quotes']
+        if literal_dose_sweep(text) is None:
+            # This optional field is required by the wire schema, not by the
+            # scientific experiment. Constrain its absent value rather than
+            # inviting the model to invent four doses and repeatedly fail.
+            schema['properties']['dose_sweep'] = {'type': 'array', 'items': {'type': 'number'},
+                'maxItems': 0, 'default': [],
+                'description': 'No literal dose sweep was supplied. Return an empty array; do not propose doses.'}
         schema['properties']['quotes'] = {'type': 'object', 'properties': {key: {'type': 'string'} for key in PBPKRequest.model_fields if key != 'quotes'},
             'required': ['entity_name', 'dose', 'dose_unit', 'route', 'duration_h'], 'additionalProperties': False,
             'description': 'Exact original-input substrings for each extracted value. Empty only when the corresponding optional control is absent/null.'}
@@ -319,7 +347,8 @@ class CompoundDossier(BaseModel):
     limitations: tuple[str, ...] = ()
     adme_parameters: dict[str, PBPKParameter] = Field(default_factory=dict)
     parameter_conflicts: tuple[dict, ...] = ()
-    ionization_status: Literal["reviewed", "missing"] = "reviewed"
+    ionization_status: Literal["reviewed", "scenario", "missing"] = "reviewed"
+    experiment_provenance: dict = Field(default_factory=dict)
 
 
 class QuantitativeActivity(BaseModel):

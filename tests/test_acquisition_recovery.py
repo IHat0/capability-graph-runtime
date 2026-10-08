@@ -9,7 +9,7 @@ import pytest
 from cgr.pulsate_api import scientific_acquisition as acquisition
 from cgr.pulsate_api import scientific_target_selection as selection
 from cgr.pulsate_api.research_sessions import ResearchSessionController, NamedInputResolutionRequired
-from cgr.pulsate_api.scientific_conversation import ScientificNamedInputCandidate
+from cgr.pulsate_api.scientific_conversation import ScientificNamedInputCandidate, ProviderNeutralScientificEvidenceInterpreter, ScientistEvidenceTurn
 from cgr.pulsate_api.scientific_objectives import ScientificInputReference
 
 
@@ -78,3 +78,23 @@ def test_retry_budget_is_bounded(monkeypatch):
     with pytest.raises(ValueError):
         acquisition._fetch_bytes('https://source.example/input', 'text/plain', 100)
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize('label,value', [('SMILES','CCO'),('SMILES','C[N+](C)(C)C'),
+    ('InChI','InChI=1S/CH4/h1H4'),('PubChem CID','12345')])
+def test_labelled_structure_literals_are_not_sent_to_name_resolution(label,value):
+    """Synthetic interpreter fixture; no molecule-specific production route."""
+    text=f'Compare Compound-X and the ligand with {label}: {value} against Target-X using PDB 1ABC.'
+    provider=SimpleNamespace(provider_kind='test',model_name='test',complete=lambda messages:json.dumps({
+        'protein_names':['Target-X','1ABC'],'ligand_names':['Compound-X',value]}))
+    turns=(ScientistEvidenceTurn(turn_identifier='turn-labelled',content=text),)
+    result=ProviderNeutralScientificEvidenceInterpreter(provider).propose_named_entities(turns)
+    assert [(c.entity_type,c.name) for c in result]==[('protein','Target-X'),('ligand','Compound-X')]
+
+
+def test_unlabelled_name_is_not_treated_as_a_graph_by_syntax_guessing():
+    provider=SimpleNamespace(provider_kind='test',model_name='test',complete=lambda messages:json.dumps({
+        'protein_names':['Target-X'],'ligand_names':['CCO']}))
+    result=ProviderNeutralScientificEvidenceInterpreter(provider).propose_named_entities((
+        ScientistEvidenceTurn(turn_identifier='turn-unlabelled',content='Compare CCO against Target-X.'),))
+    assert [c.name for c in result]==['Target-X','CCO']

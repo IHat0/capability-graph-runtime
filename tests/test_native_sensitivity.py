@@ -4,7 +4,7 @@ import copy
 import pytest
 from rdkit import Chem
 
-from cgr.pulsate_api.native_sensitivity import SCHEMA, design, conditional_acquisition, summarize
+from cgr.pulsate_api.native_sensitivity import SCHEMA, design, conditional_acquisition, summarize, concentration_metrics, native_exposure_endpoints
 
 
 def inputs(counts=(2,2)):
@@ -132,3 +132,25 @@ def test_equal_subject_ordinals_do_not_imply_the_same_virtual_person():
     assert summarize(plan,executions)['complete_discrete_space']
     executions[1]['virtual_organism']['runs'][0]['result']['series'][0]['times_h']=[0,2]
     assert not summarize(plan,executions)['complete_discrete_space']
+
+
+def test_sampled_metrics_preserve_plateaus_zero_series_and_actual_window():
+    s={'times_h':[1,2,3,4], 'values_umol_l':[0,2,2,0]}
+    metrics=concentration_metrics(s)
+    assert metrics['sampled_tmax_h']==[2,3] and metrics['auc_umol_h_l']==4 and metrics['window_h']==[1,4]
+    assert concentration_metrics(dict(s,values_umol_l=[0,0,0,0]))['sampled_tmax_h']==[]
+    with pytest.raises(ValueError): concentration_metrics(dict(s,values_umol_l=[0,True,2,0]))
+
+
+def test_native_ratios_never_mix_subjects_or_free_and_total_concentrations():
+    def series(organ,compartment,values,subject='0'):
+        return {'organ':organ,'compartment':compartment,'subject_identifier':subject,
+            'path':organ+'|'+compartment,'times_h':[0,1,2],'values_umol_l':values}
+    rows=[series('PeripheralVenousBlood','Plasma (Peripheral Venous Blood)',[0,2,0]),
+        series('PeripheralVenousBlood','Plasma Unbound (Peripheral Venous Blood)',[0,.2,0]),
+        series('Liver','Tissue',[0,4,0]), series('Liver','Interstitial Unbound',[0,.4,0]),
+        series('Liver','Intracellular Unbound',[0,.4,0],subject='other')]
+    result=native_exposure_endpoints({'runs':[{'species':'Human','result':{'series':rows}}]})
+    assert [r['auc_tissue_plasma_ratio'] for r in result['tissue_plasma_ratios']]==[2,2]
+    assert len(result['refused_ratios'])==1 and result['refused_ratios'][0]['subject_identifier']=='other'
+    assert all(r['time_ratios'][0]['ratio'] is None for r in result['tissue_plasma_ratios'])

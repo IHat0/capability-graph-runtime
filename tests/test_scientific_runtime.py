@@ -60,6 +60,97 @@ def test_answer_preserves_new_nominated_docking_refusals_and_independent_referen
     assert all(s['evidence_artifact_identifiers']==['synthetic-verified-assessment'] for s in statements if 'Bioactivity-nominated' in s['text'])
 
 
+def test_answer_keeps_candidate_binding_predictions_distinct_from_function_and_retains_refusal():
+    """Synthetic answer-synthesis fixture, not a candidate computation."""
+    candidate={'candidate_identifier':'synthetic-candidate','identity':{'name':'Synthetic candidate'},
+        'candidate_status':'INSUFFICIENT EVIDENCE','assessment_reason':'No qualified transfer',
+        'dossier_acquisition':{'missing':[]},'regimen':{'status':'requires_regimen','reason':'No measured exposure'},
+        'bioactivity_hypotheses':{'targets':[]},'virtual_organism':None,'functional_models':[],
+        'target_activity_prediction':{'scope':'Synthetic binding-only research scope','targets':[
+            {'status':'predicted','gene':'GENEA','target_accession':'P00001','kind':'Ki','value_umol_l':.1,
+                'interval_umol_l':[.01,1.],'interval_definition':'Synthetic marginal interval',
+                'limitation':'Nominal binding concentration, not functional inhibition'},
+            {'status':'refused','gene':'GENEB','target_accession':'P00002','reason':'Model validation gate failed'}]}}
+    assessment={'candidates':[], 'assumptions':[], 'verification_scope':'Synthetic integrity only',
+        'computation_selection':{'reason':'Synthetic classical fixture'}, 'virtual_investigation':{'candidates':[candidate],
+            'verification_scope':'Synthetic integrity only'}}
+    assembler=ScientistResultAssembler()
+    assembler._read_json_evidence=lambda record,kind: (assessment,'synthetic-verified-assessment') if kind=='prospective_candidate_assessment' else None
+    objective=SimpleNamespace(research_requirements=None,task_type='prospective_candidate_assessment',assumptions=())
+    statements=assembler._allowed_statements(objective,SimpleNamespace(evidence_artifact_identifiers=(),verified_scientific_summaries=(),verified=True,limitations=()),(),())
+    result=' '.join(s['text'] for s in statements)
+    assert 'Predicted candidate Ki for Human GENEA (P00001): 0.1 umol/l' in result
+    assert 'marginal interval [0.01, 1]' in result
+    assert 'No accepted candidate binding estimate for GENEB (P00002): Model validation gate failed' in result
+    assert 'not relabeled as functional IC50' in result
+    assert all(s['evidence_artifact_identifiers']==['synthetic-verified-assessment'] for s in statements if 'candidate binding' in s['text'] or 'Predicted candidate' in s['text'])
+
+
+def test_answer_reports_computed_conditional_human_exposure_without_selecting_a_nominal_case():
+    """Synthetic assembly fixture; numerical/biological validation is separate."""
+    candidate={'candidate_identifier':'synthetic-candidate','identity':{'name':'Synthetic candidate'},
+        'candidate_status':'INSUFFICIENT EVIDENCE','assessment_reason':'Unqualified functional transfer',
+        'dossier_acquisition':{'missing':[]},'regimen':{'status':'requires_regimen','reason':'No nominal case'},
+        'bioactivity_hypotheses':{'targets':[]},'virtual_organism':None,'functional_models':[],
+        'native_sensitivity':{'design':{'limitation':'Conditional levels, not a probability distribution.'},
+            'summary':{'qualitative_conclusion':'No clinical conclusion.'},'executions':[
+                {'status':'computed','case_identifier':'synthetic-low', 'virtual_organism':{'comparison':{'subjects':[
+                    {'species':'Human','subject_identifier':'virtual-person-1',
+                        'plasma_metrics':{'cmax_umol_l':.2,'tmax_h':1.,'auc_0_t_umol_h_l':2.}}]}}},
+                {'status':'refused','case_identifier':'synthetic-high','reason':'No native output'}]}}
+    assessment={'candidates':[], 'assumptions':[], 'verification_scope':'Synthetic integrity only',
+        'computation_selection':{'reason':'Synthetic classical fixture'},
+        'virtual_investigation':{'candidates':[candidate],'verification_scope':'Synthetic integrity only'}}
+    assembler=ScientistResultAssembler()
+    assembler._read_json_evidence=lambda record,kind: (assessment,'synthetic-verified-assessment') if kind=='prospective_candidate_assessment' else None
+    objective=SimpleNamespace(research_requirements=None,task_type='prospective_candidate_assessment',assumptions=())
+    statements=assembler._allowed_statements(objective,SimpleNamespace(evidence_artifact_identifiers=(),verified_scientific_summaries=(),verified=True,limitations=()),(),())
+    result=' '.join(s['text'] for s in statements)
+    assert 'computed for 1 declared conditional input cases' in result
+    assert 'Conditional synthetic-low, Human subject virtual-person-1' in result
+    assert 'Cmax 0.2 umol/l, sampled Tmax 1 h, finite-window AUC 2 umol*h/l' in result
+    assert 'No nominal case was selected' in result
+    assert 'scenario outputs, not measured PK or a nominal prediction' in result
+    assert 'Scenario ranges do not establish a clinical confidence interval' in result
+    assert 'Human exposure was not manufactured' not in result
+    assert 'Conditional synthetic-high' not in result
+    assert all(s['evidence_artifact_identifiers']==['synthetic-verified-assessment'] for s in statements if 'Conditional' in s['text'])
+
+
+def test_answer_displays_exploratory_native_response_without_candidate_decision_authority():
+    """Synthetic synthesis contract only; not a Human model qualification."""
+    candidate = {'candidate_identifier': 'synthetic-candidate',
+        'identity': {'name': 'Synthetic candidate'}, 'candidate_status': 'INSUFFICIENT EVIDENCE',
+        'assessment_reason': 'No qualified transfer', 'dossier_acquisition': {'missing': []},
+        'regimen': {'status': 'requires_regimen', 'reason': 'Synthetic exposure'},
+        'bioactivity_hypotheses': {'targets': []}, 'virtual_organism': None,
+        'functional_models': [{'status': 'computed', 'result': {
+            'model': {'identifier': 'synthetic-native-model'},
+            'perturbation': {'transfer_receipt': {'qualification_state': 'exploratory_only',
+                'candidate_decision_authority': False, 'qualification_scope': {
+                    'benchmark_discrepancy': 'Synthetic benchmark magnitude criterion failed.',
+                    'limitations': ['Native cell response is not clinical QTc.']}}},
+            'response': {'V.APD90': {'final_difference': 12.5, 'unit': 'ms'}},
+            'limitation': 'Synthetic contract, not a scientific result.'}}]}
+    assessment = {'candidates': [], 'assumptions': [], 'verification_scope': 'Synthetic integrity only',
+        'computation_selection': {'reason': 'Synthetic classical fixture'},
+        'virtual_investigation': {'candidates': [candidate], 'verification_scope': 'Synthetic integrity only'}}
+    assembler = ScientistResultAssembler()
+    assembler._read_json_evidence = lambda record, kind: (
+        (assessment, 'synthetic-verified-assessment') if kind == 'prospective_candidate_assessment' else None)
+    objective = SimpleNamespace(research_requirements=None, task_type='prospective_candidate_assessment', assumptions=())
+    record = SimpleNamespace(evidence_artifact_identifiers=(), verified_scientific_summaries=(), verified=True, limitations=())
+    statements = assembler._allowed_statements(objective, record, (), ())
+    result = ' '.join(statement['text'] for statement in statements)
+    assert 'Exploratory physiology only' in result
+    assert 'cannot independently change candidate status' in result
+    assert 'Synthetic benchmark magnitude criterion failed.' in result
+    assert 'Native cell response is not clinical QTc.' in result
+    assert 'final modeled difference 12.5 ms' in result
+    assert all(statement['evidence_artifact_identifiers'] == ['synthetic-verified-assessment']
+        for statement in statements if 'physiology' in statement['text'] or 'modeled difference' in statement['text'])
+
+
 class EvidenceHandler:
     def execute(self, *, invocation, objective, record):
         del objective, record

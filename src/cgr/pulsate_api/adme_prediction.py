@@ -49,8 +49,8 @@ def molecular_features(smiles):
     return identity, properties, values, fp
 
 
-def forest_value(model, features):
-    if model.get("schema_version") != VERSION or model.get("features") != FEATURES:
+def forest_value(model, features, *, model_schema=VERSION):
+    if model.get("schema_version") != model_schema or model.get("features") != FEATURES:
         raise ValueError("Incompatible ADME model/feature version.")
     trees = model["trees"]
     if not 1 <= len(trees) <= 256:

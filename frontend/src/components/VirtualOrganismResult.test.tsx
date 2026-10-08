@@ -27,6 +27,36 @@ function state(missing = false): ResearchSessionWorkspace {
 }
 
 describe('VirtualOrganismResult', () => {
+  it('opens a conditional sponsor population automatically without inventing a nominal result', () => {
+    const research = state()
+    const assessment = research.visualization!.virtual_organism!
+    const population = { ...assessment.population, series: assessment.population.series.filter(c => c.species === 'Human') }
+    assessment.runs = []; assessment.population.series = []
+    assessment.parameters = [{name:'fraction_unbound',species:'Human',value:null,interval:[.1,.2],unit:'fraction',
+      classification:'assumed',source:'Synthetic fixture',method:'No nominal',uncertainty:'Scenario range'}]
+    assessment.sponsor_dossiers = [{experiment_provenance:{experiment_class:'sponsor_side_prospective',historical_private_data_claim:false,
+      input_receipts:[{identifier:'scenario-1',role:'fraction_unbound',provenance_class:'sponsor_side_scenario_assumption',
+        values:[.1,.2],unit:'fraction',rationale:'Synthetic fixture only',uncertainty:'Not a measured distribution',source_sha256:'a'.repeat(64)},
+      {identifier:'missing-1',role:'intestinal_permeability',provenance_class:'missing',values:[],unit:'cm/s',
+        rationale:'Not supplied',uncertainty:'No prediction',source_sha256:'b'.repeat(64)}]}}]
+    assessment.drug_parameter_uncertainty = {scope:'Conditional synthetic scenarios, no nominal',scenarios:[{
+      species:'Human',scenario_identifier:'case-A',scenario_kind:'sponsor_input_sensitivity',scenario_policy:{nominal_withheld:true},
+      series:[],population,file_artifacts:{'scenario-Results.csv':'raw-case-A'}}]}
+    render(<VirtualOrganismResult research={research} />)
+    expect(screen.getByRole('heading',{name:'Virtual human'})).toBeTruthy()
+    expect(screen.getByText('Conditional scenario case-A — not a nominal prediction.')).toBeTruthy()
+    const region=screen.getByRole('region',{name:'Sponsor-side input provenance'})
+    expect(within(region).getByText('sponsor side scenario assumption')).toBeTruthy()
+    expect(within(region).getByText('Missing cm/s')).toBeTruthy()
+    expect(screen.getByText(/Median and empirical 5–95% range · 2 simulated subjects/)).toBeTruthy()
+    expect(screen.getByText('0.1 – 0.2 (no nominal selected) fraction')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Inspect scenario compartment'),{target:{value:'Human/Liver'}})
+    expect(screen.getByRole('img',{name:'Human Liver Tissue concentration time course'})).toBeTruthy()
+    expect(screen.queryByLabelText('Inspect modeled compartment')).toBeNull()
+    fireEvent.click(screen.getByRole('button',{name:'Download scenario concentration time series'}))
+    expect(research.exportArtifact).toHaveBeenCalledWith('raw-case-A')
+  })
+
   it('shows actual curve arrays, tissue and species selection, and raw downloads', () => {
     const research = state()
     render(<VirtualOrganismResult research={research} />)

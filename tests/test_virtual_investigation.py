@@ -25,6 +25,25 @@ def test_nested_structural_json_checks_content_not_serializer_spacing():
     assert not same_json_document(document, json.dumps(altered).encode())
 
 
+def test_interval_activity_comparison_preserves_each_case_and_does_not_select_nominal():
+    activity={'species':'Human','organ':'Liver','compartment':'Interstitial Unbound','concentration_basis':'unbound',
+        'unit':'umol/l','assay_context':'Synthetic compatible assay only','target_accession':'P00001','kind':'IC50',
+        'value':1.,'interval_umol_l':[.5,2.],'interval_definition':'Synthetic calibration interval', 'uncertainty':'Not biological validation'}
+    def exposure(case,value):
+        return {'species':'Human','organ':'Liver','compartment':'Interstitial Unbound','concentration_basis':'unbound',
+            'unit':'umol/l','path':'Native|Zone','subject_identifier':'0','exposure_case_identifier':case,
+            'times_h':[0,1,2],'values_umol_l':[0,value,0]}
+    result=activity_overlap([exposure('A',.1),exposure('B',1.),exposure('C',3.)],activity)
+    assert result['status']=='scenario_dependent_exposure_activity'
+    assert [r['exposure_case_identifier'] for r in result['comparisons']]==['A','B','C']
+    assert result['comparisons'][0]['peak_activity_ratio_interval']==[.05,.2]
+    assert [r['status'] for r in result['comparisons']]==['modeled_peak_below_activity_range',
+        'modeled_peak_overlaps_activity_range','modeled_peak_exceeds_activity_range']
+    assert activity_overlap([dict(exposure('A',1),concentration_basis='total')],activity)['status']=='insufficient_compatible_evidence'
+    for invalid in ([0,1],[2,1],[float('nan'),1],[True,1],[.1,.2]):
+        with pytest.raises(ValueError): activity_overlap([exposure('A',1)],dict(activity,interval_umol_l=invalid))
+
+
 @pytest.mark.parametrize('unit,factor', [('M',1e6),('mM',1e3),('uM',1.),('nM',1e-3),('pM',1e-6)])
 def test_activity_units_are_not_docking_scores(unit, factor):
     row = {'standard_type':'Ki','standard_relation':'=','standard_value':'2','standard_units':unit}
@@ -186,6 +205,31 @@ def test_concentration_time_units_and_actual_exposure_drive_qualified_perturbati
     assert activity_overlap([series],activity)['peak_activity_ratios']==[3.]
 
 
+def test_exploratory_transfer_preserves_actual_mapping_and_has_no_decision_authority(monkeypatch):
+    # Mock only the separately tested research-package verifier here. The source,
+    # model parameter, concentration law and downstream decision checks are real.
+    import cgr.pulsate_api.research_qualification as qualification
+    monkeypatch.setattr(qualification,'research_review',lambda *a,**k:{
+        'scope':'exploratory_only','qualification_state':'exploratory_only',
+        'candidate_decision_authority':False,'benchmark_discrepancy':'Synthetic mismatch only'})
+    activity,series,transfer=coupling()
+    transfer['review_status']='exploratory_reviewed'
+    transfer['calibration_evidence']['review_status']='exploratory_reviewed'
+    transfer['calibration_evidence']['exact_parameter_mapping']['transfer_law']='reviewed_fractional_activity'
+    transfer['calibration_sha256']=digest(canonical(transfer['calibration_evidence']))
+    contract=model().model_copy(update={'biological_parameters':{'rate':
+        dict(synthetic_parameter_mapping(),transfer_law='reviewed_fractional_activity')}})
+    p=exposure_perturbation(contract,transfer,series,activity,evidence_eligible=True,evidence_sources=calibration_sources())
+    assert p.fractions_remaining==(1.,.5)
+    assert p.transfer_receipt['qualified'] is False
+    assert p.transfer_receipt['qualification_state']=='exploratory_only'
+    assert p.transfer_receipt['candidate_decision_authority'] is False
+    from cgr.pulsate_api.virtual_investigation import decision_eligible_response
+    assert not decision_eligible_response({'perturbation':p.model_dump(mode='json')})
+    with pytest.raises(ValueError,match='mapping'):
+        exposure_perturbation(model(),transfer,series,activity,evidence_eligible=True,evidence_sources=calibration_sources())
+
+
 def test_duplicate_reviewed_combinations_are_one_experiment_without_dropping_distinct_inputs():
     activity,series,transfer=coupling()
     activity['eligibility']={'eligible':True}
@@ -342,6 +386,15 @@ def test_progression_states_require_reviewed_criteria_and_never_establish_clinic
     policy['functional_criteria'][0]['threshold']=3.
     decision=assess_candidate(candidate,policy,sources)
     assert decision['status']=='ADVANCE' and not decision['clinical_inference']
+    # A large numerically computed exploratory effect is not a decision signal,
+    # even if a caller erroneously labels the inference level available.
+    candidate['functional_models'][0]['result']['perturbation'] = {'transfer_receipt': {
+        'qualified':False,'qualification_state':'exploratory_only','candidate_decision_authority':False}}
+    for status, threshold in [('CONCERN',1.),('REJECT',1.),('CONCERN',3.)]:
+        policy['functional_criteria'][0].update(status=status,threshold=threshold)
+        exploratory = assess_candidate(candidate,policy,sources)
+        assert exploratory['status']=='INSUFFICIENT EVIDENCE' and not exploratory['matched_criteria']
+    candidate['functional_models'][0]['result'].pop('perturbation')
     candidate['functional_models']=[]
     assert assess_candidate(candidate,policy,sources)['status']=='INSUFFICIENT EVIDENCE'
     policy['functional_criteria'][0]['unit']='wrong-unit'

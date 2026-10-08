@@ -1,0 +1,33 @@
+{
+  "schema": "pulsate.finite-physiology-qualification-protocol/v1",
+  "version": "20261007-r1",
+  "scope": "Internal research validation only; not independent scientific certification or clinical qualification",
+  "prior_results_disclosure": "Existing ORd Pharm predictions and early 20-cycle TP probes have already been examined. This is not a blind experiment. These criteria are frozen before new calculations, not retrospectively optimized to the held-out candidate.",
+  "sources": {
+    "label": "807632eea0179d078a584b5bbbc95ab492c2eb9cb98e8bc4ee9ab9521c1bb32e",
+    "appendix": "ec5fe784d9f927e367d5797650a2634dd75356d706b2ba186c64d50835ccbc6e",
+    "primary_xml": "11d531d9afccda9ee06a57b75dcc701e587b8bba15e7a3ee019c5bcd9cffce10",
+    "pharm_observations": "bf986fc4bcb79e97e92339d77f6fe4ba94f454c24286e45df626443ead00ef26",
+    "cipa_observations": "6a2c25c3b8d54a6022cd978f2a5ae80384e6bfcb40d73d6585e1fcb00e5eaece"
+  },
+  "assay_selection": "Both new Roche Pharm and CiPA protocol estimates are eligible. Preserve both predictions as a protocol-sensitivity envelope, not a probabilistic confidence interval. Do not select a protocol based on prediction accuracy. Older published IC50 values remain disclosed separately; they are not pooled without complete compatible protocol evidence.",
+  "assays": [
+    {"drug": "Dofetilide", "protocol": "Pharm", "ic50_umol_l": 0.029, "hill": 1.10, "channel": "IKr", "page": 6},
+    {"drug": "Dofetilide", "protocol": "CiPA", "ic50_umol_l": 0.033, "hill": 1.17, "channel": "IKr", "page": 6},
+    {"drug": "Nifedipine", "protocol": "Pharm", "ic50_umol_l": 0.105, "hill": 0.849, "channel": "ICaL", "source": "primary Table 3"},
+    {"drug": "Nifedipine", "protocol": "CiPA", "ic50_umol_l": 0.144, "hill": 0.721, "channel": "ICaL", "source": "primary Table 3"}
+  ],
+  "current_model": "ord2011-native-endocardial",
+  "alternative_limit": 1,
+  "alternative": "tt2006-native-endocardial",
+  "alternative_selection_basis": "Barral et al overall benchmark E is lowest for TP under both assay protocols (76.6 and 83.8). Published Human endocardial equations, units and IKr/ICaL parameters are available. E alone is not qualification: even a zero-response predictor scores lower, as the authors note. No native parameter fitting permitted.",
+  "protocol": {"pacing_hz": 1, "warmup_cycles": 1500, "sample_step_ms": 0.05, "extracellular_K_mM": 4, "extracellular_Na_mM": 148.35, "extracellular_Ca_mM": 1.8, "solver": "BDF", "rtol": 1e-7, "atol": 1e-9},
+  "directionality": "Every finite Dofetilide prediction must be positive; Nifedipine predictions must be negative. This tests observed mean direction, not significance where the observed confidence interval includes zero.",
+  "ordering": "Dofetilide APD90 change must increase monotonically across all four published concentrations within each eligible assay protocol.",
+  "magnitude_and_uncertainty": "At every concentration, the eligible protocol-sensitivity prediction range must intersect the two-sided 95% Student-t confidence interval for the observed mean. Derive n by rounding (STD/SEM)^2, disclose it as derived, and require reconstruction agreement within 0.01. CI = mean +/- t.ppf(0.975,n-1)*SEM. This source-derived sampling-error criterion is an internal research gate, not a literature-endorsed clinical accuracy threshold. Assay spread is not a full model uncertainty interval; unresolved structural/exposure uncertainty precludes predictive qualification.",
+  "numerical": "Fresh same-input replay must reproduce the stored native result. Independently use Radau with rtol=1e-8 and atol=1e-10 for one Dofetilide and one Nifedipine condition per selected model; absolute APD90-delta discrepancy must be <= 0.05 ms (the published observation sampling interval). Report last-cycle state discrepancy; do not call a fixed warmup proof of physiological steady state.",
+  "exposure_link": "Retain accepted real PK-Sim two-scenario/two-subject Human run and its native Heart interstitial unbound curves. Map actual concentrations to the same Hill law under explicitly conditional plasma/assay/cardiac concentration equivalence. Do not fit PBPK to APD90. Benchmark bath concentrations remain nominal when measured concentrations are unavailable.",
+  "clinical_sanity": "FDA label concentration-dependent AP/QTc prolongation supports direction only. No APD90-to-QTc conversion, QT fitting, clinical or safety inference.",
+  "decision": "All scientific and numerical gates must pass for qualified_for_research_signal. Otherwise freeze exploratory_only; source/mapping/unit/numerical failures still refuse execution. Exploratory calculations cannot independently change candidate status.",
+  "stop": "One established alternative maximum; no parameter tuning, new model families or held-out candidate inspection before engine freeze. Stop qualification regardless of outcome."
+}

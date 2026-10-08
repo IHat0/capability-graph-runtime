@@ -45,16 +45,30 @@ export function VirtualOrganismResult({ research }: { research: ResearchSessionW
   const [species, setSpecies] = useState('Human')
   const [path, setPath] = useState('')
   const [sensitivity, setSensitivity] = useState('')
+  const [scenarioPath, setScenarioPath] = useState('')
   if (!assessment) return null
-  const selectedSpecies = assessment.runs.some(r => r.species === species) ? species : assessment.runs[0]?.species
+  const selectedSpecies = assessment.runs.some(r => r.species === species) ? species : (assessment.runs[0]?.species ?? assessment.drug_parameter_uncertainty?.scenarios[0]?.species)
   const curves = assessment.population.series.filter(c => c.species === selectedSpecies)
   const curve = curves.find(c => c.path === path) ?? curves.find(c => c.compartment === 'Plasma (Peripheral Venous Blood)') ?? curves[0]
   const run = assessment.runs.find(r => r.species === selectedSpecies)
+  const scenarioIndex = sensitivity || (!assessment.runs.length && assessment.drug_parameter_uncertainty?.scenarios.length ? '0' : '')
   return <article className="research-result virtual-organism-result" aria-label="Virtual Organism result">
     <p className="section-kicker">Virtual Organism · classical mechanistic PBPK</p>
     <h2>{selectedSpecies ? `Virtual ${selectedSpecies.toLowerCase()}` : 'Insufficient parameterization'}</h2>
     <p><strong>{assessment.candidate.name}</strong> · {assessment.request.dose} {assessment.request.dose_unit} · {assessment.request.route} · dose times {assessment.request.administration_times_h.join(', ')} h · {assessment.request.duration_h} h simulation</p>
     <p>{assessment.status.replaceAll('_', ' ')}. Computational verification {assessment.verification.passed ? 'passed' : 'not passed'}; biological validity and safety are not established.</p>
+    {!!assessment.sponsor_dossiers?.length && <section aria-label="Sponsor-side input provenance">
+      <h3>Sponsor-side candidate dossier</h3>
+      <p>No private historical data claim. Scenario assumptions, predictions, measurements and missing fields retain their declared origins.</p>
+      {assessment.sponsor_dossiers.map((dossier, index) => <div key={index} className="candidate-table-wrap" role="region" aria-label="Sponsor input evidence" tabIndex={0}>
+        <table className="candidate-table binding-evidence-table"><thead><tr><th>Input</th><th>Values / units</th><th>Origin</th><th>Uncertainty / source</th></tr></thead><tbody>
+          {dossier.experiment_provenance.input_receipts.map(input => <tr key={input.identifier}>
+            <td>{input.role.replaceAll('_', ' ')}</td><td>{input.values.length ? input.values.map(v => typeof v === 'number' ? v.toPrecision(5) : JSON.stringify(v)).join(' · ') : 'Missing'} {input.unit ?? ''}</td>
+            <td>{input.provenance_class.replaceAll('_', ' ')}</td><td>{input.uncertainty}<br />{input.rationale}<br /><small>Source SHA-256 {input.source_sha256}</small></td>
+          </tr>)}
+        </tbody></table>
+      </div>)}
+    </section>}
     {assessment.adme_parameterization && <section aria-label="ADME Parameterization">
       <h3>ADME Parameterization</h3>
       <p><strong>Predicted ADME / exploratory exposure only.</strong> Predictions are not measured values, evidence of safety or clinically validated PK.</p>
@@ -95,12 +109,20 @@ export function VirtualOrganismResult({ research }: { research: ResearchSessionW
       {assessment.drug_parameter_uncertainty.dose_analysis?.map(analysis => <p key={analysis.species}>{analysis.species} exploratory dose sweep: max/min dose-normalized Cmax ratio {analysis.dose_normalized_cmax_max_min_ratio.toPrecision(5)}; AUC ratio {analysis.dose_normalized_auc_max_min_ratio.toPrecision(5)}; modeled tissue ordering {analysis.tissue_order_changes ? 'changed' : 'unchanged'}. Near-unity ratios support proportional exposure only in the tested model/range, not a clinical dose.</p>)}
       {assessment.drug_parameter_uncertainty.scenarios.length ? <>
         <label htmlFor="drug-sensitivity">Inspect independently simulated scenario</label>
-        <select id="drug-sensitivity" value={sensitivity} onChange={event => setSensitivity(event.target.value)}><option value="">Select a scenario</option>{assessment.drug_parameter_uncertainty.scenarios.map((s,i) => <option key={i} value={String(i)}>{s.species} · {s.scenario_identifier} · {s.scenario_kind.replaceAll('_', ' ')}</option>)}</select>
-        {sensitivity !== '' && (() => {
-          const scenario = assessment.drug_parameter_uncertainty!.scenarios[Number(sensitivity)]
+        <select id="drug-sensitivity" value={scenarioIndex} onChange={event => setSensitivity(event.target.value)}><option value="">Select a scenario</option>{assessment.drug_parameter_uncertainty.scenarios.map((s,i) => <option key={i} value={String(i)}>{s.species} · {s.scenario_identifier} · {s.scenario_kind.replaceAll('_', ' ')}</option>)}</select>
+        {scenarioIndex !== '' && (() => {
+          const scenario = assessment.drug_parameter_uncertainty!.scenarios[Number(scenarioIndex)]
           const values = scenario.series.find(s => s.compartment === 'Plasma (Peripheral Venous Blood)')
-          return <><p>{JSON.stringify(scenario.scenario_policy)}</p>{values && <ExposureChart curve={{ ...values, species: scenario.species, subject_count: 1,
-            median_umol_l: values.values_umol_l, p05_umol_l: values.values_umol_l, p95_umol_l: values.values_umol_l }} />}
+          const population = scenario.population?.series ?? []
+          const selected = population.find(c => c.path === scenarioPath) ?? population.find(c => c.compartment === 'Plasma (Peripheral Venous Blood)') ?? population[0]
+          return <><p>Conditional scenario {scenario.scenario_identifier} — not a nominal prediction.</p>
+            <details><summary>Scenario inputs and assumptions</summary><p>{JSON.stringify(scenario.scenario_policy)}</p></details>
+            {!!population.length && <><label htmlFor="scenario-compartment">Inspect scenario compartment</label>
+              <select id="scenario-compartment" value={selected?.path ?? ''} onChange={event => setScenarioPath(event.target.value)}>
+                {population.map(c => <option key={c.path} value={c.path}>{c.organ} · {c.compartment}</option>)}
+              </select></>}
+            {selected ? <><ExposureChart curve={selected} /><p>{scenario.population?.interval_scope}</p></> : values && <ExposureChart curve={{ ...values, species: scenario.species, subject_count: 1,
+              median_umol_l: values.values_umol_l, p05_umol_l: values.values_umol_l, p95_umol_l: values.values_umol_l }} />}
             {Object.entries(scenario.file_artifacts).filter(([name]) => name.endsWith('-Results.csv')).map(([name, id]) => <button key={name} type="button" onClick={() => void research.exportArtifact(id)}>Download scenario concentration time series</button>)}</>
         })()}
       </> : <p>No drug-parameter uncertainty scenarios ran. This is not evidence that uncertainty is zero.</p>}
@@ -116,7 +138,7 @@ export function VirtualOrganismResult({ research }: { research: ResearchSessionW
     {assessment.missing.map(m => <p role="status" key={m.species}>{m.species}: {m.reason}</p>)}
     <h3>Evidence quality</h3><p>{Object.entries(assessment.evidence_quality).map(([label, count]) => `${label.replaceAll('_', ' ')}: ${count}`).join(' · ')}</p>
     <details><summary>Parameter provenance, assumptions and limitations</summary>
-      <table><thead><tr><th>Species / parameter</th><th>Value / units</th><th>Evidence class</th><th>Source / method</th></tr></thead><tbody>{assessment.parameters.map((p,i) => <tr key={i}><td>{p.species} / {p.name}</td><td>{p.value ?? 'missing'} {p.unit}</td><td>{p.classification}</td><td>{p.source} · {p.method}{p.uncertainty && ` · ${p.uncertainty}`}</td></tr>)}</tbody></table>
+      <table><thead><tr><th>Species / parameter</th><th>Value / units</th><th>Evidence class</th><th>Source / method</th></tr></thead><tbody>{assessment.parameters.map((p,i) => <tr key={i}><td>{p.species} / {p.name}</td><td>{p.value ?? (p.interval ? `${p.interval[0]} – ${p.interval[1]} (no nominal selected)` : 'missing')} {p.unit}</td><td>{p.classification}</td><td>{p.source} · {p.method}{p.uncertainty && ` · ${p.uncertainty}`}</td></tr>)}</tbody></table>
       <ul>{[...assessment.assumptions, ...assessment.limitations].map((text,i) => <li key={i}>{text}</li>)}</ul>
     </details>
     <p>{assessment.computation_selection.reason}</p>

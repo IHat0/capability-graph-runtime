@@ -56,6 +56,35 @@ test('unrelated real-model virtual investigation and reopening', async ({ page }
   }
   expect(investigation.computation_selection.quantum_selected).toBe(false)
   expect(investigation.candidates.every((c: { inference_levels: { clinical: boolean } }) => !c.inference_levels.clinical)).toBe(true)
+  if (process.env.PULSATE_EXPECT_ACTIVITY_PANEL_COUNT) {
+    for (const candidate of investigation.candidates) {
+      const prediction=candidate.target_activity_prediction
+      expect(prediction.targets).toHaveLength(Number(process.env.PULSATE_EXPECT_ACTIVITY_PANEL_COUNT))
+      if (process.env.PULSATE_EXPECT_MINIMUM_ACCEPTED_BINDING) {
+        expect(prediction.targets.filter((row:{status:string})=>row.status==='predicted').length)
+          .toBeGreaterThanOrEqual(Number(process.env.PULSATE_EXPECT_MINIMUM_ACCEPTED_BINDING))
+      }
+      expect(candidate.general_safety_panel.targets).toHaveLength(prediction.targets.length)
+      expect(prediction.request.graph.inchikey).toBe(candidate.identity.inchikey)
+      for (const row of prediction.targets) {
+        if (row.status==='predicted') {
+          expect(row.research_gate.accepted).toBe(true)
+          expect(row.applicability.status).toBe('in_domain')
+          expect(row.applicability.training_graph_seen).toBe(false)
+          expect(row.value_umol_l).toBeGreaterThan(0)
+          expect(row.interval_umol_l[0]).toBeLessThanOrEqual(row.value_umol_l)
+          expect(row.interval_umol_l[1]).toBeGreaterThanOrEqual(row.value_umol_l)
+          expect(row.concentration_basis).toBe('assay_nominal')
+          expect(row.functional_direction).toBeNull()
+          expect(row.tissue_potency_transfer_supported).toBe(false)
+        } else {
+          expect(row.value_umol_l).toBeUndefined()
+          expect(row.reason).toBeTruthy()
+        }
+      }
+    }
+    await expect(page.getByRole('heading',{name:'Candidate binding hypotheses · not measured potency',exact:true})).toBeVisible({timeout:45_000})
+  }
   await writeFile(info.outputPath('visualization.json'), JSON.stringify(visualization, null, 2))
   await mkdir(info.outputPath('artifacts'), { recursive: true })
   const manifest = [...visualization.export_items]
@@ -85,6 +114,18 @@ test('unrelated real-model virtual investigation and reopening', async ({ page }
   await page.screenshot({ path: info.outputPath('reopened-investigation.png'), fullPage: true })
   await page.getByRole('heading', { name: 'Virtual Investigation', exact: true }).scrollIntoViewIfNeeded()
   await page.screenshot({ path: info.outputPath('virtual-investigation-evidence.png'), fullPage: true })
+  if (process.env.PULSATE_EXPECT_ACTIVITY_PANEL_COUNT) {
+    await page.getByRole('heading',{name:'Candidate binding hypotheses · not measured potency',exact:true}).scrollIntoViewIfNeeded()
+    await page.screenshot({path:info.outputPath('candidate-binding-evidence.png'),fullPage:true})
+    if (process.env.PULSATE_EXPECT_MINIMUM_ACCEPTED_BINDING) {
+      const binding=page.getByRole('region',{name:'Binding estimates and validation',exact:true})
+      await expect(binding).toHaveAttribute('tabindex','0')
+      await binding.getByRole('row').filter({hasText:'Predicted Ki:'}).first().scrollIntoViewIfNeeded()
+      await binding.focus()
+      await binding.press('ArrowRight')
+      await page.screenshot({path:info.outputPath('accepted-binding-evidence.png'),fullPage:true})
+    }
+  }
   await page.getByRole('heading', { name: 'Functional models', exact: true }).scrollIntoViewIfNeeded()
   await page.screenshot({ path: info.outputPath('functional-model-evidence.png'), fullPage: true })
   const frozen = JSON.stringify({ schema: 'pulsate.unrelated-virtual-investigation-validation/v1',
