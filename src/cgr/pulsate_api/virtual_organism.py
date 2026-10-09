@@ -76,11 +76,6 @@ def explicit_pbpk_controls(text):
             changes.update(dose=float(doses[0].group(1)),dose_unit=doses[0].group(2).lower())
             quotes.update(dose=doses[0].group(),dose_unit=doses[0].group())
     unit = r'(hours?|hrs?|h|minutes?|mins?|min)'
-    horizons = list(re.finditer(r'(?<![\w.])(' + number + r')\s*' + unit + r'\s+(?:observation|simulation)\s+(?:period|horizon|duration)\b',text,re.I))
-    if len(horizons) == 1:
-        horizon = horizons[0]
-        changes['duration_h'] = float(horizon.group(1)) / (60 if horizon.group(2).lower().startswith('min') else 1)
-        quotes['duration_h'] = horizon.group()
     # A duration attached to the noun is the infusion control. A following
     # "for ..." can instead be the observation window; do not overwrite an
     # explicit "30 minute infusion" with that window. Separate contradictory
@@ -92,7 +87,15 @@ def explicit_pbpk_controls(text):
     else:
         infusions.extend(m for m in following if not any(
             prefix.end() == m.start() + len('infusion') for prefix in infusions))
+    durations = list(re.finditer(r'(?<![\w.])(' + number + r')\s*[- ]?\s*' + unit + r'\b', text, re.I))
+    # "Intravenously over ..." specifies an administration interval when a
+    # separate observation duration exists. A lone "IV over ..." is not enough
+    # to invent an infusion or a second clock.
+    if len(durations) > 1:
+        infusions.extend(re.finditer(r'\b(?:intravenously|intravenous|iv)\s+over\s+('
+            + number + r')\s*' + unit + r'\b', text, re.I))
     # Repeated confirmation in a resumable session is not a second regimen.
+    infusion_spans = tuple(infusions)
     distinct_infusions = {}
     for infusion in infusions:
         minutes = float(infusion.group(1)) * (1 if infusion.group(2).lower().startswith('min') else 60)
@@ -104,6 +107,28 @@ def explicit_pbpk_controls(text):
         infusion = infusions[0]
         changes['infusion_minutes'] = float(infusion.group(1)) * (1 if infusion.group(2).lower().startswith('min') else 60)
         quotes['infusion_minutes'] = infusion.group()
+    horizons = []
+    for duration in durations:
+        if any(infusion.start() <= duration.start() and duration.end() <= infusion.end()
+               for infusion in infusion_spans):
+            continue
+        # Native cellular/pacing/waveform and dosing-interval clocks are not
+        # the PBPK observation horizon. Keep them in their own contracts.
+        prefix = re.split(r'[.;\n,]', text[:duration.start()])[-1]
+        if re.search(r'\b(?:cardiac|cellular|single[ -]cell|physiology|waveform|pacing|paced|'
+                     r'stimulus|warmup|every|each|dosing[ -]interval)\b', prefix, re.I):
+            continue
+        horizons.append(duration)
+    distinct_horizons = {}
+    for horizon in horizons:
+        hours = float(horizon.group(1)) / (60 if horizon.group(2).lower().startswith('min') else 1)
+        distinct_horizons.setdefault(hours, horizon)
+    if len(distinct_horizons) > 1:
+        raise ValueError('Multiple exposure observation durations require scientist clarification.')
+    if distinct_horizons:
+        hours, horizon = next(iter(distinct_horizons.items()))
+        changes['duration_h'] = hours
+        quotes['duration_h'] = horizon.group()
     populations = list(re.finditer(r'\bpopulation\s+(?:of\s+)?(\d+)\s+human\s+(?:adults|subjects|individuals|participants)\b',text,re.I))
     if len(populations) == 1:
         changes['population_size'] = int(populations[0].group(1))
@@ -174,11 +199,13 @@ class PBPKRequest(BaseModel):
         if self.dose_unit and re.findall(r"(?<![a-z])mg(?:/kg)?(?![a-z/])", self.quotes["dose_unit"].lower().replace(" ", "")) != [self.dose_unit]:
             raise ValueError("Dose unit is not literal.")
         if self.route:
-            aliases = {"Intravenous": ("intravenous", "iv", "i.v."), "Oral": ("oral", "orally", "per os")}
+            aliases = {"Intravenous": ("intravenous", "intravenously", "iv", "i.v."), "Oral": ("oral", "orally", "per os")}
             if not any(re.search(r"(?<!\w)" + re.escape(a) + r"(?!\w)", self.quotes["route"], re.I) for a in aliases[self.route]):
                 raise ValueError("Route is not supported by the literal quote.")
         if self.species != ("Human",) and ("species" not in self.quotes or any(s.lower() not in self.quotes["species"].lower() for s in self.species)):
             raise ValueError("Nondefault species require literal evidence.")
+        if self.duration_h is not None and not re.search(r'\b(?:hours?|hrs?|h|minutes?|mins?|min)\b', self.quotes['duration_h'], re.I):
+            raise ValueError('Exposure duration requires a time-unit quote, not a dose or bare number.')
         for key in ("dose", "duration_h", "infusion_minutes", "population_size", "age_min_years", "age_max_years", "proportion_female", "seed"):
             if key in self.quotes:
                 numbers = literal_numbers(self.quotes[key])
@@ -223,7 +250,8 @@ def interpret_pbpk_request(text, provider) -> PBPKRequest | None:
                 "entity_name must be an exact input substring. species is an array of Human/Rat; default Human. "
                 "dose, dose_unit (mg or mg/kg), route (Intravenous or Oral), duration_h must be null if absent. "
                 "Convert a duration in minutes to hours. Do not choose a dose. "
-                "Simulation duration is distinct from infusion duration. An intravenous bolus has infusion_minutes=0. "
+                "duration_h is the PBPK observation horizon, not the administration interval or cardiac/cellular pacing/waveform duration. "
+                "Keep a separately supplied hours-long observation window even when the infusion lasts minutes. An intravenous bolus has infusion_minutes=0. "
                 "Do not convert the observation horizon into an infusion. Solution formulation is only extracted when explicitly requested. "
                 "Optional infusion_minutes, administration_times_h (explicit list of dose times in hours), formulation (Solution only), "
                 "dose_sweep (at most four explicit exploratory doses, same dose_unit; dose is the first point), "

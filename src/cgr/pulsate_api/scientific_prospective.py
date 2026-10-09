@@ -87,6 +87,23 @@ class ProspectiveAssessmentHandler:
             if [c['candidate_identifier'] for c in investigation['candidates']] != [c['candidate_identifier'] for c in trace['candidates']]:
                 raise ScientificCapabilityFailure('virtual_investigation_coverage', 'Virtual investigation must retain all candidates.')
             parents.extend((investigation_ref, check_ref))
+            # This optional research assessment is performed only after the
+            # final blocking investigation receipt. Never mutate its source.
+            from .virtual_investigation import load_policy
+            config, _, config_sha = load_policy()
+            if config and config.get('functional_concern_criteria'):
+                from .functional_concern import assess
+                import copy
+                if config_sha != investigation['policy_sha256']:
+                    raise ScientificCapabilityFailure('functional_criteria_changed', 'Predeclared functional criteria changed after scientific execution.')
+                primary_sources = {r.content_sha256: store.read(r) for r in references.values()
+                    if r.artifact_type == 'virtual_investigation_source'}
+                investigation = copy.deepcopy(investigation)
+                for expanded in investigation['candidates']:
+                    decision = assess(expanded, config['functional_concern_criteria'], primary_sources, verification_passed=True)
+                    expanded['functional_research_assessment'] = decision
+                    if decision['status'] == 'CONCERN':
+                        expanded.update(candidate_status='CONCERN', assessment_reason=decision['reason'])
         if (off_targets.get('verification', {}).get('passed') is not True or
                 sorted(c['candidate_identifier'] for c in off_targets['candidates']) !=
                 sorted(c['candidate_identifier'] for c in trace['candidates'])):

@@ -76,6 +76,32 @@ class _NoExecution:
         raise AssertionError("Unified research-session tests cannot use preset runs.")
 
 
+def test_rejected_composition_is_reinterpreted_from_scientist_clarification(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from cgr.pulsate_api.scientific_requirements import ScientificRequirement, ScientificRequirementProposal
+    question='Analyze structure and simulate exposure.'
+    reply='Only analyze the structure.'
+    seen=[]
+    def propose(text):
+        seen.append(text)
+        requirements=[ScientificRequirement(operation='analyze_structure',requested_output='structure_analysis',
+            supporting_quote=reply if reply in text else 'Analyze structure')]
+        if reply not in text:
+            requirements.append(ScientificRequirement(operation='simulate_organism_exposure',
+                requested_output='virtual_organism_exposure',supporting_quote='simulate exposure'))
+        return ScientificRequirementProposal(proposal_identifier='proposal-resumable-correction',summary='Synthetic test only',
+            provider_kind='test',model_name='test',requirements=tuple(requirements))
+    controller=_controller(tmp_path);controller.requirement_interpreter=SimpleNamespace(propose=propose)
+    tenant=hashlib.sha256(b'rejected-composition-test').hexdigest()
+    first=controller.create(ResearchSessionCreateRequest(question=question),tenant_identifier_sha256=tenant)
+    assert first.accepted_research_requirements is None and first.requirement_proposal is not None
+    resumed=controller.reply(first.session_identifier,ResearchSessionReplyRequest(message=reply),tenant_identifier_sha256=tenant)
+    assert resumed.session_identifier==first.session_identifier and resumed.revision==2
+    assert resumed.accepted_research_requirements.capability_profile=='structure_analysis'
+    assert len(seen)==2 and reply in seen[-1]
+    assert all('No registered composition' not in text for text in seen)
+
+
 def test_pbpk_missing_dose_reply_refreshes_controls_in_the_same_session(tmp_path: Path) -> None:
     from types import SimpleNamespace
     from cgr.pulsate_api.virtual_organism import PBPKRequest

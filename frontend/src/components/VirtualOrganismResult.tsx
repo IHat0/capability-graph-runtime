@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import type { ResearchSessionWorkspace } from '../hooks/useResearchSession'
-import type { ADMEParameter, ResearchVisualizationWorkspace } from '../api/types'
+import { FunctionalExposureResult } from './FunctionalPharmacologyResult'
+import type { ADMEParameter, ResearchVisualizationWorkspace, ScientificDisplayProjection } from '../api/types'
 
 type Assessment = NonNullable<ResearchVisualizationWorkspace['virtual_organism']>
-type Curve = Assessment['population']['series'][number]
+type Curve = Assessment['population']['series'][number] & { display_projection?: ScientificDisplayProjection }
 
 function ADMERow({ name, parameter }: { name: string; parameter: ADMEParameter }) {
   const model = parameter.prediction
@@ -37,6 +38,7 @@ export function ExposureChart({ curve }: { curve: Curve }) {
       <text x={(left + right) / 2} y={height - 6} textAnchor="middle" fill="currentColor" fontSize="12">Time (h)</text>
     </svg>
     <figcaption>{curve.subject_count === 1 ? 'Individual concentration time course' : `Median and empirical 5–95% range · ${curve.subject_count} simulated subjects`}. This is modeled exposure, not a measured response.</figcaption>
+    {curve.display_projection && <p>Display projection: {curve.display_projection.display_sample_count} of {curve.display_projection.original_sample_count} original samples · {curve.display_projection.method}. Full raw data remains downloadable.<br /><small>Source table SHA-256 {curve.display_projection.source_table_sha256}</small></p>}
   </figure>
 }
 
@@ -136,6 +138,7 @@ export function VirtualOrganismResult({ research }: { research: ResearchSessionW
     <h3>Exposure-to-mechanism evidence</h3><p>{assessment.exposure_relevance.reason}</p>
     {assessment.activity_comparisons?.map((comparison, index) => <details key={index}><summary>{comparison.activity?.target ?? 'Activity comparison'} · {comparison.status.replaceAll('_', ' ')}</summary><p>{comparison.reason}</p>{comparison.activity && <p>{comparison.activity.species} · {comparison.activity.kind} {comparison.activity.value} {comparison.activity.unit} · {comparison.activity.source}. {comparison.activity.assay_context}. {comparison.activity.compatibility_limitations}</p>}<p>Per-subject peak unbound exposure / activity ratios: {comparison.peak_exposure_to_activity_ratios?.map(r => r.toPrecision(4)).join(', ') ?? 'Not computed'}</p></details>)}
     {assessment.missing.map(m => <p role="status" key={m.species}>{m.species}: {m.reason}</p>)}
+    {assessment.functional_exposure && <FunctionalExposureResult evidence={assessment.functional_exposure} />}
     <h3>Evidence quality</h3><p>{Object.entries(assessment.evidence_quality).map(([label, count]) => `${label.replaceAll('_', ' ')}: ${count}`).join(' · ')}</p>
     <details><summary>Parameter provenance, assumptions and limitations</summary>
       <table><thead><tr><th>Species / parameter</th><th>Value / units</th><th>Evidence class</th><th>Source / method</th></tr></thead><tbody>{assessment.parameters.map((p,i) => <tr key={i}><td>{p.species} / {p.name}</td><td>{p.value ?? (p.interval ? `${p.interval[0]} – ${p.interval[1]} (no nominal selected)` : 'missing')} {p.unit}</td><td>{p.classification}</td><td>{p.source} · {p.method}{p.uncertainty && ` · ${p.uncertainty}`}</td></tr>)}</tbody></table>

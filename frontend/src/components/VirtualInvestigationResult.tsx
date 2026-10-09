@@ -1,5 +1,6 @@
 import type { ResearchSessionWorkspace } from '../hooks/useResearchSession'
 import { VirtualOrganismResult } from './VirtualOrganismResult'
+import { FunctionalPredictionTable, FunctionalTissueEvidence, PhysiologicalModels } from './FunctionalPharmacologyResult'
 
 export function VirtualInvestigationResult({ research }: { research: ResearchSessionWorkspace }) {
   const investigation = research.visualization?.prospective_assessment?.virtual_investigation
@@ -20,6 +21,11 @@ export function VirtualInvestigationResult({ research }: { research: ResearchSes
     {investigation.candidates.map(candidate => <section key={candidate.candidate_identifier} aria-label={`${candidate.identity.name} virtual investigation`}>
       <h3>{candidate.identity.name}</h3>
       <p><strong>{candidate.candidate_status}</strong> · {candidate.assessment_reason}</p>
+      {candidate.functional_research_assessment && <section aria-label="Functional research concern gates">
+        <h4>Functional research assessment: {candidate.functional_research_assessment.status}</h4>
+        <p>{candidate.functional_research_assessment.reason} {candidate.functional_research_assessment.scope} REJECT is unavailable.</p>
+        {candidate.functional_research_assessment.rule_results.map(rule=><p key={rule.identifier}>{rule.identifier}: {rule.passed ? 'research gates passed' : `missing gates: ${rule.missing_gates.join(', ')}`}</p>)}
+      </section>}
       <p>Evidence levels: {Object.entries(candidate.inference_levels).map(([level, available]) => `${level.replaceAll('_', ' ')}: ${available ? 'supported at stated scope' : 'not established'}`).join(' · ')}</p>
       <section aria-label="Virtual Human">
         <h4>Virtual Human</h4>
@@ -93,6 +99,8 @@ export function VirtualInvestigationResult({ research }: { research: ResearchSes
       </section>
       <section aria-label="Molecular investigation">
         <h4>Molecular investigation</h4>
+        {candidate.functional_activity_prediction && <FunctionalPredictionTable prediction={candidate.functional_activity_prediction} />}
+        <FunctionalTissueEvidence evidence={candidate.functional_tissue_relevance} sourcedTargets={candidate.quantitative_activity?.filter(a=>a.functional_assay_sha256).map(a=>a.target_accession)} />
         {candidate.general_safety_panel && <section aria-label="General safety-pharmacology coverage">
           <h5>General safety-pharmacology panel</h5><p>{candidate.general_safety_panel.scope}</p>
           <p>{candidate.general_safety_panel.coverage_statement}</p>
@@ -182,30 +190,7 @@ export function VirtualInvestigationResult({ research }: { research: ResearchSes
           </details>}
         </div>)}
       </section>
-      <section aria-label="Functional models">
-        <h4>Functional models</h4>
-        {!candidate.functional_models.length && <p>No reviewed mechanistic model catalogue configured. No physiological story is generated.</p>}
-        {candidate.functional_models.map((f,i) => <div key={i}>
-          {f.status === 'computed' && f.result ? <>
-            <h5>{f.result.model.name}</h5><p>Species: {f.result.model.species} · level: {f.result.inference_level.replaceAll('_', ' ')} · numerical replay {f.result.verification.passed ? 'passed' : 'failed'}</p>
-            {f.result.perturbation?.transfer_receipt?.qualification_state === 'exploratory_only' && <section className="exploratory-physiology-warning" aria-label="Exploratory physiology limitation" role="note">
-              <h5>Exploratory physiology only — not a qualified prediction</h5>
-              <p>This computation cannot independently change the candidate status to CONCERN, REJECT or ADVANCE.</p>
-              <p>{f.result.perturbation.transfer_receipt.qualification_scope?.benchmark_discrepancy}</p>
-              {f.result.perturbation.transfer_receipt.qualification_scope?.benchmarks?.map(b => <p key={b.identifier}>
-                {b.identifier}: maximum observed-benchmark discrepancy {b.maximum_absolute_error.toPrecision(5)} {b.unit};
-                predeclared error budget {b.error_budget.toPrecision(5)} {b.unit} · {b.biological_error_budget_passed ? 'passed' : 'failed'}.
-              </p>)}
-              <ul>{f.result.perturbation.transfer_receipt.qualification_scope?.limitations?.map((text,j)=><li key={j}>{text}</li>)}</ul>
-            </section>}
-            {f.exposure_case_identifier && <p>Conditional native input case: {f.exposure_case_identifier}. This is not a nominal prediction.</p>}
-            <p>Numerical replay checks software reproducibility; it does not establish independent scientific certification or clinical validity.</p>
-            <table><thead><tr><th>Model output</th><th>Baseline final</th><th>Perturbed final</th><th>Difference</th></tr></thead>
-              <tbody>{Object.entries(f.result.response).map(([key,r]) => <tr key={key}><td>{key} ({r.unit})</td><td>{r.baseline_final.toPrecision(5)}</td><td>{r.perturbed_final.toPrecision(5)}</td><td>{r.final_difference.toPrecision(5)}</td></tr>)}</tbody></table>
-            <p>{f.result.limitation}</p><small>Model SHA-256 {f.result.model.sha256}</small>
-          </> : <p><strong>{f.model_identifier}: not computed.</strong> {f.reason}</p>}
-        </div>)}
-      </section>
+      <PhysiologicalModels models={candidate.functional_models} />
       <details><summary>Prospective-source eligibility audit</summary><ul>{candidate.dossier_acquisition.eligibility.decisions.map(d => <li key={d.identifier}>{d.identifier}: {d.status.replaceAll('_',' ')} · {d.reason}</li>)}</ul></details>
     </section>)}
     <p>{investigation.verification_scope}. No clinical consequence is automatically inferred.</p>

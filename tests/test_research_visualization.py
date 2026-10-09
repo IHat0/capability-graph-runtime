@@ -97,6 +97,22 @@ def _session(protein: ArtifactReference) -> ResearchSession:
     )
 
 
+@pytest.mark.parametrize('document,status,value', [
+    ({'passed':True},'verified',True),
+    ({'passed':False},'failed',False),
+    ({'verification_scope':'No result yet'},'inconclusive','Not evaluated'),
+])
+def test_verification_overlay_reads_the_persisted_report_not_missing_metadata(document,status,value):
+    protein_payload=_pdb_payload();protein=_reference('protein_structure',protein_payload,media_type='chemical/x-pdb')
+    payload=json.dumps(document).encode();report=_reference('scientific_verification_report',payload)
+    workspace=build_research_visualization(session=_session(protein),
+        store=_Store({protein.artifact_identifier:protein_payload,report.artifact_identifier:payload}),
+        artifact_references=(protein,report))
+    indicator=next(o for o in workspace['overlays'] if o['kind']=='verification_indicator')
+    assert indicator['verification_status']==status
+    assert indicator['value']==value
+
+
 def test_visualization_composes_candidates_contacts_overlays_and_exports() -> None:
     protein_payload = _pdb_payload()
     pose_payload = _pdb_payload(0.25)

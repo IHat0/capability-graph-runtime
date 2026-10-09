@@ -1,0 +1,102 @@
+{
+  "schema": "pulsate.demo2-v5-accepted-engine-freeze/v1",
+  "branch": "feat/pulsate-scientific-autonomy-v1",
+  "baseline_head": "039289bc49a313f2248be3c37966d6cd984e87a1",
+  "session_identifier": "research-session-f3b3aefe3bd05e324b8f5e6fa933114c",
+  "session_status": "completed",
+  "session_revision": 7,
+  "qualification": "exploratory_only",
+  "candidate_decision_authority": false,
+  "clinical_inference_established": false,
+  "science_rerun_count": 0,
+  "held_out_executed": false,
+  "storage_limit_bytes": 4194304,
+  "execution_record_bytes": 1811121,
+  "execution_record_sha256": "d865a14c161aa5cd4634e1835a2eb29e414f61d32eb62ec18032aa0f2ed29a04",
+  "session_record_sha256": "a30f4ebfda2f348fe41a176c9f21738de062f4c35d0d6b1207e82eec3c783ef8",
+  "answer_bytes": 37487,
+  "answer_sha256": "e49039bdad8d2f09baac96ea60de81ecec3f770e622ab98302b1b917aca03760",
+  "visualization_wire_bytes": 3195735,
+  "original_artifacts_verified": 4844,
+  "total_artifacts_verified": 4855,
+  "exposure": {
+    "horizon_h": 24,
+    "curve_count": 196,
+    "scenario_count": 2,
+    "subjects_per_scenario": 2,
+    "infusion_minutes": 30,
+    "raw_sha256": "034076a5c7774340a543ba8aeb486ed2ea9369c23a69ffcdfca76c275946be09"
+  },
+  "physiology": {
+    "calculation_count": 8,
+    "model": "tt2006-native-endocardial",
+    "perturbation": "rapid_time_dependent_potassium_current.g_Kr",
+    "baseline_apd90_ms": 295.05627104809133,
+    "observed_delta_min_ms": 1.1124459210336113,
+    "observed_delta_max_ms": 27.91518475586639,
+    "range_scope": "Observed exploratory scenario/assay/subject cases; not a confidence interval, population interval, QTc estimate or safety prediction.",
+    "exact_endpoint_table": "docs/DEMO2_V5_FUNCTIONAL_PHARMACOLOGY_20261008.md#exact-physiological-endpoints-preserved",
+    "original_waveform_samples": 20001,
+    "display_waveform_samples": 130,
+    "projection_method": "uniform-index-plus-column-extrema/v1",
+    "raw_response_sha256": "a0d4f1cab70d73e46d83c0a34a44a1eaa03e5f8236d7954a18938127fc60e2a0"
+  },
+  "bounded_evidence": {
+    "root_id": "scientific-evidence-manifest-ab789f967c8a21eb91f5dd01375cf48d",
+    "root_bytes": 932120,
+    "root_sha256": "bc9c024d030999b16be79d999a04ace33264f579a6ecbd21502320d8a7364edc",
+    "pages": [
+      {
+        "id": "scientific-evidence-index-page-f7190311a12131cd3ef06b9709f6b08a",
+        "bytes": 3145757,
+        "sha256": "b2fe2837a0c90a991c8b83bfbb3a7caf4f4c6b78a6fc3ac403c4979503308c57"
+      },
+      {
+        "id": "scientific-evidence-index-page-1cec376be25056fc2be2ac2d37c43ccf",
+        "bytes": 1711313,
+        "sha256": "5164406d92d11a44446f5f2c4b46311cb0ea4e425ed79f82e0b513e78b6b580e"
+      }
+    ],
+    "projection_bytes": 3197487,
+    "projection_sha256": "1c0acba2548b114cf11a813821c409267f874900ff6cb4bab2e346447c4da53e",
+    "raw_assessment_bytes": 15984159,
+    "raw_assessment_sha256": "8b69fb74ea31dc75722b43a16bd94d30d5dc89ce275d1301452eb226c17f4be4",
+    "raw_preservation": "Immutable original bytes remain external, hash-verified and session-downloadable; display projections never replace raw evidence."
+  },
+  "model_bank": {
+    "manifest_sha256": "a78b1b0b2a42b78b0d62cb9d1e9666362978b88630fbd9248663d60c92ccf75f",
+    "strata": 51,
+    "supported_human_targets": 21,
+    "unsupported_targets": 82,
+    "changed_during_recovery": false
+  },
+  "freeze_receipts": {
+    "local_directory": ".test-runs/demo2-v5-functional-20261008/storage-handoff-final-freeze-20261009-r2",
+    "acceptance_freeze_sha256": "ea4db0c9c981dc3736e98bfb47e6c3573945c53274aef3f7a210954566e1e2b7",
+    "engine_source_manifest_sha256": "e1309d2c2b07ce89facc9fab65059a815357923c178bd11bf1312cb00d0db55e",
+    "engine_source_files": 53,
+    "engine_source_hash_scope": "Exact working bytes and LF-normalized Git-text hashes; report/freeze documents excluded to avoid self-reference.",
+    "model_source_manifest_sha256": "c61ff8230b1055ff2e9015576d7243fe40ad458f51dfdb917f8419f8122d87fb",
+    "model_source_files": 4573,
+    "input_source_files": 258,
+    "recovered_evidence_manifest_sha256": "fd62b99231ae809f678bcd10e3a16638f311e17994a329fb390a1ec470d70536",
+    "artifact_audit_sha256": "82dfe74599f6b8a864c630126f1fce28c9e7c8f150b509b7c2f0910642794fbf",
+    "recovery_receipt_sha256": "40540ae339ece1f517cc7767e66a65128cbb276bd5c7f0deb483b71da4638cbd",
+    "index_repack_receipt_sha256": "300790eb6efd56521d0dfc09c975714856c4ba92011f1c112fa73851f04ff235"
+  },
+  "acceptance": {
+    "read_only_real_browser": "passed",
+    "saved_session_reopening": "passed",
+    "raw_download_hash_verification": "passed",
+    "all_16_waveform_plots": "passed",
+    "missing_or_corrupt_artifact_refusal": "passed",
+    "backend_tests_passed": 242,
+    "frontend_tests_passed": 208,
+    "frontend_test_files": 25,
+    "typescript_app_compile": "passed",
+    "existing_persisted_run_molstar_browser_tests_passed": 1,
+    "recovered_real_browser_tests_passed": 1,
+    "screenshot_sha256": "82a002043ca80522ed89bcbf3488c370d2ddaaee0c091755025a7519e4581ea4"
+  },
+  "repository_hygiene": "Raw evidence, model-data sandboxes, runtime files, screenshots and credentials are preserved locally and excluded from this source commit."
+}

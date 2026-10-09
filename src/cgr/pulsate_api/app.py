@@ -1251,13 +1251,15 @@ def create_app(
                     context.principal.tenant_identifier
                 ),
             )
-            reference = next(
-                item
-                for item in _research_session_artifacts(session)
-                if item.artifact_identifier == artifact_identifier
-            )
             if scientific_payload_store is None:
                 raise RuntimeError
+            from .scientific_evidence import resolve_reference
+
+            reference = resolve_reference(
+                _research_session_artifacts(session),
+                scientific_payload_store,
+                artifact_identifier,
+            )
             return project_research_scene(
                 session_identifier=session.session_identifier,
                 reference=reference,
@@ -1416,13 +1418,15 @@ def create_app(
                     context.principal.tenant_identifier
                 ),
             )
-            reference = next(
-                item
-                for item in _research_session_artifacts(session)
-                if item.artifact_identifier == artifact_identifier
-            )
             if scientific_payload_store is None:
                 raise RuntimeError
+            from .scientific_evidence import resolve_reference
+
+            reference = resolve_reference(
+                _research_session_artifacts(session),
+                scientific_payload_store,
+                artifact_identifier,
+            )
             payload = scientific_payload_store.read(reference)
             suffix = {
                 "chemical/x-pdb": "pdb",

@@ -634,6 +634,7 @@ export interface ResearchVisualizationWorkspace {
   } | null
   virtual_organism?: {
     assessment_artifact_identifier: string; assessment_sha256: string
+    functional_exposure?: NativeFunctionalExposure
     sponsor_dossiers?: Array<{ experiment_provenance: { experiment_class: string; historical_private_data_claim: false;
       input_receipts: Array<{ identifier: string; role: string; provenance_class: string; values: unknown[];
         unit: string | null; rationale: string; uncertainty: string; source_sha256: string }> } }>
@@ -712,6 +713,19 @@ export interface NativeExposureEndpoints {
   interpretation: string
 }
 
+export interface FunctionalActivityPrediction {
+  schema: 'pulsate.functional-activity-prediction/v1'
+  scope: string; manifest_sha256: string; universe_sha256: string
+  coverage: { supported_model_targets: number; unsupported_model_targets: number; accepted_candidate_targets: number; universe_targets: number }
+  unresolved_source_rows: Array<{ label: string; status: string; reason: string }>
+  targets: Array<{ gene: string; target_accession: string; status: 'predicted' | 'refused' | 'unsupported'; reason?: string;
+    kind?: string; action?: string; readout?: string; classification?: string; concentration_basis?: string;
+    value_umol_l?: number; interval_umol_l?: number[]; interval_definition?: string; uncertainty?: string; limitation?: string;
+    applicability?: { status: string; training_graph_seen?: boolean; nearest_training_tanimoto?: number };
+    model_sha256?: string; research_gate?: { accepted: boolean; failed_metrics: string[]; scope: string;
+      metrics: { n: number; mae?: number; rmse?: number; interval_coverage?: number; spearman?: number | null; median_multiplicative_error?: number } } }>
+}
+
 export interface VirtualInvestigation {
   policy_sha256: string | null
   prospective_policy: { cutoff: string | null; cutoff_instant?: string | null; cutoff_source: string | null; allow_modern_general_knowledge: boolean }
@@ -772,6 +786,13 @@ export interface VirtualInvestigation {
         research_gate?: { accepted: boolean; failed_metrics: string[]; scope: string;
           metrics: { n: number; mae?: number; rmse?: number; interval_coverage?: number; spearman?: number | null } };
         model_sha256?: string }> } | null
+    functional_activity_prediction?: FunctionalActivityPrediction | null
+    functional_tissue_relevance?: { targets: Array<{ target_accession: string; action?: string; activity_status: string;
+      priority_status: string; limitation: string; tissue_evidence?: { classification?: string; limitation?: string; reason?: string;
+        go?: Array<{ identifier: string; term: string; evidence: string }>;
+        expression?: Array<{ source_url: string; source_sha256: string; historical_qualification: string }> } | null }> } | null
+    functional_research_assessment?: { status: string; reason: string; scope: string; reject_available: false;
+      rule_results: Array<{ identifier: string; passed: boolean; missing_gates: string[] }> }
     exposure_activity: Array<{ status: string; target_accession: string; reason?: string; limitation?: string; peak_activity_ratios?: number[]; uncertainty?: string;
       activity_interval_umol_l?: number[]; interval_definition?: string;
       comparisons?: Array<{ exposure_case_identifier?: string | null; subject_identifier?: string | null; native_path?: string | null;
@@ -783,8 +804,32 @@ export interface VirtualInvestigation {
             limitations?: string[]; benchmarks?: Array<{ identifier: string; maximum_absolute_error: number;
               unit: string; error_budget: number; biological_error_budget_passed: boolean }> } } };
         response: Record<string, { unit: string; baseline_final: number; perturbed_final: number; final_difference: number; maximum_absolute_difference: number }>;
+        waveform_evidence?: { full_response_sha256: string; scope: string;
+          curves: Array<{ condition: string; columns: string[]; sample_count: number; waveform_sha256: string;
+            display_projection?: { method: string; values: number[][]; sample_count: number; scope: string } }> };
         limitation: string; verification: { passed: boolean } } }>
   }>
+}
+
+export interface ScientificDisplayProjection {
+  method: string; original_sample_count: number; display_sample_count: number;
+  source_table_sha256: string; source_json_pointer: string; externalized_fields: string[]; scope: string
+}
+
+export interface NativeFunctionalExposure {
+  schema: 'pulsate.native-functional-exposure/v1'
+  functional_activity_prediction: FunctionalActivityPrediction
+  functional_tissue_relevance?: VirtualInvestigation['candidates'][number]['functional_tissue_relevance']
+  quantitative_activity: Array<{ target_accession: string; kind: string; value: number;
+    functional_direction: string; concentration_basis: string; uncertainty: string; functional_assay_sha256?: string }>
+  excluded_activity?: Array<{ reason: string; bounded_activity?: { target_accession: string; kind: string; relation: string;
+    activity_bound_umol_l: number; functional_direction: string; concentration_basis: string; uncertainty: string;
+    limitation: string; source_sha256: string } }>
+  exposure_activity: VirtualInvestigation['candidates'][number]['exposure_activity']
+  functional_models: VirtualInvestigation['candidates'][number]['functional_models']
+  functional_transfer_refusals: Array<{ reason: string }>
+  verification: { passed: boolean; scope: string }
+  scope: string; native_exposure_sha256: string; artifact_sha256: string
 }
 
 export interface NativeADMETranslationAudit {

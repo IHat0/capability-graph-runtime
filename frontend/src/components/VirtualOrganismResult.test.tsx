@@ -27,6 +27,52 @@ function state(missing = false): ResearchSessionWorkspace {
 }
 
 describe('VirtualOrganismResult', () => {
+  it('renders source-backed functional evidence, tissue annotations, refusals and exploratory physiology separately', () => {
+    const research = state()
+    research.visualization!.virtual_organism!.functional_exposure = {
+      schema:'pulsate.native-functional-exposure/v1',
+      functional_activity_prediction:{schema:'pulsate.functional-activity-prediction/v1',
+        scope:'Synthetic rendering fixture only',manifest_sha256:'b'.repeat(64),universe_sha256:'c'.repeat(64),
+        coverage:{supported_model_targets:0,unsupported_model_targets:1,accepted_candidate_targets:0,universe_targets:1},
+        unresolved_source_rows:[],targets:[{gene:'TEST',target_accession:'P00001',status:'unsupported',reason:'Insufficient training data'}]},
+      quantitative_activity:[{target_accession:'P00001',kind:'IC50',value:.2,functional_direction:'blocker',
+        concentration_basis:'unbound',uncertainty:'Synthetic assay uncertainty',functional_assay_sha256:'d'.repeat(64)}],
+      excluded_activity:[{reason:'Censored point refused',bounded_activity:{target_accession:'P00002',kind:'IC50',
+        relation:'>',activity_bound_umol_l:10,functional_direction:'blocker',concentration_basis:'assay_nominal',
+        uncertainty:'Unknown exact potency',limitation:'Censored bound is not zero activity',source_sha256:'a'.repeat(64)}}],
+      functional_tissue_relevance:{targets:[{target_accession:'P00001',activity_status:'unsupported',
+        priority_status:'unsupported_functional_activity',limitation:'Expression is not a candidate effect',
+        tissue_evidence:{go:[{identifier:'GO:TEST',term:'Synthetic tissue annotation',evidence:'Fixture only'}]}}]},
+      exposure_activity:[{target_accession:'P00001',status:'modeled_peak_below_activity_point',
+        peak_activity_ratios:[.1],limitation:'Subthreshold peak does not establish absence of effect'}],
+      functional_models:[{status:'computed',exposure_case_identifier:'case-A',result:{
+        model:{identifier:'synthetic-ode',name:'Synthetic native model',sha256:'e'.repeat(64),species:'Human'},
+        inference_level:'cellular_functional',perturbation:{transfer_receipt:{qualification_state:'exploratory_only',
+          qualified:false,candidate_decision_authority:false,qualification_scope:{benchmark_discrepancy:'Synthetic failed biological gate'}}},
+        response:{test_output:{unit:'test-unit',baseline_final:1,perturbed_final:2,final_difference:1,maximum_absolute_difference:1}},
+        waveform_evidence:{full_response_sha256:'1'.repeat(64),scope:'Unchanged raw download.',curves:[
+          {condition:'baseline',columns:['time','V'],sample_count:20001,waveform_sha256:'2'.repeat(64)}]},
+        verification:{passed:true},limitation:'Numerical fixture, not a biological prediction'}}],
+      functional_transfer_refusals:[{reason:'No exact transfer for another target'}],
+      verification:{passed:true,scope:'Numerical reproducibility, not clinical validity'},
+      scope:'Mechanism hypothesis is not toxicity proof',native_exposure_sha256:'f'.repeat(64),artifact_sha256:'0'.repeat(64),
+    }
+    render(<VirtualOrganismResult research={research} />)
+    const region=within(screen.getByRole('region',{name:'Native functional exposure result'}))
+    expect(region.getByText('baseline: 20001 recorded waveform samples.')).toBeTruthy()
+    expect(region.getByText('Raw waveform SHA-256 ' + '2'.repeat(64))).toBeTruthy()
+    expect(region.getByText(/0 targets have an accepted in-domain prediction/)).toBeTruthy()
+    expect(region.getByText(/P00001 · blocker · IC50/)).toBeTruthy()
+    expect(region.getByText(/P00002 · blocker · IC50 > 10.000/)).toBeTruthy()
+    expect(region.getByText(/Predictor unavailable; independently sourced activity is shown separately/)).toBeTruthy()
+    expect(region.getByText(/Synthetic tissue annotation/)).toBeTruthy()
+    expect(region.getByText(/Subthreshold peak does not establish absence of effect/)).toBeTruthy()
+    expect(region.getByRole('note',{name:'Exploratory physiology limitation'})).toBeTruthy()
+    expect(region.getByText(/cannot independently change the candidate status/)).toBeTruthy()
+    expect(region.getByText('No exact transfer for another target')).toBeTruthy()
+    expect(region.getByText('test_output (test-unit)')).toBeTruthy()
+  })
+
   it('opens a conditional sponsor population automatically without inventing a nominal result', () => {
     const research = state()
     const assessment = research.visualization!.virtual_organism!
@@ -72,6 +118,20 @@ describe('VirtualOrganismResult', () => {
     expect(research.exportArtifact).toHaveBeenCalledWith('raw-A')
     fireEvent.click(screen.getByRole('button', { name: 'Download Virtual Organism evidence' }))
     expect(research.exportArtifact).toHaveBeenCalledWith('assessment-A')
+  })
+
+  it('discloses bounded exposure sampling while raw downloads retain the original artifact', () => {
+    const research=state()
+    const curve=research.visualization!.virtual_organism!.population.series[0]
+    Object.assign(curve,{display_projection:{method:'uniform-index-plus-column-extrema/v1',
+      original_sample_count:24001,display_sample_count:curve.times_h.length,
+      source_table_sha256:'d'.repeat(64),source_json_pointer:'/population/series/0',
+      externalized_fields:['times_h','median_umol_l'],scope:'Display only'}})
+    render(<VirtualOrganismResult research={research} />)
+    expect(screen.getByText(/24001 original samples/)).toBeTruthy()
+    expect(screen.getByText(/Source table SHA-256/).textContent).toContain('d'.repeat(64))
+    fireEvent.click(screen.getByRole('button',{name:'Download raw concentration time series'}))
+    expect(research.exportArtifact).toHaveBeenCalledWith('raw-A')
   })
 
   it('never draws an invented chart when critical parameterization is missing', () => {

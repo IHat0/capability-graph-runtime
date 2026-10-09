@@ -1,0 +1,96 @@
+{
+  "schema": "pulsate.functional-research-protocol/v1",
+  "version": "2026-10-08-v1",
+  "reviewer": "Internal engineering/research protocol; not independent biological certification",
+  "scope": "Candidate-independent Human functional pharmacology; stop before the held-out challenge molecule is evaluated",
+  "universe_selection": {
+    "rule": "Union of every enumerated target in the March 2026 Reaction Biology general InVEST/PDE/CYP panel tables and the already-frozen general primary safety-panel table; no candidate-based additions",
+    "maximum_targets": 128,
+    "ambiguous_complexes_and_isoforms": "Keep visible; do not pretend a single protein or unspecified isoform is an exact functional assay target",
+    "candidate_informed": false
+  },
+  "functional_data": {
+    "source": "Projected ChEMBL direct Human target identity, compound graph, assay metadata and quantitative activity records",
+    "endpoint_model_classes": ["IC50", "EC50"],
+    "distinct_other_endpoints": ["Ki", "Kd", "AC50", "inhibition_percent", "activation_percent"],
+    "direction_required": true,
+    "target_confidence": 9,
+    "relationship_type": "D",
+    "standard_relation": "=",
+    "maximum_records_per_endpoint": 20000,
+    "oversize_policy": "Unsupported rather than a truncated or favorable sample",
+    "binding_or_ambiguous_direction": "Not admitted to functional models",
+    "partition_key": ["Human target", "endpoint", "action", "readout class", "concentration basis", "declared target variant"],
+    "assay_conditions": "Retain exact assay IDs, descriptions, host, BAO, source hashes and protocol heterogeneity; unknown pH, temperature, substrate/ATP and free concentration are not invented",
+    "concentration_basis": "Assay nominal unless exact original evidence supports measured free concentration or a separately reviewed explicit conversion"
+  },
+  "leakage_firewall": {
+    "identity_first": true,
+    "numeric_requests": "Explicit admitted molecule AND assay identifier sets only, after compound-parent/fragment/connectivity and assay-semantic checks",
+    "heldout_exclusion": "Offline challenge identity used only to deny exact parents, salts, normalized connectivity, tautomers and exact records; never used for a functional query, target selection, inference or labels",
+    "development_controls": "Also excluded from every train/calibration/test partition before unrelated end-to-end validation",
+    "nearby_analogs": "Allowed if not an exact normalized parent/connectivity match; report nearest training Morgan similarity and scaffold-held-out performance",
+    "unexpected_response": "Quarantine and fail the response before labels enter training or inference; no unsafe payload is saved as an admitted source"
+  },
+  "training": {
+    "architecture": "Morgan radius-2 512-bit fingerprints plus the existing eight RDKit descriptors; fixed random forest baseline",
+    "seed": 20261008,
+    "n_estimators": 64,
+    "max_depth": 12,
+    "min_samples_leaf": 3,
+    "max_features": 0.7,
+    "split": "Graph-deduplicated nonchiral Murcko-scaffold hash buckets: train 0..69, calibration 70..84, test 85..99",
+    "minimum_train_graphs": 100,
+    "minimum_calibration_graphs": 30,
+    "minimum_test_graphs": 30,
+    "replicates": "Median negative-log molar potency within one exact endpoint/action/readout stratum; retain all original rows and source IDs",
+    "hyperparameter_selection": "No post-test tuning or favorable model selection; a failed baseline stays unsupported",
+    "calibration": "90% marginal split-conformal absolute residual interval in endpoint-specific negative-log molar space",
+    "minimum_similarity": 0.4,
+    "domain_threshold": "Maximum of 0.4 and calibration nearest-neighbor tenth percentile, plus all training descriptor ranges; weakly supported does not count as in-domain",
+    "exact_training_overlap": "Refuse independent prediction; no apparent validation on a training graph"
+  },
+  "gate": {
+    "schema": "pulsate.functional-research-gate/v1",
+    "species": "Human",
+    "domain": "in_domain",
+    "limits": {
+      "minimum_n": 30,
+      "minimum_interval_coverage": 0.8,
+      "maximum_mae": 0.6,
+      "maximum_rmse": 0.9,
+      "minimum_spearman": 0.5,
+      "maximum_median_multiplicative_error": 4.0
+    },
+    "rationale": "Predeclared internal screening gate in log10-molar units, not a clinical error tolerance. MAE 0.6 is approximately four-fold concentration error; RMSE, ranking, finite-sample coverage and in-domain sample size must also pass",
+    "limitations": ["Conditional assay potency, not proof of activity", "90% marginal calibration is not a joint exposure/activity interval or guaranteed conditional-domain coverage", "Assay/protocol heterogeneity and censoring exclusion remain disclosed", "No gate may be weakened in response to coverage or the held-out candidate"]
+  },
+  "unrelated_acceptance": {
+    "predeclared_compounds": ["dofetilide", "isoproterenol", "propranolol", "donepezil", "acetaminophen", "insulin"],
+    "roles": ["Sourced ion-channel-block positive control and existing exploratory native current model", "GPCR agonism where supported", "GPCR antagonism where supported", "Enzyme inhibition where supported", "Weak/negative response retained only if actually supported by the source", "Macromolecular domain refusal"],
+    "heldout_candidate": "Not queried or executed",
+    "negative_case_rule": "An unsupported or subthreshold calculation is not a negative experimental finding"
+  },
+  "exposure_activity": {
+    "required": ["Human target and candidate identity", "known functional action", "exact endpoint and units", "compatible unbound concentration basis", "reviewed tissue relevance", "native exposure lineage", "time/subject/scenario retained", "potency interval or explicit unquantified measurement uncertainty"],
+    "percent_or_ac50": "Not relabelled as IC50/EC50; no dose-response or physiological transfer without an independent qualified contract",
+    "nominal_free_conversion": "No automatic conversion; exact source-bound measured-free evidence or explicit reviewed assumption is required",
+    "margin": "Sampled unbound concentration / compatible functional potency, with independent interval bounds; not a joint probability or toxicity conclusion"
+  },
+  "physiology": {
+    "interface": "Reuse current model and reviewed transfer contracts",
+    "cardiac_qualification": "Preserve State B exploratory_only and no independent candidate-decision authority",
+    "missing_prerequisite": "no_qualified_transfer",
+    "hill_slope": "No invented default",
+    "clinical_translation": "APD90 is not QTc; no toxicity probability or clinical qualification"
+  },
+  "research_assessment": {
+    "concern_scope": "Exposure-relevant research mechanism warranting investigation, not toxicity proof",
+    "necessary_gates": ["Supported Human exposure", "Supported functional candidate action/potency", "Compatible unbound exposure overlaps the functional range", "Source-bound target/tissue relevance", "Predeclared general undesirable-mechanism rule", "Uncertainty does not eliminate the finding", "Blocking verification passes"],
+    "automatic_rule_generation": false,
+    "rule_source": "Exact reviewed general mechanism evidence, never candidate-specific history",
+    "reject_available": false,
+    "default": "INSUFFICIENT EVIDENCE"
+  },
+  "freeze_and_stop": "Leave source changes uncommitted; stop after unrelated numerical/browser/regression/leakage validation. No held-out rerun, dossier revision, commit or push is authorized in this milestone"
+}

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import html
 from pathlib import Path
 from typing import Literal
 
@@ -25,6 +27,8 @@ class FunctionalAssay(BaseModel):
     assay_type: Literal['functional', 'binding']
     action: Literal['blocker', 'inhibitor', 'agonist', 'antagonist', 'activator', 'binding_only', 'unknown']
     endpoint: Literal['IC50', 'EC50', 'Ki', 'Kd']
+    relation: Literal['=', '>', '>=', '<', '<='] = '='
+    relation_evidence: dict | None = None
     assay_host: str = Field(min_length=1)
     target_species: str = Field(min_length=1)
     tissue: str = Field(min_length=1)
@@ -65,6 +69,14 @@ def _anchor(document, sources):
     return value
 
 
+def _contract_dump(assay):
+    document=assay.model_dump(mode='json')
+    # Existing exact-point source contracts keep their historical content hash.
+    if assay.relation=='=' and assay.relation_evidence is None:
+        document.pop('relation');document.pop('relation_evidence')
+    return document
+
+
 def normalize_assay(record, identity, policy, sources):
     assay = FunctionalAssay.model_validate(record)
     datum = assay.datum
@@ -76,6 +88,35 @@ def normalize_assay(record, identity, policy, sources):
         return None, decision
     _anchor(assay.action_evidence, sources)
     from .bioactivity_hypotheses import ACTIVITY_UNITS
+    if assay.relation != '=':
+        if datum.unit not in ACTIVITY_UNITS:
+            raise ValueError('Censored functional endpoint needs explicit molar units.')
+        if isinstance(datum.value,str):
+            # Verify the original bytes above; decode only standard source text
+            # entities for inequality syntax, not an inferred numerical point.
+            match=re.fullmatch(r'(>=|<=|>|<)\s*([+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)',html.unescape(datum.value).strip())
+            if not match or match[1]!=assay.relation:
+                raise ValueError('Censored relation disagrees with the exact original assay cell.')
+            bound=float(match[2])*ACTIVITY_UNITS[datum.unit]
+        else:
+            if assay.relation_evidence is None or _anchor(assay.relation_evidence,sources)!=assay.relation:
+                raise ValueError('A numeric censored bound needs its independently anchored relation.')
+            if type(datum.value) not in (float,int):raise ValueError('Invalid censored functional bound.')
+            bound=float(datum.value)*ACTIVITY_UNITS[datum.unit]
+        if not math.isfinite(bound) or bound<=0 or assay.hill is not None or assay.concentration_translation is not None:
+            raise ValueError('Censored activity is not an exact potency, Hill curve or free-concentration conversion.')
+        bounded={'status':'censored_measurement','inchikey':identity['inchikey'],'target_accession':datum.target_accession,
+            'species':assay.target_species,'kind':assay.endpoint,'relation':assay.relation,
+            'activity_bound_umol_l':bound,'unit':'umol/l','functional_direction':assay.action,
+            'original_bounded_value':datum.value,
+            'concentration_basis':datum.context.get('concentration_basis','assay_nominal'),
+            'classification':'measured','source_sha256':datum.source_sha256,
+            'functional_assay_sha256':digest(canonical(_contract_dump(assay))),
+            'uncertainty':assay.uncertainty,'datum':datum.model_dump(mode='json'),
+            'functional_transfer_supported':False,
+            'limitation':'Censored assay bound, not an exact potency or a negative safety finding; no Hill slope, exposure/activity ratio or physiological transfer inferred.'}
+        return None,dict(decision,status='censored_measurement_retained',
+            reason='Original bounded activity retained separately from quantitative point endpoints.',bounded_activity=bounded)
     if datum.unit not in ACTIVITY_UNITS or type(datum.value) not in (int, float) or not math.isfinite(datum.value) or datum.value <= 0:
         raise ValueError('Functional endpoint requires a finite positive molar concentration.')
     value = float(datum.value) * ACTIVITY_UNITS[datum.unit]
@@ -87,7 +128,7 @@ def normalize_assay(record, identity, policy, sources):
         'uncertainty': assay.uncertainty, 'applicability': assay.applicability,
         'source': datum.original_source.source_url, 'source_sha256': datum.source_sha256,
         'datum': datum.model_dump(mode='json'), 'classification': 'measured', 'eligibility': decision,
-        'functional_assay_sha256': digest(canonical(assay.model_dump(mode='json'))),
+        'functional_assay_sha256': digest(canonical(_contract_dump(assay))),
         'functional_transfer_supported': False}
     if assay.hill is not None:
         hill = _anchor(assay.hill, sources)

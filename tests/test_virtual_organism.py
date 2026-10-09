@@ -40,6 +40,55 @@ def test_same_session_repeated_confirmation_is_not_a_second_infusion():
     changes, quotes = explicit_pbpk_controls(text)
     assert changes['infusion_minutes'] == 12.
     assert quotes['infusion_minutes'] == '12 minute infusion'
+    assert changes['duration_h'] == 8.
+
+
+@pytest.mark.parametrize('phrase', [
+    'intravenous infusion over 30 minutes, 24 hours',
+    'intravenously over 30 minutes, 24 hours',
+    '30-minute infusion for 24 hours',
+    '24-hour observation period with an infusion over 30 minutes',
+])
+def test_requested_exposure_horizon_survives_infusion_clock_and_lossy_model(phrase):
+    text = 'candidate-A 1 mg ' + phrase + '; cardiac pacing for 20 minutes; waveform for 1 min.'
+    broken = request(dose=1., dose_unit='mg', duration_h=.5, infusion_minutes=30.,
+        quotes={'dose':'1 mg', 'dose_unit':'1 mg', 'route':'intravenous' if 'intravenous' in text else 'iv',
+                'duration_h':'1', 'infusion_minutes':'30 minutes'}).model_dump(mode='json')
+    if 'intravenous' not in text:
+        text = 'candidate-A 1 mg intravenous ' + phrase + '; cardiac pacing for 20 minutes; waveform for 1 min.'
+        broken['quotes']['route'] = 'intravenous'
+    parsed = interpret_pbpk_request(text, SimpleNamespace(complete=lambda messages: json.dumps(broken)))
+    assert parsed is not None and parsed.duration_h == 24. and parsed.infusion_minutes == 30.
+    # Native concentration evidence must cover the requested PBPK clock, not
+    # the independently declared cellular/pacing/waveform clock.
+    csv = csv_fixture().replace(b',60,', b',720,').replace(b',120,', b',1440,')
+    evidence = parse_results(csv, 'candidate-A', parsed)
+    assert all(curve['times_h'][0] == 0. and curve['times_h'][-1] == 24. for curve in evidence['series'])
+    with pytest.raises(ValueError, match='time domain'):
+        parse_results(csv_fixture(), 'candidate-A', parsed)
+
+
+def test_same_session_mixed_infusion_wording_preserves_both_clocks():
+    from cgr.pulsate_api.virtual_organism import explicit_pbpk_controls
+    text = ('candidate-A 1 mg intravenously over 15 minutes, 36 hours. '
+        'Scientist follow-up: candidate-A 1 mg intravenous infusion over 15 minutes, 36 hours.')
+    changes, quotes = explicit_pbpk_controls(text)
+    assert changes['duration_h'] == 36 and changes['infusion_minutes'] == 15
+    parsed = request(dose=1, dose_unit='mg', duration_h=36, infusion_minutes=15,
+        quotes={'dose':'1 mg','dose_unit':'1 mg','route':'intravenously', **quotes})
+    assert parsed.check_grounding(text).duration_h == 36
+
+
+def test_conflicting_observation_horizons_require_clarification_not_first_number():
+    from cgr.pulsate_api.virtual_organism import explicit_pbpk_controls
+    with pytest.raises(ValueError, match='observation durations'):
+        explicit_pbpk_controls('Observe candidate-A for 18 hours or 36 hours after a 15 minute infusion.')
+
+
+def test_bare_dose_number_cannot_ground_exposure_duration():
+    with pytest.raises(ValueError, match='time-unit quote'):
+        request(duration_h=1., quotes={'dose':'1 mg/kg', 'dose_unit':'1 mg/kg',
+            'route':'intravenous', 'duration_h':'1'}).check_grounding('candidate-A 1 mg/kg intravenous')
 
 
 def test_structured_extraction_cannot_propose_an_unspecified_dose_sweep():

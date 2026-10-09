@@ -295,6 +295,7 @@ def create_scientific_production_composition(
         execution_repository=execution_repository,
         capability_registry=registry,
         result_assembler=result_assembler,
+        payload_store=payload_store,
     )
     return ScientificProductionComposition(
         payload_store=payload_store,

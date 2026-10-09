@@ -523,6 +523,10 @@ function Result({ result, research }: { result: NonNullable<ResearchSessionWorks
       <p className="section-kicker">Scientist-facing result · {result.verification_status}</p>
       <h2>Result</h2>
       <p className="research-result__primary">{result.principal_result ?? result.scientific_result}</p>
+      {result.principal_result && result.principal_result !== result.scientific_result && <details open>
+        <summary>Complete evidence-grounded answer</summary>
+        <p>{result.scientific_result}</p>
+      </details>}
       <h3>Resolved interpretation</h3>
       <p>{result.resolved_interpretation}</p>
       {result.assumptions.length > 0 && <><h3>Assumptions used</h3><ul>{result.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></>}

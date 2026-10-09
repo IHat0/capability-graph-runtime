@@ -30,13 +30,16 @@ def _replay(model_bytes, manifest_bytes, report_bytes):
     model_sha, manifest_sha = digest(model_bytes), digest(manifest_bytes)
     matches = [m for m in manifest.get('models', []) if m['sha256'] == model_sha]
     formats = {'pulsate.adme-rf/v1': 'pulsate.adme-model-manifest/v1',
-        'pulsate.target-activity-rf/v1': 'pulsate.target-activity-manifest/v1'}
+        'pulsate.target-activity-rf/v1': 'pulsate.target-activity-manifest/v1',
+        'pulsate.functional-activity-rf/v1': 'pulsate.functional-activity-manifest/v1'}
     if (model.get('schema_version') not in formats or manifest.get('schema_version') != formats.get(model.get('schema_version')) or len(matches) != 1
             or report.get('manifest_sha256') != manifest_sha
             or model['training']['rdkit_version'] != rdBase.rdkitVersion):
         raise ValueError('Prediction model, feature runtime, manifest and validation report disagree.')
     entry = matches[0]
     keys = ('endpoint', 'species') if model['schema_version']=='pulsate.adme-rf/v1' else ('kind', 'species', 'target_accession')
+    if model['schema_version']=='pulsate.functional-activity-rf/v1':
+        keys += ('action', 'readout', 'concentration_basis', 'variant')
     if any(entry[k] != model[k] for k in keys):
         raise ValueError('Predictive endpoint/species mismatch in the frozen manifest.')
     evidence = report['endpoints'][entry['path']]

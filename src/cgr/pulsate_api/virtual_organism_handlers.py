@@ -634,9 +634,31 @@ class VirtualOrganismHandler:
                     "No terminal half-life, systemic clearance or bioavailability is inferred from a finite sampled curve.",
                     *[limitation for m in models["models"] for limitation in m["limitations"]]],
                 "computation_selection": {"selected_compute": "classical", "quantum_selected": False, "reason": "PBPK is classical mechanistic ODE simulation, not an electronic structure problem."}}
-            ref = self.write(assessment, "virtual_organism_assessment", invocation, (exposure_ref, model_ref, pop_ref, comparison_ref, check_ref))
+            functional_refs=[]
+            if not getattr(objective,'skip_functional_integration',False):
+                from .virtual_investigation import load_policy
+                config,root,_=load_policy()
+                if config and config.get('functional_native_exposure_integration') is True:
+                    if not config.get('functional_prediction_models') or verification.get('passed') is not True:
+                        raise ValueError('Native functional integration requires its frozen models and blocking native exposure verification.')
+                    from .functional_exposure import investigate
+                    functional,sources,model_artifacts=investigate(models['identity'],exposure,config,root)
+                    for sha,raw in sources.items():
+                        functional_refs.append(self.runner.write_bytes(artifact_type='virtual_investigation_source',payload=raw,
+                            media_type='application/octet-stream',producer=name,execution_identifier=invocation.invocation_identifier,
+                            metadata={'source_sha256':sha}))
+                    for contract,payload in model_artifacts:
+                        functional_refs.append(self.runner.write_bytes(artifact_type='mechanistic_cellml_compilation' if contract.format=='cellml_compiled' else 'mechanistic_sbml_source',
+                            payload=payload,media_type='application/json' if contract.format=='cellml_compiled' else 'application/sbml+xml',
+                            producer=name,execution_identifier=invocation.invocation_identifier,metadata={'model_sha256':contract.sha256}))
+                    functional_ref=self.write(functional,'native_functional_exposure',invocation,
+                        (exposure_ref,check_ref,*functional_refs))
+                    functional_refs.append(functional_ref)
+                    assessment['functional_exposure']=dict(functional,artifact_identifier=functional_ref.artifact_identifier,
+                        artifact_sha256=functional_ref.content_sha256)
+            ref = self.write(assessment, "virtual_organism_assessment", invocation, (exposure_ref, model_ref, pop_ref, comparison_ref, check_ref,*functional_refs))
             summary = exposure_summary(assessment['status'], exposure['runs'])
-            return ScientificCapabilityOutcome(output_artifacts=(ref,), scientific_summary=summary, limitations=tuple(assessment["limitations"]))
+            return ScientificCapabilityOutcome(output_artifacts=(ref,), evidence_artifacts=tuple(functional_refs), scientific_summary=summary, limitations=tuple(assessment["limitations"]))
         raise ValueError("Unknown virtual organism capability.")
 
 

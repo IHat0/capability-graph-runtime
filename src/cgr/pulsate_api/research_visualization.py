@@ -61,14 +61,17 @@ def _json_payload(
     store: ResearchVisualizationPayloadStore,
 ) -> dict[str, object]:
     payload = store.read(reference)
-    if len(payload) > 8 * 1024 * 1024:
-        raise ResearchVisualizationError("Visualization evidence exceeds its size limit.")
     try:
-        value = json.loads(payload)
+        from .functional_exposure import read_summary
+        value = read_summary(payload, reference.artifact_type, 4 * 1024 * 1024,
+            expected_sha256=reference.content_sha256, expected_byte_size=reference.byte_size,
+            artifact_reference=reference)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ResearchVisualizationError(
             "Visualization evidence is not valid JSON."
         ) from None
+    except ValueError as error:
+        raise ResearchVisualizationError(str(error)) from None
     if not isinstance(value, dict):
         raise ResearchVisualizationError(
             "Visualization evidence must be a JSON object."
@@ -416,6 +419,9 @@ def build_research_visualization(
         elif reference.artifact_type == "scientific_verification_report":
             verification_artifacts.append(artifact_identifier)
             outcome = _string(document.get("overall_outcome"))
+            flags = [value for value in (document.get("passed"), reference.metadata.get("passed"))
+                     if type(value) is bool]
+            passed = False if False in flags else True if True in flags else None
             overlays.append(
                 {
                     "overlay_identifier": f"overlay-{artifact_identifier}",
@@ -423,12 +429,12 @@ def build_research_visualization(
                     "label": str(document.get("objective_family", "Scientific verification")).replace("_", " "),
                     "structure_artifact_identifier": source_structure(reference),
                     "candidate_identifier": None,
-                    "value": outcome or bool(reference.metadata.get("passed")),
+                    "value": outcome or (passed if passed is not None else "Not evaluated"),
                     "unit": None,
                     "atom_identifiers": [],
                     "residue_identifiers": [],
                     "verification_status": outcome or (
-                        "verified" if reference.metadata.get("passed") is True else "failed"
+                        "verified" if passed is True else "failed" if passed is False else "inconclusive"
                     ),
                     "uncertainty": document.get("uncertainty"),
                     "evidence_artifact_identifier": artifact_identifier,
@@ -691,13 +697,19 @@ def build_research_visualization(
         # Each candidate's download must point to its own verified native result.
         import copy
         prospective_workspace = copy.deepcopy(prospective_workspace)
-        for candidate in prospective_workspace['virtual_investigation']['candidates']:
+        original_prospective_ref = next(r for r in all_references if r.artifact_type == 'prospective_candidate_assessment')
+        # Compare original documents, not lossy display projections. Projection
+        # provenance/path metadata legitimately differs between nested/standalone.
+        original_candidates = json.loads(store.read(original_prospective_ref))['virtual_investigation']['candidates']
+        for candidate_index, candidate in enumerate(prospective_workspace['virtual_investigation']['candidates']):
             native_results=[candidate,*((candidate.get('native_sensitivity') or {}).get('executions',[]))]
-            for result in native_results:
+            original_candidate = original_candidates[candidate_index]
+            original_results = [original_candidate, *((original_candidate.get('native_sensitivity') or {}).get('executions', []))]
+            for result_index, result in enumerate(native_results):
                 if not result.get('virtual_organism'): continue
                 matches = [r for r in all_references if r.artifact_type == 'virtual_organism_assessment'
                     and r.artifact_identifier in result['native_artifact_identifiers']]
-                if len(matches) != 1 or documents[matches[0].artifact_identifier] != result['virtual_organism']:
+                if len(matches) != 1 or json.loads(store.read(matches[0])) != original_results[result_index]['virtual_organism']:
                     raise ValueError('Nested native visualization lacks its exact verified assessment artifact.')
                 result['virtual_organism'].update(assessment_artifact_identifier=matches[0].artifact_identifier,
                     assessment_sha256=matches[0].content_sha256)

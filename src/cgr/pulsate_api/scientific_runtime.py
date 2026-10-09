@@ -323,10 +323,15 @@ class ScientistResultAssembler:
             return None
         try:
             payload = self.payload_reader.read(reference)  # type: ignore[attr-defined]
-            if len(payload) > 4 * 1024 * 1024:
-                return None
-            return json.loads(payload), reference.artifact_identifier
-        except (AttributeError, KeyError, TypeError, ValueError, UnicodeError, RuntimeError):
+            from .functional_exposure import read_summary
+            return read_summary(payload, artifact_type, 4 * 1024 * 1024,
+                expected_sha256=reference.content_sha256,
+                expected_byte_size=reference.byte_size,
+                artifact_reference=reference), reference.artifact_identifier
+        except (AttributeError, KeyError, TypeError, ValueError, UnicodeError, RuntimeError) as error:
+            if artifact_type in {'virtual_organism_assessment', 'prospective_candidate_assessment', 'native_functional_exposure'}:
+                raise ScientificCapabilityFailure('scientific_evidence_invalid',
+                    'Physiological answer evidence failed bounded integrity validation: ' + str(error)) from error
             return None
 
     def review_candidate_evidence(self, record, question, previous=None):
@@ -542,7 +547,7 @@ class ScientistResultAssembler:
             source = f"public record CID {assessment['candidate']['pubchem_cid']}" if assessment['candidate']['pubchem_cid'] is not None else "scientist-supplied/generated graph, independently identity-checked"
             add("entity", f"Candidate {assessment['candidate']['name']}; identity {assessment['candidate']['inchikey']}; {source}.", (identifier,), True)
             request = assessment['request']
-            add("understanding", f"Organism exposure experiment: {request['dose']} {request['dose_unit']}, {request['route']}, dose times {request['administration_times_h']} h, simulated through {request['duration_h']} h.", (identifier,), True)
+            add("understanding", f"EXPOSURE: real PK-Sim organism exposure experiment: {request['dose']} {request['dose_unit']}, {request['route']}, dose times {request['administration_times_h']} h, simulated through {request['duration_h']} h. This PBPK horizon is distinct from the cellular pacing/waveform clock.", (identifier,), True)
             add("principal_result", "Virtual Organism state: " + assessment['status'].replace('_', ' ') + ".", (identifier,), True)
             adme = assessment.get('adme_parameterization')
             if adme:
@@ -559,6 +564,10 @@ class ScientistResultAssembler:
                 add("principal_result", f"{item['species']} subject {item['subject_identifier']}: sampled plasma Cmax {pk['cmax_umol_l']:.6g} umol/l at {pk['tmax_h']:.6g} h; finite-window AUC {pk['auc_0_t_umol_h_l']:.6g} umol*h/l. No terminal extrapolation.", (identifier,), True)
             sponsor_cases = [s for s in assessment.get('drug_parameter_uncertainty', {}).get('scenarios', [])
                 if s['scenario_kind'] == 'sponsor_input_sensitivity']
+            exposure_curves = [curve for run in assessment.get('runs', []) for curve in run.get('result', {}).get('series', [])]
+            exposure_curves += [curve for scenario in sponsor_cases for curve in scenario.get('series', [])]
+            if exposure_curves:
+                add('principal_result', f"EXPOSURE: {len(exposure_curves)} recorded exposure curves; Human experiment completed through {request['duration_h']} h. Full original curve samples remain downloadable; display projections do not replace raw evidence.", (identifier,), True)
             if sponsor_cases:
                 add('methods', f"Real PK-Sim Human computation evaluated {len(sponsor_cases)} conditional sponsor-input scenarios. No nominal input set was selected. These are scenario outputs, not measured PK.", (identifier,), True)
                 for scenario in sponsor_cases:
@@ -583,6 +592,50 @@ class ScientistResultAssembler:
                     add('limitation', activity['compatibility_limitations'], (identifier,), True)
                 else:
                     add('limitation', comparison['reason'], (identifier,), True)
+            functional = assessment.get('functional_exposure')
+            if functional:
+                prediction = functional['functional_activity_prediction']
+                coverage = prediction['coverage']
+                add('methods', 'Native PK-Sim exposure was connected to source-replayed, scaffold-validated functional pharmacology. ' + functional['verification']['scope'], (identifier,), True)
+                add('principal_result', f"Functional panel: {coverage['supported_model_targets']} supported model targets, {coverage['unsupported_model_targets']} unsupported; {coverage['accepted_candidate_targets']} targets have accepted in-domain candidate predictions. Refusal is not negative activity.", (identifier,), True)
+                for activity in prediction['targets']:
+                    if activity['status'] != 'predicted': continue
+                    low, high = activity['interval_umol_l']
+                    add('principal_result', f"Predicted Human {activity['gene']} {activity['action']} {activity['kind']}: {activity['value_umol_l']:.5g} umol/l, 90% marginal interval [{low:.5g}, {high:.5g}]. Nominal assay potency, not measured/free tissue potency.", (identifier,), True)
+                for activity in functional['quantitative_activity']:
+                    if activity.get('functional_assay_sha256'):
+                        add('principal_result', f"FUNCTIONAL PHARMACOLOGY: independently sourced Human {activity['target_accession']} {activity['functional_direction']} {activity['kind']}: {activity['value']:.5g} umol/l; evidence classification {activity.get('classification', 'sourced')}; assay protocol {activity['assay_context']}; concentration basis {activity['concentration_basis']}. " + activity['uncertainty'], (identifier,), True)
+                for overlap in functional['exposure_activity']:
+                    if overlap.get('comparisons') or overlap.get('peak_activity_ratios'):
+                        add('principal_result', f"EXPOSURE RELEVANCE: source-compatible Human unbound exposure/activity for {overlap['target_accession']}: {overlap['status']}; ratios {overlap.get('peak_activity_ratios', [])}. " + overlap['limitation'], (identifier,), True)
+                    else:
+                        add('limitation', f"Exposure/activity comparison refused for {overlap['target_accession']}: " + (overlap.get('reason') or overlap.get('limitation', 'No accepted comparison')), (identifier,), True)
+                for model in functional['functional_models']:
+                    if model['status'] != 'computed': continue
+                    result = model['result']
+                    qualification = result['perturbation'].get('transfer_receipt') or {}
+                    activity = next((a for a in functional['quantitative_activity']
+                        if hashlib.sha256(json.dumps(a, ensure_ascii=False, sort_keys=True,
+                            separators=(',', ':'), allow_nan=False).encode()).hexdigest() == model.get('activity_sha256')), None)
+                    protocol = activity['assay_context'] if activity else 'See hash-bound source assay receipt'
+                    add('principal_result', 'PHYSIOLOGY: Native physiological numerical response for ' + result['model']['name']
+                        + ' (' + result['model']['identifier'] + '), scenario ' + str(model.get('exposure_case_identifier'))
+                        + ', assay protocol ' + protocol + ', perturbation ' + result['perturbation']['parameter']
+                        + '; qualification state ' + str(qualification.get('qualification_state')) + '.', (identifier,), True)
+                    for output, response in result['response'].items():
+                        add('principal_result', f"Model output {output}: baseline {response['baseline_final']!r}, perturbed {response['perturbed_final']!r}, delta {response['final_difference']!r} {response['unit']}. " + result['limitation'], (identifier,), True)
+                    add('limitation', 'Existing cardiac physiology retains exploratory_only State B, with no independent candidate-decision authority. These are separate exploratory single-cell simulations across scenarios/assay protocols, not a confidence interval, population interval, clinical QTc or safety prediction. Numerical replay is not independent biological certification.', (identifier,), True)
+                computed_models = [model for model in functional['functional_models'] if model['status'] == 'computed']
+                add('principal_result', f"PHYSIOLOGY: {len(computed_models)} verified physiological calculations retained in the raw evidence.", (identifier,), True)
+                endpoint_groups = {}
+                for model in computed_models:
+                    for output, response in model['result']['response'].items():
+                        endpoint_groups.setdefault((output, response['unit']), []).append(response['final_difference'])
+                for (output, unit), deltas in endpoint_groups.items():
+                    add('principal_result', f"Observed scenario/protocol delta range for {output}: {min(deltas)!r} to {max(deltas)!r} {unit} (rounded {min(deltas):+.2f} to {max(deltas):+.2f} {unit}). This is a range of computed exploratory cases, not a confidence or population interval.", (identifier,), True)
+                add('limitation', f"Exact physiological transfer refusals retained: {len(functional['functional_transfer_refusals'])}. Incompatible species, target, tissue, concentration basis or assay contexts are not simulated.", (identifier,), True)
+                add('limitation', 'CLINICAL INFERENCE: not established. EXPOSURE is a real PK-Sim result; functional evidence and exploratory numerical physiology do not establish Human safety.', (identifier,), True)
+                add('limitation', functional['scope'] + ' No assay free fraction or Hill slope was guessed; incompatible exposures and transfers were refused.', (identifier,), True)
             add("recommendation", "Review the species-specific ADME measurements and modeled tissue exposures. Resolve missing binding/clearance/absorption evidence and obtain compatible quantitative activity measurements before exposure-to-mechanism conclusions. PBPK does not certify safety.", (identifier,), True)
             return tuple(statements)
         prospective = self._read_json_evidence(record, "prospective_candidate_assessment")
@@ -612,6 +665,24 @@ class ScientistResultAssembler:
                             else:
                                 add('limitation', f"No accepted candidate binding estimate for {activity['gene']} ({activity['target_accession']}): " + activity['reason'], (identifier,), True)
                         add('limitation', 'Nominal binding assay predictions were not relabeled as functional IC50 or unbound tissue potency. No exposure-to-physiology transfer is established by these models.', (identifier,), True)
+                    functional_prediction = candidate.get('functional_activity_prediction')
+                    if functional_prediction:
+                        coverage = functional_prediction['coverage']
+                        add('methods', 'Classical action/readout-specific Human functional models were checked against original assay bytes, excluded identities, scaffold-held-out labels and frozen uncertainty gates. ' + functional_prediction['scope'], (identifier,), True)
+                        add('principal_result', f"Functional universe: {coverage['supported_model_targets']} supported model targets and {coverage['unsupported_model_targets']} unsupported targets; {coverage['accepted_candidate_targets']} targets have accepted independent in-domain predictions for this candidate. Unsupported/refused is not negative activity.", (identifier,), True)
+                        for activity in functional_prediction['targets']:
+                            if activity['status'] != 'predicted': continue
+                            low, high = activity['interval_umol_l']
+                            add('principal_result', f"Predicted Human {activity['gene']} ({activity['target_accession']}) {activity['action']}, {activity['kind']} via {activity['readout']}: {activity['value_umol_l']:.5g} umol/l, 90% marginal interval [{low:.5g}, {high:.5g}], nearest training similarity {activity['applicability']['nearest_training_tanimoto']:.4g}. " + activity['limitation'], (identifier,), True)
+                        add('limitation', 'Functional predictions use nominal assay concentrations: free Human tissue overlap and physiological transfer are not established. Unknown Hill slopes are not supplied by the model.', (identifier,), True)
+                    for activity in candidate.get('quantitative_activity', []):
+                        if not activity.get('functional_assay_sha256'): continue
+                        add('principal_result', f"Independently sourced Human {activity['target_accession']} {activity['functional_direction']} {activity['kind']}: {activity['value']:.5g} umol/l; concentration basis {activity['concentration_basis']}; assay host {activity['assay_host']}. " + activity['uncertainty'], (identifier,), True)
+                    for overlap in candidate.get('exposure_activity', []):
+                        if overlap.get('comparisons'):
+                            add('principal_result', f"Compatible exposure/activity comparison for {overlap['target_accession']}: {overlap['status']}; {len(overlap['comparisons'])} source-bound population/scenario curves. " + overlap['limitation'], (identifier,), True)
+                        elif overlap.get('peak_activity_ratios'):
+                            add('principal_result', f"Compatible unbound exposure/activity point ratios for {overlap['target_accession']}: {overlap['peak_activity_ratios']}. " + overlap['limitation'], (identifier,), True)
                     structural = investigation.get('bioactivity_structural') or {}
                     panel_candidate = next((c for c in (structural.get('screening') or {}).get('candidates', [])
                         if c['candidate_identifier'] == candidate['candidate_identifier']), None)
@@ -919,10 +990,12 @@ class ScientificObjectiveRuntime:
         execution_repository: ScientificExecutionRepository,
         capability_registry: ScientistCapabilityRegistry,
         result_assembler: ScientistCapabilityHandler | None = None,
+        payload_store: object | None = None,
     ) -> None:
         self.root = Path(root)
         self.execution_repository = execution_repository
         self.capability_registry = capability_registry
+        self.payload_store = payload_store
         if self.capability_registry.get("scientist.result_assemble") is None:
             self.capability_registry.register(
                 "scientist.result_assemble",
@@ -1305,6 +1378,8 @@ class ScientificObjectiveRuntime:
             **updates,
             "updated_at": now,
         })
+        from .scientific_evidence import compact_execution_record
+        replacement = compact_execution_record(replacement, self.payload_store)
         return self.execution_repository.replace(
             replacement, expected_updated_at=record.updated_at
         )

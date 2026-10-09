@@ -648,6 +648,19 @@ class ResearchSessionController:
                 else current.accepted_task_type
             )
             requirement_validation_error: str | None = None
+            if (requirement_proposal is not None and accepted_requirements is None
+                    and self.requirement_interpreter is not None):
+                try:
+                    validate_requirement_proposal(requirement_proposal,
+                        available_input_types=tuple(i.artifact_type for i in inputs))
+                except ValueError:
+                    # A rejected composition is not accepted intent. Re-read
+                    # the scientist's clarification, not our generated prompts,
+                    # instead of permanently replaying the same invalid proposal.
+                    context = ' Scientist follow-up: '.join(turn.content for turn in scientist_turns)
+                    refreshed = self.requirement_interpreter.propose(context)
+                    if refreshed is not None:
+                        requirement_proposal = refreshed
             if (accepted_requirements is not None
                     and accepted_requirements.capability_profile == 'virtual_organism'
                     and self.requirement_interpreter is not None):

@@ -617,6 +617,10 @@ function parseResearchVisualization(value: unknown): ResearchVisualizationWorksp
   }
   if (containsCredentialField(value)) malformed('The backend returned unsafe visualization data.')
   const construction = value.construction_summary
+  const organism = value.virtual_organism
+  if (isRecord(organism) && organism.functional_exposure != null && !validNativeFunctionalExposure(organism.functional_exposure)) {
+    malformed('The backend returned malformed native functional pharmacology evidence.')
+  }
   const prospective = value.prospective_assessment
   if (prospective !== undefined && prospective !== null && (
     !isRecord(prospective) || !hasString(prospective, 'assessment_artifact_identifier')
@@ -665,6 +669,7 @@ function validVirtualInvestigation(value: unknown): boolean {
     && isRecord(c.dossier_acquisition.eligibility) && Array.isArray(c.dossier_acquisition.eligibility.decisions)
     && c.dossier_acquisition.eligibility.decisions.every(v => isRecord(v) && hasString(v, 'identifier') && hasString(v, 'status') && hasString(v, 'reason'))
     && isRecord(c.regimen) && hasString(c.regimen, 'status')
+    && (c.functional_activity_prediction == null || validFunctionalActivityPrediction(c.functional_activity_prediction))
     && (c.native_sensitivity === undefined || c.native_sensitivity === null || validNativeSensitivity(c.native_sensitivity))
     && isRecord(c.bioactivity_hypotheses) && Array.isArray(c.bioactivity_hypotheses.targets)
     && c.bioactivity_hypotheses.targets.every(t => isRecord(t) && hasString(t, 'target_accession')
@@ -682,6 +687,57 @@ function validVirtualInvestigation(value: unknown): boolean {
         && Object.values(f.result.response).every(r => isRecord(r) && hasString(r, 'unit')
           && ['baseline_final', 'perturbed_final', 'final_difference', 'maximum_absolute_difference'].every(k => isFiniteNumber(r[k])))))
   )
+}
+
+function validNativeFunctionalExposure(value: unknown): boolean {
+  return isRecord(value) && value.schema === 'pulsate.native-functional-exposure/v1'
+    && validFunctionalActivityPrediction(value.functional_activity_prediction)
+    && isRecord(value.verification) && value.verification.passed === true && hasString(value.verification,'scope')
+    && hasString(value,'scope') && hasString(value,'native_exposure_sha256') && hasString(value,'artifact_sha256')
+    && Array.isArray(value.quantitative_activity) && value.quantitative_activity.every(a=>isRecord(a)
+      && hasString(a,'target_accession') && ['Ki','Kd','IC50','EC50'].includes(String(a.kind))
+      && Number.isFinite(a.value) && Number(a.value)>0 && hasString(a,'concentration_basis'))
+    && (value.excluded_activity==null || (Array.isArray(value.excluded_activity) && value.excluded_activity.every(a=>isRecord(a)
+      && hasString(a,'reason') && (a.bounded_activity==null || (isRecord(a.bounded_activity)
+        && ['target_accession','kind','functional_direction','concentration_basis','uncertainty','limitation','source_sha256'].every(k=>hasString(a.bounded_activity as Record<string,unknown>,k))
+        && ['>','>=','<','<='].includes(String(a.bounded_activity.relation))
+        && isFiniteNumber(a.bounded_activity.activity_bound_umol_l) && a.bounded_activity.activity_bound_umol_l>0
+        && a.bounded_activity.value===undefined)))))
+    && Array.isArray(value.exposure_activity) && value.exposure_activity.every(a=>isRecord(a)
+      && hasString(a,'target_accession') && hasString(a,'status'))
+    && Array.isArray(value.functional_models) && value.functional_models.every(f=>isRecord(f)
+      && (f.status==='refused' ? hasString(f,'model_identifier') && hasString(f,'reason') :
+        f.status==='computed' && isRecord(f.result) && isRecord(f.result.model)
+        && hasString(f.result.model,'name') && hasString(f.result.model,'species') && hasString(f.result.model,'sha256')
+        && hasString(f.result,'inference_level') && hasString(f.result,'limitation')
+        && isRecord(f.result.verification) && f.result.verification.passed===true && isRecord(f.result.response)
+        && Object.values(f.result.response).every(r=>isRecord(r) && hasString(r,'unit')
+          && ['baseline_final','perturbed_final','final_difference','maximum_absolute_difference'].every(k=>isFiniteNumber(r[k])))))
+    && Array.isArray(value.functional_transfer_refusals) && value.functional_transfer_refusals.every(f=>isRecord(f) && hasString(f,'reason'))
+}
+
+function validFunctionalActivityPrediction(value: unknown): boolean {
+  if (!isRecord(value) || value.schema !== 'pulsate.functional-activity-prediction/v1'
+    || !['scope','manifest_sha256','universe_sha256'].every(k=>hasString(value,k))
+    || !isRecord(value.coverage) || !['supported_model_targets','unsupported_model_targets','accepted_candidate_targets','universe_targets'].every(
+      k=>Number.isInteger(value.coverage && (value.coverage as Record<string, unknown>)[k]) && Number((value.coverage as Record<string, unknown>)[k])>=0)
+    || Number(value.coverage.supported_model_targets)+Number(value.coverage.unsupported_model_targets)!==value.coverage.universe_targets
+    || !Array.isArray(value.targets) || value.targets.length>512 || !Array.isArray(value.unresolved_source_rows)) return false
+  return value.targets.every(t=>isRecord(t) && hasString(t,'gene') && hasString(t,'target_accession') && (
+    t.status==='unsupported' ? hasString(t,'reason') :
+    ['predicted','refused'].includes(String(t.status)) && ['IC50','EC50'].includes(String(t.kind))
+      && ['blocker','inhibitor','agonist','antagonist'].includes(String(t.action))
+      && hasString(t,'readout') && t.classification==='predicted' && t.concentration_basis==='assay_nominal'
+      && isRecord(t.applicability) && hasString(t.applicability,'status') && isRecord(t.research_gate)
+      && typeof t.research_gate.accepted==='boolean' && isStringArray(t.research_gate.failed_metrics)
+      && isRecord(t.research_gate.metrics) && isFiniteNumber(t.research_gate.metrics.n)
+      && (t.status==='refused' ? hasString(t,'reason') && t.value_umol_l===undefined :
+        t.research_gate.accepted===true && t.applicability.status==='in_domain' && t.applicability.training_graph_seen===false
+        && isFiniteNumber(t.value_umol_l) && t.value_umol_l>0 && Array.isArray(t.interval_umol_l)
+        && t.interval_umol_l.length===2 && t.interval_umol_l.every(v=>isFiniteNumber(v)&&v>0)
+        && t.interval_umol_l[0]<=t.value_umol_l && t.value_umol_l<=t.interval_umol_l[1]
+        && hasString(t,'interval_definition'))))
+    && value.unresolved_source_rows.every(r=>isRecord(r)&&hasString(r,'label')&&r.status==='unsupported_identity'&&hasString(r,'reason'))
 }
 
 function validNativeSensitivity(value: unknown): boolean {

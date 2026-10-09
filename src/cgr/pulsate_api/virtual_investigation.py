@@ -39,13 +39,17 @@ def load_policy():
     if doc.get('schema') != 'pulsate.virtual-investigation-policy/v1' or not doc.get('reviewer'):
         raise ValueError('Virtual investigation policy is not versioned/reviewed.')
     ProspectivePolicy.model_validate(doc['prospective_evidence'])
-    for field in ('source_library', 'mechanistic_catalogue', 'sponsor_side_dossier', 'general_safety_panel', 'target_activity_models', 'functional_activity_library'):
+    for field in ('source_library', 'mechanistic_catalogue', 'sponsor_side_dossier', 'general_safety_panel', 'target_activity_models', 'functional_activity_library', 'functional_target_universe', 'functional_prediction_models', 'functional_tissue_evidence'):
         if doc.get(field):
             resolved = (path.parent / doc[field]['path']).resolve(strict=True)
             if not resolved.is_relative_to(path.parent) or digest(resolved.read_bytes()) != doc[field]['sha256']:
                 raise ValueError('Virtual investigation configuration path/hash mismatch: ' + field)
     if doc.get('target_activity_models') and not doc.get('general_safety_panel'):
         raise ValueError('Target activity models require their exact frozen general safety panel.')
+    if doc.get('functional_prediction_models') and not doc.get('functional_target_universe'):
+        raise ValueError('Functional models require their exact frozen Human target universe.')
+    if doc.get('functional_tissue_evidence') and not doc.get('functional_target_universe'):
+        raise ValueError('Functional tissue evidence requires the exact frozen Human universe.')
     return doc, path.parent, digest(payload)
 
 
@@ -144,6 +148,15 @@ def predict_activity(identity, config, root, panel, panel_sha, *, timestamp=None
     from .activity_prediction import predict_panel, quantitative_hypotheses
     prediction, sources = predict_panel(identity, panel, panel_sha,
         root / config['target_activity_models']['path'], timestamp=timestamp)
+    return prediction, quantitative_hypotheses(prediction, identity), sources
+
+
+def predict_functional_activity(identity, config, root, universe, universe_sha, *, timestamp=None):
+    if not config or not config.get('functional_prediction_models'):
+        return None, [], {}
+    from .functional_prediction import predict_universe, quantitative_hypotheses
+    prediction, sources = predict_universe(identity, universe, universe_sha,
+        root / config['functional_prediction_models']['path'], timestamp=timestamp)
     return prediction, quantitative_hypotheses(prediction, identity), sources
 
 
@@ -287,7 +300,8 @@ def native_experiment(store, identity, acquisition, regimen, invocation):
         producer='discovery.virtual_investigate', execution_identifier=invocation.invocation_identifier, parents=(source,))
     references = [source, ref]
     record = SimpleNamespace(artifact_references=tuple(references), verified=True)
-    objective = SimpleNamespace(research_requirements=SimpleNamespace(pbpk_request=request), input_references=())
+    objective = SimpleNamespace(research_requirements=SimpleNamespace(pbpk_request=request), input_references=(),
+        skip_functional_integration=True) # Outer investigation performs this once across every case.
     workflow = []
     names = ('physiology.organism_construct', 'pharmacokinetics.pbpk_simulate', 'pharmacokinetics.population_simulate',
         'pharmacokinetics.cross_species_compare', 'pharmacokinetics.exposure_verify', 'discovery.exposure_relevance_assess')
@@ -425,6 +439,16 @@ class VirtualInvestigationHandler:
         if config and config.get('general_safety_panel'):
             safety_panel, safety_sources, safety_sha = load_safety_panel(root / config['general_safety_panel']['path'])
             sources.update(safety_sources)
+        functional_universe, functional_universe_sha = None, None
+        if config and config.get('functional_target_universe'):
+            from .functional_universe import load_universe
+            functional_universe, universe_sources, functional_universe_sha = load_universe(root / config['functional_target_universe']['path'])
+            sources.update(universe_sources)
+        tissue_evidence = None
+        if config and config.get('functional_tissue_evidence'):
+            from .functional_tissue import load_tissues
+            tissue_evidence, tissue_sources, _ = load_tissues(root / config['functional_tissue_evidence']['path'], functional_universe_sha)
+            sources.update(tissue_sources)
         for contract,payload in models:
             refs.append(self.runner.write_bytes(artifact_type='mechanistic_cellml_compilation' if contract.format == 'cellml_compiled' else 'mechanistic_sbml_source',payload=payload,
                 media_type='application/json' if contract.format == 'cellml_compiled' else 'application/sbml+xml',producer='discovery.virtual_investigate',execution_identifier=invocation.invocation_identifier,
@@ -480,6 +504,12 @@ class VirtualInvestigationHandler:
             prediction, predicted_activities, prediction_sources = predict_activity(identity, config, root, safety_panel, safety_sha)
             sources.update(prediction_sources)
             activities.extend(predicted_activities)
+            functional_prediction, functional_predictions, functional_prediction_sources = predict_functional_activity(
+                identity, config, root, functional_universe, functional_universe_sha)
+            sources.update(functional_prediction_sources)
+            activities.extend(functional_predictions)
+            from .functional_tissue import annotate_predictions
+            functional_tissues = annotate_predictions(functional_prediction, tissue_evidence) if tissue_evidence else None
             safety_coverage = evaluate_safety_panel(safety_panel, safety_sha, bioactivity, activities, intended) if safety_panel else None
             series = exposure_evidence(organism, sensitivity)
             snapshots, excluded_exposure = compatible_exposure_snapshots(identity, library, sources, policy)
@@ -510,6 +540,8 @@ class VirtualInvestigationHandler:
                 'native_exposure_endpoints': native_metrics,
                 'general_safety_panel': safety_coverage,
                 'target_activity_prediction': prediction,
+                'functional_activity_prediction': functional_prediction,
+                'functional_tissue_relevance': functional_tissues,
                 'native_artifact_identifiers':[r.artifact_identifier for r in child_refs] if organism else [],
                 'excluded_activity':excluded_activity, 'exposure_activity':relevance, 'functional_models':functional,
                 'functional_transfer_refusals':transfer_refusals,
@@ -555,6 +587,7 @@ class VirtualInvestigationHandler:
         document = {'schema':'pulsate.virtual-investigation/v1', 'policy_sha256':config_sha,
             'prospective_policy':policy.model_dump(mode='json'), 'source_library_sha256':library_sha, 'candidates':results,
             'functional_activity_library_sha256': functional_sha,
+            'functional_target_universe_sha256': functional_universe_sha,
             'bioactivity_structural':structural,
             'computation_selection':{'selected_compute':'classical','quantum_selected':False,
                 'reason':'PBPK and mechanistic ODEs are classical; no independently justified electronic subproblem was identified.'},
@@ -613,6 +646,20 @@ class VirtualInvestigationVerificationHandler:
             safety_panel, safety_sources, safety_sha = load_safety_panel(root / config['general_safety_panel']['path'])
             if any(sources.get(sha) != payload for sha, payload in safety_sources.items()):
                 raise ValueError('General safety panel source bytes were omitted or changed.')
+        functional_universe, functional_universe_sha = None, None
+        if config and config.get('functional_target_universe'):
+            from .functional_universe import load_universe
+            functional_universe, universe_sources, functional_universe_sha = load_universe(root / config['functional_target_universe']['path'])
+            if any(sources.get(sha) != payload for sha, payload in universe_sources.items()):
+                raise ValueError('Functional universe primary identity/membership sources were omitted or changed.')
+        if functional_universe_sha != report.get('functional_target_universe_sha256'):
+            raise ValueError('Functional target universe changed before verification.')
+        tissue_evidence = None
+        if config and config.get('functional_tissue_evidence'):
+            from .functional_tissue import load_tissues
+            tissue_evidence, tissue_sources, _ = load_tissues(root / config['functional_tissue_evidence']['path'], functional_universe_sha)
+            if any(sources.get(sha) != payload for sha,payload in tissue_sources.items()):
+                raise ValueError('Human tissue annotation primary sources were omitted or changed.')
         _, rows = _descriptors(record, self.runner.store)
         if [c['candidate_identifier'] for c,_,_ in rows] != [c['candidate_identifier'] for c in report['candidates']]:
             raise ValueError('Investigation omitted/reordered a candidate.')
@@ -666,6 +713,20 @@ class VirtualInvestigationVerificationHandler:
                 raise ValueError('Target activity model, validation, gate or manifest source bytes were omitted or changed.')
             library_sources.update(prediction_sources)
             activities.extend(predicted_activities)
+            functional_prediction = candidate.get('functional_activity_prediction')
+            expected_functional, functional_predictions, functional_sources = predict_functional_activity(
+                identity, config, root, functional_universe, functional_universe_sha,
+                timestamp=functional_prediction.get('timestamp') if functional_prediction else None)
+            if canonical(expected_functional) != canonical(functional_prediction):
+                raise ValueError('Functional action/potency/interval/domain/refusal failed independent numerical replay.')
+            if any(sources.get(sha) != payload for sha, payload in functional_sources.items()):
+                raise ValueError('Functional model, primary assay, split, calibration or gate sources were omitted or changed.')
+            library_sources.update(functional_sources)
+            activities.extend(functional_predictions)
+            from .functional_tissue import annotate_predictions
+            expected_tissues = annotate_predictions(expected_functional, tissue_evidence) if tissue_evidence else None
+            if canonical(expected_tissues) != canonical(candidate.get('functional_tissue_relevance')):
+                raise ValueError('Human tissue relevance failed source-bound independent replay.')
             expected_coverage = evaluate_safety_panel(safety_panel, safety_sha, bioactivity, activities, intended) if safety_panel else None
             if canonical(expected_coverage) != canonical(candidate.get('general_safety_panel')):
                 raise ValueError('General safety panel coverage failed independent replay.')

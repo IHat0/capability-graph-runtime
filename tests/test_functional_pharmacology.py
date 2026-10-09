@@ -1,5 +1,6 @@
 """Synthetic semantic guards; not observed drug-response acceptance evidence."""
 import pytest
+import json
 from cgr.pulsate_api.functional_pharmacology import normalize_assay, candidate_assays
 from cgr.pulsate_api.prospective_evidence import ProspectivePolicy
 from cgr.pulsate_api.virtual_organism import canonical, digest
@@ -38,6 +39,34 @@ def test_functional_endpoint_units_and_assumption_are_not_laundered():
     assert activity['functional_transfer_supported'] and activity['hill_coefficient'] == 1.3
     assert activity['concentration_basis_classification'] == 'assumption'
     assert activity['measured_unbound_concentration'] is False
+
+
+def test_exact_point_assay_hash_is_backward_compatible():
+    from cgr.pulsate_api.functional_pharmacology import FunctionalAssay
+    record,identity,sources,policy=fixture()
+    activity,_=normalize_assay(record,identity,policy,sources)
+    old=FunctionalAssay.model_validate(record).model_dump(mode='json',exclude={'relation','relation_evidence'})
+    assert activity['functional_assay_sha256']==digest(canonical(old))
+
+
+def test_censored_original_cell_stays_a_bound_and_cannot_drive_physiology():
+    record,identity,sources,policy=fixture()
+    document=json.loads(next(iter(sources.values())));document['value']='>120'
+    raw=canonical(document);sha=digest(raw);sources={sha:raw}
+    record['datum'].update(value='>120',source_sha256=sha)
+    record['datum']['original_source']['source_sha256']=sha
+    record['action_evidence']['source_sha256']=sha
+    record.update(relation='>',hill=None,concentration_translation=None)
+    activities,refusals=candidate_assays(identity,{'assays':[record]},sources,policy)
+    assert not activities and len(refusals)==1
+    bounded=refusals[0]['bounded_activity']
+    assert bounded['relation']=='>' and bounded['activity_bound_umol_l']==pytest.approx(.12)
+    assert 'value' not in bounded and not bounded['functional_transfer_supported']
+    assert 'hill_coefficient' not in bounded
+    record['relation']='<'
+    with pytest.raises(ValueError,match='relation disagrees'):normalize_assay(record,identity,policy,sources)
+    record['relation']='>';record['hill']={'value':1.}
+    with pytest.raises(ValueError,match='not an exact potency'):normalize_assay(record,identity,policy,sources)
 
 
 @pytest.mark.parametrize('unit,value', [('nmol/l', 120.), ('umol/l', .12)])

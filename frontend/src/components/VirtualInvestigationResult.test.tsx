@@ -25,6 +25,27 @@ function fixture(): ResearchSessionWorkspace {
 }
 
 describe('VirtualInvestigationResult', () => {
+  it('shows functional actions separately from binding and refuses unsupported numbers',()=>{
+    const research=fixture()
+    research.visualization!.prospective_assessment!.virtual_investigation!.candidates[0].functional_activity_prediction={
+      schema:'pulsate.functional-activity-prediction/v1',scope:'Synthetic rendering contract only',
+      universe_sha256:'a'.repeat(64),manifest_sha256:'b'.repeat(64),
+      coverage:{supported_model_targets:1,unsupported_model_targets:1,accepted_candidate_targets:1,universe_targets:2},
+      unresolved_source_rows:[{label:'Unspecified complex',status:'unsupported_identity',reason:'Subunits unknown'}],
+      targets:[{gene:'GENEA',target_accession:'P00001',status:'predicted',action:'inhibitor',kind:'IC50',readout:'enzymatic_activity',
+        classification:'predicted',concentration_basis:'assay_nominal',value_umol_l:.2,interval_umol_l:[.05,.8],
+        applicability:{status:'in_domain',training_graph_seen:false,nearest_training_tanimoto:.7},
+        interval_definition:'Synthetic marginal interval',limitation:'Not measured functional activity'},
+        {gene:'GENEB',target_accession:'P00002',status:'unsupported',reason:'No sufficient Human data'}]}
+    render(<VirtualInvestigationResult research={research}/>)
+    expect(screen.getByRole('heading',{name:'Functional pharmacology · predicted, not measured'})).toBeTruthy()
+    expect(screen.getByText('1 supported functional targets · 1 unsupported targets.')).toBeTruthy()
+    expect(screen.getByText(/Predicted: 0.20000/)).toBeTruthy()
+    expect(screen.getByText(/inhibitor · IC50/)).toBeTruthy()
+    expect(screen.getByText(/unsupported: No sufficient Human data/)).toBeTruthy()
+    expect(screen.getByText(/Nominal assay potency is not free Human-tissue potency/)).toBeTruthy()
+    expect(screen.getByText(/Unspecified complex — Subunits unknown/)).toBeTruthy()
+  })
   it('prominently shows exploratory physiology and its failed benchmark without implying candidate risk',()=>{
     const research=fixture()
     research.visualization!.prospective_assessment!.virtual_investigation!.candidates[0].functional_models=[{

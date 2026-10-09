@@ -504,7 +504,7 @@ def verify_simulation(report, payload):
 def exposure_perturbation(model, transfer, series, activity, *, evidence_eligible, evidence_sources=None, qualification_cache=None):
     """Only reviewed fractional-activity transfer models; no Vina -> potency."""
     if not evidence_eligible: raise ValueError('Quantitative transfer evidence is not prospectively eligible.')
-    if 'functional_assay_sha256' in activity and (
+    if ('functional_assay_sha256' in activity or 'functional_prediction_sha256' in activity) and (
             activity.get('functional_transfer_supported') is not True
             or activity.get('assay_type') != 'functional'
             or activity.get('functional_direction') not in {'inhibitor', 'blocker'}
