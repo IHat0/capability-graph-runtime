@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from collections.abc import Mapping
 
 from cgr.science import ArtifactReference
 
@@ -173,27 +174,202 @@ def compact_execution_record(record, store, maximum_bytes=RECORD_LIMIT):
     return type(record).model_validate(compact.model_dump(mode="json"))
 
 
+class EvidenceReferenceLookup(Mapping):
+    """Owned direct references plus a verified, lazily expanded provenance index.
+
+    No global store lookup is permitted. Manifest/page hashes are checked before
+    their references are admitted; each requested payload is hash/size checked.
+    Retained inline references may also occur in their own index, but must agree
+    exactly. Duplicate declarations or overlapping external indexes are refused.
+    """
+
+    def __init__(self, references, store, *, execution_identifier=None,
+                 tenant_identifier_sha256=None):
+        self.store = store
+        self.execution_identifier = execution_identifier
+        self.tenant_identifier_sha256 = tenant_identifier_sha256
+        self._references = {}
+        for reference in references:
+            identifier = reference.artifact_identifier
+            if identifier in self._references:
+                raise ValueError("Duplicate scientific artifact reference: " + identifier)
+            self._references[identifier] = reference
+        self.manifests = tuple(ref for ref in self._references.values()
+            if ref.artifact_type == MANIFEST_TYPE)
+        self._expanded = False
+
+    def _expand(self):
+        if self._expanded:
+            return
+        # Build transactionally: a corrupt or ambiguous index must not leave a
+        # partially usable cache behind after a failed lookup.
+        merged = dict(self._references)
+        indexed_identifiers = set()
+        for manifest in self.manifests:
+            document, indexed = manifest_references(self.store, manifest)
+            for field, expected in (("execution_identifier", self.execution_identifier),
+                    ("tenant_identifier_sha256", self.tenant_identifier_sha256)):
+                if expected is not None and document.get(field) != expected:
+                    raise ValueError("Scientific evidence manifest ownership mismatch: " + field)
+            pages = tuple(ArtifactReference.model_validate(value)
+                for value in document.get("pages", []))
+            for reference in (*indexed, *pages):
+                identifier = reference.artifact_identifier
+                if identifier in indexed_identifiers:
+                    raise ValueError("Ambiguous scientific evidence index reference: " + identifier)
+                indexed_identifiers.add(identifier)
+                if identifier in merged and merged[identifier] != reference:
+                    raise ValueError("Conflicting scientific artifact reference: " + identifier)
+                merged[identifier] = reference
+        self._references = merged
+        self._expanded = True
+
+    def __getitem__(self, identifier):
+        if identifier not in self._references:
+            self._expand()
+        try:
+            reference = self._references[identifier]
+        except KeyError:
+            raise KeyError("Scientific artifact is not referenced by this session: " + identifier) from None
+        verified_payload(self.store, reference)
+        return reference
+
+    def __iter__(self):
+        self._expand()
+        return iter(self._references)
+
+    def __len__(self):
+        self._expand()
+        return len(self._references)
+
+    def values(self):
+        # Type discovery enumerates verified index metadata, not raw payloads.
+        # Payload consumers still use __getitem__/verified_payload (or the
+        # immutable store's checked read); do not reread thousands of unrelated
+        # sources each time a handler locates a single report by artifact type.
+        self._expand()
+        return self._references.values()
+
+
 def resolve_reference(references, store, identifier):
     """Resolve only within an owned record's verified manifest; never global lookup."""
-    for reference in references:
-        if reference.artifact_identifier == identifier:
-            verified_payload(store, reference)
-            return reference
-    for manifest in references:
-        if manifest.artifact_type != MANIFEST_TYPE:
-            continue
-        document, indexed = manifest_references(store, manifest)
-        for reference in indexed:
-            if reference.artifact_identifier == identifier:
-                verified_payload(store, reference)
-                return reference
-        # Index pages are themselves immutable, hash-verifiable downloads.
-        for value in document.get('pages', []):
-            reference = ArtifactReference.model_validate(value)
-            if reference.artifact_identifier == identifier:
-                verified_payload(store, reference)
-                return reference
-    raise KeyError("Scientific artifact is not referenced by this session.")
+    return EvidenceReferenceLookup(references, store)[identifier]
+
+
+def recover_reference_handoff(record, *, store, verifier, assessor, assembler,
+                              expected_record_sha256):
+    """One-shot recovery of completed evidence, without the scientific runtime.
+
+    Only the failed reference-verification stage and its two pending consumers
+    may execute. Previously succeeded nodes, objectives, graph and raw evidence
+    remain unchanged. The caller persists the result with optimistic concurrency.
+    """
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+    from .phase8_scientific_handlers import _NativeRunner
+    from .scientific_executions import ScientificExecutionRecord
+
+    stages = ("discovery.virtual_investigation_verify", "discovery.prospective_assess",
+        "scientist.result_assemble")
+    remaining = tuple(node for node in record.node_executions if node.status != "succeeded")
+    if (record.status != "failed" or record.scientist_result is not None
+            or tuple(node.capability_name for node in remaining) != stages
+            or remaining[0].status != "failed"
+            or remaining[0].error_code != "virtual_investigation_verification_failed"
+            or any(node.status != "pending" for node in remaining[1:])):
+        raise ValueError("Record is not eligible for evidence-reference recovery.")
+    original = canonical(record.model_dump(mode="json"))
+    if hashlib.sha256(original).hexdigest() != expected_record_sha256:
+        raise ValueError("Recovery record differs from the reviewed failed snapshot.")
+    lookup = EvidenceReferenceLookup(record.artifact_references, store,
+        execution_identifier=record.execution_identifier,
+        tenant_identifier_sha256=record.tenant_identifier_sha256)
+    # Validate every original owned artifact before any recovery output is saved.
+    for identifier in lookup:
+        lookup[identifier]
+    # A terminal failure clears the aggregate verified flag. Restore only the
+    # already-passed intended-screening prerequisite from its owned receipt;
+    # the remaining investigation verifier still has to pass independently.
+    prerequisites = [node for node in record.node_executions
+        if node.capability_name == "scientific_verification.candidate_ranking" and node.status == "succeeded"]
+    if len(prerequisites) != 1:
+        raise ValueError("Recovery lacks the original succeeded screening verification.")
+    checks = [lookup[identifier] for identifier in prerequisites[0].output_artifact_identifiers
+        if lookup[identifier].artifact_type == "scientific_verification_report"]
+    if len(checks) != 1:
+        raise ValueError("Recovery screening-verification receipt is missing or ambiguous.")
+    previous_verification = checks[0]
+    check = json.loads(verified_payload(store, previous_verification))
+    if check.get("overall_outcome") != "passed":
+        raise ValueError("Original screening verification did not pass.")
+    runner = _NativeRunner(store)
+    prior = runner.write_json(artifact_type="scientific_handoff_prior_record",
+        payload=original, producer="pulsate-reference-handoff-recovery",
+        execution_identifier=record.execution_identifier)
+    now = max(datetime.now(UTC), record.updated_at + timedelta(microseconds=1))
+    staging = ScientificExecutionRecord.model_validate({**record.model_dump(mode="json"),
+        "status": "running", "updated_at": now, "verified": True,
+        "artifact_references": (*record.artifact_references, prior)})
+    recovered_outputs = []
+    for node, handler in zip(remaining, (verifier, assessor, assembler), strict=True):
+        invocation = SimpleNamespace(invocation_identifier="reference-recovery-" +
+            hashlib.sha256((record.execution_identifier + node.step_identifier + expected_record_sha256).encode()).hexdigest()[:32])
+        outcome = handler.execute(invocation=invocation, objective=staging.objective, record=staging)
+        if outcome.verified is not True:
+            raise ValueError("Recovery stage did not verify its saved evidence: " + node.capability_name)
+        refs = {ref.artifact_identifier: ref for ref in staging.artifact_references}
+        for ref in (*outcome.output_artifacts, *outcome.evidence_artifacts):
+            verified_payload(store, ref)
+            if ref.artifact_identifier in refs and refs[ref.artifact_identifier] != ref:
+                raise ValueError("Recovery artifact identity conflict.")
+            refs[ref.artifact_identifier] = ref
+        outputs = tuple(ref.artifact_identifier for ref in outcome.output_artifacts)
+        result = outcome.scientist_result
+        if node.capability_name == stages[-1]:
+            if result is None or result.verification_status != "passed":
+                raise ValueError("Recovery did not produce a verified scientist-facing answer.")
+            answer_bytes = canonical(result.model_dump(mode="json"))
+            if len(answer_bytes) > RECORD_LIMIT:
+                raise ValueError("Recovered answer exceeds its unchanged synthesis bound.")
+            answer = runner.write_json(artifact_type="scientist_answer", payload=answer_bytes,
+                producer="pulsate-scientist-result-assembler", execution_identifier=invocation.invocation_identifier,
+                parents=tuple(refs[identifier] for identifier in recovered_outputs))
+            refs[answer.artifact_identifier] = answer
+            outputs = (answer.artifact_identifier,)
+        recovered_outputs.extend(outputs)
+        updated_node = node.model_copy(update={"status": "succeeded", "error_code": None,
+            "error_message": None, "attempt_count": node.attempt_count + 1,
+            "output_artifact_identifiers": outputs,
+            "evidence_artifact_identifiers": tuple(ref.artifact_identifier for ref in outcome.evidence_artifacts)})
+        staging = ScientificExecutionRecord.model_validate({**staging.model_dump(mode="json"),
+            "artifact_references": tuple(refs.values()), "verified": True,
+            "pending_scientific_summaries": (),
+            "verified_scientific_summaries": tuple(dict.fromkeys((*staging.verified_scientific_summaries,
+                *staging.pending_scientific_summaries,
+                *((outcome.scientific_summary,) if outcome.scientific_summary else ())))),
+            "scientist_summary": outcome.scientific_summary or staging.scientist_summary,
+            "scientist_result": result or staging.scientist_result,
+            "evidence_artifact_identifiers": tuple(dict.fromkeys((*staging.evidence_artifact_identifiers,
+                *(ref.artifact_identifier for ref in outcome.evidence_artifacts)))),
+            "limitations": tuple(dict.fromkeys((*staging.limitations, *outcome.limitations))),
+            "node_executions": tuple(updated_node if item.step_identifier == node.step_identifier else item
+                for item in staging.node_executions)})
+        staging = compact_execution_record(staging, store)
+    receipt = runner.write_json(artifact_type="scientific_handoff_recovery_receipt",
+        payload=canonical({"schema": "pulsate.evidence-reference-recovery/v1",
+            "prior_record": prior.model_dump(mode="json"),
+            "restored_prerequisite_verification": previous_verification.model_dump(mode="json"),
+            "original_workflow_snapshot_fingerprint": record.workflow_snapshot_fingerprint,
+            "recovered_stages": list(stages), "recovered_output_artifact_identifiers": recovered_outputs,
+            "scientific_execution_stages_repeated": [], "new_scientific_sessions": 0,
+            "scope": "Existing evidence verification, frozen assessment and answer assembly only. Original failed workflow snapshot retained."}),
+        producer="pulsate-reference-handoff-recovery", execution_identifier=record.execution_identifier,
+        parents=(prior, previous_verification, *lookup.manifests))
+    final = ScientificExecutionRecord.model_validate({**staging.model_dump(mode="json"),
+        "status": "succeeded", "result_artifact_identifiers": tuple(recovered_outputs[1:]),
+        "checkpoint_identifiers": (*staging.checkpoint_identifiers, receipt.artifact_identifier),
+        "artifact_references": (*staging.artifact_references, receipt)})
+    return compact_execution_record(final, store), receipt
 
 
 def reassemble_saved_handoff(record, references, *, store, assembler, output_reference,

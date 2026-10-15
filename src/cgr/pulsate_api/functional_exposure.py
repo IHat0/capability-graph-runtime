@@ -87,6 +87,35 @@ def read_summary(payload, artifact_type, maximum_bytes, *, expected_sha256=None,
             for index, item in enumerate(value):
                 project_tables(item, path + '/' + str(index))
         elif isinstance(value, dict):
+            # Dense row-oriented observations are not scalar endpoints. Keep
+            # the exact endpoint document, but link its recorded time-ratio
+            # table to the hash-checked raw artifact instead of inlining it.
+            rows = value.get('time_ratios')
+            if isinstance(rows, list) and len(rows) > 256:
+                if artifact_reference is None:
+                    raise ValueError('Dense evidence rows require a bound raw artifact reference.')
+                if (len(rows) > 200001 or any(not isinstance(row, dict)
+                        or set(row) != {'time_h', 'ratio', 'reason'}
+                        or type(row['time_h']) not in (int, float)
+                        or (row['ratio'] is not None and type(row['ratio']) not in (int, float))
+                        or (row['reason'] is not None and not isinstance(row['reason'], str)) for row in rows)):
+                    raise ValueError('Native time-ratio evidence has an unsupported row schema/bound.')
+                numeric = [row for row in rows if type(row['ratio']) in (int, float)]
+                value['time_ratio_evidence'] = {
+                    'method': 'external-immutable-rows/v1',
+                    'externalized_fields': ['time_ratios'],
+                    'original_sample_count': len(rows),
+                    'source_rows_sha256': digest(canonical(rows)),
+                    'source_json_pointer': path + '/time_ratios',
+                    'raw_download_ref': artifact_reference.artifact_identifier,
+                    'raw_artifact_sha256': artifact_reference.content_sha256,
+                    'units': {'time_h': 'h', 'ratio': 'dimensionless'},
+                    'first_row': rows[0], 'last_row': rows[-1],
+                    'minimum_ratio_row': min(numeric, key=lambda row: row['ratio']) if numeric else None,
+                    'maximum_ratio_row': max(numeric, key=lambda row: row['ratio']) if numeric else None,
+                    'undefined_ratio_count': sum(row['ratio'] is None for row in rows),
+                    'scope': 'Full recorded rows remain in the immutable raw artifact. Scalar endpoints and qualification are unchanged; no continuous-time ratio is inferred.'}
+                del value['time_ratios']
             times = value.get('times_h')
             if isinstance(times, list) and len(times) > 256:
                 names = ['times_h'] + [name for name in ('values_umol_l', 'median_umol_l', 'p05_umol_l', 'p95_umol_l')

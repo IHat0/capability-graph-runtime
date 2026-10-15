@@ -613,9 +613,13 @@ class VirtualInvestigationVerificationHandler:
 
     def _execute(self, invocation, objective, record):
         from .scientific_off_targets import _descriptors, _intended_accession
+        from .scientific_evidence import EvidenceReferenceLookup
         config, root, config_sha = load_policy()
-        by_id = {r.artifact_identifier:r for r in record.artifact_references}
+        by_id = EvidenceReferenceLookup(record.artifact_references, self.runner.store,
+            execution_identifier=getattr(record, 'execution_identifier', None),
+            tenant_identifier_sha256=getattr(record, 'tenant_identifier_sha256', None))
         ref = next(r for r in by_id.values() if r.artifact_type == 'virtual_investigation')
+        ref = by_id[ref.artifact_identifier]
         report = json.loads(self.runner.store.read(ref))
         if report['policy_sha256'] != config_sha: raise ValueError('Investigation policy changed before verification.')
         sources = {}
@@ -826,5 +830,6 @@ class VirtualInvestigationVerificationHandler:
                 raise ValueError('Inference levels or unsupported advancement recommendation were altered.')
         payload = canonical({'passed':True,'report_sha256':ref.content_sha256, 'artifact_sha256':report['artifact_sha256'], 'scope':report['verification_scope']})
         check_ref = self.runner.write_json(artifact_type='virtual_investigation_verification',payload=payload,
-            producer='discovery.virtual_investigation_verify',execution_identifier=invocation.invocation_identifier,parents=(ref,))
+            producer='discovery.virtual_investigation_verify',execution_identifier=invocation.invocation_identifier,
+            parents=(ref, *by_id.manifests))
         return ScientificCapabilityOutcome(output_artifacts=(check_ref,),verified=True, scientific_summary='Independently replayed prospective source, dosing, native and mechanistic evidence chains.')

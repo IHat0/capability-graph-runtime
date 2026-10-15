@@ -53,11 +53,15 @@ class ProspectiveAssessmentHandler:
 
     def execute(self, *, invocation, objective, record):
         from rdkit import Chem, rdBase
+        from .scientific_evidence import EvidenceReferenceLookup
 
         store = self.runner.store
-        references = {r.artifact_identifier: r for r in record.artifact_references}
+        references = EvidenceReferenceLookup(record.artifact_references, store,
+            execution_identifier=getattr(record, 'execution_identifier', None),
+            tenant_identifier_sha256=getattr(record, 'tenant_identifier_sha256', None))
         def typed(kind):
-            return next(r for r in references.values() if r.artifact_type == kind)
+            ref = next(r for r in references.values() if r.artifact_type == kind)
+            return references[ref.artifact_identifier]
         trace_ref, pocket_ref, verifier_ref, off_target_ref = (typed(k) for k in
             ('discovery_design_loop_trace', 'binding_pocket', 'scientific_verification_report', 'prospective_off_target_screen'))
         off_targets = json.loads(store.read(off_target_ref))
@@ -68,7 +72,7 @@ class ProspectiveAssessmentHandler:
         trace, pocket = (json.loads(store.read(r)) for r in (trace_ref, pocket_ref))
         if not record.verified or not trace.get('loop_complete'):
             raise ScientificCapabilityFailure('prospective_unverified', 'Prospective assessment requires blocking screening verification.')
-        source_audit, assessment_candidates, parents = [], [], [trace_ref, pocket_ref, verifier_ref, off_target_ref, off_verifier_ref]
+        source_audit, assessment_candidates, parents = [], [], [trace_ref, pocket_ref, verifier_ref, off_target_ref, off_verifier_ref, *references.manifests]
         investigation_refs = [r for r in references.values() if r.artifact_type == 'virtual_investigation']
         investigation = None
         if investigation_refs:

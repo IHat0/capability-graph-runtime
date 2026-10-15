@@ -84,6 +84,57 @@ def test_large_aligned_exposure_arrays_are_externalized_without_endpoint_or_peak
     assert canonical(document)==payload
 
 
+def test_dense_ratio_rows_externalize_without_changing_exact_endpoints(tmp_path):
+    from cgr.pulsate_api.phase8_scientific_handlers import _NativeRunner
+    from cgr.pulsate_api.scientific_production import DurableScientificPayloadStore
+    store=DurableScientificPayloadStore(tmp_path/'artifacts'); store.start()
+    rows=[{'time_h':i/20.,'ratio':None if i==0 else i/37.,
+        'reason':'Undefined at zero plasma' if i==0 else None} for i in range(481)]
+    rows[117]['ratio']=91.12345678901234
+    endpoint={'peak_umol_l':.12345678901234567,'sampled_tmax_h':[.5],
+        'auc_umol_h_l':2.1234567890123457,'window_h':[0.,24.],'qualification':'exploratory_only'}
+    ratio={'auc_tissue_plasma_ratio':1.1234567890123457,'window_h':[0.,24.],'time_ratios':rows}
+    document={'native_exposure_endpoints':{'endpoints':[endpoint],
+        'tissue_plasma_ratios':[copy.deepcopy(ratio) for _ in range(180)]}}
+    raw=canonical(document)
+    assert len(raw)>4*1024*1024
+    ref=_NativeRunner(store).write_json(artifact_type='prospective_candidate_assessment',
+        payload=raw,producer='synthetic',execution_identifier='synthetic')
+    kwargs=dict(expected_sha256=ref.content_sha256,expected_byte_size=ref.byte_size,artifact_reference=ref)
+    summary=read_summary(raw,ref.artifact_type,4*1024*1024,**kwargs)
+    assert summary==read_summary(raw,ref.artifact_type,4*1024*1024,**kwargs)
+    assert len(canonical(summary))<4*1024*1024
+    assert summary['native_exposure_endpoints']['endpoints']==[endpoint]
+    small=summary['native_exposure_endpoints']['tissue_plasma_ratios'][0]
+    assert small['auc_tissue_plasma_ratio']==ratio['auc_tissue_plasma_ratio']
+    assert small['window_h']==ratio['window_h'] and 'time_ratios' not in small
+    receipt=small['time_ratio_evidence']
+    assert receipt['source_rows_sha256']==digest(canonical(rows))
+    assert receipt['first_row']==rows[0] and receipt['last_row']==rows[-1]
+    assert receipt['maximum_ratio_row']==rows[117] and receipt['original_sample_count']==481
+    assert receipt['undefined_ratio_count']==1 and receipt['raw_download_ref']==ref.artifact_identifier
+    assert receipt['source_json_pointer']=='/native_exposure_endpoints/tissue_plasma_ratios/0/time_ratios'
+    assert canonical(document)==raw and store.read(ref)==raw
+    store.close(); reopened=DurableScientificPayloadStore(tmp_path/'artifacts'); reopened.start()
+    assert digest(reopened.read(ref))==ref.content_sha256
+    with pytest.raises(ValueError,match='full payload hash/size'):
+        read_summary(raw+b' ',ref.artifact_type,4*1024*1024,**kwargs)
+    with pytest.raises(ValueError,match='bound raw artifact'):
+        read_summary(raw,ref.artifact_type,4*1024*1024)
+
+
+def test_small_ratio_tables_are_unchanged_and_unknown_dense_rows_refuse():
+    from types import SimpleNamespace
+    rows=[{'time_h':i,'ratio':None,'reason':'Undefined'} for i in range(257)]
+    small={'time_ratios':rows[:2]}
+    assert read_summary(canonical(small),'prospective_candidate_assessment',10000)==small
+    rows[0]['unexpected']='Not silently dropped'
+    raw=canonical({'time_ratios':rows})
+    ref=SimpleNamespace(artifact_identifier='synthetic',content_sha256=digest(raw))
+    with pytest.raises(ValueError,match='unsupported row schema'):
+        read_summary(raw,'prospective_candidate_assessment',10000,artifact_reference=ref)
+
+
 def test_answer_preserves_every_verified_scenario_protocol_and_exact_endpoint():
     """Synthetic assembly values, not a scientific acceptance benchmark."""
     from types import SimpleNamespace

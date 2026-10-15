@@ -301,7 +301,8 @@ def test_names_and_activity_points_do_not_qualify_human_transfer(defect):
         evidence_eligible=True,evidence_sources=sources)
 
 
-def test_unconfigured_engine_is_verified_partial_not_invented_human(monkeypatch):
+@pytest.mark.parametrize('external_manifest', [False, True])
+def test_unconfigured_engine_is_verified_partial_not_invented_human(monkeypatch, external_manifest):
     monkeypatch.delenv('PULSATE_VIRTUAL_INVESTIGATION_POLICY',raising=False)
     class Store:
         def __init__(self): self.values={}
@@ -318,14 +319,30 @@ def test_unconfigured_engine_is_verified_partial_not_invented_human(monkeypatch)
     pocket=write('binding_pocket',{})
     record=SimpleNamespace(artifact_references=(descriptor,trace,pocket),verified=True)
     outcome=VirtualInvestigationHandler(store).execute(invocation=invocation,objective=None,record=record)
-    record.artifact_references+=(*outcome.output_artifacts,*outcome.evidence_artifacts)
-    report=json.loads(store.read(outcome.output_artifacts[0]))
+    record.artifact_references=tuple({r.artifact_identifier:r for r in
+        (*record.artifact_references,*outcome.output_artifacts,*outcome.evidence_artifacts)}.values())
+    # A synthetic child exercises the source-reference seam, without requiring
+    # a model bank, native calculation or public acquisition in this test.
+    source = write('virtual_investigation_source', {'synthetic_reference': True})
+    report = json.loads(store.read(outcome.output_artifacts[0]))
+    report['artifact_sha256'][source.artifact_identifier] = source.content_sha256
+    report_ref = write('virtual_investigation', report)
+    record.artifact_references = (*tuple(r for r in record.artifact_references
+        if r.artifact_identifier != outcome.output_artifacts[0].artifact_identifier), source, report_ref)
+    if external_manifest:
+        index = write('scientific_evidence_manifest', {
+            'schema': 'pulsate.scientific-evidence-manifest/v1',
+            'artifact_references': [r.model_dump(mode='json') for r in record.artifact_references]})
+        record.artifact_references = (*tuple(r for r in record.artifact_references
+            if r.artifact_identifier != source.artifact_identifier), index)
     assert report['candidates'][0]['virtual_organism'] is None
     check=VirtualInvestigationVerificationHandler(store).execute(invocation=invocation,objective=None,record=record)
     assert json.loads(store.read(check.output_artifacts[0]))['passed']
+    if external_manifest:
+        assert index.pointer in check.output_artifacts[0].parents
     report['candidates'][0]['inference_levels']['clinical']=True
-    store.values[outcome.output_artifacts[0].artifact_identifier]=canonical(report)
-    with pytest.raises(Exception,match='Inference levels'):
+    store.values[report_ref.artifact_identifier]=canonical(report)
+    with pytest.raises(Exception,match='hash/size mismatch'):
         VirtualInvestigationVerificationHandler(store).execute(invocation=invocation,objective=None,record=record)
 
 
